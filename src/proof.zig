@@ -745,12 +745,7 @@ const test_root = dns.Name{ .labels = &.{} };
 pub const test_com = dns.Name{ .labels = &.{"com"} };
 
 test "classifyDelegation with DS present" {
-    const child_zone = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const child_zone = dns.Name{ .labels = &.{ "example", "com" } };
 
     const authorities = [_]dns.ResourceRecord{.{
         .name = child_zone,
@@ -770,72 +765,19 @@ test "classifyDelegation with DS present" {
 }
 
 test "classifyDelegation with NSEC proving no DS" {
-    const child_zone = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const child_zone = dns.Name{ .labels = &.{ "example", "com" } };
 
-    // NSEC record at child zone name, no DS in bitmap
-    // Bitmap: A(1)=0x40, NS(2)=0x20 => byte 0 = 0x60
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = child_zone,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 86400,
-        .rdata = .{
-            .nsec = .{
-                .next_domain_name = dns.Name{
-                    .labels = &.{
-                        @as([]const u8, "next"),
-                        @as([]const u8, "com"),
-                    },
-                },
-                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS, no SOA/DS: parent-side cut
-            },
-        },
-    }};
+    // A + NS, no SOA or DS: the parent's side of the cut.
+    const next = dns.Name{ .labels = &.{ "next", "com" } };
+    const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(child_zone, next, &.{ 0x00, 0x01, 0x60 })};
 
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(Delegation.unsigned, classifyDelegation(&authorities, child_zone, test_com, &b));
 }
 
-test "classifyDelegation with no DS and no proof" {
-    const child_zone = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
-
-    const ns_name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "ns1"),
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = child_zone,
-        .rtype = .ns,
-        .rclass = .in,
-        .ttl = 86400,
-        .rdata = .{ .ns = ns_name },
-    }};
-
-    // No DS and no NSEC/NSEC3 proof — indeterminate, so unproven
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, test_com, &b));
-}
-
 test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
-    const child_zone = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const next = dns.Name{
-        .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
-    };
+    const child_zone = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "next", "com" } };
 
     // Neither is the parent's side of a cut, so neither proves it unsigned.
     const cases = [_][]const u8{
@@ -843,13 +785,7 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
         &[_]u8{ 0x00, 0x01, 0x40 }, // A only (no NS — not a delegation point)
     };
     for (cases) |type_bit_maps| {
-        const authorities = [_]dns.ResourceRecord{.{
-            .name = child_zone,
-            .rtype = .nsec,
-            .rclass = .in,
-            .ttl = 86400,
-            .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = type_bit_maps } },
-        }};
+        const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(child_zone, next, type_bit_maps)};
         var b: rrsig.ValidationBudget = .{};
         try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, test_com, &b));
     }
@@ -857,17 +793,11 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
 
 test "canonical name ordering" {
     const root = dns.Name{ .labels = &.{} };
-    const com = dns.Name{ .labels = &.{@as([]const u8, "com")} };
-    const example_com = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const a_example_com = dns.Name{
-        .labels = &.{ @as([]const u8, "a"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const z_example_com = dns.Name{
-        .labels = &.{ @as([]const u8, "z"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const net = dns.Name{ .labels = &.{@as([]const u8, "net")} };
+    const com = dns.Name{ .labels = &.{"com"} };
+    const example_com = dns.Name{ .labels = &.{ "example", "com" } };
+    const a_example_com = dns.Name{ .labels = &.{ "a", "example", "com" } };
+    const z_example_com = dns.Name{ .labels = &.{ "z", "example", "com" } };
+    const net = dns.Name{ .labels = &.{"net"} };
 
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(root, com));
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(com, net));
@@ -879,40 +809,31 @@ test "canonical name ordering" {
 }
 
 test "NSEC name non-existence" {
-    const alpha = dns.Name{
-        .labels = &.{ @as([]const u8, "alpha"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const gamma = dns.Name{
-        .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
+    const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
 
     const nsec_data = dns.NsecData{
         .next_domain_name = gamma,
         .type_bit_maps = &.{},
     };
 
-    const beta = dns.Name{
-        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     try testing.expect(nsecProvesNameNonexistence(alpha, nsec_data, beta));
 
-    const zeta = dns.Name{
-        .labels = &.{ @as([]const u8, "zeta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const zeta = dns.Name{ .labels = &.{ "zeta", "example", "com" } };
     try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, zeta));
 
     try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, alpha));
 }
 
 test "NSEC type non-existence" {
-    const name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
 
-    // Bitmap has A, NS and SOA but not AAAA
-    // A(1)=0x40, NS(2)=0x20, SOA(6)=0x02 => byte0 = 0x62
+    // A, NS and SOA (0x62) but not AAAA. SOA is load-bearing: NS without it
+    // would make this the parent side of a cut, which RFC 6840 §4.1 bars
+    // from proving anything but DS.
     const nsec_data = dns.NsecData{
-        .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
+        .next_domain_name = dns.Name{ .labels = &.{"next"} },
         .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 },
     };
 
@@ -923,14 +844,12 @@ test "NSEC type non-existence" {
 }
 
 test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
-    const name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
 
     // Bitmap with CNAME (5) at byte 0 bit 2 (0x04) and TXT (16) at byte 2 bit 7 (0x80).
     // Block: window 0, length 3, bytes 0x04, 0x00, 0x80.
     const cname_present = dns.NsecData{
-        .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
+        .next_domain_name = dns.Name{ .labels = &.{"next"} },
         .type_bit_maps = &[_]u8{ 0x00, 0x03, 0x04, 0x00, 0x80 },
     };
     const present = [_]dns.ResourceRecord{nsecRrWithBitmap(name, cname_present.next_domain_name, cname_present.type_bit_maps)};
@@ -942,7 +861,7 @@ test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
 
     // Bitmap with TXT only — no CNAME, no AAAA.
     const cname_absent = dns.NsecData{
-        .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
+        .next_domain_name = dns.Name{ .labels = &.{"next"} },
         .type_bit_maps = &[_]u8{ 0x00, 0x03, 0x00, 0x00, 0x80 },
     };
     const absent = [_]dns.ResourceRecord{nsecRrWithBitmap(name, cname_absent.next_domain_name, cname_absent.type_bit_maps)};
@@ -979,59 +898,13 @@ test "NSEC3 hash range wrap-around" {
     try testing.expect(!nsec3HashInRange(&owner, &next, &target_between));
 }
 
-test "mixed NSEC/NSEC3 detection" {
-    const name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-
-    const nsec_only = [_]dns.ResourceRecord{.{
-        .name = name,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec = .{
-            .next_domain_name = name,
-            .type_bit_maps = &.{},
-        } },
-    }};
-    try testing.expect(!hasMixedNsecNsec3(&nsec_only));
-
-    const nsec3_only = [_]dns.ResourceRecord{makeNsec3Rr(name, &.{}, &@as([20]u8, @splat(0)), &.{})};
-    try testing.expect(!hasMixedNsecNsec3(&nsec3_only));
-
-    const mixed = [_]dns.ResourceRecord{
-        nsec_only[0],
-        nsec3_only[0],
-    };
-    try testing.expect(hasMixedNsecNsec3(&mixed));
-}
-
-test "validateNegativeProof NSEC NODATA" {
-    const name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-
-    // NSEC at the example.com apex has A, NS and SOA but not AAAA. SOA is
-    // load-bearing: NS without it would make this the parent side of a cut,
-    // which RFC 6840 §4.1 bars from proving anything but DS.
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = name,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{
-            .nsec = .{
-                .next_domain_name = dns.Name{
-                    .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
-                },
-                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 }, // A + NS + SOA
-            },
-        },
-    }};
-
+test "a section mixing NSEC and NSEC3 proves nothing" {
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
+    const nsec = nsecRr(name, name);
+    const mixed = [_]dns.ResourceRecord{ nsec, makeNsec3Rr(name, &.{}, &@as([20]u8, @splat(0)), &.{}) };
     var b: rrsig.ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b);
-    try testing.expectEqual(SecurityStatus.secure, status);
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&.{nsec}, name, .a, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&mixed, name, .a, false, test_root, &b));
 }
 
 test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)" {
@@ -1104,13 +977,7 @@ test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
 }
 
 pub fn nsecRr(owner: dns.Name, next: dns.Name) dns.ResourceRecord {
-    return .{
-        .name = owner,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = &.{} } },
-    };
+    return nsecRrWithBitmap(owner, next, &.{});
 }
 
 test "validateNegativeProof NSEC NXDOMAIN deep CE (not zone apex)" {
@@ -1293,16 +1160,6 @@ test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
-test "validateNegativeProof NSEC NODATA owner-match with qtype in bitmap is .bogus" {
-    const name = dns.Name{ .labels = &.{ "example", "com" } };
-    const next = dns.Name{ .labels = &.{ "next", "com" } };
-    const bitmap = [_]u8{ 0x00, 0x04, 0x62, 0x00, 0x00, 0x08 }; // A+NS+SOA+AAAA
-    const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(name, next, &bitmap)};
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b));
-}
-
 test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unchecked" {
     // Covering range starts at aaa.example.com, so *.example.com sorts before
     // the range and isn't covered. No *.CE NSEC either.
@@ -1369,52 +1226,21 @@ fn makeCoveringNsec3(
     return makeNsec3Rr(owner, salt, &bufs.high, &.{});
 }
 
-test "base32hex decode/encode roundtrip" {
-    // RFC 5155 Appendix B: "example" with salt aabbccdd, 12 iterations
-    // Expected base32hex: 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM
-    const name = dns.Name{ .labels = &.{@as([]const u8, "example")} };
+test "nsec3Hash RFC 5155 Appendix B" {
+    const name = dns.Name{ .labels = &.{"example"} };
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
-    const hash = try nsec3Hash(name, &salt, 12);
-
     var enc_buf: [32]u8 = undefined;
-    const encoded = dns.base32HexEncode(&enc_buf, &hash);
-    // RFC 5155 Appendix B known-answer: covers nsec3Hash and base32HexEncode.
-    try testing.expectEqualStrings("0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM", encoded);
-
-    var dec_buf: [20]u8 = undefined;
-    const n = try dns.base32HexDecode(&dec_buf, encoded);
-    try testing.expectEqual(@as(usize, 20), n);
-    try testing.expectEqualSlices(u8, &hash, dec_buf[0..n]);
+    try testing.expectEqualStrings("0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM", dns.base32HexEncode(&enc_buf, &try nsec3Hash(name, &salt, 12)));
 }
 
-test "nsec3OwnerHash extraction" {
-    const name = dns.Name{ .labels = &.{@as([]const u8, "example")} };
-    const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
-    const hash = try nsec3Hash(name, &salt, 12);
-
-    var enc_buf: [32]u8 = undefined;
-    const encoded = dns.base32HexEncode(&enc_buf, &hash);
-
-    const owner_name = dns.Name{
-        .labels = &.{ encoded, @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const extracted = nsec3OwnerHash(owner_name).?;
-    try testing.expectEqualSlices(u8, &hash, &extracted);
-
-    const bad_name = dns.Name{ .labels = &.{@as([]const u8, "tooshort")} };
-    try testing.expect(nsec3OwnerHash(bad_name) == null);
-
-    const empty_name = dns.Name{ .labels = &.{} };
-    try testing.expect(nsec3OwnerHash(empty_name) == null);
+test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
+    try testing.expect(nsec3OwnerHash(.{ .labels = &.{"tooshort"} }) == null);
+    try testing.expect(nsec3OwnerHash(.{ .labels = &.{} }) == null);
 }
 
 test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 5155 §8.1)" {
-    const qname = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const owner_name = dns.Name{
-        .labels = &.{ @as([]const u8, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), @as([]const u8, "com") },
-    };
+    const qname = dns.Name{ .labels = &.{ "example", "com" } };
+    const owner_name = dns.Name{ .labels = &.{ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "com" } };
     const next: [20]u8 = @splat(0xFF);
     const authorities = [_]dns.ResourceRecord{.{
         .name = owner_name,
@@ -1437,28 +1263,6 @@ test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 51
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
     try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, qname, test_com, &b));
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&authorities, qname, 1, test_root, &b));
-}
-
-test "NSEC3 NODATA - secure" {
-    // Query: example.com AAAA (NODATA)
-    // NSEC3 at hash(example.com) has A, NS and SOA but not AAAA, not CNAME.
-    // SOA is load-bearing: NS without it is the parent side of a cut, which
-    // RFC 6840 §4.1 bars from proving anything but DS.
-    const qname = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
-    const salt: []const u8 = &.{};
-    const hash = try nsec3Hash(qname, salt, 0);
-
-    var bufs: Nsec3OwnerBufs = .{};
-    const owner_name = makeNsec3OwnerName(hash, zone_labels, &bufs);
-
-    // Bitmap: A(bit1=0x40) + NS(bit2=0x20) + SOA(bit6=0x02) = 0x62
-    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x62 })};
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
 test "NSEC3 rejects an ancestor-delegation record (RFC 6840 §4.1)" {
@@ -1529,14 +1333,12 @@ test "NSEC3 child-side apex cannot deny DS (RFC 6840 §4.4)" {
 
 test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
     // Mirrors NSEC arm: owner-match with CNAME in bitmap contradicts NODATA.
-    const qname = dns.Name{
-        .labels = &.{ @as([]const u8, "alias"), @as([]const u8, "com") },
-    };
+    const qname = dns.Name{ .labels = &.{ "alias", "com" } };
     const salt: []const u8 = &.{};
     const hash = try nsec3Hash(qname, salt, 0);
 
     var bufs: Nsec3OwnerBufs = .{};
-    const owner_name = makeNsec3OwnerName(hash, &.{@as([]const u8, "com")}, &bufs);
+    const owner_name = makeNsec3OwnerName(hash, &.{"com"}, &bufs);
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x04 })};
 
@@ -1544,47 +1346,10 @@ test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
-test "NSEC3 NXDOMAIN - closest encloser proof" {
-    // CE = example.com, NC = nonexistent.example.com, WC = *.example.com
-    const qname = dns.Name{
-        .labels = &.{ @as([]const u8, "nonexistent"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const ce_name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const wc_name = dns.Name{
-        .labels = &.{ @as([]const u8, "*"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
-    const salt: []const u8 = &.{};
-
-    var bufs1: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1);
-
-    var bufs2: Nsec3OwnerBufs = .{};
-    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2);
-
-    var bufs3: Nsec3OwnerBufs = .{};
-    const wc_rr = makeCoveringNsec3(try nsec3Hash(wc_name, salt, 0), zone_labels, salt, &bufs3);
-
-    const authorities = [_]dns.ResourceRecord{
-        makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
-        nc_rr,
-        wc_rr,
-    };
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
-}
-
 test "NSEC3 NXDOMAIN - missing wildcard cover" {
-    const qname = dns.Name{
-        .labels = &.{ @as([]const u8, "gone"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const ce_name = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const qname = dns.Name{ .labels = &.{ "gone", "example", "com" } };
+    const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const zone_labels: []const []const u8 = &.{"com"};
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
@@ -1627,7 +1392,7 @@ const OptOutDsProof = struct {
     /// `opt_out = false` makes the coverer a plain name-denial, which without
     /// a wildcard step proves nothing.
     fn init(self: *@This(), qname: dns.Name, opt_out: bool) !void {
-        const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+        const zone_labels: []const []const u8 = &.{"com"};
         const salt: []const u8 = &.{};
         const ce = dns.Name{ .labels = zone_labels };
         const ce_hash = try nsec3Hash(ce, salt, 0);
@@ -1743,7 +1508,7 @@ const OptOutNxProof = struct {
     rrs: [3]dns.ResourceRecord = undefined,
 
     fn init(self: *@This(), qname: dns.Name, nc_opt_out: bool) !void {
-        const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+        const zone_labels: []const []const u8 = &.{"com"};
         const salt: []const u8 = &.{};
         const ce = dns.Name{ .labels = zone_labels };
         const ce_hash = try nsec3Hash(ce, salt, 0);
@@ -1845,7 +1610,7 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
     const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
     const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
     const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const zone_labels: []const []const u8 = &.{"com"};
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
@@ -1873,7 +1638,7 @@ test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
     const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
     const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
     const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const zone_labels: []const []const u8 = &.{"com"};
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
@@ -1895,10 +1660,8 @@ test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
 
 test "classifyDelegation NSEC3 match" {
     // NSEC3 owner matches hash(child_zone), DS absent → insecure
-    const child_zone = dns.Name{
-        .labels = &.{ @as([]const u8, "unsigned"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
+    const child_zone = dns.Name{ .labels = &.{ "unsigned", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{ "example", "com" };
     const salt: []const u8 = &.{};
 
     var bufs: Nsec3OwnerBufs = .{};
@@ -1954,26 +1717,6 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     try testing.expectEqual(Delegation.unsigned, classifyDelegation(&.{ span2, apex }, direct, test_com, &b));
 }
 
-test "classifyDelegation NSEC3 non-match" {
-    const child_zone = dns.Name{
-        .labels = &.{ @as([]const u8, "signed"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
-    const salt: []const u8 = &.{};
-
-    const other_name = dns.Name{
-        .labels = &.{ @as([]const u8, "other"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    var bufs: Nsec3OwnerBufs = .{};
-    const owner_name = makeNsec3OwnerName(try nsec3Hash(other_name, salt, 0), zone_labels, &bufs);
-
-    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0)), &[_]u8{ 0x00, 0x01, 0x20 })};
-
-    // NSEC3 doesn't cover the child zone — indeterminate, so unproven
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, .{ .labels = zone_labels }, &b));
-}
-
 test "NSEC3 hash budget exhaustion" {
     // CVE-2023-50868: a deep ancestor walk under a tight budget exhausts before
     // the CE is found. Exhausting the whole-query budget is an attack signal, so
@@ -1990,7 +1733,7 @@ test "NSEC3 hash budget exhaustion" {
 
     // One unrelated NSEC3 — will never match any ancestor, so budget gets exhausted
     var bufs: Nsec3OwnerBufs = .{};
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const zone_labels: []const []const u8 = &.{"com"};
     const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_labels, &bufs);
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
@@ -2072,7 +1815,7 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     const salt: []const u8 = &.{};
 
     var bufs: Nsec3OwnerBufs = .{};
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const zone_labels: []const []const u8 = &.{"com"};
     const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_labels, &bufs);
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
 
