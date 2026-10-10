@@ -15,7 +15,7 @@
         };
         bench = pkgs.mkShell {
           packages = with pkgs; [
-            nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck valgrind strace
+            nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck strace
             unbound pdns-recursor knot-resolver_6 bind
             python3 go_1_27
           ];
