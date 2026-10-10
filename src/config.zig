@@ -590,14 +590,11 @@ test "tcp idle and queries knobs parse and validate" {
     try testing.expectEqual(@as(u32, 8000), cfg.tcp_idle_timeout_ms);
     try testing.expectEqual(@as(u32, 64), cfg.tcp_queries_per_conn);
 
-    // Zero queries-per-conn would loop forever; parser must reject.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\tcp-queries-per-conn = 0
     ));
 
-    // RFC 7828 §3.1 caps the wire TIMEOUT field at u16 (100-ms units);
-    // reject configs that would overflow the @intCast at emit time.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\tcp-idle-timeout-ms = 7000000
@@ -693,15 +690,10 @@ test "test-only knobs gated on -Dtesting" {
 }
 
 test "an out-of-range integer is rejected, never clamped" {
-    // Regression: the parser used to fold anything larger down to
-    // maxInt(u32). For `user` that is 4294967295 == (uid_t)-1, setresuid's
-    // "leave unchanged" sentinel — the kernel returns success and hark
-    // logged that it had dropped privileges while still running as root.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\user = 99999999999
     ));
-    // Written literally, the sentinel is just as wrong.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\user = 4294967295
@@ -710,9 +702,6 @@ test "an out-of-range integer is rejected, never clamped" {
         \\[server]
         \\group = 4294967295
     ));
-    // 0 reaches the same false "dropped user to uid=0" log by a much likelier
-    // route: a template substituting an unset variable. setresuid(0,0,0)
-    // succeeds trivially, so the report would be a lie while still root.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\user = 0
@@ -721,14 +710,10 @@ test "an out-of-range integer is rejected, never clamped" {
         \\[server]
         \\group = 0
     ));
-    // Semantic limits are rejected too, not silently clamped: stagger-ms = 5000
-    // meant five seconds to whoever wrote it.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\stagger-ms = 5000
     ));
-    // Not credential-specific: silent clamping contradicts the strict schema
-    // everywhere, so every nonNegative caller rejects too.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[cache]
         \\serve-stale-ttl = 99999999999
@@ -738,7 +723,6 @@ test "an out-of-range integer is rejected, never clamped" {
         \\min-ttl = 4294967296
     ));
 
-    // Real ids still parse, including the largest legitimate one.
     var cfg = try parseConfig(testing.allocator,
         \\[server]
         \\user = 4294967294
