@@ -163,23 +163,19 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
     return gop.value_ptr;
 }
 
-/// A proof carries at most this many NSECs (closest encloser, next closer,
-/// wildcard); the rest is stuffing.
-const max_proofs = 8;
-
 /// A secure negative's SOA and NSECs become facts, each for as long as
-/// its own proof holds (RFC 8198 §5.4).
+/// its own proof holds (RFC 8198 §5.4). A flood never proved anything.
 pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const i64, keys_until: i64) !void {
+    std.debug.assert(!proof.proofFlood(r.authorities));
     var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     const zkey = signer.formatLower(&buf);
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
-    var proofs: usize = 0;
     for (r.authorities, 0..) |rr, i| {
         if ((rr.rtype != .nsec and rr.rtype != .soa) or !rr.name.isSubdomainOf(signer)) continue;
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
-        if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
+        if (rr.rtype == .nsec and minimal(rr)) continue;
         const rrs = dnssec.setFrom(r.authorities, i);
         const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
@@ -195,7 +191,6 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
             z.soa = .{ .judged = judged, .expires_ns = expires };
             continue;
         }
-        proofs += 1;
         const sp = Span.init(g.gpa, rr, expires, judged) catch |e| {
             g.store.unref(judged);
             return e;
