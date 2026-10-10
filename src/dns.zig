@@ -765,9 +765,8 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
-/// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels.
-/// `@constCast` is sound because `parseDottedName` `dupe`s each label, so
-/// the underlying storage is mutable. RFC draft Vixie/Dagon.
+/// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels,
+/// which the caller owns. RFC draft Vixie/Dagon.
 fn applyCase0x20(rng: std.Random, name: Name) void {
     var pool: u64 = 0;
     var bits_left: u8 = 0;
@@ -800,8 +799,8 @@ const QueryOptions = struct {
     case_rng: ?std.Random = null,
 };
 
-pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
-    const name = try parseDottedName(allocator, name_str);
+pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, options: QueryOptions) Allocator.Error!Message {
+    const name = try cloneNameFlat(allocator, qname, false);
     if (options.case_rng) |rng| applyCase0x20(rng, name);
     const questions = try allocator.alloc(Question, 1);
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
@@ -2022,7 +2021,7 @@ test "EDNS0: serialized OPT has correct wire format" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQuery(alloc, 0xABCD, "x.com", .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
+    const msg = try buildQuery(alloc, 0xABCD, .{ .labels = &.{ "x", "com" } }, .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
 
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
@@ -2685,8 +2684,8 @@ test "applyCase0x20 only flips ASCII letters; round-trips eql" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const original = try parseDottedName(alloc, "Foo.Bar123-baz.com");
-    const randomized = try parseDottedName(alloc, "Foo.Bar123-baz.com");
+    const original: Name = .{ .labels = &.{ "Foo", "Bar123-baz", "com" } };
+    const randomized = try cloneNameFlat(alloc, original, false);
 
     applyCase0x20(prng.random(), randomized);
 

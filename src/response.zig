@@ -271,7 +271,7 @@ test "serializeErrorResponse produces valid DNS message" {
 test "validateQuery rejects QR=1 (response posing as query)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
+    var spoofed = try dns.buildQuery(arena.allocator(), 0, .{ .labels = &.{ "example", "com" } }, .a, .{});
     spoofed.header.flags.qr = true;
 
     try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
@@ -280,7 +280,7 @@ test "validateQuery rejects QR=1 (response posing as query)" {
 test "validateQuery returns BADVERS for unsupported EDNS version" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
+    var query = try dns.buildQuery(arena.allocator(), 0, .{ .labels = &.{ "example", "com" } }, .a, .{});
     query.opt = .{
         .udp_payload_size = 4096,
         .extended_rcode = 0,
