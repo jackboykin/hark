@@ -626,12 +626,9 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
         const text = try dir.readFileAlloc(io, ent.path, arena, .limited(1 << 20));
         var diag: rpl.Diag = .{};
-        const scenario = rpl.parse(arena, text, &diag) catch |err| switch (err) {
-            error.UnsupportedRType => continue,
-            else => {
-                std.debug.print("{s}/{s}:{d}: {s}\n", .{ root, ent.path, diag.line, diag.msg });
-                return err;
-            },
+        const scenario = rpl.parse(arena, text, &diag) catch |err| {
+            std.debug.print("{s}/{s}:{d}: {s}\n", .{ root, ent.path, diag.line, diag.msg });
+            return err;
         };
         r.parsed += 1;
         var expect_fail = false;

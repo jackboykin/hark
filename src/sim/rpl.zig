@@ -156,7 +156,7 @@ pub const Diag = struct {
     msg: []const u8 = "",
 };
 
-pub const Error = error{ Parse, UnsupportedRType } || dns.Error;
+pub const Error = error{ Parse, OutOfMemory };
 
 /// Unbound's `server:` … `CONFIG_END` prelude is lifted: stripped, qmin and
 /// minimal-responses honoured, the first RANGE's ADDRESS the root hint. No
@@ -647,7 +647,7 @@ const Parser = struct {
                 } };
             },
             else => {
-                if (rtype != .hinfo) return error.UnsupportedRType;
+                if (rtype != .hinfo) return p.fail("unsupported RR type");
                 // Wire form, as the resolver synthesises it (RFC 8482).
                 var wire: std.ArrayList(u8) = .empty;
                 for (try p.charStrings(toks)) |str| {
