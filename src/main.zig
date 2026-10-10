@@ -20,10 +20,6 @@ fn logFn(
     if (level == .debug and !log_verbose) return;
 
     const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
-    const level_prefix = comptime level.asText() ++ scope_prefix;
-
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
 
     const secs: u64 = @intCast(hark.monotonic.wallclockSec());
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
@@ -31,20 +27,12 @@ fn logFn(
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
 
-    const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z ", .{
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z " ++ level.asText() ++ scope_prefix ++ format ++ "\n", .{
         yd.year,              md.month.numeric(),      @as(u9, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
-    }) catch return;
-    pos = ts.len;
-
-    if (pos + level_prefix.len >= buf.len) return;
-    @memcpy(buf[pos..][0..level_prefix.len], level_prefix);
-    pos += level_prefix.len;
-
-    const msg = std.fmt.bufPrint(buf[pos..], format ++ "\n", args) catch return;
-    pos += msg.len;
-
-    std.debug.print("{s}", .{buf[0..pos]});
+    } ++ args) catch return;
+    std.debug.print("{s}", .{line});
 }
 
 const log = std.log;
@@ -53,31 +41,22 @@ pub fn main(init: std.process.Init) !void {
     const allocator = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
 
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
-    var args_list = std.ArrayList([:0]const u8).empty;
-    defer args_list.deinit(allocator);
-    while (args_iter.next()) |arg| {
-        try args_list.append(allocator, arg);
-    }
-    const args = args_list.items;
-
-    if (args.len < 2) {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.skip();
+    const command = args.next() orelse {
         printUsage();
         std.process.exit(1);
-    }
+    };
 
-    const command = args[1];
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
-        return;
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-V")) {
         var stdout_buf: [64]u8 = undefined;
         var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
         stdout_writer.interface.print("hark {s}\n", .{build_options.version}) catch std.process.exit(1);
         stdout_writer.interface.flush() catch std.process.exit(1);
-        return;
     } else if (std.mem.eql(u8, command, "serve")) {
-        return runServe(allocator, args[2..], io);
+        return runServe(allocator, &args, io);
     } else {
         log.err("unknown command: {s}", .{command});
         printUsage();
@@ -100,28 +79,24 @@ fn printUsage() void {
     , .{});
 }
 
-fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
+fn runServe(allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--config")) {
-            i += 1;
-            if (i >= args.len) {
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next() orelse {
                 log.err("--config requires a path", .{});
                 std.process.exit(1);
-            }
-            config_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
+            };
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             cli_verbose = true;
         } else {
-            log.err("unknown serve option: {s}", .{args[i]});
+            log.err("unknown serve option: {s}", .{arg});
             std.process.exit(1);
         }
     }
 
-    // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
-    // Only fall through on FileNotFound; surface any other error (parse, I/O).
+    // Only a missing default config falls back to the built-in defaults.
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
@@ -129,10 +104,8 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     else
         loadDefaultConfig(allocator, io) catch std.process.exit(1);
-
-    if (cli_verbose or cfg.log_queries) {
-        log_verbose = true;
-    }
+    defer cfg.deinit();
+    log_verbose = cli_verbose or cfg.log_queries;
 
     // A socket per exchange in flight can exceed systemd's default 1024 soft cap.
     if (std.posix.getrlimit(.NOFILE)) |lim| {
@@ -140,7 +113,6 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    defer cfg.deinit();
     hark.serve.run(allocator, &cfg, cli_verbose) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
@@ -148,9 +120,8 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 }
 
 fn loadDefaultConfig(allocator: std.mem.Allocator, io: Io) !hark.config.ServerConfig {
-    // No CWD-relative search: under systemd or any non-interactive runner the
-    // working directory is unrelated to where the operator put the config.
-    // Pass --config <path> for non-default locations.
+    // Never relative to the working directory, which under a service
+    // manager is unrelated to where the operator put the config.
     const default_path = "/etc/hark/hark.toml";
     if (hark.config.parseConfigFile(allocator, io, default_path)) |cfg| {
         return cfg;
