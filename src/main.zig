@@ -37,8 +37,14 @@ fn logFn(
 
 const log = std.log;
 
+/// Debug keeps std's allocator, which names every leak.
+var reserve: hark.slab.Reserve = .{};
+var lasting: hark.slab.Tenant = .init(&reserve);
+var work: hark.slab.Tenant = .init(&reserve);
+
 pub fn main(init: std.process.Init) !void {
-    const allocator = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
+    const allocator = if (builtin.mode == .debug) init.gpa else lasting.allocator();
+    const work_allocator = if (builtin.mode == .debug) init.gpa else work.allocator();
     const io = init.io;
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -56,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
         stdout_writer.interface.print("hark {s}\n", .{build_options.version}) catch std.process.exit(1);
         stdout_writer.interface.flush() catch std.process.exit(1);
     } else if (std.mem.eql(u8, command, "serve")) {
-        return runServe(allocator, &args, io);
+        return runServe(allocator, work_allocator, &args, io);
     } else {
         log.err("unknown command: {s}", .{command});
         printUsage();
@@ -79,7 +85,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn runServe(allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
+fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
     while (args.next()) |arg| {
@@ -113,7 +119,7 @@ fn runServe(allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: 
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    hark.serve.run(allocator, &cfg, cli_verbose) catch |err| {
+    hark.serve.run(allocator, work_allocator, if (builtin.mode == .debug) null else &reserve, &cfg, cli_verbose) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
     };

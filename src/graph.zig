@@ -562,9 +562,9 @@ pub const Graph = struct {
     verify_memo: rrsig.VerifyMemo = .{},
     store: store.Store,
 
-    pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
+    pub fn init(gpa: Allocator, work: Allocator, cfg: Config, edge: Edge) !Graph {
         const rtt = try ns_rtt.Table.create(gpa);
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = store.Store.init(gpa, cfg.store_bytes) catch |err| {
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = store.Store.init(gpa, cfg.store_bytes) catch |err| {
             gpa.destroy(rtt);
             return err;
         } };
@@ -1639,7 +1639,7 @@ const Quiet = struct {
     wall: i64 = 0,
 
     fn graph(q: *Quiet, cfg: Config) !Graph {
-        return .init(std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
+        return .init(std.testing.allocator, std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
     }
 
     fn send(_: *anyopaque, _: Exchange) anyerror!void {}

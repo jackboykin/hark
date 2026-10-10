@@ -92,7 +92,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         edge.chaos = &ch;
         s.chaos = &ch;
     }
-    var g = try graph.Graph.init(gpa, .{
+    var g = try graph.Graph.init(gpa, gpa, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
         .stub_zones = scenario.stub_zones,
@@ -1058,7 +1058,7 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, seed);
     defer s.deinit();
-    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger_ms }, s.edge());
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger_ms }, s.edge());
     defer g.deinit();
     if (planted.ns1) |e| g.rtt.write(ns1, 0).* = e;
     if (planted.ns2) |e| g.rtt.write(ns2, 0).* = e;
@@ -1230,7 +1230,7 @@ test "the door counts exchanges in flight" {
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
     defer s.deinit();
-    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
     defer g.deinit();
     const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
@@ -1257,7 +1257,7 @@ test "an exchange that never left the host writes no estimate" {
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
     defer s.deinit();
-    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
     defer g.deinit();
     s.pending_unsent = 1;
     const root = try g.demandRoot(q.name, q.qtype, .new);

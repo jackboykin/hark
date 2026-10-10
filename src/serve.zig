@@ -6,6 +6,7 @@ const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const answer = @import("answer.zig");
 const Arena = @import("arena.zig");
+const slab = @import("slab.zig");
 const Batch = @import("batch.zig");
 
 const linux = std.os.linux;
@@ -815,11 +816,11 @@ const Server = struct {
     }
 };
 
-pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
+pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
     rand.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
-    var g = try graph.Graph.init(gpa, .{
+    var g = try graph.Graph.init(gpa, work, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),
         .stub_zones = cfg.stub_zones,
@@ -858,6 +859,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         if (e.now_ns >= sweep_at) {
             sweep_at = e.now_ns + std.time.ns_per_s;
             s.sweep();
+            if (reserve) |r| r.tick();
         }
         try s.reopen();
         if (e.now_ns >= stats_at) {

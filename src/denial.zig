@@ -319,7 +319,7 @@ fn testGraph(ctx: *u8, now: *const i64, wall: *const i64) !Graph {
         fn send(_: *anyopaque, _: graph.Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    return Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = ctx, .now_ns = now, .wall_sec = wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    return Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = ctx, .now_ns = now, .wall_sec = wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
 }
 
 test "re-absorbing a spanless zone survives the store replacing its SOA" {
