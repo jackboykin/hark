@@ -1,13 +1,7 @@
-/// CIDR-based access control. Used by the server's UDP and TCP
-/// front-ends to enforce `[server].allow-from` from the operator's
-/// config. An empty entry list means "no ACL" — every client allowed
-/// (back-compatible default).
-///
-/// Scope: a recursive resolver bound to a public IP without an ACL is
-/// an open recursive resolver and a reflection-amplification surface
-/// (BCP 140). Default-loopback config keeps the absent-ACL case safe;
-/// operators flipping listen= to a public address must opt in to a
-/// CIDR list to deserve service.
+//! CIDR prefixes: `[server].allow-from`, which the server's UDP and TCP
+//! front-ends enforce, and the rebinding scrub's extra sets. An empty
+//! allow-from lets every client in: fine on loopback, the default, and an
+//! open resolver and reflection amplifier anywhere else (BCP 140).
 const std = @import("std");
 const mem = std.mem;
 const na = @import("net_address.zig");
@@ -40,30 +34,23 @@ pub const Cidr = struct {
 /// take an implied /32 (v4) or /128 (v6).
 pub fn parse(s: []const u8) ?Cidr {
     const slash = mem.indexOfScalar(u8, s, '/');
-    const addr_str = if (slash) |i| s[0..i] else s;
-    const prefix_str = if (slash) |i| s[i + 1 ..] else null;
-
-    if (mem.indexOfScalar(u8, addr_str, ':') != null) {
-        const ip6 = std.Io.net.Ip6Address.parse(addr_str, 0) catch return null;
-        const default_prefix: u8 = 128;
-        const prefix = if (prefix_str) |p| std.fmt.parseInt(u8, p, 10) catch return null else default_prefix;
-        if (prefix > 128) return null;
-        var bytes = ip6.bytes;
-        normalizeInPlace(&bytes, prefix);
-        return .{ .address = na.initIp6(bytes, 0, 0, 0), .prefix = prefix };
-    }
-
-    const ip4 = std.Io.net.Ip4Address.parse(addr_str, 0) catch return null;
-    const default_prefix: u8 = 32;
-    const prefix = if (prefix_str) |p| std.fmt.parseInt(u8, p, 10) catch return null else default_prefix;
-    if (prefix > 32) return null;
-    var bytes = ip4.bytes;
-    normalizeInPlace(&bytes, prefix);
-    return .{ .address = na.initIp4(bytes, 0), .prefix = prefix };
+    const addr_str = s[0 .. slash orelse s.len];
+    var address: na.Address = if (mem.indexOfScalar(u8, addr_str, ':') != null)
+        na.initIp6((std.Io.net.Ip6Address.parse(addr_str, 0) catch return null).bytes, 0, 0, 0)
+    else
+        na.initIp4((std.Io.net.Ip4Address.parse(addr_str, 0) catch return null).bytes, 0);
+    const bytes: []u8 = switch (address) {
+        .ip4 => |*a| &a.bytes,
+        .ip6 => |*a| &a.bytes,
+    };
+    const bits: u8 = @intCast(bytes.len * 8);
+    const prefix = if (slash) |i| std.fmt.parseInt(u8, s[i + 1 ..], 10) catch return null else bits;
+    if (prefix > bits) return null;
+    normalizeInPlace(bytes, prefix);
+    return .{ .address = address, .prefix = prefix };
 }
 
-/// Returns true when `entries` is empty (back-compat: no ACL configured)
-/// or when `addr` matches at least one entry.
+/// Empty allows every client.
 pub fn allow(entries: []const Cidr, addr: na.Address) bool {
     if (entries.len == 0) return true;
     for (entries) |e| if (e.matches(addr)) return true;
