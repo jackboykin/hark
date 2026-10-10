@@ -250,20 +250,12 @@ pub const Sim = struct {
     /// Advance to the next completion, or to `until_ns` if none lies
     /// before it.
     pub fn next(s: *Sim, until_ns: i64) ?struct { id: u32, completion: Completion } {
-        const ev = s.events.peek() orelse {
-            s.now_ns = @max(s.now_ns, until_ns);
-            s.syncWall();
-            return null;
-        };
-        if (ev.at_ns > until_ns) {
-            s.now_ns = @max(s.now_ns, until_ns);
-            s.syncWall();
-            return null;
-        }
-        _ = s.events.pop();
-        s.now_ns = @max(s.now_ns, ev.at_ns);
+        const due = if (s.events.peek()) |ev| ev.at_ns <= until_ns else false;
+        const ev = if (due) s.events.pop() else null;
+        s.now_ns = @max(s.now_ns, if (ev) |e| e.at_ns else until_ns);
         s.syncWall();
-        return .{ .id = ev.id, .completion = ev.completion };
+        const e = ev orelse return null;
+        return .{ .id = e.id, .completion = e.completion };
     }
 
     /// A rule run mid-window judges signatures at its own time.
