@@ -102,7 +102,7 @@ fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
 }
 
 fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) anyerror!void {
-    _ = try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, gen, .wake);
+    try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, gen, .wake);
 }
 
 /// Time is read once per event: rules see one instant.
@@ -134,7 +134,7 @@ fn send(e: *Edge, ex: Exchange) !void {
         return e.push(.{ .exchange = .{ .id = ex.id, .completion = completion } });
     };
     flight.seq = e.seq + 1;
-    _ = try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
+    try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);
 }
 
@@ -178,10 +178,9 @@ fn finish(e: *Edge, id: CellId, completion: Completion) Event {
     return .{ .exchange = .{ .id = id, .completion = completion } };
 }
 
-fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: @FieldType(Timer, "kind")) !u32 {
+fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: @FieldType(Timer, "kind")) !void {
     e.seq += 1;
     try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
-    return e.seq;
 }
 
 fn push(e: *Edge, ev: Event) !void {
