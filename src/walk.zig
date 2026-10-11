@@ -1300,7 +1300,7 @@ fn learn(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *s
         for (families, &unknown) |family, *u| {
             if (g.proven(server.key.at(.rrset, family)) != null) continue;
             const key = server.key.at(.addr, family);
-            if (g.index.get(key)) |aid| {
+            if (g.indexed(key)) |aid| {
                 const c = g.cell(aid);
                 if (!c.settled()) {
                     left.awaited = left.awaited or g.holdsInput(id, aid);

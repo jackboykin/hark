@@ -330,7 +330,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     const t = g.cell(rid);
     std.debug.assert(t.state == .fact);
     const key = graph.Key.of(&kb, .secure, t.name, t.key.rtype);
-    if (g.index.get(key)) |sid| {
+    if (g.indexed(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == g.gen(rid);
         if (same and (!c.settled() or g.serves(sid))) return g.join(by, sid);
@@ -413,7 +413,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         while (it.next()) |c| {
             const signer = signerOf(r, c, within, no_bound) orelse continue;
             const key = graph.Key.of(&kb, .dnskey, signer, .a);
-            if (!g.holds(key) and !g.index.contains(key)) try g.fetchKeys(signer);
+            if (!g.holds(key) and g.indexed(key) == null) try g.fetchKeys(signer);
         }
     }
     const budget = &g.payer.validation;
