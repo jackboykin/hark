@@ -34,9 +34,9 @@ pub const Verdict = extern struct {
         return v.until_ns != 0;
     }
 
-    /// Stands for a demander bounded at `bound_ns` (`Graph.bound`).
-    pub fn serves(v: Verdict, bound_ns: i64) bool {
-        return v.until_ns > bound_ns;
+    /// Stands at `instant_ns` (`Graph.instant`).
+    pub fn serves(v: Verdict, instant_ns: i64) bool {
+        return v.until_ns > instant_ns;
     }
 
     pub fn chain(v: Verdict) trust.Chain {

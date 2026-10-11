@@ -738,7 +738,7 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
     const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
     if (!provable(d.held.blob)) return false;
     const v = d.held.blob.verdict;
-    if (v.serves(g.bound(g.payer))) {
+    if (v.serves(g.instant())) {
         if (v.chain().status != .secure) return false;
         try g.settleAs(id, d.held);
         return true;

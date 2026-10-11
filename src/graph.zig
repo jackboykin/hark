@@ -157,6 +157,15 @@ pub const Key = struct {
     };
 };
 
+pub const Asked = struct {
+    key: Key,
+    as_of: i64,
+
+    fn hash(a: Asked) u32 {
+        return @truncate(a.key.hash() ^ @as(u64, @bitCast(a.as_of)) *% 0x9e3779b97f4a7c15);
+    }
+};
+
 pub const Config = struct {
     qmin: bool = true,
     root_hints: []const na.Address,
@@ -354,10 +363,6 @@ pub const Budget = struct {
     deadline_ns: i64,
     /// The roots sharing it: a question and the key fetches its walk began.
     refs: u32 = 1,
-    /// When a refresh began, and when the life it replaces ends; 0 for a
-    /// client.
-    refresh_ns: i64 = 0,
-    lapses_ns: i64 = 0,
     /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: rrsig.ValidationBudget = .{},
 
@@ -477,6 +482,10 @@ pub const Scratch = union(enum) {
 pub const Cell = struct {
     key: Key,
     name: dns.Name,
+    /// The instant whose facts it reads: 0, a client's, is now; a refresh's
+    /// is when the life it renews lapses. A client and a refresh never
+    /// share a cell.
+    as_of: i64,
     orphan: bool = false,
     /// The cycle check that last walked through here.
     seen: u64 = 0,
@@ -592,6 +601,8 @@ pub const Graph = struct {
     budgets: u32 = 0,
     /// Who pays for the running rule: derived at each run, never stored.
     payer: *Budget = undefined,
+    /// The running cell's `as_of`.
+    as_of: i64 = 0,
     /// A run nobody waits on spends nothing.
     unpaid: Budget = undefined,
     /// Exchanges the edge holds.
@@ -602,7 +613,7 @@ pub const Graph = struct {
     failed: std.ArrayHashMapUnmanaged(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
-    /// Live cells by key. An entry is the id alone, so every call is
+    /// Live cells by key and instant. An entry is the id alone, so every call is
     /// adapted, and stored hashes spare the map from hashing one.
     index: std.ArrayHashMapUnmanaged(CellId, void, struct {}, true) = .empty,
     ready: std.ArrayList(CellId) = .empty,
@@ -692,14 +703,14 @@ pub const Graph = struct {
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !CellId {
         var kb: KeyBuf = undefined;
         const key = Key.of(&kb, .answer, name, qtype);
-        if (g.indexed(key)) |id| if (!g.cell(id).settled() or g.fresh(id)) {
+        if (g.asking(.{ .key = key, .as_of = 0 })) |id| if (!g.cell(id).settled() or g.fresh(id)) {
             if (!g.cell(id).settled() and g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
             g.cell(id).holds += 1;
             return id;
         };
         if (admit != .new) return error.Novel;
         if (g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
-        const id = try g.newRoot(key, name, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
+        const id = try g.newRoot(key, name, 0, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.ready.append(g.gpa, id);
@@ -723,7 +734,7 @@ pub const Graph = struct {
         if (g.spent(g.payer) or try g.skips(.ahead, key)) return null;
         const akey = key.at(.ahead, key.rtype);
         if (g.indexed(akey)) |id| if (!g.cell(id).settled()) return id;
-        const id = try g.newCell(akey, name);
+        const id = try g.newCell(akey, name, g.as_of);
         g.cell(id).scratch.ahead.budget = g.payer;
         g.payer.refs += 1;
         g.cell(id).holds += 1;
@@ -734,17 +745,19 @@ pub const Graph = struct {
         return id;
     }
 
-    /// One per key at a time; holds itself until it settles.
+    /// The question asked again as of when the life it renews lapses. One
+    /// per key and instant at a time; holds itself until it settles.
     pub fn refresh(g: *Graph, key: Key, name: dns.Name, lapses_ns: i64) !void {
+        std.debug.assert(lapses_ns > 0);
         const rkey = key.at(.refresh, key.rtype);
-        if (g.indexed(rkey) != null or try g.skips(.prefetch, rkey)) return;
+        if (g.asking(.{ .key = rkey, .as_of = lapses_ns }) != null or try g.skips(.prefetch, rkey)) return;
         if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.detail.unrefreshed += 1;
             return;
         }
         const jitter = @min(refresh_jitter_ns, @divTrunc(lapses_ns - g.now(), 2));
         const at = g.now() + if (jitter > 0) @as(i64, @intCast(try g.uniform(.prefetch, rkey, @intCast(jitter)))) else 0;
-        const id = try g.newRoot(rkey, name, .{ .deadline_ns = 0, .refresh_ns = g.now(), .lapses_ns = lapses_ns });
+        const id = try g.newRoot(rkey, name, lapses_ns, .{ .deadline_ns = 0 });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.wake(id, at);
@@ -907,7 +920,7 @@ pub const Graph = struct {
     // ── Cells ──────────────────────────────────────────────────────────
 
     /// A question's cell, holding its budget.
-    fn newRoot(g: *Graph, key: Key, name: dns.Name, budget: Budget) !CellId {
+    fn newRoot(g: *Graph, key: Key, name: dns.Name, as_of: i64, budget: Budget) !CellId {
         const b = try g.work.allocator().create(Budget);
         errdefer g.work.allocator().destroy(b);
         b.* = budget;
@@ -917,14 +930,14 @@ pub const Graph = struct {
         v.max_sig_verify -= @intCast(try g.decide(.budget, key, v.max_sig_verify + 1));
         v.max_nsec3_blocks -= @intCast(try g.decide(.budget, key, v.max_nsec3_blocks + 1));
         if (b.deadline_ns > g.now()) b.deadline_ns -= @intCast(try g.decide(.budget, key, @intCast(b.deadline_ns - g.now())));
-        const id = try g.newCell(key, name);
+        const id = try g.newCell(key, name, as_of);
         g.cell(id).scratch.answer.budget = b;
         g.budgets += 1;
         return id;
     }
 
     /// All or nothing.
-    pub fn newCell(g: *Graph, key: Key, name: dns.Name) !CellId {
+    pub fn newCell(g: *Graph, key: Key, name: dns.Name, as_of: i64) !CellId {
         if (g.empty == .none) {
             try g.cells.append(g.gpa, .{});
             g.empty = .wrap(@intCast(g.cells.items.len - 1));
@@ -940,7 +953,7 @@ pub const Graph = struct {
         const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
         if (key.kind != .exchange) {
             // In progress keeps the slot; a settled owner yields it.
-            const gop = try g.index.getOrPutAdapted(g.gpa, key, Indexed{ .g = g });
+            const gop = try g.index.getOrPutAdapted(g.gpa, Asked{ .key = key, .as_of = as_of }, Indexed{ .g = g });
             if (!gop.found_existing or g.cell(gop.key_ptr.*).settled()) gop.key_ptr.* = id;
         }
         // Nothing fallible past here: the errdefers assume `c` unbuilt.
@@ -950,6 +963,7 @@ pub const Graph = struct {
         c.* = .{
             .key = own_key,
             .name = own_name,
+            .as_of = as_of,
             .arena = arena,
             .scratch = scratch,
         };
@@ -961,11 +975,12 @@ pub const Graph = struct {
     // ── Pins ───────────────────────────────────────────────────────────
 
     pub fn pin(g: *Graph, id: CellId, by: CellId) !void {
+        const c = g.cell(id);
+        const b = g.cell(by);
+        std.debug.assert(c.as_of == b.as_of);
         if (g.holdsInput(by, id)) return;
         const p = try g.work.allocator().create(Pin);
         p.* = .{ .on = id, .by = by };
-        const c = g.cell(id);
-        const b = g.cell(by);
         c.waiters.append(&p.waiter);
         b.inputs.prepend(&p.input);
         if (b.orphan) return;
@@ -1020,7 +1035,7 @@ pub const Graph = struct {
 
     fn free(g: *Graph, id: CellId) void {
         const c = g.cell(id);
-        _ = g.index.swapRemoveAdapted(c.key, Own{ .id = id });
+        _ = g.index.swapRemoveAdapted(Asked{ .key = c.key, .as_of = c.as_of }, Own{ .id = id });
         const s = &g.cells.items[id];
         s.* = .{ .gen = s.gen +% 1, .next = g.empty };
         g.empty = .wrap(id);
@@ -1155,7 +1170,7 @@ pub const Graph = struct {
     /// already remembered is held by its own window, never another's.
     pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
-        if (why.cause == .zone and !why.remembered and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, why);
+        if (why.cause == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) try g.remember(c.key, why);
         try g.fail(id, why);
     }
 
@@ -1201,38 +1216,41 @@ pub const Graph = struct {
         return c.settled() and c.expires_ns > g.now();
     }
 
-    pub fn bound(g: *const Graph, budget: *const Budget) i64 {
-        return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.lapses_ns);
+    /// What the running cell reads must hold past.
+    pub fn instant(g: *const Graph) i64 {
+        return @max(g.now(), g.as_of);
     }
 
+    /// The running cell's own cell for `key`, if live.
     pub fn indexed(g: *const Graph, key: Key) ?CellId {
-        return g.index.getKeyAdapted(key, Indexed{ .g = g });
+        return g.asking(.{ .key = key, .as_of = g.as_of });
+    }
+
+    fn asking(g: *const Graph, asked: Asked) ?CellId {
+        return g.index.getKeyAdapted(asked, Indexed{ .g = g });
     }
 
     const Indexed = struct {
         g: *const Graph,
-        pub fn hash(_: Indexed, k: Key) u32 {
-            return @truncate(k.hash());
+        pub fn hash(_: Indexed, a: Asked) u32 {
+            return a.hash();
         }
-        pub fn eql(x: Indexed, k: Key, id: CellId, _: usize) bool {
-            return k.eql(x.g.cells.items[id].cell.?.key);
+        pub fn eql(x: Indexed, a: Asked, id: CellId, _: usize) bool {
+            const c = x.g.cells.items[id].cell.?;
+            return a.as_of == c.as_of and a.key.eql(c.key);
         }
     };
 
     const Own = struct {
         id: CellId,
-        pub fn hash(_: Own, k: Key) u32 {
-            return @truncate(k.hash());
+        pub fn hash(_: Own, a: Asked) u32 {
+            return a.hash();
         }
-        pub fn eql(o: Own, _: Key, id: CellId, _: usize) bool {
+        pub fn eql(o: Own, _: Asked, id: CellId, _: usize) bool {
             return id == o.id;
         }
     };
 
-    /// Evidence stored since the refresh began counts, inclusive: the edge
-    /// reads the clock once per event, so a refresh shares an instant with
-    /// what its trigger fetched. A verdict is stored when judged, however
-    /// old its evidence, so it is judged again.
     fn lookup(g: *Graph, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
         if (found) |s| return switch (s) {
             .stored => |e| g.liveVersion(live, e) orelse try g.materialise(key, name, e),
@@ -1251,9 +1269,11 @@ pub const Graph = struct {
         return .{ .live = g.liveServed(live) orelse return null };
     }
 
+    /// Its own cells serve the running cell while merely fresh: they are
+    /// its own fetches.
     fn liveServed(g: *Graph, live: ?CellId) ?CellId {
         const id = live orelse return null;
-        return if (g.cell(id).settled() and g.serves(id)) id else null;
+        return if (g.fresh(id)) id else null;
     }
 
     fn liveVersion(g: *Graph, live: ?CellId, e: store.Entry) ?CellId {
@@ -1264,8 +1284,7 @@ pub const Graph = struct {
     /// The stored fact `demand` would hand the running rule.
     fn stored(g: *Graph, key: Key) ?store.Entry {
         const e = g.store.get(key, g.now()) orelse return null;
-        const verdict = key.kind == .ds or key.kind == .dnskey;
-        return if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) e else null;
+        return if (e.expires_ns > g.instant()) e else null;
     }
 
     /// A stored rrset its judge would pass without running: with DNSSEC
@@ -1273,7 +1292,7 @@ pub const Graph = struct {
     pub fn proven(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         const e = g.stored(key) orelse return null;
-        if (g.cfg.trust_anchors != null and !e.blob.verdict.serves(g.bound(g.payer))) return null;
+        if (g.cfg.trust_anchors != null and !e.blob.verdict.serves(g.instant())) return null;
         return e.blob;
     }
 
@@ -1313,31 +1332,8 @@ pub const Graph = struct {
         return if (c.state == .fact) .{ .value = c.state.fact.*, .expires_ns = c.expires_ns } else null;
     }
 
-    /// A live fact serves the running rule while it outlives the payer's
-    /// bound, or, still fresh, is already the payer's own input.
-    pub fn serves(g: *Graph, id: CellId) bool {
-        const c = g.cell(id);
-        return c.expires_ns > g.bound(g.payer) or (g.fresh(id) and g.pays(id));
-    }
-
-    /// Does the running rule's payer already wait on `id`?
-    fn pays(g: *Graph, id: CellId) bool {
-        g.checks += 1;
-        var stack: std.ArrayList(CellId) = .empty;
-        stack.append(g.scratch.allocator(), id) catch return false;
-        while (stack.pop()) |i| {
-            const c = g.cell(i);
-            if (c.seen == g.checks) continue;
-            c.seen = g.checks;
-            if (budgetOf(c)) |b| if (b == g.payer) return true;
-            var it = c.waiterIds();
-            while (it.next()) |w| stack.append(g.scratch.allocator(), w) catch return false;
-        }
-        return false;
-    }
-
     fn materialise(g: *Graph, key: Key, name: dns.Name, e: store.Entry) !CellId {
-        const id = try g.newCell(key, name);
+        const id = try g.newCell(key, name, g.as_of);
         errdefer g.free(id);
         const c = g.cell(id);
         c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), e.blob)) };
@@ -1352,7 +1348,7 @@ pub const Graph = struct {
 
     /// The answer rule read against the store, building no cell: the
     /// question's chain as stored, into `arena`. `.fresh` is what the rule
-    /// would settle on for a client, whose bound is now; `.any` is every
+    /// would settle on for a client, asked as of now; `.any` is every
     /// age, for the callers that decide what age serves. Null where the
     /// rule would have work to do: a hop not stored, not judged or no
     /// longer proven (DNSSEC on), or a broken chain. The blobs are the
@@ -1407,7 +1403,8 @@ pub const Graph = struct {
         return if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key);
     }
 
-    /// No cell, no wait: `demand` is the only pin.
+    /// No cell, no wait: `demand` is the only pin. The store is read as of
+    /// now: a speedup's guess, never a cause.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.indexed(key);
         if (g.store.get(key, g.now())) |e| return try g.factOf(live, e);
@@ -1444,7 +1441,7 @@ pub const Graph = struct {
     fn demandFound(g: *Graph, by: CellId, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
         if (try g.lookup(key, name, live, found)) |id| return g.join(by, id);
         if (g.cell(by).orphan) return null;
-        const id = try g.newCell(key, name);
+        const id = try g.newCell(key, name, g.as_of);
         try g.pin(id, by);
         if (try g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
         return id;
@@ -1573,7 +1570,7 @@ pub const Graph = struct {
         const root = try g.ahead(key, name) orelse return;
         const s = g.cell(root).scratch.ahead;
         if (s.rrset != .none) return;
-        const id = try g.newCell(key, name);
+        const id = try g.newCell(key, name, g.as_of);
         try g.pin(id, root);
         s.rrset = .wrap(id);
         try g.settle(id, value, expires_ns);
@@ -1611,6 +1608,8 @@ pub const Graph = struct {
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
         g.payer = g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;
+        g.as_of = c.as_of;
+        defer g.as_of = 0;
         g.tally.runs += 1;
         if (builtin.is_test) g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
         const clock = Tally.clock(&g.tally.rule_ns);
@@ -1681,7 +1680,7 @@ pub const Graph = struct {
             }
             return null;
         }
-        const id = try g.newCell(.init(.exchange, "", .a), qname);
+        const id = try g.newCell(.init(.exchange, "", .a), qname, g.as_of);
         try g.pin(id, by);
         budget.queries += 1;
         g.cell(id).holds += 1;
@@ -1795,7 +1794,7 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
     const first = try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, .new);
     const second = try g.demandRoot(host, .a, .new);
-    const shared = try g.newCell(Key.of(&kb, .rrset, host, .a), host);
+    const shared = try g.newCell(Key.of(&kb, .rrset, host, .a), host, 0);
     try g.pin(shared, first);
     try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;

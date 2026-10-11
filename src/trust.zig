@@ -333,12 +333,12 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     if (g.indexed(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == g.gen(rid);
-        if (same and (!c.settled() or g.serves(sid))) return g.join(by, sid);
+        if (same and (!c.settled() or g.fresh(sid))) return g.join(by, sid);
     }
-    const sid = try g.newCell(key, t.name);
+    const sid = try g.newCell(key, t.name, g.as_of);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = g.gen(rid) };
     try g.pin(sid, by);
-    if (t.blob) |b| if (b.verdict.serves(g.bound(g.payer))) {
+    if (t.blob) |b| if (b.verdict.serves(g.instant())) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
     };
