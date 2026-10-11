@@ -181,8 +181,11 @@ fn isNonRoutableIp4(b: [4]u8) bool {
 }
 
 fn isNonRoutableIp6(b: [16]u8) bool {
-    if (isIp4Mapped(&b)) return isNonRoutableIp4(b[12..16].*);
-    return isSpecialUseIp6(b) or b[0] == 0xff; // + ff00::/8 multicast
+    return switch (b[0]) {
+        0 => if (isIp4Mapped(&b)) isNonRoutableIp4(b[12..16].*) else isSpecialUseIp6(b),
+        0xff => true, // + ff00::/8 multicast
+        else => isSpecialUseIp6(b),
+    };
 }
 
 /// Shared special-use IPv4 set: Knot's set + the IANA special-use registries
@@ -212,14 +215,16 @@ pub fn isSpecialUseIp4(b: [4]u8) bool {
 
 /// ::/96, ULA, link-local, 2001:db8::/32, and IPv4-mapped judged as v4; no multicast.
 pub fn isSpecialUseIp6(b: [16]u8) bool {
-    const hi = mem.readInt(u64, b[0..8], .big);
-    const mid = mem.readInt(u32, b[8..12], .big);
-    if (hi == 0 and mid == 0) return true;
-    // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
-    // doesn't slip through as a "v6 address" the v6 set has no opinion on.
-    if (hi == 0 and mid == 0xffff) return isSpecialUseIp4(b[12..16].*);
     return switch (b[0]) {
-        0x20 => (hi >> 32) == 0x20010db8, // 2001:db8::/32 (RFC 3849)
+        0 => mem.readInt(u64, b[0..8], .big) == 0 and switch (mem.readInt(u32, b[8..12], .big)) {
+            0 => true, // ::/96
+            // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped
+            // 127.0.0.1 doesn't slip through as a "v6 address" the v6 set
+            // has no opinion on.
+            0xffff => isSpecialUseIp4(b[12..16].*),
+            else => false,
+        },
+        0x20 => mem.readInt(u32, b[0..4], .big) == 0x20010db8, // 2001:db8::/32 (RFC 3849)
         0xfc, 0xfd => true, // fc00::/7 (ULA, RFC 4193)
         0xfe => (b[1] & 0xc0) == 0x80, // fe80::/10 (link-local)
         else => false,
