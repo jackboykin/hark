@@ -26,7 +26,7 @@ pub const Proof = enum(u8) { secure, insecure, absent };
 pub const Chain = struct {
     status: Proof,
     records: []const RR = &.{},
-    /// `secure` only: where the signatures' validity ends (`rrsig.ttlCap`).
+    /// `secure` only: where the signatures' validity ends (`rrsig.Cap`).
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
@@ -123,8 +123,10 @@ fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
     try failBogus(g, id, rid);
 }
 
-fn capExpiry(g: *Graph, cap: u32) i64 {
-    return g.now() + @as(i64, cap) * std.time.ns_per_s;
+/// Where `cap` ends a set stored at `stored_ns`.
+fn capExpiry(g: *Graph, cap: rrsig.Cap, stored_ns: i64) i64 {
+    const ns = std.time.ns_per_s;
+    return @min(stored_ns + @as(i64, cap.original_ttl) * ns, g.now() + @as(i64, cap.window_s) * ns);
 }
 
 /// `ds(zone)`: the anchor at the root; below it, `rrset(zone, DS)` judged
@@ -218,7 +220,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
         .answer => {
             const sig = (dnssec.validateRrset(r.answers, zone, .ds, false, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus).sig;
-            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
+            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires_ns, keys.expires_ns));
@@ -229,7 +231,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                 return .bogus;
             const cap = dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus;
-            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap));
+            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap, r.stored_ns));
             const until = @min(rs.expires_ns, keys.expires_ns);
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => {
@@ -316,7 +318,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const now = g.wallNow();
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget, &g.verify_memo) catch
         return failChain(g, id, s.rrset.unwrap().?);
-    g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
+    g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
     try g.keep(s.rrset.unwrap().?);
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires_ns, ds.expires_ns));
@@ -473,7 +475,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 const v = dnssec.validateRrset(records, c.owner, c.rtype, c.is == .proof, keys.records, now, budget, &g.verify_memo) orelse
                     break :f .bogus;
                 const verified = v.sig;
-                const cap = capExpiry(g, rrsig.ttlCap(verified, now));
+                const cap = capExpiry(g, .of(verified, now), r.stored_ns);
                 s.expires = @min(s.expires, cap);
                 s.proven = @min(s.proven, cap);
                 if (c.is == .proof) {

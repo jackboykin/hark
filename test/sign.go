@@ -24,6 +24,7 @@ type key struct {
 type signer struct {
 	keys                  []*key
 	inception, expiration uint32
+	originalTTL           uint32
 	// Where each zone signed: only those addresses answer its DNSKEY.
 	served map[netip.Addr][]*key
 }
@@ -51,9 +52,10 @@ func (s *signer) anchor() string {
 	return fmt.Sprintf("%d %d %d %s", ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToUpper(ds.Digest))
 }
 
-func (s *signer) bake(ranges []*rangeBlock, validity time.Duration) error {
+func (s *signer) bake(ranges []*rangeBlock, validity time.Duration, originalTTL uint32) error {
 	now := time.Now()
 	s.inception, s.expiration = uint32(now.AddDate(0, 0, -1).Unix()), uint32(now.Add(validity).Unix())
+	s.originalTTL = originalTTL
 	for _, k := range s.keys {
 		sig, err := s.sign(k, []dns.RR{k.dnskey}, "")
 		if err != nil {
@@ -221,12 +223,15 @@ func (s *signer) named(zone string) *key {
 
 func (s *signer) sign(k *key, set []dns.RR, wildcard string) (dns.RR, error) {
 	// Signing lowercases and sorts what it is given; a wildcard owner sets
-	// the labels field.
+	// the labels field, and the first record's TTL the original TTL.
 	rrs := make([]dns.RR, len(set))
 	for i, rr := range set {
 		rrs[i] = rr.Clone()
 		if wildcard != "" {
 			rrs[i].Header().Name = wildcard
+		}
+		if s.originalTTL != 0 && rrs[i].Header().TTL > s.originalTTL {
+			rrs[i].Header().TTL = s.originalTTL
 		}
 	}
 	sig := dns.NewRRSIG(k.zone, dns.ECDSAP256SHA256, k.dnskey.KeyTag(), s.inception, s.expiration)

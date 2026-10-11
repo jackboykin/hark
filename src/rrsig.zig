@@ -636,11 +636,24 @@ fn verifyMlDsa(signature: []const u8, data: *const SignedData, key_data: []const
     verifier.verify() catch return error.InvalidSignature;
 }
 
-/// How long an RRset this signature verified may be held: RFC 4034 §3.1.2
-/// Original TTL or RFC 4035 §5.3.3 remaining window, whichever is shorter.
-pub fn ttlCap(sig: dns.RrsigData, now_u32: u32) u32 {
-    return @min(sig.original_ttl, dns.secondsUntil(sig.sig_expiration, now_u32));
-}
+/// How long an RRset its signatures verified may be held (RFC 4035
+/// §5.3.3): the original TTL, which ages from receipt as the set's own TTL
+/// does, and the window left before a signature expires, which runs from
+/// now. Two clocks, so two terms.
+pub const Cap = struct {
+    original_ttl: u32,
+    window_s: u32,
+
+    pub const none: Cap = .{ .original_ttl = std.math.maxInt(u32), .window_s = std.math.maxInt(u32) };
+
+    pub fn of(sig: dns.RrsigData, now_u32: u32) Cap {
+        return .{ .original_ttl = sig.original_ttl, .window_s = dns.secondsUntil(sig.sig_expiration, now_u32) };
+    }
+
+    pub fn meet(a: Cap, b: Cap) Cap {
+        return .{ .original_ttl = @min(a.original_ttl, b.original_ttl), .window_s = @min(a.window_s, b.window_s) };
+    }
+};
 
 /// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
 pub fn signedLabels(name: dns.Name) usize {

@@ -136,6 +136,8 @@ pub const Scenario = struct {
     dnssec_zones: []const []const u8 = &.{},
     /// Seconds the harness's signatures stay valid; null, a year.
     sig_validity: ?u32 = null,
+    /// Caps the original TTL the harness's signatures carry; null, none.
+    sig_original_ttl: ?u32 = null,
 };
 
 const no_flags: dns.Header.Flags = .{
@@ -262,6 +264,8 @@ const Parser = struct {
             s.min_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "sig-validity")) {
             s.sig_validity = try p.int(u32, val);
+        } else if (mem.eql(u8, key, "sig-original-ttl")) {
+            s.sig_original_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "prefetch")) {
             s.prefetch = yes(val);
         } else if (mem.eql(u8, key, "client-timeout")) {

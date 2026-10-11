@@ -16,13 +16,15 @@ import (
 )
 
 type scenario struct {
-	rootHints     []netip.Addr
-	zones         []string
-	sigValidity   time.Duration
-	clientTimeout time.Duration
-	config        config
-	ranges        []*rangeBlock
-	steps         []*step
+	rootHints   []netip.Addr
+	zones       []string
+	sigValidity time.Duration
+	// Caps the original TTL signatures carry; 0, none.
+	sigOriginalTTL uint32
+	clientTimeout  time.Duration
+	config         config
+	ranges         []*rangeBlock
+	steps          []*step
 }
 
 type config struct {
@@ -467,6 +469,10 @@ func (p *parser) directive(key, val string) error {
 	case "sig-validity":
 		s, err := strconv.Atoi(val)
 		sc.sigValidity = time.Duration(s) * time.Second
+		return err
+	case "sig-original-ttl":
+		s, err := strconv.ParseUint(val, 10, 32)
+		sc.sigOriginalTTL = uint32(s)
 		return err
 	case "client-timeout":
 		s, err := strconv.ParseFloat(val, 64)

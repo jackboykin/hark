@@ -451,7 +451,7 @@ pub fn verifyAuthorityProofSigs(
     now_u32: u32,
     budget: *rrsig.ValidationBudget,
     memo: *rrsig.VerifyMemo,
-) ?u32 {
+) ?rrsig.Cap {
     for (authorities) |rr| {
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
     } else return null;
@@ -460,7 +460,7 @@ pub fn verifyAuthorityProofSigs(
     if (!keyset.init(dnskey_records)) return null;
     const zone = keyset.zone orelse return null;
 
-    var cap: u32 = std.math.maxInt(u32);
+    var cap: rrsig.Cap = .none;
     for (authorities, 0..) |rr, i| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
         // A duplicated owner re-collects the same set; verify it once.
@@ -485,7 +485,7 @@ pub fn verifyAuthorityProofSigs(
             const sig = authorities[j].rdata.rrsig;
             if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return null) break sig;
         } else return null;
-        cap = @min(cap, rrsig.ttlCap(sig, now_u32));
+        cap = cap.meet(.of(sig, now_u32));
     }
     return cap;
 }
@@ -1073,30 +1073,8 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     };
     var budget: rrsig.ValidationBudget = .{};
     const sig = validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo).?.sig;
-    // The verifying signature's own bounds: original_ttl 300 against a
-    // remaining window of 100_000_000 s. Never the junk record's 1.
-    try testing.expectEqual(@as(u32, 300), rrsig.ttlCap(sig, now));
-}
-
-test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the shorter bound" {
-    // Same signature, evaluated close to its expiration: now the remaining
-    // window is what binds, not RFC 4034 §3.1.2's original TTL.
-    const recs = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-    };
-    var sig_bytes: [64]u8 = undefined;
-    var pub_bytes: [32]u8 = undefined;
-    const signed = try rrsig.testSignRrset(&recs, .a, rrsig.test_owner, .ed25519, &sig_bytes, &pub_bytes);
-    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
-    const answers = [_]dns.ResourceRecord{
-        recs[0],
-        .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
-    };
-    // 60 s before the signature dies.
-    const now: u32 = 1_800_000_000 - 60;
-    var budget: rrsig.ValidationBudget = .{};
-    const sig = validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo).?.sig;
-    try testing.expectEqual(@as(u32, 60), rrsig.ttlCap(sig, now));
+    // The verifying signature's original TTL, never the junk record's 1.
+    try testing.expectEqual(@as(u32, 300), rrsig.Cap.of(sig, now).original_ttl);
 }
 
 test "validateRrset: >64-member RRset is bogus, not a validated prefix" {

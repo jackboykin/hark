@@ -149,7 +149,7 @@ func launch(ctx context.Context, t *testing.T, sc *scenario) (*responder, *hark)
 	// Signed once hark is ready, so its start spends none of a signature's
 	// validity.
 	if sg != nil {
-		if err := sg.bake(sc.ranges, sc.sigValidity); err != nil {
+		if err := sg.bake(sc.ranges, sc.sigValidity, sc.sigOriginalTTL); err != nil {
 			t.Fatal(err)
 		}
 	}

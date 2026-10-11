@@ -1,7 +1,8 @@
 //! The simulator's signer. One ECDSA P-256 key per declared zone, from its name (RFC
 //! 6605, flags 256, SHA-256 DS); a placeholder DS takes the child's digest;
 //! every RRset gets an RRSIG from the zone the cut rules say owns it,
-//! inception a day back, expiry a year out unless `sig-validity` says.
+//! inception a day back, expiry a year out unless `sig-validity` says, its
+//! original TTL the set's own unless `sig-original-ttl` caps it.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -61,6 +62,7 @@ pub const Signer = struct {
     /// Wall seconds at minting.
     now: i64,
     validity: i64,
+    original_ttl: ?u32,
     /// Where each zone signed something: the addresses answering its
     /// DNSKEY. A forced signer (SIGN_AS) registers nothing.
     served: std.ArrayList(Served) = .empty,
@@ -68,7 +70,7 @@ pub const Signer = struct {
     const Served = struct { address: na.Address, key: *const Key };
 
     pub fn init(arena: Allocator, scenario: *const rpl.Scenario, mint: *Mint, wall_sec: i64) !Signer {
-        return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400 };
+        return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400, .original_ttl = scenario.sig_original_ttl };
     }
 
     /// The first declared zone's DS: the root, by the loader's rule.
@@ -197,7 +199,7 @@ pub const Signer = struct {
             .type_covered = head.rtype,
             .algorithm = .ecdsap256sha256,
             .labels = @intCast(rrsig.signedLabels(wildcard orelse head.name)),
-            .original_ttl = head.ttl,
+            .original_ttl = @min(head.ttl, self.original_ttl orelse head.ttl),
             .sig_expiration = @intCast(self.now + self.validity),
             .sig_inception = @intCast(self.now - 86400),
             .key_tag = key.key_tag,

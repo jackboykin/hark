@@ -1,0 +1,110 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: sig-original-ttl = 300
+SCENARIO_BEGIN an original ttl ages from receipt, not judgement
+; Every set is served at 3600 s and signed at 300 s, so each lives 300 s
+; from when it arrived: the original TTL caps a TTL, which ages from
+; receipt (RFC 4035 §5.3.3). doc.example.'s DNAME arrives at 100 s. At
+; 350 s the root's keys are fetched again and mail.doc.example. is
+; redirected by the held DNAME, its signature judged then; aged from
+; 100 s, the redirect has lapsed by 450 s and the name is asked again,
+; now aliased elsewhere.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.archive.example. IN A
+    SECTION ANSWER
+      mail.archive.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      doc.example. IN DNAME
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 10 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME new.example.
+      mail.doc.example. 3600 IN CNAME mail.new.example.
+      mail.new.example. 3600 IN A 192.0.2.20
+  ENTRY_END
+RANGE_END
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.archive.example. IN A
+ENTRY_END
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.archive.example. IN A
+ENTRY_END
+STEP 3 TIME_PASSES ELAPSE 100
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    doc.example. IN DNAME
+ENTRY_END
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    doc.example. IN DNAME
+ENTRY_END
+STEP 6 TIME_PASSES ELAPSE 250
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    mail.doc.example. 3600 IN CNAME mail.archive.example.
+    mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+STEP 9 TIME_PASSES ELAPSE 100
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME new.example.
+    mail.doc.example. 3600 IN CNAME mail.new.example.
+    mail.new.example. 3600 IN A 192.0.2.20
+ENTRY_END
+SCENARIO_END
