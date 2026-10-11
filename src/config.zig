@@ -331,7 +331,7 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
     // Told servers skip the ask's policy, so the root's are held to it
     // here: a private root hint is a footgun, not a steer. Loopback ones
     // only if the operator opted in (tests do).
-    for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(addr)) return error.InvalidRootHintAddress;
+    for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(.fromAddress(addr))) return error.InvalidRootHintAddress;
 
     // hark recurses for any question: a stub server that is hark itself
     // asks hark, which asks hark.

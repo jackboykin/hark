@@ -85,16 +85,15 @@ pub const Ask = struct {
         return @as(u32, 1) << @intCast(i);
     }
 
-    fn knows(a: *const Ask, server: na.Address) bool {
-        const key = na.AddressKey.fromAddress(server);
-        for (a.servers[0..a.nservers]) |s| if (s.eql(key)) return true;
+    fn knows(a: *const Ask, server: na.AddressKey) bool {
+        for (a.servers[0..a.nservers]) |s| if (s.eql(server)) return true;
         return false;
     }
 
     /// Of what a delegation handed over, what is new to this ask and may be
     /// sent to. Hark's policy, not the authorities' word: facts keep every
     /// address, and the public DNS never steers an ask at the inside.
-    fn sift(a: *const Ask, g: *Graph, list: *std.ArrayList(na.Address)) void {
+    fn sift(a: *const Ask, g: *Graph, list: *std.ArrayList(na.AddressKey)) void {
         var i: usize = 0;
         while (i < list.items.len) {
             const x = list.items[i];
@@ -167,13 +166,13 @@ pub const Ask = struct {
         return true;
     }
 
-    fn add(a: *Ask, g: *Graph, addrs: []const na.Address) void {
+    fn add(a: *Ask, g: *Graph, addrs: []const na.AddressKey) void {
         // Told servers are learned from no delegation: no DS hark holds
         // describes them.
         if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
-            a.servers[a.nservers] = na.AddressKey.fromAddress(s);
+            a.servers[a.nservers] = s;
             a.nservers += 1;
         }
     }
@@ -181,7 +180,7 @@ pub const Ask = struct {
     /// The first pass, from the cut in hand: a cut learned this instant
     /// may be one the store refused, or one that lives no time.
     fn seed(a: *Ask, g: *Graph, cut: graph.Cut) !void {
-        var list: std.ArrayList(na.Address) = .empty;
+        var list: std.ArrayList(na.AddressKey) = .empty;
         a.more = try reach(g, a.take(cut), &list);
         a.sift(g, &list);
         a.add(g, list.items);
@@ -564,16 +563,16 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         if (j.failure()) |why| return g.fail(id, why);
         expires = @min(expires, j.expires_ns);
     }
-    var addrs: std.ArrayList(na.Address) = .empty;
+    var addrs: std.ArrayList(na.AddressKey) = .empty;
     try ownAddresses(g, g.cell(rid).blob.?, key.rtype, &addrs);
     std.debug.assert(addrs.items.len == 0 or g.cell(rid).state.fact.rrset.answers[0].name.eql(host));
-    try g.settle(id, .{ .addr = try g.cell(id).arena.allocator().dupe(na.Address, addrs.items) }, expires);
+    try g.settle(id, .{ .addr = try g.cell(id).arena.allocator().dupe(na.AddressKey, addrs.items) }, expires);
 }
 
 /// A chain is kept in the order followed (`classify`), so a set at the
 /// name asked leads its answer. One led by anything else is another
 /// name's: an NS name must not be an alias (RFC 2181 §10.3).
-fn ownAddresses(g: *Graph, blob: *store.Blob, family: dns.RType, list: *std.ArrayList(na.Address)) !void {
+fn ownAddresses(g: *Graph, blob: *store.Blob, family: dns.RType, list: *std.ArrayList(na.AddressKey)) !void {
     var own = store.Rrset.answered(blob) orelse return;
     while (own.next()) |rr| {
         if (rr.rtype() == family) try list.append(g.scratch.allocator(), g.cfg.addr_policy.wire(rr).?) else if (rr.rtype() != .rrsig) return;
@@ -808,7 +807,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     for (servers, ref.nsNames()) |*server, host| {
         var key = Key.of(&kb, .addr, host, .a);
         key.name = try sa.dupe(u8, key.name);
-        var glue: std.ArrayList(na.Address) = .empty;
+        var glue: std.ArrayList(na.AddressKey) = .empty;
         // Glue is the parent's word only inside its own zone.
         if (speaksFor(g, zone, host)) for (msg.additionals) |rr| {
             if (!rr.name.eql(host)) continue;
@@ -1194,11 +1193,14 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
     var kb: graph.KeyBuf = undefined;
     const sa = g.scratch.allocator();
-    var list: std.ArrayList(na.Address) = .empty;
+    var list: std.ArrayList(na.AddressKey) = .empty;
     const zone = a.zone;
     if (told(g, zone)) |servers| {
         // Told, not handed over: config holds them to what it allows.
-        for (servers) |h| if (!a.knows(h)) try list.append(sa, h);
+        for (servers) |h| {
+            const k: na.AddressKey = .fromAddress(h);
+            if (!a.knows(k)) try list.append(sa, k);
+        }
     } else {
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);
@@ -1274,7 +1276,7 @@ const Left = struct {
 /// parent's word, if it gave any, else at its own zone's stored sets, a
 /// family at a time. Nothing else held is read, so what a glued server's
 /// zone says of it never changes how it is reached.
-fn reach(g: *Graph, servers: []const graph.Server, list: *std.ArrayList(na.Address)) !bool {
+fn reach(g: *Graph, servers: []const graph.Server, list: *std.ArrayList(na.AddressKey)) !bool {
     const sa = g.scratch.allocator();
     var partial = false;
     for (servers) |server| {
@@ -1292,7 +1294,7 @@ fn reach(g: *Graph, servers: []const graph.Server, list: *std.ArrayList(na.Addre
 /// What `reach` found no stored set for: this walk's own settled lookups,
 /// lookups in progress, and the unknown. Unknown is never none: a set
 /// that lapsed, failed or was never asked for says nothing of the host.
-fn learn(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *std.ArrayList(na.Address), left: *Left) !void {
+fn learn(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *std.ArrayList(na.AddressKey), left: *Left) !void {
     const sa = g.scratch.allocator();
     for (servers) |server| {
         if (server.glue.len > 0) continue;

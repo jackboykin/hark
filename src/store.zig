@@ -307,7 +307,7 @@ pub const Store = struct {
                 const zone = try r.name(arena);
                 const placed_until_ns = try r.int(i64);
                 const servers = try arena.alloc(graph.Server, try r.int(u16));
-                const glue = try arena.alloc(na.Address, try r.int(u16));
+                const glue = try arena.alloc(na.AddressKey, try r.int(u16));
                 var at: usize = 0;
                 for (servers) |*server| {
                     const name = try r.slice(try r.int(u16));
@@ -473,8 +473,7 @@ const Writer = struct {
         w.pos += try dns.writeNameWire(w.buf[w.pos..], n);
     }
 
-    fn addr(w: *Writer, a: na.Address) !void {
-        const k = na.AddressKey.fromAddress(a);
+    fn addr(w: *Writer, k: na.AddressKey) !void {
         try w.int(u8, k.family);
         try w.int(u16, k.port);
         try w.slice(&k.addr);
@@ -509,11 +508,10 @@ const Reader = struct {
         return r.slice(dns.wireNameLen(r.buf[r.pos..]));
     }
 
-    fn addr(r: *Reader) !na.Address {
+    fn addr(r: *Reader) !na.AddressKey {
         const family = try r.int(u8);
         const port = try r.int(u16);
-        const raw = try r.slice(16);
-        return if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
+        return .{ .family = family, .port = port, .addr = (try r.slice(16))[0..16].* };
     }
 
     fn records(r: *Reader, arena: Allocator, n: u16) ![]RR {
@@ -603,13 +601,13 @@ test "a fact survives the blob byte for byte" {
     }
 
     _ = blob.ref();
-    const glue = [_]na.Address{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) };
+    const glue = [_]na.AddressKey{ .ip4(.{ 10, 0, 0, 1 }, 53), .ip6(@splat(1), 853) };
     const newer = try s.build(.{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .init(.addr, "ns.example.com", .a), .glue = &glue }} } });
     try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
     const cut = (try Store.parse(arena, newer)).cut;
     try testing.expect(cut.zone.eqlExact(zone));
-    try testing.expect(cut.servers[0].glue.len == 2 and na.ipEqual(cut.servers[0].glue[1], glue[1]));
+    try testing.expect(cut.servers[0].glue.len == 2 and cut.servers[0].glue[1].eql(glue[1]));
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
 }

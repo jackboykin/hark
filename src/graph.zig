@@ -206,7 +206,7 @@ pub const Server = struct {
     /// The host as a key, so no walk formats or hashes its name: each
     /// family's `rrset` and `addr` key is `at` it.
     key: Key,
-    glue: []const na.Address = &.{},
+    glue: []const na.AddressKey = &.{},
 };
 
 /// The RRset at (name, type), as the reply sections that settled it, so
@@ -295,7 +295,7 @@ pub const Failure = struct {
 
 pub const Value = union(Kind) {
     cut: Cut,
-    addr: []const na.Address,
+    addr: []const na.AddressKey,
     rrset: Reply,
     stub: Reply,
     answer: Answer,

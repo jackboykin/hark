@@ -48,31 +48,29 @@ pub const AddrPolicy = struct {
     upstream_port: u16 = 53,
     allow_loopback: bool = false,
 
-    pub fn address(policy: AddrPolicy, rr: dns.ResourceRecord) ?na.Address {
+    pub fn address(policy: AddrPolicy, rr: dns.ResourceRecord) ?na.AddressKey {
         return switch (rr.rtype) {
-            .a => na.initIp4(rr.rdata.a, policy.upstream_port),
-            .aaaa => na.initIp6(rr.rdata.aaaa, policy.upstream_port, 0, 0),
+            .a => .ip4(rr.rdata.a, policy.upstream_port),
+            .aaaa => .ip6(rr.rdata.aaaa, policy.upstream_port),
             else => null,
         };
     }
 
-    pub fn wire(policy: AddrPolicy, rr: dns.WireRecord) ?na.Address {
+    pub fn wire(policy: AddrPolicy, rr: dns.WireRecord) ?na.AddressKey {
         return switch (rr.rtype()) {
-            .a => na.initIp4(rr.rdata()[0..4].*, policy.upstream_port),
-            .aaaa => na.initIp6(rr.rdata()[0..16].*, policy.upstream_port, 0, 0),
+            .a => .ip4(rr.rdata()[0..4].*, policy.upstream_port),
+            .aaaa => .ip6(rr.rdata()[0..16].*, policy.upstream_port),
             else => null,
         };
     }
 
-    pub fn allows(policy: AddrPolicy, addr: na.Address) bool {
+    pub fn allows(policy: AddrPolicy, addr: na.AddressKey) bool {
         return (policy.allow_loopback and loopback(addr)) or !na.isNonRoutableNs(addr);
     }
 
-    fn loopback(addr: na.Address) bool {
-        return switch (addr) {
-            .ip4 => |v4| v4.bytes[0] == 127,
-            .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
-        };
+    fn loopback(addr: na.AddressKey) bool {
+        if (addr.family == std.posix.AF.INET) return addr.addr[0] == 127;
+        return std.mem.eql(u8, &addr.addr, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
     }
 };
 

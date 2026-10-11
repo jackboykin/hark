@@ -39,21 +39,21 @@ pub const AddressKey = struct {
         return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
     }
 
+    pub fn ip4(bytes: [4]u8, port: u16) AddressKey {
+        var addr: [16]u8 = @splat(0);
+        addr[0..4].* = bytes;
+        return .{ .family = @intCast(posix.AF.INET), .addr = addr, .port = port };
+    }
+
+    pub fn ip6(bytes: [16]u8, port: u16) AddressKey {
+        return .{ .family = @intCast(posix.AF.INET6), .addr = bytes, .port = port };
+    }
+
     pub fn fromAddress(address: Address) AddressKey {
-        var key = AddressKey{ .family = 0, .addr = @splat(0), .port = 0 };
-        switch (address) {
-            .ip4 => |v4| {
-                key.family = @intCast(posix.AF.INET);
-                @memcpy(key.addr[0..4], &v4.bytes);
-                key.port = v4.port;
-            },
-            .ip6 => |v6| {
-                key.family = @intCast(posix.AF.INET6);
-                @memcpy(&key.addr, &v6.bytes);
-                key.port = v6.port;
-            },
-        }
-        return key;
+        return switch (address) {
+            .ip4 => |v4| .ip4(v4.bytes, v4.port),
+            .ip6 => |v6| .ip6(v6.bytes, v6.port),
+        };
     }
 
     pub fn toAddress(k: AddressKey) Address {
@@ -169,11 +169,8 @@ pub fn ipEqual(a: Address, b: Address) bool {
 /// that should not be contacted during recursive resolution (DNS rebinding defense).
 /// Superset of the shared special-use table: NS contact also refuses multicast,
 /// which the answer scrub (rebinding.zig) deliberately serves.
-pub fn isNonRoutableNs(addr: Address) bool {
-    return switch (addr) {
-        .ip4 => |v4| isNonRoutableIp4(v4.bytes),
-        .ip6 => |v6| isNonRoutableIp6(v6.bytes),
-    };
+pub fn isNonRoutableNs(addr: AddressKey) bool {
+    return if (addr.family == posix.AF.INET) isNonRoutableIp4(addr.addr[0..4].*) else isNonRoutableIp6(addr.addr);
 }
 
 fn isNonRoutableIp4(b: [4]u8) bool {
@@ -321,37 +318,37 @@ test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv4" {
-    try testing.expect(isNonRoutableNs(initIp4(.{ 127, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(.ip4(.{ 127, 0, 0, 1 }, 53)));
     // Multicast — NS-only addition over the shared table
-    try testing.expect(isNonRoutableNs(initIp4(.{ 224, 0, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 239, 255, 255, 255 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 255, 255, 255, 255 }, 53)));
+    try testing.expect(isNonRoutableNs(.ip4(.{ 224, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(.ip4(.{ 239, 255, 255, 255 }, 53)));
+    try testing.expect(isNonRoutableNs(.ip4(.{ 255, 255, 255, 255 }, 53)));
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv6" {
     // Loopback ::1
-    try testing.expect(isNonRoutableNs(initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53)));
     // Unspecified ::
-    try testing.expect(isNonRoutableNs(initIp6(@splat(0), 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6(@splat(0), 53)));
     // Unique local fc00::/7
-    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfc, 0 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
-    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfd, 0x12 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfc, 0 } ++ @as([14]u8, @splat(0)), 53)));
+    try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfd, 0x12 } ++ @as([14]u8, @splat(0)), 53)));
     // Link-local fe80::/10
-    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53)));
     // Multicast ff00::/8 — NS-only addition over the shared table
-    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53)));
     // Documentation 2001:db8::/32
-    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53)));
     // IPv4-mapped ::ffff:127.0.0.1
-    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53)));
     // IPv4-mapped ::ffff:10.0.0.1
-    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53)));
     // IPv4-mapped multicast ::ffff:224.0.0.1 — must stay blocked at NS-time
-    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53)));
 }
 
 test "isNonRoutableNs allows routable IPv6" {
-    try testing.expect(!isNonRoutableNs(initIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    try testing.expect(!isNonRoutableNs(.ip6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53)));
     // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
-    try testing.expect(!isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
+    try testing.expect(!isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53)));
 }
