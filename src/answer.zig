@@ -222,21 +222,48 @@ pub const Desk = struct {
     }
 
     /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.
-    pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: enum { fresh, live, floored, stale }) !?Served {
+    pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: How) !?Served {
         const aq = try d.asked(arena, q, c);
-        const served = try switch (how) {
-            .fresh => fresh(d, arena, aq, c, true),
-            .live => fresh(d, arena, aq, c, false),
-            .floored => floored(d, arena, aq, c),
-            .stale => stale(d, arena, aq, c),
-        } orelse return null;
-        const x = Dns64.on(d.dns64, c) orelse return served;
-        // Synthesis needs the A: the graph's to fetch.
-        if (how == .fresh and Dns64.wantsA(q, served)) {
-            served.release(&d.g.store);
-            return null;
-        }
-        return try x.shape(arena, q, served, null);
+        const x = Dns64.on(d.dns64, c) orelse return recall(d, arena, aq, c, how);
+        const modes = ladder(how);
+        const exact = try best(d, arena, aq, c, modes[0..1]);
+        const served = exact orelse (if (q.qtype == .aaaa) try best(d, arena, aq, c, modes[1..]) else null) orelse return null;
+        errdefer served.release(&d.g.store);
+        const wants = Dns64.wantsA(q, served);
+        if (!wants and exact == null) return d.drop(served);
+        const a = if (!wants) null else try best(d, arena, aOf(q), c, if (exact != null) modes else modes[0..1]) orelse return d.drop(served);
+        errdefer if (a) |s| s.release(&d.g.store);
+        return try x.shape(arena, q, served, a);
+    }
+
+    const How = enum { fresh, live, floored, stale };
+
+    fn ladder(how: How) []const How {
+        return switch (how) {
+            .fresh => &.{.fresh},
+            .live => &.{.live},
+            .floored => &.{ .floored, .live },
+            .stale => &.{ .stale, .floored, .live },
+        };
+    }
+
+    fn recall(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: How) !?Served {
+        return switch (how) {
+            .fresh => fresh(d, arena, q, c, true),
+            .live => fresh(d, arena, q, c, false),
+            .floored => floored(d, arena, q, c),
+            .stale => stale(d, arena, q, c),
+        };
+    }
+
+    fn best(d: *Desk, arena: Allocator, q: dns.Question, c: Client, modes: []const How) !?Served {
+        for (modes) |m| if (try recall(d, arena, q, c, m)) |s| return s;
+        return null;
+    }
+
+    fn drop(d: *Desk, s: Served) ?Served {
+        s.release(&d.g.store);
+        return null;
     }
 
     pub fn asked(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !dns.Question {
