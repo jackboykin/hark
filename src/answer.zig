@@ -66,7 +66,8 @@ pub const Dns64 = struct {
                 .authorities = from.authorities,
                 .additionals = from.additionals,
                 .cacheable = served.cacheable and from.cacheable,
-                .ede = from.ede,
+                .ede = if (served.hold_until_ns > 0) served.ede else from.ede,
+                .hold_until_ns = @max(served.hold_until_ns, from.hold_until_ns),
                 .local = from.local,
             };
         };
