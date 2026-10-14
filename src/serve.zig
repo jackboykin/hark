@@ -696,7 +696,13 @@ const Server = struct {
                 served.release(&s.g.store);
                 return null;
             }
-        } else |err| if (err != error.Full) return err;
+        } else |err| {
+            served.release(&s.g.store);
+            if (err != error.Full) return err;
+            var full = answer.servfail(q, .{ .code = .over_quota });
+            full.theirs = true;
+            return full;
+        };
         return try s.desk.finish(arena, q, client, served, p.a);
     }
 

@@ -58,19 +58,18 @@ pub const Dns64 = struct {
             // A denial there proves a name the client never asked about.
             out.authorities = &.{};
             out.additionals = &.{};
-        } else if (a) |from| if (try dns64.synthesizeAaaa(arena, d.prefix, from.answers, served.authorities)) |aaaa| {
-            out = .{
-                .rcode = from.rcode,
-                .question = from.question,
-                .answers = aaaa,
-                .authorities = from.authorities,
-                .additionals = from.additionals,
-                .cacheable = served.cacheable and from.cacheable,
-                .ede = if (served.hold_until_ns > 0) served.ede else from.ede,
-                .hold_until_ns = @max(served.hold_until_ns, from.hold_until_ns),
-                .local = from.local,
-            };
-        };
+        } else if (a) |from| {
+            if (try dns64.synthesizeAaaa(arena, d.prefix, from.answers, served.authorities)) |aaaa| {
+                out = from;
+                out.answers = aaaa;
+                out.ad = false;
+            } else if (from.rcode != .no_error) out = from;
+            if (from.rcode == .no_error) {
+                out.cacheable = served.cacheable and from.cacheable;
+                if (out.hold_until_ns == 0) out.ede = if (served.hold_until_ns > 0) served.ede else if (from.hold_until_ns > 0) from.ede else out.ede;
+                out.hold_until_ns = @max(served.hold_until_ns, from.hold_until_ns);
+            }
+        }
         if (a) |from| out.held = try std.mem.concat(arena, *store.Blob, &.{ served.held, from.held });
         out.question = q;
         return out;
