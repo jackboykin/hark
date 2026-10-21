@@ -52,35 +52,30 @@ pub const Prefix = struct {
 };
 
 /// §5.1.2, §5.1.4: NOERROR with no AAAA beyond `::ffff:0:0/96`.
-pub fn wantsSynthesis(rcode: dns.RCode, answers: []const dns.WireRecord) bool {
+pub fn wantsSynthesis(rcode: dns.RCode, answers: []const dns.ResourceRecord) bool {
     if (rcode != .no_error) return false;
-    for (answers) |rr| if (rr.rtype() == .aaaa and !na.isIp4Mapped(rr.rdata())) return false;
+    for (answers) |rr| if (rr.rtype == .aaaa and !na.isIp4Mapped(rr.rdata)) return false;
     return true;
 }
 
 /// The A reply's answers with each A embedded under `p` and the A RRSIG
 /// dropped; null when there is no A to embed. §5.1.7: TTL capped by the
 /// negative's SOA, else 600 s. AD is the caller's to clear.
-pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: []const dns.WireRecord, negative_authorities: []const dns.WireRecord) !?[]dns.WireRecord {
+pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: []const dns.ResourceRecord, negative_authorities: []const dns.ResourceRecord) !?[]dns.ResourceRecord {
     for (a) |rr| {
-        if (rr.rtype() == .a) break;
+        if (rr.rtype == .a) break;
     } else return null;
     const cap = for (negative_authorities) |rr| {
-        if (rr.rtype() == .soa) break rr.ttl;
+        if (rr.rtype == .soa) break rr.ttl;
     } else 600;
-    const out = try alloc.alloc(dns.WireRecord, a.len);
+    const out = try alloc.alloc(dns.ResourceRecord, a.len);
     var n: usize = 0;
     for (a) |rr| {
         if (rr.covers() == .a) continue;
-        out[n] = if (rr.rtype() != .a) rr else blk: {
-            const rest = try alloc.alloc(u8, 10 + 16);
-            const ttl = @min(rr.ttl, cap);
-            mem.writeInt(u16, rest[0..2], @backingInt(dns.RType.aaaa), .big);
-            @memcpy(rest[2..4], rr.rest[2..4]);
-            mem.writeInt(u32, rest[4..8], ttl, .big);
-            mem.writeInt(u16, rest[8..10], 16, .big);
-            rest[10..26].* = p.embed(rr.rdata()[0..4].*);
-            break :blk .{ .owner = rr.owner, .rest = rest, .ttl = ttl };
+        out[n] = if (rr.rtype != .a) rr else blk: {
+            const addr = try alloc.create([16]u8);
+            addr.* = p.embed(rr.a());
+            break :blk .{ .name = rr.name, .rtype = .aaaa, .rclass = rr.rclass, .ttl = @min(rr.ttl, cap), .rdata = addr };
         };
         n += 1;
     }
@@ -102,13 +97,14 @@ pub fn parseIp6Arpa(name: dns.Name) ?[16]u8 {
 }
 
 /// CNAMEs (RFC 2317) and RRSIGs are untrue under the new owner.
-pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.WireRecord, qname: dns.Name) ![]dns.WireRecord {
-    const owner = try alloc.dupe(u8, qname.wire);
-    const out = try alloc.alloc(dns.WireRecord, answers.len);
+pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.ResourceRecord, qname: dns.Name) ![]dns.ResourceRecord {
+    const owner = try qname.clone(alloc);
+    const out = try alloc.alloc(dns.ResourceRecord, answers.len);
     var n: usize = 0;
     for (answers) |rr| {
-        if (rr.rtype() != .ptr) continue;
-        out[n] = .{ .owner = owner, .rest = rr.rest, .ttl = rr.ttl };
+        if (rr.rtype != .ptr) continue;
+        out[n] = rr;
+        out[n].name = owner;
         n += 1;
     }
     return out[0..n];
@@ -153,19 +149,19 @@ test "synthesizeAaaa embeds every A, drops its RRSIG and caps TTL by the SOA" {
     const al = arena.allocator();
     const host = try dns.parseDottedName(al, "host.example.com.");
     const sig: dns.RrsigData = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 0, .sig_expiration = 0, .sig_inception = 0, .key_tag = 0, .signer_name = host, .signature = "" };
-    const a = [_]dns.WireRecord{
-        try .from(al, .fixture(.{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })),
-        try .from(al, .fixture(.{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } })),
+    const a = [_]dns.ResourceRecord{
+        .fixture(.{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
+        .fixture(.{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } }),
     };
-    const soa = [_]dns.WireRecord{try .from(al, .fixture(.{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } }))};
+    const soa = [_]dns.ResourceRecord{.fixture(.{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } })};
     try testing.expect(wantsSynthesis(.no_error, &.{}));
     const out = (try synthesizeAaaa(al, Prefix.well_known, &a, &soa)).?;
     try testing.expectEqual(@as(usize, 1), out.len);
-    try testing.expectEqual(dns.RType.aaaa, out[0].rtype());
+    try testing.expectEqual(dns.RType.aaaa, out[0].rtype);
     try testing.expectEqual(@as(u32, 300), out[0].ttl);
-    try testing.expectEqualSlices(u8, &Prefix.well_known.embed(.{ 192, 0, 2, 1 }), out[0].rdata());
+    try testing.expectEqualSlices(u8, &Prefix.well_known.embed(.{ 192, 0, 2, 1 }), out[0].rdata);
     try testing.expect(!wantsSynthesis(.no_error, out));
-    try testing.expectEqual(@as(?[]dns.WireRecord, null), try synthesizeAaaa(al, Prefix.well_known, &.{}, &soa));
+    try testing.expectEqual(@as(?[]dns.ResourceRecord, null), try synthesizeAaaa(al, Prefix.well_known, &.{}, &soa));
 }
 
 test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME hop" {
@@ -175,13 +171,13 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const in_addr = try dns.parseDottedName(a, "1.2.0.192.in-addr.arpa.");
     const classless = try dns.parseDottedName(a, "1.0-25.2.0.192.in-addr.arpa.");
     const host = try dns.parseDottedName(a, "host.example.com.");
-    const answers = [_]dns.WireRecord{
-        try .from(a, .fixture(.{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } })),
-        try .from(a, .fixture(.{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } })),
+    const answers = [_]dns.ResourceRecord{
+        .fixture(.{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } }),
+        .fixture(.{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } }),
     };
     const qname = try dns.parseDottedName(a, "1.0.2.0.0.0.0.C.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.B.9.F.F.4.6.0.0.ip6.arpa.");
     const out = try renamePtr(a, &answers, qname);
     try testing.expectEqual(@as(usize, 1), out.len);
-    try testing.expectEqualSlices(u8, qname.wire, out[0].owner);
-    try testing.expectEqualSlices(u8, answers[1].rest, out[0].rest);
+    try testing.expect(out[0].name.eql(qname));
+    try testing.expectEqualSlices(u8, answers[1].rdata, out[0].rdata);
 }

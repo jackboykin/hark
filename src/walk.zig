@@ -573,8 +573,8 @@ const OwnAddresses = struct {
     fn next(o: *OwnAddresses) ?na.AddressKey {
         const own = if (o.own) |*own| own else return null;
         while (own.next()) |rr| {
-            if (rr.rtype() == o.family) return o.policy.wire(rr).?;
-            if (rr.rtype() != .rrsig) break;
+            if (rr.rtype == o.family) return o.policy.address(rr).?;
+            if (rr.rtype != .rrsig) break;
         }
         o.own = null;
         return null;
@@ -746,7 +746,7 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
 
 fn provable(b: *store.Blob) bool {
     var it = store.Rrset.of(b).sections[1].iterator();
-    while (it.next()) |rr| if (rr.rtype() == .nsec or rr.rtype() == .nsec3) return true;
+    while (it.next()) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) return true;
     return false;
 }
 
@@ -761,7 +761,7 @@ fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
         const r: store.Rrset = .of(d.blob);
         if (r.kind != .answer) continue;
         var it = r.sections[0].iterator();
-        while (it.next()) |rr| if (rr.rtype() == .dname and named(rr.owner, owner)) return owner;
+        while (it.next()) |rr| if (rr.rtype == .dname and rr.name.eql(owner)) return owner;
     }
     return null;
 }

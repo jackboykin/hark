@@ -65,16 +65,16 @@ pub const Config = struct {
 /// Inspects A/AAAA addresses and SVCB/HTTPS address hints; every other
 /// rtype passes through. The allowlist walk runs only on records that
 /// would otherwise drop, so public records never pay a name comparison.
-fn shouldDrop(rr: dns.WireRecord, cfg: Config) bool {
+fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     if (!cfg.enabled) return false;
-    const private = switch (rr.rtype()) {
-        .a, .aaaa => isPrivate(rr.rdata(), cfg),
-        .svcb, .https => svcbHintsPrivate(rr.rdata(), cfg),
+    const private = switch (rr.rtype) {
+        .a, .aaaa => isPrivate(rr.rdata, cfg),
+        .svcb, .https => svcbHintsPrivate(rr.rdata, cfg),
         else => false,
     };
     if (!private) return false;
     for (cfg.allow_zones) |zone| {
-        if (dns.Name.of(rr.owner).isSubdomainOf(zone)) return false;
+        if (rr.name.isSubdomainOf(zone)) return false;
     }
     return true;
 }
@@ -123,9 +123,9 @@ fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
 /// nothing is returned as is, allocating nothing.
 pub fn scrub(
     alloc: mem.Allocator,
-    records: []const dns.WireRecord,
+    records: []const dns.ResourceRecord,
     cfg: Config,
-) mem.Allocator.Error![]const dns.WireRecord {
+) mem.Allocator.Error![]const dns.ResourceRecord {
     if (!cfg.enabled) return records;
     const first = for (records, 0..) |rr, i| {
         if (shouldDrop(rr, cfg)) break i;
@@ -142,21 +142,21 @@ pub fn scrub(
     }
 
     var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    log.info("scrub dropped={d} owner={s}", .{ drop_count, dns.Name.of(records[first].owner).formatInto(&name_buf) });
+    log.info("scrub dropped={d} owner={s}", .{ drop_count, records[first].name.formatInto(&name_buf) });
 
     for (records, 0..) |rr, i| {
         if (marks[i]) continue;
         const covered = rr.covers() orelse continue;
         for (records, 0..) |other, k| {
-            if (!marks[k] or other.rtype() != covered) continue;
-            if (!std.mem.eql(u8, other.owner, rr.owner)) continue;
+            if (!marks[k] or other.rtype != covered) continue;
+            if (!other.name.eql(rr.name)) continue;
             marks[i] = true;
             drop_count += 1;
             break;
         }
     }
 
-    const out = try alloc.alloc(dns.WireRecord, records.len - drop_count);
+    const out = try alloc.alloc(dns.ResourceRecord, records.len - drop_count);
     var j: usize = 0;
     for (records, marks) |rr, m| {
         if (m) continue;
@@ -204,22 +204,16 @@ fn matchesDefault(bytes: []const u8) bool {
 
 const public_name = dns.Name.lit("attacker.com");
 
-var test_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-
-fn wire(rr: dns.ResourceRecord) dns.WireRecord {
-    return dns.WireRecord.from(test_arena.allocator(), rr) catch @panic("OOM");
+fn rrA(name: dns.Name, ip: [4]u8) dns.ResourceRecord {
+    return .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } });
 }
 
-fn rrA(name: dns.Name, ip: [4]u8) dns.WireRecord {
-    return wire(.fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } }));
+fn rrAAAA(name: dns.Name, ip: [16]u8) dns.ResourceRecord {
+    return .fixture(.{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 60, .rdata = .{ .aaaa = ip } });
 }
 
-fn rrAAAA(name: dns.Name, ip: [16]u8) dns.WireRecord {
-    return wire(.fixture(.{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 60, .rdata = .{ .aaaa = ip } }));
-}
-
-fn rrHttps(name: dns.Name, rdata: []const u8) dns.WireRecord {
-    return wire(.fixture(.{ .name = name, .rtype = .https, .rclass = .in, .ttl = 60, .rdata = .{ .unknown = rdata } }));
+fn rrHttps(name: dns.Name, rdata: []const u8) dns.ResourceRecord {
+    return .fixture(.{ .name = name, .rtype = .https, .rclass = .in, .ttl = 60, .rdata = .{ .unknown = rdata } });
 }
 
 /// SvcPriority 1 · TargetName "."
@@ -230,8 +224,8 @@ fn svcParam(comptime key: u16, comptime value: []const u8) []const u8 {
     return &(hdr ++ value[0..value.len].*);
 }
 
-fn rrsigOver(covered: dns.RType) dns.WireRecord {
-    return wire(.fixture(.{ .name = public_name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = .{
+fn rrsigOver(covered: dns.RType) dns.ResourceRecord {
+    return .fixture(.{ .name = public_name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = .{
         .type_covered = covered,
         .algorithm = .ecdsap256sha256,
         .labels = 2,
@@ -241,7 +235,7 @@ fn rrsigOver(covered: dns.RType) dns.WireRecord {
         .key_tag = 0,
         .signer_name = public_name,
         .signature = &.{},
-    } } }));
+    } } });
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {
@@ -259,14 +253,14 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
 test "nat64 prefix: synthesized AAAA is judged by its embedded v4" {
     const p = dns64.Prefix.well_known;
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{}, .nat64 = p };
-    var rrs = [_]dns.WireRecord{
+    var rrs = [_]dns.ResourceRecord{
         rrAAAA(public_name, p.embed(.{ 192, 168, 1, 1 })),
         rrAAAA(public_name, p.embed(.{ 93, 184, 216, 34 })),
     };
     const kept = try scrub(testing.allocator, &rrs, cfg);
     defer testing.allocator.free(kept);
     try testing.expectEqual(@as(usize, 1), kept.len);
-    try testing.expectEqualSlices(u8, &p.embed(.{ 93, 184, 216, 34 }), kept[0].rdata());
+    try testing.expectEqualSlices(u8, &p.embed(.{ 93, 184, 216, 34 }), kept[0].rdata);
     try testing.expectEqual(rrs.len, (try scrub(testing.allocator, &rrs, .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} })).len);
 }
 
@@ -308,9 +302,9 @@ test "svcb hints: malformed rdata is drop-biased past the TargetName, pass-biase
 
 test "scrub drops a private A and the RRSIG over its set" {
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const answers = [_]dns.WireRecord{ rrA(public_name, .{ 8, 8, 8, 8 }), rrA(public_name, .{ 192, 168, 0, 1 }), rrsigOver(.a) };
+    const answers = [_]dns.ResourceRecord{ rrA(public_name, .{ 8, 8, 8, 8 }), rrA(public_name, .{ 192, 168, 0, 1 }), rrsigOver(.a) };
     const scrubbed = try scrub(testing.allocator, &answers, cfg);
     defer testing.allocator.free(scrubbed);
     try testing.expectEqual(1, scrubbed.len);
-    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, scrubbed[0].rdata());
+    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, scrubbed[0].rdata);
 }

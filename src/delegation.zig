@@ -56,14 +56,6 @@ pub const AddrPolicy = struct {
         };
     }
 
-    pub fn wire(policy: AddrPolicy, rr: dns.WireRecord) ?na.AddressKey {
-        return switch (rr.rtype()) {
-            .a => .ip4(rr.rdata()[0..4].*, policy.upstream_port),
-            .aaaa => .ip6(rr.rdata()[0..16].*, policy.upstream_port),
-            else => null,
-        };
-    }
-
     pub fn allows(policy: AddrPolicy, addr: na.AddressKey) bool {
         return (policy.allow_loopback and loopback(addr)) or !na.isNonRoutableNs(addr);
     }

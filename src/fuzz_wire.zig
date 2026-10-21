@@ -265,9 +265,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     _ = dns.serializeMessage(&small, msg) catch {};
 
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.additionals }) |section| {
-        const records = try alloc.alloc(dns.WireRecord, section.len);
-        for (records, section) |*w, rr| w.* = dns.WireRecord.from(alloc, rr) catch return;
-        const once = try rebinding.scrub(alloc, records, scrub_cfg);
+        const once = try rebinding.scrub(alloc, section, scrub_cfg);
         if ((try rebinding.scrub(alloc, once, scrub_cfg)).len != once.len) return error.ScrubNotIdempotent;
     }
 }

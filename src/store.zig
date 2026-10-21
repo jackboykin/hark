@@ -385,7 +385,7 @@ pub const Rrset = struct {
         it: Records.Iterator,
         left: u16,
 
-        pub fn next(a: *Answered) ?dns.WireRecord {
+        pub fn next(a: *Answered) ?dns.ResourceRecord {
             if (a.left == 0) return null;
             a.left -= 1;
             return a.it.next();
@@ -440,15 +440,20 @@ pub const Records = struct {
         bytes: []const u8,
         pos: usize = 0,
 
-        pub fn next(it: *Iterator) ?dns.WireRecord {
+        pub fn next(it: *Iterator) ?dns.ResourceRecord {
             if (it.pos == it.bytes.len) return null;
             const owner_len = dns.wireNameLen(it.bytes[it.pos..]);
             const owner = it.bytes[it.pos..][0..owner_len];
-            const rest_at = it.pos + owner_len;
-            const rest_len = 10 + mem.readInt(u16, it.bytes[rest_at + 8 ..][0..2], .big);
-            it.pos = rest_at + rest_len;
-            const rest = it.bytes[rest_at..][0..rest_len];
-            return .{ .owner = owner, .rest = rest, .ttl = mem.readInt(u32, rest[4..8], .big) };
+            const fixed = it.bytes[it.pos + owner_len ..][0..10];
+            const rdata = it.bytes[it.pos + owner_len + 10 ..][0..mem.readInt(u16, fixed[8..10], .big)];
+            it.pos += owner_len + 10 + rdata.len;
+            return .{
+                .name = .of(owner),
+                .rtype = @fromBackingInt(mem.readInt(u16, fixed[0..2], .big)),
+                .rclass = @fromBackingInt(mem.readInt(u16, fixed[2..4], .big)),
+                .ttl = mem.readInt(u32, fixed[4..8], .big),
+                .rdata = rdata,
+            };
         }
     };
 };
@@ -590,12 +595,9 @@ test "a fact survives the blob byte for byte" {
         try testing.expectEqual(want.len, got.len);
         var it = got.iterator();
         for (want) |rr| {
-            const wr = it.next().?;
-            var wa: [4096]u8 = undefined;
-            const bytes = try dns.buildResourceRecordWire(&wa, rr);
-            try testing.expectEqualSlices(u8, bytes[0..wr.owner.len], wr.owner);
-            try testing.expectEqualSlices(u8, bytes[wr.owner.len..], wr.rest);
-            try testing.expectEqual(rr.ttl, wr.ttl);
+            const read = it.next().?;
+            try testing.expect(read.name.eql(rr.name) and read.rtype == rr.rtype and read.rclass == rr.rclass and read.ttl == rr.ttl);
+            try testing.expectEqualSlices(u8, rr.rdata, read.rdata);
         }
         try testing.expectEqual(null, it.next());
     }

@@ -83,9 +83,9 @@ pub const Served = struct {
     ad: bool = false,
     /// What the graph was asked; DNS64 may have asked another name.
     question: dns.Question,
-    answers: []const dns.WireRecord = &.{},
-    authorities: []const dns.WireRecord = &.{},
-    additionals: []const dns.WireRecord = &.{},
+    answers: []const dns.ResourceRecord = &.{},
+    authorities: []const dns.ResourceRecord = &.{},
+    additionals: []const dns.ResourceRecord = &.{},
     /// A fact past this instant (TTL 0 is served but never memoised).
     cacheable: bool,
     ede: ?dns.Ede = null,
@@ -107,24 +107,18 @@ pub const Served = struct {
     }
 };
 
-fn wireAll(arena: Allocator, rrs: []const dns.ResourceRecord) ![]dns.WireRecord {
-    const out = try arena.alloc(dns.WireRecord, rrs.len);
-    for (out, rrs) |*w, rr| w.* = try .from(arena, rr);
-    return out;
-}
-
-fn synthesized(arena: Allocator, q: dns.Question, s: special_use.Synthesized) !Served {
-    return .{ .rcode = s.rcode, .aa = s.aa, .question = q, .answers = try wireAll(arena, s.answers), .authorities = try wireAll(arena, s.authorities), .cacheable = false, .local = true };
+fn synthesized(q: dns.Question, s: special_use.Synthesized) Served {
+    return .{ .rcode = s.rcode, .aa = s.aa, .question = q, .answers = s.answers, .authorities = s.authorities, .cacheable = false, .local = true };
 }
 
 pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
-    const served = try synthesized(arena, q, try special_use.synthesize(arena, q, o));
+    const served = synthesized(q, try special_use.synthesize(arena, q, o));
     // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
         var qa = q;
         qa.qtype = .a;
         const of_a = special_use.classify(qa.name, qa.qtype, false) orelse return served;
-        var a = try synthesized(arena, q, try special_use.synthesize(arena, qa, of_a));
+        var a = synthesized(q, try special_use.synthesize(arena, qa, of_a));
         a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
     };
@@ -134,7 +128,7 @@ pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dn
 /// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
 pub fn hinfo(arena: Allocator, q: dns.Question) !Served {
     const rr: dns.ResourceRecord = try .init(arena, .{ .name = q.name, .rtype = .hinfo, .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } });
-    return .{ .rcode = .no_error, .question = q, .answers = try wireAll(arena, &.{rr}), .cacheable = false };
+    return .{ .rcode = .no_error, .question = q, .answers = try arena.dupe(dns.ResourceRecord, &.{rr}), .cacheable = false };
 }
 
 /// SERVFAIL, and why.
@@ -327,8 +321,8 @@ fn retainedUntil(d: *const Desk, r: store.Rrset) i64 {
     const wall = g.wallNow();
     for (r.sections[0..2]) |section| {
         var it = section.iterator();
-        while (it.next()) |rr| if (rr.rtype() == .rrsig) {
-            until = @min(until, g.now() + @as(i64, dns.secondsUntil(rr.sigExpiration(), wall)) * std.time.ns_per_s);
+        while (it.next()) |rr| if (rr.rtype == .rrsig) {
+            until = @min(until, g.now() + @as(i64, dns.secondsUntil(rr.rrsig().sig_expiration, wall)) * std.time.ns_per_s);
         };
     }
     return @max(own, until);
@@ -456,7 +450,7 @@ fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served 
 fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []const Hop, secure: bool, cacheable: bool) !Served {
     const g = d.g;
     const held = try arena.alloc(*store.Blob, hops.len);
-    var answers: std.ArrayList(dns.WireRecord) = .empty;
+    var answers: std.ArrayList(dns.ResourceRecord) = .empty;
     var n: usize = 0;
     var proofs: usize = 0;
     for (hops) |hop| {
@@ -488,9 +482,9 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     const r = last.rrset;
     // Unbound's positive_answer() carve-out: NS asked, the NS and glue are the answer (RFC 8109 priming).
     const trim = d.minimal and q.qtype != .ns;
-    var authorities: std.ArrayList(dns.WireRecord) = .empty;
+    var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = proofs };
-    var additionals: std.ArrayList(dns.WireRecord) = .empty;
+    var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     // AD vouches for authority (RFC 4035 §3.2.3): under a secure verdict,
     // only the proofs it judged. Every hop's go out, minimal or not: the
     // client needs each to validate the chain (RFC 6672 §5.3.3).
@@ -547,8 +541,8 @@ const Keep = struct {
     denial: bool = true,
     proofs_only: bool = false,
 
-    fn keeps(k: Keep, rr: dns.WireRecord) bool {
-        const t = rr.rtype();
+    fn keeps(k: Keep, rr: dns.ResourceRecord) bool {
+        const t = rr.rtype;
         return switch (k.section) {
             .answer => t == k.qtype or switch (t) {
                 .rrsig, .nsec, .nsec3 => k.do_bit,
@@ -586,7 +580,7 @@ const Keep = struct {
 /// The records `keep` keeps, TTLs aged since the reply, floored to
 /// `floor` and capped by `life`; a record past its TTL in a stale reply
 /// gets the hold (RFC 8767 §4).
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.WireRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
     var it = records.iterator();
     while (it.next()) |rr| {
         if (!keep.keeps(rr)) continue;
@@ -608,7 +602,7 @@ const Seen = struct {
     const empty = std.math.maxInt(u32);
 
     /// False if `out` holds `rr`; else `rr` must be appended to `out` next.
-    fn add(s: *Seen, arena: Allocator, out: []const dns.WireRecord, rr: dns.WireRecord) !bool {
+    fn add(s: *Seen, arena: Allocator, out: []const dns.ResourceRecord, rr: dns.ResourceRecord) !bool {
         if (s.slots.len == 0) {
             s.slots = try arena.alloc(u32, std.math.ceilPowerOfTwoAssert(usize, 2 * s.bound));
             @memset(s.slots, empty);
@@ -620,18 +614,18 @@ const Seen = struct {
         return true;
     }
 
-    fn hash(rr: dns.WireRecord) usize {
+    fn hash(rr: dns.ResourceRecord) usize {
         var h: std.hash.Wyhash = .init(rand.hash_seed);
-        h.update(rr.owner);
-        h.update(rr.rest[0..4]);
-        h.update(rr.rest[8..]);
+        h.update(rr.name.wire);
+        h.update(std.mem.asBytes(&[2]u16{ @backingInt(rr.rtype), @backingInt(rr.rclass) }));
+        h.update(rr.rdata);
         return @truncate(h.final());
     }
 };
 
 /// Owner, type, class and data alike; TTLs aside.
-fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
-    return std.mem.eql(u8, a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
+fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
+    return a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and std.mem.eql(u8, a.rdata, b.rdata);
 }
 
 /// RFC 9520 §3.2's failure cache: a question that failed is answered here,
@@ -766,10 +760,9 @@ test "a client is sent what Keep keeps" {
         .{ .section = .additional, .rtype = .rrsig, .trim = false, .kept = false },
     };
     for (rows) |row| {
-        var rest: [12]u8 = @splat(0);
-        std.mem.writeInt(u16, rest[0..2], @backingInt(row.rtype), .big);
-        std.mem.writeInt(u16, rest[10..12], @backingInt(row.covers), .big);
-        const rr: dns.WireRecord = .{ .owner = "\x00", .rest = &rest, .ttl = 0 };
+        var rdata: [2]u8 = undefined;
+        std.mem.writeInt(u16, &rdata, @backingInt(row.covers), .big);
+        const rr: dns.ResourceRecord = .{ .name = .root, .rtype = row.rtype, .rclass = .in, .ttl = 0, .rdata = &rdata };
         const keep: Keep = .{ .section = row.section, .qtype = row.qtype, .do_bit = row.do_bit, .trim = row.trim, .positive = row.positive };
         try std.testing.expectEqual(row.kept, keep.keeps(rr));
     }
@@ -786,7 +779,7 @@ test "a proof two hops share goes out once" {
         .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec, .len = 2 },
         .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec, .len = 2 },
     };
-    var out: std.ArrayList(dns.WireRecord) = .empty;
+    var out: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = 4 };
     for (hops) |hop| try appendAged(a, &out, &seen, hop, .{ .section = .authority, .qtype = .a, .do_bit = true }, 0, std.math.maxInt(u32), 0, false);
     try std.testing.expectEqual(3, out.items.len);

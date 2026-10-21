@@ -858,43 +858,6 @@ pub const ResourceRecord = struct {
     }
 };
 
-/// A record as the store keeps it: the owner uncompressed, then type,
-/// class, TTL, RDLENGTH and RDATA with its names uncompressed, all as
-/// `buildResourceRecordWire` wrote them. `ttl` is the one sent; the
-/// bytes carry the one received.
-pub const WireRecord = struct {
-    owner: []const u8,
-    /// TYPE through RDATA.
-    rest: []const u8,
-    ttl: u32,
-
-    pub fn rtype(r: WireRecord) RType {
-        return @fromBackingInt(mem.readInt(u16, r.rest[0..2], .big));
-    }
-
-    pub fn rdata(r: WireRecord) []const u8 {
-        return r.rest[10..];
-    }
-
-    pub fn covers(r: WireRecord) ?RType {
-        if (r.rtype() != .rrsig) return null;
-        return @fromBackingInt(mem.readInt(u16, r.rdata()[0..2], .big));
-    }
-
-    pub fn sigExpiration(r: WireRecord) u32 {
-        std.debug.assert(r.rtype() == .rrsig);
-        return mem.readInt(u32, r.rdata()[8..12], .big);
-    }
-
-    /// `rr` written into `allocator` as the store writes it, sent with its own TTL.
-    pub fn from(allocator: Allocator, rr: ResourceRecord) !WireRecord {
-        const buf = try allocator.alloc(u8, max_name_wire_len + 10 + std.math.maxInt(u16));
-        const bytes = try allocator.realloc(buf, (try buildResourceRecordWire(buf, rr)).len);
-        const n = wireNameLen(bytes);
-        return .{ .owner = bytes[0..n], .rest = bytes[n..], .ttl = rr.ttl };
-    }
-};
-
 pub fn wireNameLen(wire: []const u8) usize {
     var i: usize = 0;
     while (wire[i] != 0) i += 1 + wire[i];
@@ -1517,16 +1480,6 @@ pub const Serializer = struct {
         try self.writeU16(@backingInt(q.qclass));
     }
 
-    /// Names compressed as `writeResourceRecord` would, the rest copied,
-    /// `r.ttl` written over the stored TTL.
-    fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
-        if (self.names != null) try self.writeWireName(r.owner) else try self.writeSlice(r.owner);
-        const at = self.pos;
-        try self.writeSlice(r.rest[0..8]);
-        mem.writeInt(u32, self.buf[at + 4 ..][0..4], r.ttl, .big);
-        try self.writeRdata(r.rtype(), r.rdata());
-    }
-
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name.wire, true);
         try self.writeU16(@backingInt(rr.rtype));
@@ -1578,7 +1531,7 @@ pub const Serializer = struct {
     }
 };
 
-/// Uncompressed, as a stored record: `WireRecord`'s layout.
+/// Uncompressed, as the store keeps a record.
 pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
     var ser: Serializer = .{ .buf = buf };
     try ser.writeResourceRecord(rr);
@@ -1615,44 +1568,40 @@ pub const SectionEnds = struct { question: usize = 0, answers: usize = 0, author
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ends: SectionEnds = .{};
-    const sections: Sections(ResourceRecord) = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
-    return serializeEnds(buf, msg.header, msg.question, ResourceRecord, sections, msg.opt, &ends);
+    const sections: Sections = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
+    return serializeEnds(buf, msg.header, msg.question, sections, msg.opt, &ends);
 }
 
-/// A message's record sections, parsed (`ResourceRecord`) or as stored (`WireRecord`).
-pub fn Sections(comptime R: type) type {
-    return struct {
-        answers: []const R = &.{},
-        authorities: []const R = &.{},
-        additionals: []const R = &.{},
+pub const Sections = struct {
+    answers: []const ResourceRecord = &.{},
+    authorities: []const ResourceRecord = &.{},
+    additionals: []const ResourceRecord = &.{},
 
-        pub fn header(s: @This(), hdr: Header, question: bool, opt: bool) Header {
-            var out = hdr;
-            out.qd_count = @intFromBool(question);
-            out.an_count = @intCast(s.answers.len);
-            out.ns_count = @intCast(s.authorities.len);
-            out.ar_count = @intCast(s.additionals.len + @intFromBool(opt));
-            return out;
-        }
-    };
-}
+    pub fn header(s: Sections, hdr: Header, question: bool, opt: bool) Header {
+        var out = hdr;
+        out.qd_count = @intFromBool(question);
+        out.an_count = @intCast(s.answers.len);
+        out.ns_count = @intCast(s.authorities.len);
+        out.ar_count = @intCast(s.additionals.len + @intFromBool(opt));
+        return out;
+    }
+};
 
 /// The header goes last and counts only records that fit in one message,
 /// so each count fits a u16.
-pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
+pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, sections: Sections, opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
     var ser: Serializer = .{ .buf = buf[0..@min(buf.len, max_message_len)], .names = &names };
-    const write = if (R == WireRecord) Serializer.writeWireRecord else Serializer.writeResourceRecord;
 
     try ser.ensureSpace(12);
     ser.pos = 12;
     if (question) |q| try ser.writeQuestion(q);
     ends.question = ser.pos;
-    for (sections.answers) |rr| try write(&ser, rr);
+    for (sections.answers) |rr| try ser.writeResourceRecord(rr);
     ends.answers = ser.pos;
-    for (sections.authorities) |rr| try write(&ser, rr);
+    for (sections.authorities) |rr| try ser.writeResourceRecord(rr);
     ends.authorities = ser.pos;
-    for (sections.additionals) |rr| try write(&ser, rr);
+    for (sections.additionals) |rr| try ser.writeResourceRecord(rr);
     if (opt) |o| try ser.writeOpt(o);
 
     sections.header(hdr, question != null, opt != null).serialize(buf[0..12]);
@@ -1839,49 +1788,6 @@ test "name compression follows a pointer inside an earlier name" {
     try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
     const back = try parseMessage(a, wire);
     for (back.answers) |got| try testing.expect(got.name.eql(mail));
-}
-
-test "a record written from its stored bytes is the record written from its fields" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const owner = try parseDottedName(a, "www.example.com");
-    const other = try parseDottedName(a, "ns1.Example.com");
-    const zone = try parseDottedName(a, "example.com");
-    const datas = [_]RData{
-        .{ .a = .{ 192, 0, 2, 1 } },
-        .{ .aaaa = @splat(7) },
-        .{ .ns = other },
-        .{ .cname = other },
-        .{ .dname = other },
-        .{ .ptr = other },
-        .{ .mx = .{ .preference = 10, .exchange = other } },
-        .{ .soa = .{ .mname = other, .rname = zone, .serial = 1, .refresh = 2, .retry = 3, .expire = 4, .minimum = 5 } },
-        .{ .txt = .{ .strings = &.{ "a", "bc" } } },
-        .{ .rrsig = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 60, .sig_expiration = 2, .sig_inception = 1, .key_tag = 7, .signer_name = zone, .signature = "sig" } },
-        .{ .nsec = .{ .next_domain_name = other, .type_bit_maps = "\x00\x01\x40" } },
-    };
-    for (datas) |d| {
-        const rtype: RType = switch (d) {
-            .unknown => unreachable,
-            inline else => |_, field| @field(RType, @tagName(field)),
-        };
-        const rr: ResourceRecord = .fixture(.{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d });
-        var stage: [512]u8 = undefined;
-        const stored = try buildResourceRecordWire(&stage, rr);
-        const n = wireNameLen(stored);
-        const wr: WireRecord = .{ .owner = stored[0..n], .rest = stored[n..], .ttl = 42 };
-        try testing.expectEqual(rtype, wr.rtype());
-        var aged = rr;
-        aged.ttl = 42;
-        const q: Question = .{ .name = zone, .qtype = rtype, .qclass = .in };
-        var want_buf: [512]u8 = undefined;
-        var got_buf: [512]u8 = undefined;
-        const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .question = q, .answers = &.{ aged, aged } });
-        var ends: SectionEnds = .{};
-        const got = try serializeEnds(&got_buf, mem.zeroes(Header), q, WireRecord, .{ .answers = &.{ wr, wr } }, null, &ends);
-        try testing.expectEqualSlices(u8, want, got);
-    }
 }
 
 test "edge case: empty message (too short)" {

@@ -1368,9 +1368,8 @@ pub const Graph = struct {
             var pos: usize = 0;
             const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .root;
             var it = r.sections[0].iterator();
-            while (it.next()) |rr| if (rr.rtype() == .cname) {
-                var at: usize = 0;
-                if (links.pass(try dns.readNameWire(arena, rr.owner, &at)) != null) return null;
+            while (it.next()) |rr| if (rr.rtype == .cname) {
+                if (links.pass(rr.name) != null) return null;
             };
             switch (links.end(r.kind, target, qtype)) {
                 .done => return hops.items,
