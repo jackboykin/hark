@@ -76,12 +76,16 @@ const Slot = struct {
 const slot_bits = 20;
 const slot_mask = (1 << slot_bits) - 1;
 
-/// Re-read at answer time: the graph never holds client bytes.
+/// A client parked on a cell, and the query it asked: the graph never
+/// holds client bytes.
 const Pending = struct {
     root: graph.CellId,
     /// Under DNS64, the A behind an empty AAAA.
     a: ?graph.CellId = null,
-    wire: []u8,
+    query: dns.Query,
+    /// Where the question's name lives once parked; until then the query
+    /// borrows it from the read.
+    name_bytes: []align(@alignOf([]const u8)) u8 = &.{},
     reply: Reply,
     asked_ns: i64,
     /// When the first client parked on the same cell asked.
@@ -421,7 +425,7 @@ const Server = struct {
             return;
         };
         try s.g.drain();
-        var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .query = query, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
         {
             errdefer s.release(p);
             // Recall declined what the graph holds: inside the refresh window, a
@@ -431,7 +435,8 @@ const Server = struct {
                 try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
-            p.wire = try s.g.work.allocator().dupe(u8, wire);
+            p.name_bytes = try s.g.work.allocator().alignedAlloc(u8, .of([]const u8), dns.nameFlatSize(q.name));
+            p.query.question.?.name = dns.writeNameFlat(p.name_bytes, q.name, false);
         }
         try s.hold(p);
     }
@@ -450,7 +455,7 @@ const Server = struct {
         try s.timers.ensureUnusedCapacity(s.gpa, 1);
         try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
         const i: u32 = s.vacant.pop() orelse blk: {
-            try s.pending.append(s.gpa, .{ .root = 0, .wire = &.{}, .reply = undefined, .asked_ns = 0, .origin_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
+            try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .reply = undefined, .asked_ns = 0, .origin_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
             break :blk @intCast(s.pending.items.len - 1);
         };
         const gen = s.pending.items[i].gen +% 1;
@@ -499,7 +504,7 @@ const Server = struct {
         }
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        const query = try dns.readQuery(arena, p.wire);
+        const query = p.query;
         const served = try s.shape(arena, p, query.question.?, answer.Client.fromQuery(query)) orelse {
             try s.reach(p.a.?);
             return s.link(i);
@@ -607,7 +612,7 @@ const Server = struct {
         p.stale_tried = true;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        const query = try dns.readQuery(arena, p.wire);
+        const query = p.query;
         const q = query.question.?;
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
@@ -709,7 +714,7 @@ const Server = struct {
     fn release(s: *Server, p: Pending) void {
         s.g.unhold(p.root);
         if (p.a) |a| s.g.unhold(a);
-        s.g.work.allocator().free(p.wire);
+        s.g.work.allocator().free(p.name_bytes);
     }
 
     fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {
