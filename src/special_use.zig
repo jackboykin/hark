@@ -43,9 +43,9 @@ pub const Zone = struct {
     soa: []const dns.RData,
     ns: []const dns.RData,
 
-    fn of(comptime apex: []const []const u8) Zone {
-        const name: dns.Name = .{ .labels = apex };
-        const nobody: dns.Name = .{ .labels = &.{ "nobody", "invalid" } };
+    fn of(comptime apex: []const u8) Zone {
+        const name: dns.Name = .lit(apex);
+        const nobody: dns.Name = .lit("nobody.invalid");
         return .{
             .apex = name,
             .soa = &.{.{ .soa = .{ .mname = name, .rname = nobody, .serial = 1, .refresh = 3600, .retry = 1200, .expire = 604800, .minimum = ttl } }},
@@ -54,7 +54,7 @@ pub const Zone = struct {
     }
 };
 
-const own_zones = [_]Zone{ .of(&.{ "home", "arpa" }), .of(&.{ "service", "arpa" }) };
+const own_zones = [_]Zone{ .of("home.arpa"), .of("service.arpa") };
 
 const loopback4: []const dns.RData = &.{.{ .a = .{ 127, 0, 0, 1 } }};
 const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1} }};
@@ -63,9 +63,9 @@ const ipv4only: []const dns.RData = &.{ .{ .a = .{ 192, 0, 0, 170 } }, .{ .a = .
 
 /// hark's own answer to the question, or null: ask the DNS.
 pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
-    const n = name.labels.len;
+    const n = name.depth();
     if (n == 0) return null;
-    const last = name.labels[n - 1];
+    const last = name.ancestor(1).leaf();
     if (is(last, "localhost")) return switch (qtype) {
         .a => .{ .is = .{ .answer = loopback4 } },
         .aaaa => .{ .is = .{ .answer = loopback6 } },
@@ -73,8 +73,8 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     };
     if (is(last, "invalid") or is(last, "test") or is(last, "onion")) return .{ .is = .nxdomain };
     if (!is(last, "arpa") or n < 2) return null;
-    const second = name.labels[n - 2];
-    for (&own_zones) |*z| if (is(second, z.apex.labels[0])) {
+    const second = name.ancestor(2).leaf();
+    for (&own_zones) |*z| if (is(second, z.apex.leaf())) {
         if (n > 2) return .{ .is = .nxdomain, .zone = z };
         return switch (qtype) {
             .soa => .{ .is = .{ .answer = z.soa }, .zone = z },
@@ -102,11 +102,11 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
 /// default" only (RFC 6761 §6.2); home.arpa and service.arpa may be
 /// served (RFC 8375 §4.4.B, RFC 6303 §3).
 pub fn fixed(name: dns.Name) bool {
-    const n = name.labels.len;
+    const n = name.depth();
     if (n == 0) return false;
-    const last = name.labels[n - 1];
+    const last = name.ancestor(1).leaf();
     if (is(last, "localhost") or is(last, "invalid") or is(last, "onion")) return true;
-    return n >= 2 and is(last, "arpa") and is(name.labels[n - 2], "ipv4only");
+    return n >= 2 and is(last, "arpa") and is(name.ancestor(2).leaf(), "ipv4only");
 }
 
 fn is(label: []const u8, word: []const u8) bool {
@@ -197,5 +197,5 @@ test "synthesize localhost A produces 127.0.0.1" {
     try testing.expectEqual(dns.RCode.no_error, msg.rcode);
     try testing.expect(!msg.aa);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
-    try testing.expectEqualStrings("localhost", msg.answers[0].name.labels[0]);
+    try testing.expectEqualStrings("localhost", msg.answers[0].name.leaf());
 }

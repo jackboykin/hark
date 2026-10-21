@@ -220,9 +220,9 @@ pub const Reply = struct {
     additionals: []const dns.ResourceRecord = &.{},
     /// Where the chain in `answers` ends: an alias's next name, or the
     /// name a negative denies.
-    target: dns.Name = .{ .labels = &.{} },
+    target: dns.Name = .root,
     /// The zone whose servers answered; what `secure` judges it against.
-    zone: dns.Name = .{ .labels = &.{} },
+    zone: dns.Name = .root,
     ede: ?dns.Ede.Code = null,
     /// TTLs age from here.
     stored_ns: i64 = 0,
@@ -642,7 +642,7 @@ pub const Graph = struct {
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
         if (cfg.trust_anchors != null and !forgoes) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
-        _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
+        _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .root } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -1366,7 +1366,7 @@ pub const Graph = struct {
             const r: store.Rrset = .of(e.blob);
             try hops.append(arena, .{ .kind = kind.?, .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
             var pos: usize = 0;
-            const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .{ .labels = &.{} };
+            const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .root;
             var it = r.sections[0].iterator();
             while (it.next()) |rr| if (rr.rtype() == .cname) {
                 var at: usize = 0;

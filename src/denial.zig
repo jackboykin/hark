@@ -127,9 +127,9 @@ pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
         dropIfEmpty(g, i);
         return;
     }
-    for (0..owner.labels.len + 1) |i| {
+    var up: ?dns.Name = owner;
+    while (up) |zone| : (up = zone.parent()) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const zone: dns.Name = .{ .labels = owner.labels[i..] };
         const zi = g.denial.zones.getIndex(zone.formatLower(&buf)) orelse continue;
         const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
@@ -216,7 +216,8 @@ fn delegated(rr: RR, zone: dns.Name) bool {
 /// nothing but types at its owner.
 fn minimal(rr: RR) bool {
     const next = rr.rdata.nsec.next_domain_name;
-    return next.labels.len == rr.name.labels.len + 1 and next.labels[0].len == 1 and next.labels[0][0] == 0 and next.isSubdomainOf(rr.name);
+    const up = next.parent() orelse return false;
+    return std.mem.eql(u8, next.leaf(), "\x00") and up.eql(rr.name);
 }
 
 /// Never a DS: that is the parent's word at the cut alone (RFC 6840 §4.4),
@@ -236,8 +237,8 @@ pub fn denies(g: *const Graph, qtype: dns.RType) bool {
 pub fn deny(g: *Graph, id: CellId) !bool {
     if (g.denial.zones.count() == 0 or !denies(g, g.cell(id).key.rtype)) return false;
     const name = g.cell(id).name;
-    for (0..name.labels.len + 1) |i| {
-        const zone: dns.Name = .{ .labels = name.labels[i..] };
+    var up: ?dns.Name = name;
+    while (up) |zone| : (up = zone.parent()) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         const z = g.denial.zones.getPtr(zone.formatLower(&buf)) orelse continue;
         if (try denyIn(g, z, id, zone)) return true;
@@ -258,8 +259,8 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         proofs[0] = cover;
         if (proof.nsecProvesNameNonexistence(cover.owner, cover.nsec, name)) {
             const ce = proof.closestEncloser(name, cover.owner, cover.nsec.next_domain_name) orelse return false;
-            var wc_buf: [dns.max_label_count + 1][]const u8 = undefined;
-            const wildcard = dns.makeWildcardName(&wc_buf, ce) orelse return false;
+            var wc_buf: dns.Name.Buf = undefined;
+            const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return false;
             if (z.exact(g, wildcard)) |wc| {
                 proofs[1] = wc;
             } else if (z.span(g, wildcard)) |wc| {
@@ -329,7 +330,7 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
     var g = try testGraph(&ctx, &now, &wall);
     defer g.deinit();
 
-    const zone: dns.Name = .{ .labels = &.{@as([]const u8, "example")} };
+    const zone: dns.Name = .lit("example");
     const soa: RR = .{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } };
     const reply: graph.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
