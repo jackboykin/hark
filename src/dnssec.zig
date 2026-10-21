@@ -325,7 +325,7 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bo
             const p = c.rrs[x];
             const q = c.rrs[y];
             const t = std.math.order(@backingInt(covers(p)), @backingInt(covers(q)));
-            return if (t != .eq) t else proof.canonicalNameOrder(p.name, q.name);
+            return if (t != .eq) t else p.name.order(q.name);
         }
 
         fn lessThan(c: @This(), x: u32, y: u32) bool {
@@ -794,14 +794,14 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
 
 test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
     // Every RRSIG's tag matches the key, so each one tried draws on the budget.
-    const zone_labels: []const []const u8 = &.{ "example", "com" };
+    const zone: dns.Name = .lit("example.com");
     const next_owner: [20]u8 = @splat(0xFF);
     const key: dns.ResourceRecord = .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } };
     var bufs: [2 * (proof.max_proof_records + 1)]proof.Nsec3OwnerBufs = undefined;
     var rrs: [2 * (proof.max_proof_records + 1)]dns.ResourceRecord = undefined;
     for (0..proof.max_proof_records + 1) |i| {
         bufs[i] = .{};
-        const owner = proof.makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone_labels, &bufs[i]);
+        const owner = proof.makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone, &bufs[i]);
         rrs[2 * i] = proof.makeNsec3Rr(owner, &.{}, &next_owner, &.{});
         rrs[2 * i + 1] = .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
             .type_covered = .nsec3,

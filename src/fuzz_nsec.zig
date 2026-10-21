@@ -159,7 +159,7 @@ const Zone = struct {
                 if (std.mem.eql(u8, owner, &h) or between(std.mem.order(u8, owner, &h), std.mem.order(u8, &h, next), std.mem.order(u8, owner, next))) return i;
             } else {
                 const next = rr.rdata.nsec.next_domain_name;
-                if (rr.name.eql(name) or between(proof.canonicalNameOrder(rr.name, name), proof.canonicalNameOrder(name, next), proof.canonicalNameOrder(rr.name, next))) return i;
+                if (rr.name.eql(name) or between(rr.name.order(name), name.order(next), rr.name.order(next))) return i;
             }
         }
         unreachable;
@@ -265,7 +265,7 @@ fn draw(z: *Zone, s: *Smith) void {
     std.mem.sort(usize, order[0..z.n_recs], Ctx{ .z = z, .ehash = &ehash }, struct {
         fn lt(c: Ctx, a: usize, b: usize) bool {
             if (c.z.nsec3) return std.mem.order(u8, &c.ehash[a], &c.ehash[b]) == .lt;
-            return proof.canonicalNameOrder(c.z.entries[a].name(), c.z.entries[b].name()) == .lt;
+            return c.z.entries[a].name().order(c.z.entries[b].name()) == .lt;
         }
     }.lt);
     for (order[0..z.n_recs], 0..) |i, r| z.hashes[r] = ehash[i];

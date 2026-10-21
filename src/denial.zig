@@ -72,7 +72,7 @@ const Zone = struct {
         var hi: usize = z.spans.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (proof.canonicalNameOrder(z.spans.items[mid].owner, name) == .lt) lo = mid + 1 else hi = mid;
+            if (z.spans.items[mid].owner.order(name) == .lt) lo = mid + 1 else hi = mid;
         }
         return lo;
     }
