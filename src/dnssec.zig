@@ -249,7 +249,7 @@ pub fn signerBelow(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.
     for (rrs) |rr| {
         if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != rtype or !rr.name.eql(owner)) continue;
         const z = rr.rdata.rrsig.signer_name;
-        if (z.labels.len < below and (best == null or z.labels.len > best.?.labels.len)) best = z;
+        if (z.depth() < below and (best == null or z.depth() > best.?.depth())) best = z;
     }
     return best;
 }
@@ -516,7 +516,7 @@ const test_dnskey = dns.DnskeyData{
 test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify, and a flipped bit does not" {
     const Case = struct { owner: dns.Name, flags: u16, algorithm: dns.DnssecAlgorithm, key_b64: []const u8, tag: u16, digest_type: dns.DigestType, digest_hex: []const u8 };
     for ([_]Case{ .{
-        .owner = .{ .labels = &.{ "dskey", "example", "com" } },
+        .owner = .lit("dskey.example.com"),
         .flags = 256,
         .algorithm = .rsasha1,
         .key_b64 = "AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMzNXxeYCmZ" ++
@@ -526,7 +526,7 @@ test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify, a
         .digest_type = .sha1,
         .digest_hex = "2BB183AF5F22588179A53B0A98631FAD1A292118",
     }, .{
-        .owner = .{ .labels = &.{ "example", "net" } },
+        .owner = .lit("example.net"),
         .flags = 257,
         .algorithm = .ecdsap384sha384,
         .key_b64 = "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RCOpgQ6K8X" ++
@@ -769,7 +769,7 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .rtype = .mx,
         .rclass = .in,
         .ttl = 3600,
-        .rdata = .{ .mx = .{ .preference = 10, .exchange = .{ .labels = &[_][]const u8{ "mail", "example", "com" } } } },
+        .rdata = .{ .mx = .{ .preference = 10, .exchange = .lit("mail.example.com") } },
     }};
     var sig = dns.RrsigData{
         .type_covered = .mx,
@@ -832,11 +832,11 @@ fn rrsigRr(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
 }
 
 test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" {
-    const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
-    const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
+    const alpha = dns.Name.lit("alpha.example.com");
+    const gamma = dns.Name.lit("gamma.example.com");
     const nsecs = [_]dns.ResourceRecord{
-        proof.nsecRr(alpha, .{ .labels = &.{ "beta", "example", "com" } }),
-        proof.nsecRr(gamma, .{ .labels = &.{ "delta", "example", "com" } }),
+        proof.nsecRr(alpha, .lit("beta.example.com")),
+        proof.nsecRr(gamma, .lit("delta.example.com")),
     };
     var sig_bufs: [2][64]u8 = undefined;
     var pub_bufs: [2][32]u8 = undefined;
@@ -850,7 +850,7 @@ test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" 
 }
 
 test "verifyAuthorityProofSigs: a set past the buffer is refused, not a verified prefix" {
-    const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .{ .labels = &.{ "a", "example", "com" } })};
+    const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .lit("a.example.com"))};
     var soas: [17]dns.ResourceRecord = undefined;
     for (&soas, 0..) |*r, i| r.* = .{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
         .mname = rrsig.test_owner,
@@ -890,7 +890,7 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
     }.f;
 
     var budget: rrsig.ValidationBudget = .{};
-    const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.{ .labels = &.{ "other", "com" } }, signed.rrsig) };
+    const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.lit("other.com"), signed.rrsig) };
     try testing.expect(validateRrset(&moved, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) == null);
     const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
     try testing.expect(validateRrset(&home, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) != null);
@@ -901,9 +901,9 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     // `v.example.com`: labels 2 < 3 reconstructs `*.example.com` for the
     // signature, which verifies. As `v NSEC a` it is an apex wrap covering
     // every name after `v`, including ones that exist.
-    const star = dns.Name{ .labels = &.{ "*", "example", "com" } };
-    const a = dns.Name{ .labels = &.{ "a", "example", "com" } };
-    const v = dns.Name{ .labels = &.{ "v", "example", "com" } };
+    const star = dns.Name.lit("*.example.com");
+    const a = dns.Name.lit("a.example.com");
+    const v = dns.Name.lit("v.example.com");
     const real = [_]dns.ResourceRecord{proof.nsecRr(star, a)};
     var sig_buf: [64]u8 = undefined;
     var pub_buf: [32]u8 = undefined;
@@ -939,7 +939,7 @@ fn testSignMlDsa(
     var sig = dns.RrsigData{
         .type_covered = covered,
         .algorithm = .mldsa44,
-        .labels = @intCast(rrsig.signedLabels(rrset[0].name)),
+        .labels = rrsig.signedLabels(rrset[0].name),
         .original_ttl = 300,
         .sig_inception = 1_699_000_000,
         .sig_expiration = 1_800_000_000,

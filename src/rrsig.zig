@@ -165,24 +165,14 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
 // ── Canonical Name Wire Format (RFC 4034 §6.1) ──────────────────────
 
 pub fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
-    return writeNameWire(buf, name, true);
+    const len = try writeNameWire(buf, name);
+    // Length octets sit below 'A', so lowering the whole name lowers its labels.
+    for (buf[0..len]) |*b| b.* = std.ascii.toLower(b.*);
+    return len;
 }
 
-fn writeNameWire(buf: []u8, name: dns.Name, comptime lower: bool) error{BufferTooSmall}!usize {
-    var pos: usize = 0;
-    for (name.labels) |label| {
-        if (pos + 1 + label.len > buf.len) return error.BufferTooSmall;
-        buf[pos] = @intCast(label.len);
-        pos += 1;
-        for (label) |c| {
-            buf[pos] = if (comptime lower) std.ascii.toLower(c) else c;
-            pos += 1;
-        }
-    }
-    if (pos >= buf.len) return error.BufferTooSmall;
-    buf[pos] = 0; // root label
-    pos += 1;
-    return pos;
+fn writeNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
+    return dns.writeNameWire(buf, name) catch error.BufferTooSmall;
 }
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
@@ -241,9 +231,9 @@ pub fn buildSignedData(
     for (rrset, 0..) |rr, idx| {
         const rr_start = temp_pos;
 
-        var wc_labels: [dns.max_label_count + 1][]const u8 = undefined;
-        const owner_name = if (rrsig.labels < rr.name.labels.len)
-            dns.makeWildcardName(&wc_labels, .{ .labels = rr.name.labels[rr.name.labels.len - rrsig.labels ..] }).?
+        var wc_buf: dns.Name.Buf = undefined;
+        const owner_name = if (rrsig.labels < rr.name.depth())
+            dns.Name.child(&wc_buf, "*", rr.name.ancestor(rrsig.labels)).?
         else
             rr.name;
 
@@ -327,7 +317,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
         .nsec => |nsec_data| {
             var pos: usize = 0;
             // RFC 6840 §5.1: NSEC next_domain_name is the one field never folded.
-            pos += try writeNameWire(buf[pos..], nsec_data.next_domain_name, false);
+            pos += try writeNameWire(buf[pos..], nsec_data.next_domain_name);
             if (pos + nsec_data.type_bit_maps.len > buf.len) return error.BufferTooSmall;
             @memcpy(buf[pos..][0..nsec_data.type_bit_maps.len], nsec_data.type_bit_maps);
             pos += nsec_data.type_bit_maps.len;
@@ -391,10 +381,10 @@ pub fn verifyRrsig(
     // fall below the signer's: fewer means the wildcard that signed sits above
     // the zone. Owner-vs-signer is also checked at the resolver layer (bailiwick
     // scrubbing); enforcing here defends future callers from missing it.
-    if (rrsig.labels < rrsig.signer_name.labels.len) return error.InvalidSignature;
+    if (rrsig.labels < rrsig.signer_name.depth()) return error.InvalidSignature;
     for (rrset) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
-        if (rrsig.labels > rr.name.labels.len) return error.InvalidSignature;
+        if (rrsig.labels > rr.name.depth()) return error.InvalidSignature;
     }
 
     // An SOA or NS RRset *defines* the name it sits at: SOA marks an apex, and
@@ -656,9 +646,9 @@ pub const Cap = struct {
 };
 
 /// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
-pub fn signedLabels(name: dns.Name) usize {
-    const star = name.labels.len > 0 and mem.eql(u8, name.labels[0], "*");
-    return name.labels.len - @intFromBool(star);
+pub fn signedLabels(name: dns.Name) u8 {
+    const star = !name.isRoot() and mem.eql(u8, name.leaf(), "*");
+    return name.depth() - @intFromBool(star);
 }
 
 test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
@@ -677,27 +667,17 @@ test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
 test "canonical name wire format" {
     var buf: [256]u8 = undefined;
 
-    const name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "Example"),
-            @as([]const u8, "COM"),
-        },
-    };
+    const name = dns.Name.lit("Example.COM");
     const len = try writeCanonicalNameWire(&buf, name);
     try testing.expectEqualSlices(u8, "\x07example\x03com\x00", buf[0..len]);
 
-    const root = dns.Name{ .labels = &.{} };
+    const root = dns.Name.root;
     const root_len = try writeCanonicalNameWire(&buf, root);
     try testing.expectEqual(@as(usize, 1), root_len);
     try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
-pub const test_owner = dns.Name{
-    .labels = &.{
-        @as([]const u8, "example"),
-        @as([]const u8, "com"),
-    },
-};
+pub const test_owner = dns.Name.lit("example.com");
 
 const TestFlatten = struct {
     buf: [4096]u8 = undefined,
@@ -709,12 +689,7 @@ const TestFlatten = struct {
 };
 
 test "buildSignedData produces correct header" {
-    const signer_name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const signer_name = dns.Name.lit("example.com");
     const rrsig = dns.RrsigData{
         .type_covered = .a,
         .algorithm = .ecdsap256sha256,
@@ -727,13 +702,7 @@ test "buildSignedData produces correct header" {
         .signature = &.{},
     };
 
-    const owner_name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "www"),
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const owner_name = dns.Name.lit("www.example.com");
 
     const rrset = [_]dns.ResourceRecord{.{
         .name = owner_name,
@@ -773,12 +742,7 @@ test "buildSignedData produces correct header" {
 
 test "buildSignedData reconstructs wildcard owner name" {
     // RFC 4035 §5.3.2: when rrsig.labels < owner label count, reconstruct wildcard
-    const signer_name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const signer_name = dns.Name.lit("example.com");
     const rrsig = dns.RrsigData{
         .type_covered = .a,
         .algorithm = .ecdsap256sha256,
@@ -792,13 +756,7 @@ test "buildSignedData reconstructs wildcard owner name" {
     };
 
     // Owner has 3 labels but RRSIG says 2 — wildcard expansion
-    const owner_name = dns.Name{
-        .labels = &.{
-            @as([]const u8, "foo"),
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
+    const owner_name = dns.Name.lit("foo.example.com");
 
     const rrset = [_]dns.ResourceRecord{.{
         .name = owner_name,
@@ -998,7 +956,7 @@ const test_window_rrsig = dns.RrsigData{
     .sig_expiration = 1700000000,
     .sig_inception = 1699000000,
     .key_tag = 12345,
-    .signer_name = .{ .labels = &.{ "example", "com" } },
+    .signer_name = .lit("example.com"),
     .signature = &.{},
 };
 const test_window_dnskey = dns.DnskeyData{
@@ -1034,7 +992,7 @@ test "verifyRrsig tolerates clock skew within window" {
 test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.1.3)" {
     // Cross-zone signer ("example.org" trying to sign "example.com" record):
     // the crypto layer rejects independently of the bailiwick check upstream.
-    const cross_signer = dns.Name{ .labels = &.{ "example", "org" } };
+    const cross_signer = dns.Name.lit("example.org");
     const rrsig = dns.RrsigData{
         .type_covered = .a,
         .algorithm = .ecdsap256sha256,
@@ -1086,7 +1044,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
 test "verifyRrsig rejects labels below the signer's label count" {
     // `*.com` cannot sign inside example.com: the wildcard that generated the
     // owner would sit above the zone. Unbound: "RRSIG label count too low for signer".
-    const owner = dns.Name{ .labels = &.{ "foo", "example", "com" } };
+    const owner = dns.Name.lit("foo.example.com");
     const recs = [_]dns.ResourceRecord{
         .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
     };
@@ -1121,13 +1079,13 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
     // rejects: a signed NS marks a child-side apex (RFC 4035 §2.2 forbids
     // signing the parent-side delegation NS) and an SOA marks an apex, so the
     // containing zone is the owner itself.
-    const parent = dns.Name{ .labels = &.{ "example", "com" } };
-    const child = dns.Name{ .labels = &.{ "sub", "example", "com" } };
+    const parent = dns.Name.lit("example.com");
+    const child = dns.Name.lit("sub.example.com");
     var budget: ValidationBudget = .{};
 
     inline for (.{ dns.RType.ns, dns.RType.soa }) |rtype| {
         const rdata: dns.RData = switch (rtype) {
-            .ns => .{ .ns = dns.Name{ .labels = &.{ "ns1", "example", "com" } } },
+            .ns => .{ .ns = dns.Name.lit("ns1.example.com") },
             .soa => .{ .soa = .{
                 .mname = parent,
                 .rname = parent,
@@ -1194,7 +1152,7 @@ pub fn testSignRrset(
     var rrsig = dns.RrsigData{
         .type_covered = covered,
         .algorithm = .ed25519,
-        .labels = @intCast(signedLabels(rrset[0].name)),
+        .labels = signedLabels(rrset[0].name),
         .original_ttl = 300,
         .sig_inception = 1_699_000_000,
         .sig_expiration = 1_800_000_000,
