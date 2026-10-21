@@ -244,7 +244,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
                 var eb: [256]u8 = undefined;
                 if (x.next_hashed_owner.len <= 40) _ = proof.base32HexEncode(&eb, x.next_hashed_owner);
             },
-            else => if (rr.rdata == .named) for (rr.rdata.named.names) |n| try checkName(alloc, n),
+            else => {},
         }
         var lb: dns.Name.Buf = undefined;
         if (dns.Name.child(&lb, "*", rr.name)) |wn| _ = wn.formatInto(&buf);

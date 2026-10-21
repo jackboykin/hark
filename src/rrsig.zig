@@ -262,13 +262,11 @@ pub fn buildSignedData(
     return out;
 }
 
-/// Canonical RDATA (RFC 4034 §6.2) is the RDATA as kept: names were
-/// lowercased as read, and NSEC's next name, which RFC 6840 §5.1 never
-/// folds, goes out as signed.
-fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize {
-    var ser: dns.Serializer = .{ .buf = buf };
-    ser.writeRData(rdata) catch return error.BufferTooSmall;
-    return ser.pos;
+/// Canonical RDATA (RFC 4034 §6.2) is the RDATA as kept.
+fn writeCanonicalRData(buf: []u8, rdata: []const u8) error{BufferTooSmall}!usize {
+    if (rdata.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[0..rdata.len], rdata);
+    return rdata.len;
 }
 
 // RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
@@ -1053,6 +1051,8 @@ fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
 
 /// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
 /// that verifies it. Buffers are caller-owned so the slices outlive the call.
+pub const TestSigned = struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData };
+
 pub fn testSignRrset(
     rrset: []const dns.ResourceRecord,
     covered: dns.RType,
@@ -1060,8 +1060,20 @@ pub fn testSignRrset(
     key_algo: dns.DnssecAlgorithm,
     sig_buf: *[64]u8,
     pub_buf: *[32]u8,
-) !struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData } {
-    const kp = Ed25519.KeyPair.generate(testing.io);
+) !TestSigned {
+    return testSignRrsetBy(Ed25519.KeyPair.generate(testing.io), rrset, covered, signer, key_algo, sig_buf, pub_buf);
+}
+
+/// `testSignRrset` by a key made beforehand, so the set may hold it.
+pub fn testSignRrsetBy(
+    kp: Ed25519.KeyPair,
+    rrset: []const dns.ResourceRecord,
+    covered: dns.RType,
+    signer: dns.Name,
+    key_algo: dns.DnssecAlgorithm,
+    sig_buf: *[64]u8,
+    pub_buf: *[32]u8,
+) !TestSigned {
     pub_buf.* = kp.public_key.toBytes();
     const dnskey = dns.DnskeyData{
         .flags = 256, // ZONE, not SEP

@@ -515,40 +515,27 @@ fn rrEql(a: dns.ResourceRecord, b: dns.ResourceRecord, compare_ttl: bool) bool {
     // Owners byte-exact: hark scrubs 0x20 case off every owner.
     if (!a.name.eql(b.name) or a.rtype != b.rtype) return false;
     if (compare_ttl and @max(a.ttl, b.ttl) - @min(a.ttl, b.ttl) > ttl_slack) return false;
-    return rdataEql(a.rdata, b.rdata);
+    return rdataEql(a, b);
 }
 
 /// Names folded, as the harness lowercases rdata text.
-fn rdataEql(a: dns.RData, b: dns.RData) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .a => |v| mem.eql(u8, &v, &b.a),
-        .aaaa => |v| mem.eql(u8, &v, &b.aaaa),
-        .ns => |v| v.eql(b.ns),
-        .cname => |v| v.eql(b.cname),
-        .dname => |v| v.eql(b.dname),
-        .ptr => |v| v.eql(b.ptr),
-        .mx => |v| v.preference == b.mx.preference and v.exchange.eql(b.mx.exchange),
-        .soa => |v| v.mname.eql(b.soa.mname) and v.rname.eql(b.soa.rname) and v.serial == b.soa.serial and
-            v.refresh == b.soa.refresh and v.retry == b.soa.retry and v.expire == b.soa.expire and v.minimum == b.soa.minimum,
-        .txt => |v| blk: {
-            if (v.strings.len != b.txt.strings.len) break :blk false;
-            for (v.strings, b.txt.strings) |x, y| if (!std.ascii.eqlIgnoreCase(x, y)) break :blk false;
-            break :blk true;
-        },
-        .ds => |v| v.key_tag == b.ds.key_tag and v.algorithm == b.ds.algorithm and v.digest_type == b.ds.digest_type and mem.eql(u8, v.digest, b.ds.digest),
-        .nsec => |v| v.next_domain_name.eql(b.nsec.next_domain_name) and mem.eql(u8, v.type_bit_maps, b.nsec.type_bit_maps),
-        .dnskey => |v| v.flags == b.dnskey.flags and v.algorithm == b.dnskey.algorithm and mem.eql(u8, v.public_key, b.dnskey.public_key),
-        .nsec3 => |v| v.hash_algorithm == b.nsec3.hash_algorithm and v.flags == b.nsec3.flags and v.iterations == b.nsec3.iterations and
-            mem.eql(u8, v.salt, b.nsec3.salt) and mem.eql(u8, v.next_hashed_owner, b.nsec3.next_hashed_owner) and mem.eql(u8, v.type_bit_maps, b.nsec3.type_bit_maps),
-        .named => |v| blk: {
-            if (!mem.eql(u8, v.head, b.named.head) or v.names.len != b.named.names.len) break :blk false;
-            for (v.names, b.named.names) |x, y| if (!x.eql(y)) break :blk false;
-            break :blk true;
+fn rdataEql(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
+    return switch (a.rtype) {
+        .nsec => blk: {
+            var na_buf: dns.Name.Buf = undefined;
+            var nb_buf: dns.Name.Buf = undefined;
+            const x = a.nsec(&na_buf);
+            const y = b.nsec(&nb_buf);
+            break :blk x.next_domain_name.eql(y.next_domain_name) and mem.eql(u8, x.type_bit_maps, y.type_bit_maps);
         },
         // A scenario cannot spell a signature minted at run time.
-        .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.labels == b.rrsig.labels and v.signer_name.eql(b.rrsig.signer_name),
-        .unknown => |v| std.ascii.eqlIgnoreCase(v, b.unknown),
+        .rrsig => blk: {
+            const x = a.rrsig();
+            const y = b.rrsig();
+            break :blk x.type_covered == y.type_covered and x.algorithm == y.algorithm and x.labels == y.labels and x.signer_name.eql(y.signer_name);
+        },
+        .a, .aaaa, .ns, .cname, .dname, .ptr, .mx, .soa, .ds, .dnskey, .nsec3, .rp, .afsdb, .rt, .kx, .px, .srv, .naptr => mem.eql(u8, a.rdata, b.rdata),
+        else => std.ascii.eqlIgnoreCase(a.rdata, b.rdata),
     };
 }
 

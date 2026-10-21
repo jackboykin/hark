@@ -552,7 +552,10 @@ const Parser = struct {
             t = toks.next() orelse return p.fail("RR needs a type");
         }
         const rtype = rtypeFromText(t) orelse return p.fail("unknown RR type");
-        return .init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) });
+        return dns.ResourceRecord.init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) }) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidRDataLength => p.fail("rdata field too long"),
+        };
     }
 
     fn rdata(p: *Parser, rtype: dns.RType, owner: dns.Name, toks: *mem.TokenIterator(u8, .any), ds_from: *std.ArrayList(DsFrom)) Error!dns.RData {

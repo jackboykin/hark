@@ -162,7 +162,7 @@ pub const Header = struct {
 
 /// RFC 4034 §6.2 canonical form: uncompressed wire labels, lowercase,
 /// at most 255 octets. Case someone wrote lives in `Question.spelled`
-/// and `NsecData.next_spelled`, never here.
+/// and an NSEC's rdata, never here.
 pub const Name = struct {
     wire: []const u8,
 
@@ -345,13 +345,14 @@ pub const TxtData = struct {
     strings: []const []const u8,
 
     pub const Strings = struct {
-        strings: []const []const u8,
-        i: usize = 0,
+        rdata: []const u8,
+        at: usize = 0,
 
         pub fn next(s: *Strings) ?[]const u8 {
-            if (s.i == s.strings.len) return null;
-            s.i += 1;
-            return s.strings[s.i - 1];
+            if (s.at == s.rdata.len) return null;
+            const len = s.rdata[s.at];
+            defer s.at += 1 + len;
+            return s.rdata[s.at + 1 ..][0..len];
         }
     };
 };
@@ -458,10 +459,6 @@ pub const DsData = struct {
 pub const NsecData = struct {
     next_domain_name: Name,
     type_bit_maps: []const u8,
-    /// The next name as signed, case and all: RFC 6840 §5.1 never folds
-    /// it, so the signature covers these bytes and they are what goes on.
-    /// Null when that is `next_domain_name`.
-    next_spelled: ?[]const u8 = null,
 };
 
 pub const Nsec3Data = struct {
@@ -473,11 +470,7 @@ pub const Nsec3Data = struct {
     type_bit_maps: []const u8,
 };
 
-pub const NamedData = struct {
-    head: []const u8,
-    names: []const Name,
-};
-
+/// A record's rdata in its parts, for building one.
 pub const RData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
@@ -493,9 +486,187 @@ pub const RData = union(enum) {
     ds: DsData,
     nsec: NsecData,
     nsec3: Nsec3Data,
-    named: NamedData,
+    /// Already wire.
     unknown: []const u8,
+
+    pub const Error = Allocator.Error || error{InvalidRDataLength};
+
+    fn encode(rdata: RData, gpa: Allocator) RData.Error![]const u8 {
+        switch (rdata) {
+            .ns, .cname, .dname, .ptr => |n| return n.wire,
+            .unknown => |bytes| return bytes,
+            else => {},
+        }
+        var w: std.Io.Writer.Allocating = .init(gpa);
+        errdefer w.deinit();
+        rdata.write(&w.writer) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => |e| e,
+        };
+        return try w.toOwnedSlice();
+    }
+
+    fn write(rdata: RData, w: *std.Io.Writer) (std.Io.Writer.Error || RData.Error)!void {
+        switch (rdata) {
+            .a => |addr| try w.writeAll(&addr),
+            .aaaa => |addr| try w.writeAll(&addr),
+            .ns, .cname, .ptr, .dname => |name| try w.writeAll(name.wire),
+            .mx => |mx| {
+                try w.writeInt(u16, mx.preference, .big);
+                try w.writeAll(mx.exchange.wire);
+            },
+            .soa => |soa| {
+                try w.writeAll(soa.mname.wire);
+                try w.writeAll(soa.rname.wire);
+                for ([_]u32{ soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum }) |v| try w.writeInt(u32, v, .big);
+            },
+            .txt => |txt| for (txt.strings) |str| {
+                try w.writeByte(std.math.cast(u8, str.len) orelse return error.InvalidRDataLength);
+                try w.writeAll(str);
+            },
+            .rrsig => |sig| {
+                try w.writeInt(u16, @backingInt(sig.type_covered), .big);
+                try w.writeByte(@backingInt(sig.algorithm));
+                try w.writeByte(sig.labels);
+                try w.writeInt(u32, sig.original_ttl, .big);
+                try w.writeInt(u32, sig.sig_expiration, .big);
+                try w.writeInt(u32, sig.sig_inception, .big);
+                try w.writeInt(u16, sig.key_tag, .big);
+                try w.writeAll(sig.signer_name.wire);
+                try w.writeAll(sig.signature);
+            },
+            .dnskey => |key| {
+                try w.writeInt(u16, key.flags, .big);
+                try w.writeByte(key.protocol);
+                try w.writeByte(@backingInt(key.algorithm));
+                try w.writeAll(key.public_key);
+            },
+            .ds => |ds| {
+                try w.writeInt(u16, ds.key_tag, .big);
+                try w.writeByte(@backingInt(ds.algorithm));
+                try w.writeByte(@backingInt(ds.digest_type));
+                try w.writeAll(ds.digest);
+            },
+            .nsec => |nsec| {
+                try w.writeAll(nsec.next_domain_name.wire);
+                try w.writeAll(nsec.type_bit_maps);
+            },
+            .nsec3 => |nsec3| {
+                try w.writeByte(@backingInt(nsec3.hash_algorithm));
+                try w.writeByte(nsec3.flags);
+                try w.writeInt(u16, nsec3.iterations, .big);
+                try w.writeByte(std.math.cast(u8, nsec3.salt.len) orelse return error.InvalidRDataLength);
+                try w.writeAll(nsec3.salt);
+                try w.writeByte(std.math.cast(u8, nsec3.next_hashed_owner.len) orelse return error.InvalidRDataLength);
+                try w.writeAll(nsec3.next_hashed_owner);
+                try w.writeAll(nsec3.type_bit_maps);
+            },
+            .unknown => |bytes| try w.writeAll(bytes),
+        }
+    }
 };
+
+// Each type's layout, stated once: the parser checks records with these,
+// and the accessors read records the parser or `init` proved.
+
+fn nameLen(d: []const u8) Error!usize {
+    var i: usize = 0;
+    while (i < d.len) : (i += 1 + d[i]) if (d[i] == 0) return i + 1;
+    return error.InvalidRDataLength;
+}
+
+fn readMx(d: []const u8) Error!MxData {
+    if (d.len < 2) return error.InvalidRDataLength;
+    return .{ .preference = mem.readInt(u16, d[0..2], .big), .exchange = .of(d[2..]) };
+}
+
+fn readSoa(d: []const u8) Error!SoaData {
+    const m = try nameLen(d);
+    const r = m + try nameLen(d[m..]);
+    if (d.len != r + 20) return error.FormatError;
+    const n = d[r..][0..20];
+    return .{
+        .mname = .of(d[0..m]),
+        .rname = .of(d[m..r]),
+        .serial = mem.readInt(u32, n[0..4], .big),
+        .refresh = mem.readInt(u32, n[4..8], .big),
+        .retry = mem.readInt(u32, n[8..12], .big),
+        .expire = mem.readInt(u32, n[12..16], .big),
+        .minimum = mem.readInt(u32, n[16..20], .big),
+    };
+}
+
+fn checkTxt(d: []const u8) Error!void {
+    var at: usize = 0;
+    while (at < d.len) at += 1 + @as(usize, d[at]);
+    if (at != d.len) return error.FormatError;
+}
+
+fn readRrsig(d: []const u8) Error!RrsigData {
+    if (d.len < 18) return error.InvalidRDataLength;
+    const n = 18 + try nameLen(d[18..]);
+    return .{
+        .type_covered = @fromBackingInt(mem.readInt(u16, d[0..2], .big)),
+        .algorithm = @fromBackingInt(d[2]),
+        .labels = d[3],
+        .original_ttl = mem.readInt(u32, d[4..8], .big),
+        .sig_expiration = mem.readInt(u32, d[8..12], .big),
+        .sig_inception = mem.readInt(u32, d[12..16], .big),
+        .key_tag = mem.readInt(u16, d[16..18], .big),
+        .signer_name = .of(d[18..n]),
+        .signature = d[n..],
+    };
+}
+
+fn readDnskey(d: []const u8) Error!DnskeyData {
+    if (d.len < 4) return error.InvalidRDataLength;
+    return .{ .flags = mem.readInt(u16, d[0..2], .big), .protocol = d[2], .algorithm = @fromBackingInt(d[3]), .public_key = d[4..] };
+}
+
+fn readDs(d: []const u8) Error!DsData {
+    if (d.len < 4) return error.InvalidRDataLength;
+    return .{ .key_tag = mem.readInt(u16, d[0..2], .big), .algorithm = @fromBackingInt(d[2]), .digest_type = @fromBackingInt(d[3]), .digest = d[4..] };
+}
+
+fn readNsec(d: []const u8, buf: *Name.Buf) Error!NsecData {
+    const n = try nameLen(d);
+    // A length octet is at most 63, never a capital.
+    const spelled = d[0..n];
+    const folded = for (spelled) |c| {
+        if (std.ascii.isUpper(c)) break std.ascii.lowerString(buf[0..n], spelled);
+    } else spelled;
+    return .{ .next_domain_name = .of(folded), .type_bit_maps = d[n..] };
+}
+
+fn readNsec3(d: []const u8) Error!Nsec3Data {
+    if (d.len < 6) return error.InvalidRDataLength;
+    const salt_len: usize = d[4];
+    if (5 + salt_len + 1 > d.len) return error.InvalidRDataLength;
+    const hash_len: usize = d[5 + salt_len];
+    const consumed = 6 + salt_len + hash_len;
+    if (consumed > d.len) return error.InvalidRDataLength;
+    return .{
+        .hash_algorithm = @fromBackingInt(d[0]),
+        .flags = d[1],
+        .iterations = mem.readInt(u16, d[2..4], .big),
+        .salt = d[5..][0..salt_len],
+        .next_hashed_owner = d[6 + salt_len .. consumed],
+        .type_bit_maps = d[consumed..],
+    };
+}
+
+/// Names were checked as they were read; these are the rest.
+fn checkRdata(rtype: RType, d: []const u8) Error!void {
+    switch (rtype) {
+        .a => if (d.len != 4) return error.InvalidRDataLength,
+        .aaaa => if (d.len != 16) return error.InvalidRDataLength,
+        .txt => try checkTxt(d),
+        .dnskey => _ = try readDnskey(d),
+        .ds => _ = try readDs(d),
+        .nsec3 => _ = try readNsec3(d),
+        else => {},
+    }
+}
 
 /// Check if an RType is present in a type bitmap (RFC 4034 §4.1.2).
 /// Used by NSEC and NSEC3 records.
@@ -590,7 +761,9 @@ pub const ResourceRecord = struct {
     rtype: RType,
     rclass: RClass,
     ttl: u32,
-    rdata: RData,
+    /// Canonical wire (RFC 4034 §6.2): names uncompressed and lowercase,
+    /// but an NSEC's next name, kept as signed (RFC 6840 §5.1).
+    rdata: []const u8,
 
     pub const Parts = struct {
         name: Name,
@@ -600,78 +773,88 @@ pub const ResourceRecord = struct {
         rdata: RData,
     };
 
-    pub fn init(gpa: Allocator, p: Parts) Allocator.Error!ResourceRecord {
-        _ = gpa;
-        return .{ .name = p.name, .rtype = p.rtype, .rclass = p.rclass, .ttl = p.ttl, .rdata = p.rdata };
+    pub fn init(gpa: Allocator, p: Parts) RData.Error!ResourceRecord {
+        return .{ .name = p.name, .rtype = p.rtype, .rclass = p.rclass, .ttl = p.ttl, .rdata = try p.rdata.encode(gpa) };
     }
 
     /// For tests: memory the test binary never frees.
     pub fn fixture(p: Parts) ResourceRecord {
-        return init(fixtures.allocator(), p) catch @panic("OOM");
+        return init(fixtures.allocator(), p) catch @panic("bad fixture");
     }
 
-    // Each reads the rdata of the type it is named for.
-
     pub fn a(rr: ResourceRecord) [4]u8 {
-        return rr.rdata.a;
+        std.debug.assert(rr.rtype == .a);
+        return rr.rdata[0..4].*;
     }
 
     pub fn aaaa(rr: ResourceRecord) [16]u8 {
-        return rr.rdata.aaaa;
+        std.debug.assert(rr.rtype == .aaaa);
+        return rr.rdata[0..16].*;
     }
 
     pub fn ns(rr: ResourceRecord) Name {
-        return rr.rdata.ns;
+        std.debug.assert(rr.rtype == .ns);
+        return .of(rr.rdata);
     }
 
     pub fn cname(rr: ResourceRecord) Name {
-        return rr.rdata.cname;
+        std.debug.assert(rr.rtype == .cname);
+        return .of(rr.rdata);
     }
 
     pub fn dname(rr: ResourceRecord) Name {
-        return rr.rdata.dname;
+        std.debug.assert(rr.rtype == .dname);
+        return .of(rr.rdata);
     }
 
     pub fn ptr(rr: ResourceRecord) Name {
-        return rr.rdata.ptr;
+        std.debug.assert(rr.rtype == .ptr);
+        return .of(rr.rdata);
     }
 
     pub fn mx(rr: ResourceRecord) MxData {
-        return rr.rdata.mx;
+        std.debug.assert(rr.rtype == .mx);
+        return readMx(rr.rdata) catch unreachable;
     }
 
     pub fn soa(rr: ResourceRecord) SoaData {
-        return rr.rdata.soa;
+        std.debug.assert(rr.rtype == .soa);
+        return readSoa(rr.rdata) catch unreachable;
     }
 
     pub fn txt(rr: ResourceRecord) TxtData.Strings {
-        return .{ .strings = rr.rdata.txt.strings };
+        std.debug.assert(rr.rtype == .txt);
+        return .{ .rdata = rr.rdata };
     }
 
     pub fn rrsig(rr: ResourceRecord) RrsigData {
-        return rr.rdata.rrsig;
+        std.debug.assert(rr.rtype == .rrsig);
+        return readRrsig(rr.rdata) catch unreachable;
     }
 
     pub fn dnskey(rr: ResourceRecord) DnskeyData {
-        return rr.rdata.dnskey;
+        std.debug.assert(rr.rtype == .dnskey);
+        return readDnskey(rr.rdata) catch unreachable;
     }
 
     pub fn ds(rr: ResourceRecord) DsData {
-        return rr.rdata.ds;
+        std.debug.assert(rr.rtype == .ds);
+        return readDs(rr.rdata) catch unreachable;
     }
 
     /// The next name folded, into `buf` when it was signed with capitals.
     pub fn nsec(rr: ResourceRecord, buf: *Name.Buf) NsecData {
-        _ = buf;
-        return rr.rdata.nsec;
+        std.debug.assert(rr.rtype == .nsec);
+        return readNsec(rr.rdata, buf) catch unreachable;
     }
 
     pub fn nsec3(rr: ResourceRecord) Nsec3Data {
-        return rr.rdata.nsec3;
+        std.debug.assert(rr.rtype == .nsec3);
+        return readNsec3(rr.rdata) catch unreachable;
     }
 
     pub fn covers(rr: ResourceRecord) ?RType {
-        return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else null;
+        return if (rr.rtype == .rrsig) @fromBackingInt(mem.readInt(u16, rr.rdata[0..2], .big)) else null;
     }
 };
 
@@ -718,24 +901,39 @@ pub fn wireNameLen(wire: []const u8) usize {
     return i + 1;
 }
 
-/// RFC 1035 rdata whose names may be compressed (RFC 3597 §4): `skip`
-/// bytes, then `names` names, then the rest as is.
-fn compressedNames(rtype: RType) ?struct { skip: u8, names: u8 } {
-    return switch (rtype) {
-        .ns, .cname, .ptr => .{ .skip = 0, .names = 1 },
-        .mx => .{ .skip = 2, .names = 1 },
-        .soa => .{ .skip = 0, .names = 2 },
-        else => null,
-    };
-}
+/// Where an rdata's names lie. `tail` is the octets after them, null for any.
+const Embedded = struct {
+    skip: u8 = 0,
+    strings: u8 = 0,
+    names: u8,
+    spelling: Spelling,
+    tail: ?u8 = 0,
 
-fn embeddedNames(rtype: RType) ?struct { skip: u8, strings: u8 = 0, names: u8 } {
+    const Spelling = enum {
+        /// Compressed both ways (RFC 3597 §4).
+        rfc1035,
+        /// Read through pointers, written flat (RFC 3597 §4).
+        read_compressed,
+        /// Never a pointer (RFC 4034 §3.1.7).
+        flat,
+        /// Never a pointer nor folded (RFC 4034 §4.1.1, RFC 6840 §5.1).
+        signed,
+    };
+};
+
+fn embedded(rtype: RType) ?Embedded {
     return switch (rtype) {
-        .rp => .{ .skip = 0, .names = 2 },
-        .afsdb, .rt, .kx => .{ .skip = 2, .names = 1 },
-        .px => .{ .skip = 2, .names = 2 },
-        .srv => .{ .skip = 6, .names = 1 },
-        .naptr => .{ .skip = 4, .strings = 3, .names = 1 },
+        .ns, .cname, .ptr => .{ .names = 1, .spelling = .rfc1035 },
+        .mx => .{ .skip = 2, .names = 1, .spelling = .rfc1035 },
+        .soa => .{ .names = 2, .spelling = .rfc1035, .tail = 20 },
+        .dname => .{ .names = 1, .spelling = .read_compressed },
+        .rrsig => .{ .skip = 18, .names = 1, .spelling = .flat, .tail = null },
+        .nsec => .{ .names = 1, .spelling = .signed, .tail = null },
+        .rp => .{ .names = 2, .spelling = .read_compressed },
+        .afsdb, .rt, .kx => .{ .skip = 2, .names = 1, .spelling = .read_compressed },
+        .px => .{ .skip = 2, .names = 2, .spelling = .read_compressed },
+        .srv => .{ .skip = 6, .names = 1, .spelling = .read_compressed },
+        .naptr => .{ .skip = 4, .strings = 3, .names = 1, .spelling = .read_compressed },
         else => null,
     };
 }
@@ -931,6 +1129,11 @@ const Parser = struct {
     /// lowercase copy, 255 octets at most however few the message spent.
     fn parseName(self: *Parser, allocator: Allocator, comptime form: Form) Error!Name {
         var buf: Name.Buf = undefined;
+        const name = try self.readName(&buf, form);
+        return if (name.wire.ptr == &buf) .{ .wire = try allocator.dupe(u8, name.wire) } else name;
+    }
+
+    fn readName(self: *Parser, buf: *Name.Buf, comptime form: Form) Error!Name {
         // Where the name lies whole: no label before a pointer.
         var whole: ?usize = self.pos;
         var upper = false;
@@ -975,7 +1178,7 @@ const Parser = struct {
         self.pos = resume_at orelse cursor;
         if (len == 1) return .root;
         if (whole) |at| if (!upper) return .{ .wire = self.msg[at..cursor] };
-        return .{ .wire = try allocator.dupe(u8, buf[0..len]) };
+        return .{ .wire = buf[0..len] };
     }
 
     fn skipName(self: *Parser) Error!void {
@@ -1020,197 +1223,55 @@ const Parser = struct {
         const raw_ttl = try self.readU32();
         const ttl = if (rtype == .opt) raw_ttl else if (raw_ttl > std.math.maxInt(i32)) 0 else @min(raw_ttl, ttlCeiling(rtype));
         const rdlength: usize = try self.readU16();
-
-        if (self.pos + rdlength > self.msg.len) return error.EndOfData;
-        const rdata_end = self.pos + rdlength;
-
-        const rdata = try self.parseRData(rtype, rdlength, allocator);
-        self.pos = rdata_end;
-
-        return .{
-            .name = name,
-            .rtype = rtype,
-            .rclass = rclass,
-            .ttl = ttl,
-            .rdata = rdata,
-        };
+        const rdata = try self.readRdata(allocator, rtype, rdlength);
+        try checkRdata(rtype, rdata);
+        return .{ .name = name, .rtype = rtype, .rclass = rclass, .ttl = ttl, .rdata = rdata };
     }
 
-    fn parseRData(self: *Parser, rtype: RType, rdlength: usize, allocator: Allocator) Error!RData {
-        switch (rtype) {
-            .a => {
-                if (rdlength != 4) return error.InvalidRDataLength;
-                const data = try self.readSlice(4);
-                return .{ .a = data[0..4].* };
-            },
-            .aaaa => {
-                if (rdlength != 16) return error.InvalidRDataLength;
-                const data = try self.readSlice(16);
-                return .{ .aaaa = data[0..16].* };
-            },
-            inline .ns, .cname, .dname, .ptr => |t| return @unionInit(RData, @tagName(t), try self.parseNameRdata(allocator, rdlength)),
-            .mx => {
-                const rdata_end = self.pos + rdlength;
-                const preference = try self.readU16();
-                const exchange = try self.parseName(allocator, .compressed);
-                if (self.pos != rdata_end) return error.FormatError;
-                return .{ .mx = .{ .preference = preference, .exchange = exchange } };
-            },
-            .soa => {
-                const rdata_end = self.pos + rdlength;
-                const mname = try self.parseName(allocator, .compressed);
-                const rname = try self.parseName(allocator, .compressed);
-                const serial = try self.readU32();
-                const refresh = try self.readU32();
-                const retry = try self.readU32();
-                const expire = try self.readU32();
-                const minimum = try self.readU32();
-                if (self.pos != rdata_end) return error.FormatError;
-                return .{ .soa = .{
-                    .mname = mname,
-                    .rname = rname,
-                    .serial = serial,
-                    .refresh = refresh,
-                    .retry = retry,
-                    .expire = expire,
-                    .minimum = minimum,
-                } };
-            },
-            .txt => {
-                const rdata_end = self.pos + rdlength;
-                var strings: ArrayList([]const u8) = .empty;
-                while (self.pos < rdata_end) {
-                    const str_len: usize = try self.readU8();
-                    if (self.pos + str_len > rdata_end) return error.FormatError;
-                    const str_data = try self.readSlice(str_len);
-                    try strings.append(allocator, str_data);
-                }
-                return .{ .txt = .{
-                    .strings = try strings.toOwnedSlice(allocator),
-                } };
-            },
-            .rrsig => {
-                if (rdlength < 18) return error.InvalidRDataLength;
-                const type_covered: RType = @fromBackingInt(@intCast(try self.readU16()));
-                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
-                const label_count = try self.readU8();
-                const original_ttl = try self.readU32();
-                const sig_expiration = try self.readU32();
-                const sig_inception = try self.readU32();
-                const key_tag = try self.readU16();
-                const name_start = self.pos;
-                // RFC 4034 §3.1.7: a sender MUST NOT compress it.
-                const signer_name = try self.parseName(allocator, .uncompressed);
-                const name_len = self.pos - name_start;
-                if (18 + name_len > rdlength) return error.InvalidRDataLength;
-                const sig_len = rdlength - 18 - name_len;
-                const signature = try self.readSlice(sig_len);
-                return .{ .rrsig = .{
-                    .type_covered = type_covered,
-                    .algorithm = algorithm,
-                    .labels = label_count,
-                    .original_ttl = original_ttl,
-                    .sig_expiration = sig_expiration,
-                    .sig_inception = sig_inception,
-                    .key_tag = key_tag,
-                    .signer_name = signer_name,
-                    .signature = signature,
-                } };
-            },
-            .dnskey => {
-                if (rdlength < 4) return error.InvalidRDataLength;
-                const flags = try self.readU16();
-                const protocol = try self.readU8();
-                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
-                const public_key = try self.readSlice(rdlength - 4);
-                return .{ .dnskey = .{
-                    .flags = flags,
-                    .protocol = protocol,
-                    .algorithm = algorithm,
-                    .public_key = public_key,
-                } };
-            },
-            .ds => {
-                if (rdlength < 4) return error.InvalidRDataLength;
-                const key_tag = try self.readU16();
-                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
-                const digest_type: DigestType = @fromBackingInt(@intCast(try self.readU8()));
-                const digest = try self.readSlice(rdlength - 4);
-                return .{ .ds = .{
-                    .key_tag = key_tag,
-                    .algorithm = algorithm,
-                    .digest_type = digest_type,
-                    .digest = digest,
-                } };
-            },
-            .nsec => {
-                if (rdlength < 1) return error.InvalidRDataLength;
-                const name_start = self.pos;
-                // RFC 4034 §4.1.1: a sender MUST NOT compress it.
-                const next_domain_name = try self.parseName(allocator, .uncompressed);
-                const name_len = self.pos - name_start;
-                if (name_len > rdlength) return error.InvalidRDataLength;
-                return .{ .nsec = .{
-                    .next_domain_name = next_domain_name,
-                    .type_bit_maps = try self.readSlice(rdlength - name_len),
-                    .next_spelled = self.msg[name_start..][0..name_len],
-                } };
-            },
-            .nsec3 => {
-                if (rdlength < 6) return error.InvalidRDataLength;
-                const hash_algorithm: Nsec3HashAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
-                const flags = try self.readU8();
-                const iterations = try self.readU16();
-                const salt_len: usize = try self.readU8();
-                if (5 + salt_len + 1 > rdlength) return error.InvalidRDataLength;
-                const salt = try self.readSlice(salt_len);
-                const hash_len: usize = try self.readU8();
-                const consumed = 6 + salt_len + hash_len;
-                if (consumed > rdlength) return error.InvalidRDataLength;
-                const next_hashed_owner = try self.readSlice(hash_len);
-                const bitmap_len = rdlength - consumed;
-                return .{ .nsec3 = .{
-                    .hash_algorithm = hash_algorithm,
-                    .flags = flags,
-                    .iterations = iterations,
-                    .salt = salt,
-                    .next_hashed_owner = next_hashed_owner,
-                    .type_bit_maps = try self.readSlice(bitmap_len),
-                } };
-            },
-            else => {
-                if (embeddedNames(rtype) != null) return .{ .named = try self.parseNamed(rtype, rdlength, allocator) };
-                return .{ .unknown = try self.readSlice(rdlength) };
-            },
-        }
-    }
-
-    fn parseNamed(self: *Parser, rtype: RType, rdlength: usize, allocator: Allocator) Error!NamedData {
-        const layout = embeddedNames(rtype).?;
+    fn readRdata(self: *Parser, allocator: Allocator, rtype: RType, rdlength: usize) Error![]const u8 {
         const start = self.pos;
-        const rdata_end = start + rdlength;
-        var at = start + layout.skip;
-        for (0..layout.strings) |_| {
-            if (at >= rdata_end) return error.InvalidRDataLength;
+        const end = start + rdlength;
+        if (end > self.msg.len) return error.EndOfData;
+        const e = embedded(rtype) orelse return self.readSlice(rdlength);
+        var at = start + e.skip;
+        for (0..e.strings) |_| {
+            if (at >= end) return error.InvalidRDataLength;
             at += 1 + @as(usize, self.msg[at]);
         }
-        if (at > rdata_end) return error.InvalidRDataLength;
+        if (at > end) return error.InvalidRDataLength;
         self.pos = at;
-        var names: [2]Name = undefined;
-        var n: usize = 0;
-        for (0..layout.names) |_| {
-            names[n] = try self.parseName(allocator, .compressed);
-            n += 1;
+        var bufs: [2]Name.Buf = undefined;
+        var names: [2][]const u8 = undefined;
+        var in_place = true;
+        for (names[0..e.names], bufs[0..e.names]) |*n, *buf| {
+            const from = self.pos;
+            n.* = switch (e.spelling) {
+                .rfc1035, .read_compressed => (try self.readName(buf, .compressed)).wire,
+                .flat => (try self.readName(buf, .uncompressed)).wire,
+                .signed => blk: {
+                    _ = try self.readName(buf, .uncompressed);
+                    break :blk self.msg[from..self.pos];
+                },
+            };
+            in_place = in_place and mem.eql(u8, n.*, self.msg[from..self.pos]);
         }
-        if (self.pos != rdata_end) return error.FormatError;
-        return .{ .head = self.msg[start..at], .names = try allocator.dupe(Name, names[0..n]) };
-    }
-
-    fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
-        const rdata_end = self.pos + rdlength;
-        const name = try self.parseName(allocator, .compressed);
-        if (self.pos != rdata_end) return error.FormatError;
-        return name;
+        if (self.pos > end) return if (e.tail == null) error.InvalidRDataLength else error.FormatError;
+        if (e.tail) |t| if (end - self.pos != t) return error.FormatError;
+        const head = self.msg[start..at];
+        const tail = self.msg[self.pos..end];
+        self.pos = end;
+        if (in_place) return self.msg[start..end];
+        var len = head.len + tail.len;
+        for (names[0..e.names]) |n| len += n.len;
+        const out = try allocator.alloc(u8, len);
+        @memcpy(out[0..head.len], head);
+        var w = head.len;
+        for (names[0..e.names]) |n| {
+            @memcpy(out[w..][0..n.len], n);
+            w += n.len;
+        }
+        @memcpy(out[w..], tail);
+        return out;
     }
 };
 
@@ -1244,7 +1305,7 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
             if (opt.* != null) return error.MultipleOptRecords;
             // RFC 6891 §6.1.2: OPT owner name MUST be root.
             if (!rr.name.isRoot()) return error.FormatError;
-            const options = try parseEdnsOptions(allocator, rr.rdata.unknown);
+            const options = try parseEdnsOptions(allocator, rr.rdata);
             opt.* = .{
                 .udp_payload_size = @backingInt(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
@@ -1461,19 +1522,9 @@ pub const Serializer = struct {
     fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
         if (self.names != null) try self.writeWireName(r.owner) else try self.writeSlice(r.owner);
         const at = self.pos;
-        try self.writeSlice(r.rest[0..10]);
+        try self.writeSlice(r.rest[0..8]);
         mem.writeInt(u32, self.buf[at + 4 ..][0..4], r.ttl, .big);
-        const layout = (if (self.names != null) compressedNames(r.rtype()) else null) orelse return self.writeSlice(r.rdata());
-        const rdata = r.rdata();
-        try self.writeSlice(rdata[0..layout.skip]);
-        var p: usize = layout.skip;
-        for (0..layout.names) |_| {
-            const n = wireNameLen(rdata[p..]);
-            try self.writeWireName(rdata[p..][0..n]);
-            p += n;
-        }
-        try self.writeSlice(rdata[p..]);
-        mem.writeInt(u16, self.buf[at + 8 ..][0..2], try castOrRDataErr(u16, self.pos - at - 10), .big);
+        try self.writeRdata(r.rtype(), r.rdata());
     }
 
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
@@ -1481,86 +1532,29 @@ pub const Serializer = struct {
         try self.writeU16(@backingInt(rr.rtype));
         try self.writeU16(@backingInt(rr.rclass));
         try self.writeU32(rr.ttl);
+        try self.writeRdata(rr.rtype, rr.rdata);
+    }
 
-        const rdlength_pos = self.pos;
+    /// RDLENGTH, then the rdata: RFC 1035's names compressed when names
+    /// are, the rest as kept.
+    fn writeRdata(self: *Serializer, rtype: RType, rdata: []const u8) Error!void {
+        const at = self.pos;
         try self.writeU16(0);
-        const rdata_start = self.pos;
-        try self.writeRDataNames(rr.rdata, compressedNames(rr.rtype) != null);
-        const rdata_len = self.pos - rdata_start;
-        mem.writeInt(u16, self.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
-    }
-
-    pub fn writeRData(self: *Serializer, rdata: RData) Error!void {
-        return self.writeRDataNames(rdata, false);
-    }
-
-    fn writeRDataNames(self: *Serializer, rdata: RData, compress: bool) Error!void {
-        switch (rdata) {
-            .a => |addr| try self.writeSlice(&addr),
-            .aaaa => |addr| try self.writeSlice(&addr),
-            .ns, .cname, .ptr, .dname => |name| try self.writeName(name.wire, compress),
-            .mx => |mx| {
-                try self.writeU16(mx.preference);
-                try self.writeName(mx.exchange.wire, compress);
-            },
-            .soa => |soa| {
-                try self.writeName(soa.mname.wire, compress);
-                try self.writeName(soa.rname.wire, compress);
-                try self.writeU32(soa.serial);
-                try self.writeU32(soa.refresh);
-                try self.writeU32(soa.retry);
-                try self.writeU32(soa.expire);
-                try self.writeU32(soa.minimum);
-            },
-            .txt => |txt| {
-                for (txt.strings) |s| {
-                    try self.writeU8(try castOrRDataErr(u8, s.len));
-                    try self.writeSlice(s);
-                }
-            },
-            .rrsig => |rrsig| {
-                try self.writeU16(@backingInt(rrsig.type_covered));
-                try self.writeU8(@backingInt(rrsig.algorithm));
-                try self.writeU8(rrsig.labels);
-                try self.writeU32(rrsig.original_ttl);
-                try self.writeU32(rrsig.sig_expiration);
-                try self.writeU32(rrsig.sig_inception);
-                try self.writeU16(rrsig.key_tag);
-                try self.writeName(rrsig.signer_name.wire, compress);
-                try self.writeSlice(rrsig.signature);
-            },
-            .dnskey => |dnskey| {
-                try self.writeU16(dnskey.flags);
-                try self.writeU8(dnskey.protocol);
-                try self.writeU8(@backingInt(dnskey.algorithm));
-                try self.writeSlice(dnskey.public_key);
-            },
-            .ds => |ds_data| {
-                try self.writeU16(ds_data.key_tag);
-                try self.writeU8(@backingInt(ds_data.algorithm));
-                try self.writeU8(@backingInt(ds_data.digest_type));
-                try self.writeSlice(ds_data.digest);
-            },
-            .nsec => |nsec_data| {
-                try self.writeName(nsec_data.next_spelled orelse nsec_data.next_domain_name.wire, compress);
-                try self.writeSlice(nsec_data.type_bit_maps);
-            },
-            .nsec3 => |nsec3| {
-                try self.writeU8(@backingInt(nsec3.hash_algorithm));
-                try self.writeU8(nsec3.flags);
-                try self.writeU16(nsec3.iterations);
-                try self.writeU8(try castOrRDataErr(u8, nsec3.salt.len));
-                try self.writeSlice(nsec3.salt);
-                try self.writeU8(try castOrRDataErr(u8, nsec3.next_hashed_owner.len));
-                try self.writeSlice(nsec3.next_hashed_owner);
-                try self.writeSlice(nsec3.type_bit_maps);
-            },
-            .named => |d| {
-                try self.writeSlice(d.head);
-                for (d.names) |name| try self.writeName(name.wire, false);
-            },
-            .unknown => |data| try self.writeSlice(data),
+        const e = embedded(rtype);
+        if (self.names == null or e == null or e.?.spelling != .rfc1035) {
+            try self.writeSlice(rdata);
+        } else {
+            const skip = e.?.skip;
+            try self.writeSlice(rdata[0..skip]);
+            var p: usize = skip;
+            for (0..e.?.names) |_| {
+                const n = wireNameLen(rdata[p..]);
+                try self.writeWireName(rdata[p..][0..n]);
+                p += n;
+            }
+            try self.writeSlice(rdata[p..]);
         }
+        mem.writeInt(u16, self.buf[at..][0..2], try castOrRDataErr(u16, self.pos - at - 2), .big);
     }
 
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
@@ -1742,7 +1736,7 @@ test "A record parsing" {
     const rr = msg.answers[0];
     try testing.expectEqual(RType.a, rr.rtype);
     try testing.expectEqual(@as(u32, 300), rr.ttl);
-    try testing.expectEqualSlices(u8, &[_]u8{ 93, 184, 216, 34 }, &rr.rdata.a);
+    try testing.expectEqualSlices(u8, &[_]u8{ 93, 184, 216, 34 }, &rr.a());
 }
 
 test "SOA record parsing" {
@@ -1755,7 +1749,7 @@ test "SOA record parsing" {
     var pkt: [max_udp_payload]u8 = undefined;
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .soa, rd.slice(), rd.pos));
 
-    const soa = msg.answers[0].rdata.soa;
+    const soa = msg.answers[0].soa();
     try testing.expect(soa.mname.eql(.lit("ns.example.com")));
     try testing.expect(soa.rname.eql(.lit("admin.example.com")));
     try testing.expectEqual(@as(u32, 2023010101), soa.serial);
@@ -1774,7 +1768,7 @@ test "MX record parsing" {
     var pkt: [max_udp_payload]u8 = undefined;
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .mx, rd.slice(), rd.pos));
 
-    const mx = msg.answers[0].rdata.mx;
+    const mx = msg.answers[0].mx();
     try testing.expectEqual(@as(u16, 10), mx.preference);
     try testing.expect(mx.exchange.eql(.lit("mail.example.com")));
 }
@@ -1786,10 +1780,10 @@ test "TXT record parsing" {
     const rdata = "\x1av=spf1 include:example.com\x05hello";
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .txt, rdata, rdata.len));
 
-    const txt = msg.answers[0].rdata.txt;
-    try testing.expectEqual(@as(usize, 2), txt.strings.len);
-    try testing.expectEqualStrings("v=spf1 include:example.com", txt.strings[0]);
-    try testing.expectEqualStrings("hello", txt.strings[1]);
+    var txt = msg.answers[0].txt();
+    try testing.expectEqualStrings("v=spf1 include:example.com", txt.next().?);
+    try testing.expectEqualStrings("hello", txt.next().?);
+    try testing.expectEqual(null, txt.next());
 }
 
 test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names stay flat" {
@@ -1828,8 +1822,8 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
 
     const parsed = try parseMessage(a, wire);
     try testing.expect(parsed.answers[0].name.eql(owner));
-    try testing.expect(parsed.answers[1].rdata.rrsig.signer_name.eql(rrsig.signer_name));
-    try testing.expect(parsed.authorities[0].rdata.ns.eql(ns1));
+    try testing.expect(parsed.answers[1].rrsig().signer_name.eql(rrsig.signer_name));
+    try testing.expect(parsed.authorities[0].ns().eql(ns1));
 }
 
 test "name compression follows a pointer inside an earlier name" {
@@ -1869,7 +1863,7 @@ test "a record written from its stored bytes is the record written from its fiel
     };
     for (datas) |d| {
         const rtype: RType = switch (d) {
-            .named, .unknown => unreachable,
+            .unknown => unreachable,
             inline else => |_, field| @field(RType, @tagName(field)),
         };
         const rr: ResourceRecord = .fixture(.{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d });
@@ -2038,13 +2032,31 @@ test "a pointer flood costs each name its 255 octets, no more" {
     try testing.expectEqual(answers, msg.answers.len);
 }
 
+test "a TXT of empty strings costs its record, not a slice a string" {
+    var buf: [max_message_len]u8 = undefined;
+    const head = "\x00\x01\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00\x07example\x03com\x00\x00\x10\x00\x01\x00\x00\x01\x2c";
+    @memcpy(buf[0..head.len], head);
+    const rdlength = buf.len - head.len - 2;
+    mem.writeInt(u16, buf[head.len..][0..2], rdlength, .big);
+    @memset(buf[head.len + 2 ..], 0);
+    var room: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&room);
+    const msg = try parseMessage(fixed.allocator(), &buf);
+    var strings = msg.answers[0].txt();
+    var n: usize = 0;
+    while (strings.next()) |str| : (n += 1) try testing.expectEqual(0, str.len);
+    try testing.expectEqual(rdlength, n);
+}
+
 test "an NSEC's next name goes back out as signed (RFC 6840 §5.1)" {
     const rdata = "\x04HoSt\x07example\x00\x00\x01\x40";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pkt: [max_udp_payload]u8 = undefined;
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rdata, rdata.len));
-    try testing.expect(msg.answers[0].rdata.nsec.next_domain_name.eql(.lit("host.example")));
+    var next: Name.Buf = undefined;
+    try testing.expect(msg.answers[0].nsec(&next).next_domain_name.eql(.lit("host.example")));
+    try testing.expectEqualStrings(rdata, msg.answers[0].rdata);
     var out: [max_udp_payload]u8 = undefined;
     try testing.expect(mem.endsWith(u8, try buildResourceRecordWire(&out, msg.answers[0]), rdata));
 }
@@ -2177,7 +2189,7 @@ test "compression past its work budget writes names whole, and they read back" {
     const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = q, .answers = &rrs });
     const back = try parseMessage(a, wire);
     try testing.expectEqual(rrs.len, back.answers.len);
-    for (rrs, back.answers) |want, got| try testing.expect(want.rdata.ptr.eql(got.rdata.ptr));
+    for (rrs, back.answers) |want, got| try testing.expect(want.ptr().eql(got.ptr()));
 }
 
 test "parseDottedName: trailing dot optional, root is empty, bad labels refused" {
@@ -2267,11 +2279,6 @@ test "isSubdomainOf: self, descendants and the root; never a sibling, nor a labe
     try testing.expect(!(Name.lit("a.example.com")).isSubdomainOf(.lit("b.example.com")));
 }
 
-fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Message {
-    const wire = try serializeMessage(wire_buf, msg);
-    return parseMessage(allocator, wire);
-}
-
 const TestRdata = struct {
     buf: [256]u8 = undefined,
     pos: u16 = 0,
@@ -2303,7 +2310,7 @@ fn testAnswer(pkt: *[max_udp_payload]u8, rtype: RType, rdata: []const u8, rdleng
     return pkt[0 .. at + 10 + rdata.len];
 }
 
-test "DNSKEY record parse/serialize roundtrip" {
+test "DNSKEY record parsing" {
     // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
     const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
     var rd = TestRdata{};
@@ -2318,24 +2325,15 @@ test "DNSKEY record parse/serialize roundtrip" {
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .dnskey, rd.slice(), rd.pos));
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
-    const dnskey = msg.answers[0].rdata.dnskey;
+    const dnskey = msg.answers[0].dnskey();
     try testing.expectEqual(@as(u16, 257), dnskey.flags);
     try testing.expectEqual(@as(u8, 3), dnskey.protocol);
     try testing.expectEqual(DnssecAlgorithm.rsasha256, dnskey.algorithm);
     try testing.expect(dnskey.isZoneKey());
     try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const dk2 = msg2.answers[0].rdata.dnskey;
-    try testing.expectEqual(dnskey.flags, dk2.flags);
-    try testing.expectEqual(dnskey.protocol, dk2.protocol);
-    try testing.expectEqual(dnskey.algorithm, dk2.algorithm);
-    try testing.expectEqualSlices(u8, dnskey.public_key, dk2.public_key);
 }
 
-test "DS record parse/serialize roundtrip" {
+test "DS record parsing" {
     // RDATA: key_tag=20326, alg=8, digest_type=2 (SHA-256), digest=32 bytes
     const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
     var rd = TestRdata{};
@@ -2349,21 +2347,14 @@ test "DS record parse/serialize roundtrip" {
     defer arena.deinit();
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .ds, rd.slice(), rd.pos));
 
-    const ds = msg.answers[0].rdata.ds;
+    const ds = msg.answers[0].ds();
     try testing.expectEqual(@as(u16, 20326), ds.key_tag);
     try testing.expectEqual(DnssecAlgorithm.rsasha256, ds.algorithm);
     try testing.expectEqual(DigestType.sha256, ds.digest_type);
     try testing.expectEqualSlices(u8, &digest, ds.digest);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const ds2 = msg2.answers[0].rdata.ds;
-    try testing.expectEqual(ds.key_tag, ds2.key_tag);
-    try testing.expectEqualSlices(u8, ds.digest, ds2.digest);
 }
 
-test "RRSIG record parse/serialize roundtrip" {
+test "RRSIG record parsing" {
     const signer_wire = "\x07example\x03com\x00";
     const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
     var rd = TestRdata{};
@@ -2382,7 +2373,7 @@ test "RRSIG record parse/serialize roundtrip" {
     defer arena.deinit();
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), rd.pos));
 
-    const rrsig = msg.answers[0].rdata.rrsig;
+    const rrsig = msg.answers[0].rrsig();
     try testing.expectEqual(RType.a, rrsig.type_covered);
     try testing.expectEqual(DnssecAlgorithm.ecdsap256sha256, rrsig.algorithm);
     try testing.expectEqual(@as(u8, 2), rrsig.labels);
@@ -2392,18 +2383,9 @@ test "RRSIG record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u16, 12345), rrsig.key_tag);
     try testing.expect(rrsig.signer_name.eql(.lit("example.com")));
     try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const rrsig2 = msg2.answers[0].rdata.rrsig;
-    try testing.expectEqual(rrsig.type_covered, rrsig2.type_covered);
-    try testing.expectEqual(rrsig.key_tag, rrsig2.key_tag);
-    try testing.expect(rrsig.signer_name.eql(rrsig2.signer_name));
-    try testing.expectEqualSlices(u8, rrsig.signature, rrsig2.signature);
 }
 
-test "NSEC record parse/serialize roundtrip" {
+test "NSEC record parsing" {
     const next_name = "\x04host\x07example\x03com\x00";
     const bitmap = "\x00\x07\x62\x01\x00\x00\x00\x03\x80";
     var rd = TestRdata{};
@@ -2415,19 +2397,13 @@ test "NSEC record parse/serialize roundtrip" {
     defer arena.deinit();
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rd.slice(), rd.pos));
 
-    const nsec = msg.answers[0].rdata.nsec;
+    var next: Name.Buf = undefined;
+    const nsec = msg.answers[0].nsec(&next);
     try testing.expectEqualStrings("host", nsec.next_domain_name.leaf());
     try testing.expectEqualSlices(u8, bitmap, nsec.type_bit_maps);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const nsec2 = msg2.answers[0].rdata.nsec;
-    try testing.expect(nsec.next_domain_name.eql(nsec2.next_domain_name));
-    try testing.expectEqualSlices(u8, nsec.type_bit_maps, nsec2.type_bit_maps);
 }
 
-test "NSEC3 record parse/serialize roundtrip" {
+test "NSEC3 record parsing" {
     const salt = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
     const bitmap = [_]u8{ 0x00, 0x01, 0x40 }; // window 0, len 1, A bit set
@@ -2446,23 +2422,13 @@ test "NSEC3 record parse/serialize roundtrip" {
     defer arena.deinit();
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec3, rd.slice(), rd.pos));
 
-    const nsec3 = msg.answers[0].rdata.nsec3;
+    const nsec3 = msg.answers[0].nsec3();
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
     try testing.expectEqual(@as(u8, 0), nsec3.flags);
     try testing.expectEqual(@as(u16, 10), nsec3.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3.salt);
     try testing.expectEqualSlices(u8, &next_hash, nsec3.next_hashed_owner);
     try testing.expectEqualSlices(u8, &bitmap, nsec3.type_bit_maps);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const n3_2 = msg2.answers[0].rdata.nsec3;
-    try testing.expectEqual(nsec3.hash_algorithm, n3_2.hash_algorithm);
-    try testing.expectEqual(nsec3.iterations, n3_2.iterations);
-    try testing.expectEqualSlices(u8, nsec3.salt, n3_2.salt);
-    try testing.expectEqualSlices(u8, nsec3.next_hashed_owner, n3_2.next_hashed_owner);
-    try testing.expectEqualSlices(u8, nsec3.type_bit_maps, n3_2.type_bit_maps);
 }
 
 test "typeBitmapContains" {

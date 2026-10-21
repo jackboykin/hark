@@ -590,15 +590,13 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
         });
     }
 
-    var sig_bytes: [64]u8 = undefined;
-    var signer_pub: [32]u8 = undefined;
-    const signed = try rrsig.testSignRrset(recs[0..64], .dnskey, rrsig.test_owner, .ed25519, &sig_bytes, &signer_pub);
     // The signing key must itself be in the RRset and DS-anchored, or the
     // refusal could be blamed on anchoring rather than on size.
-    recs[0] = dnskeyRr(rrsig.test_owner, signed.dnskey);
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(testing.io);
+    var signer_pub = kp.public_key.toBytes();
+    recs[0] = dnskeyRr(rrsig.test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .ed25519, .public_key = &signer_pub });
     var sig2: [64]u8 = undefined;
-    const resigned = try rrsig.testSignRrset(recs[0..64], .dnskey, rrsig.test_owner, .ed25519, &sig2, &signer_pub);
-    recs[0] = dnskeyRr(rrsig.test_owner, resigned.dnskey);
+    const resigned = try rrsig.testSignRrsetBy(kp, recs[0..64], .dnskey, rrsig.test_owner, .ed25519, &sig2, &signer_pub);
 
     var digest = dsDigest(Sha256, rrsig.test_owner, resigned.dnskey);
     const ds = dns.DsData{
@@ -959,7 +957,8 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const pq_kp = try MlDsa44.KeyPair.generateDeterministic(@splat(7));
     const pq_pub = pq_kp.public_key.toBytes();
     const pq_key = dns.DnskeyData{ .flags = 257, .protocol = 3, .algorithm = .mldsa44, .public_key = &pq_pub };
-    var ed_pub: [32]u8 = undefined;
+    const ed_kp = std.crypto.sign.Ed25519.KeyPair.generate(testing.io);
+    var ed_pub = ed_kp.public_key.toBytes();
     var ed_sig: [64]u8 = undefined;
     const ed_key = dns.DnskeyData{ .flags = 256, .protocol = 3, .algorithm = .ed25519, .public_key = &ed_pub };
     const key = struct {
@@ -970,10 +969,8 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
             return .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = s } });
         }
     };
-    // ed_pub is undefined until testSignRrset fills it, so the Ed25519 signature
-    // goes first and the ML-DSA-44 one sees the finished keyset.
     const keys = [_]dns.ResourceRecord{ key.rr(ed_key), key.rr(pq_key) };
-    const ed = try rrsig.testSignRrset(&keys, .dnskey, rrsig.test_owner, .ed25519, &ed_sig, &ed_pub);
+    const ed = try rrsig.testSignRrsetBy(ed_kp, &keys, .dnskey, rrsig.test_owner, .ed25519, &ed_sig, &ed_pub);
     var pq_sig: [MlDsa44.Signature.encoded_length]u8 = undefined;
     const pq = try testSignMlDsa(&keys, .dnskey, rrsig.test_owner, pq_key, &pq_kp, &pq_sig);
     var ed_digest = dsDigest(Sha256, rrsig.test_owner, ed_key);
