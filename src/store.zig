@@ -487,13 +487,8 @@ const Writer = struct {
     /// As `Records.Iterator` reads them.
     fn records(w: *Writer, rrs: []const RR) !void {
         for (rrs) |rr| {
-            var fixed: [10]u8 = undefined;
-            mem.writeInt(u16, fixed[0..2], @backingInt(rr.rtype), .big);
-            mem.writeInt(u16, fixed[2..4], @backingInt(rr.rclass), .big);
-            mem.writeInt(u32, fixed[4..8], rr.ttl, .big);
-            mem.writeInt(u16, fixed[8..10], @intCast(rr.rdata.len), .big);
             try w.slice(rr.name.wire);
-            try w.slice(&fixed);
+            try w.slice(&try rr.fixed());
             try w.slice(rr.rdata);
         }
     }

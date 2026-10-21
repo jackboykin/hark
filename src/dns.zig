@@ -853,6 +853,16 @@ pub const ResourceRecord = struct {
         return readNsec3(rr.rdata) catch unreachable;
     }
 
+    /// TYPE, CLASS, TTL and RDLENGTH as on the wire.
+    pub fn fixed(rr: ResourceRecord) error{InvalidRDataLength}![10]u8 {
+        var f: [10]u8 = undefined;
+        mem.writeInt(u16, f[0..2], @backingInt(rr.rtype), .big);
+        mem.writeInt(u16, f[2..4], @backingInt(rr.rclass), .big);
+        mem.writeInt(u32, f[4..8], rr.ttl, .big);
+        mem.writeInt(u16, f[8..10], std.math.cast(u16, rr.rdata.len) orelse return error.InvalidRDataLength, .big);
+        return f;
+    }
+
     pub fn covers(rr: ResourceRecord) ?RType {
         return if (rr.rtype == .rrsig) @fromBackingInt(mem.readInt(u16, rr.rdata[0..2], .big)) else null;
     }
@@ -1481,32 +1491,19 @@ pub const Serializer = struct {
 
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name.wire, true);
-        try self.writeU16(@backingInt(rr.rtype));
-        try self.writeU16(@backingInt(rr.rclass));
-        try self.writeU32(rr.ttl);
-        try self.writeRdata(rr.rtype, rr.rdata);
-    }
-
-    /// RDLENGTH, then the rdata: RFC 1035's names compressed when names
-    /// are, the rest as kept.
-    fn writeRdata(self: *Serializer, rtype: RType, rdata: []const u8) Error!void {
         const at = self.pos;
-        try self.writeU16(0);
-        const e = embedded(rtype);
-        if (self.names == null or e == null or e.?.spelling != .rfc1035) {
-            try self.writeSlice(rdata);
-        } else {
-            const skip = e.?.skip;
-            try self.writeSlice(rdata[0..skip]);
-            var p: usize = skip;
-            for (0..e.?.names) |_| {
-                const n = wireNameLen(rdata[p..]);
-                try self.writeWireName(rdata[p..][0..n]);
-                p += n;
-            }
-            try self.writeSlice(rdata[p..]);
+        try self.writeSlice(&try rr.fixed());
+        const e = (if (self.names != null) embedded(rr.rtype) else null) orelse return self.writeSlice(rr.rdata);
+        if (e.spelling != .rfc1035) return self.writeSlice(rr.rdata);
+        try self.writeSlice(rr.rdata[0..e.skip]);
+        var p: usize = e.skip;
+        for (0..e.names) |_| {
+            const n = wireNameLen(rr.rdata[p..]);
+            try self.writeWireName(rr.rdata[p..][0..n]);
+            p += n;
         }
-        mem.writeInt(u16, self.buf[at..][0..2], try castOrRDataErr(u16, self.pos - at - 2), .big);
+        try self.writeSlice(rr.rdata[p..]);
+        mem.writeInt(u16, self.buf[at + 8 ..][0..2], try castOrRDataErr(u16, self.pos - at - 10), .big);
     }
 
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {

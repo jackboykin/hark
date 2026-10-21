@@ -189,13 +189,10 @@ pub const SignedData = struct {
             // RFC 4035 §5.3.2: fewer labels than the owner's sign the wildcard.
             var wc: dns.Name.Buf = undefined;
             const owner = if (self.labels < rr.name.depth()) dns.Name.child(&wc, "*", rr.name.ancestor(self.labels)).? else rr.name;
-            var fixed: [10]u8 = undefined;
-            mem.writeInt(u16, fixed[0..2], @backingInt(rr.rtype), .big);
-            mem.writeInt(u16, fixed[2..4], @backingInt(rr.rclass), .big);
-            mem.writeInt(u32, fixed[4..8], self.original_ttl, .big);
-            mem.writeInt(u16, fixed[8..10], @intCast(rr.rdata.len), .big);
+            var signed = rr;
+            signed.ttl = self.original_ttl;
             hasher.update(owner.wire);
-            hasher.update(&fixed);
+            hasher.update(&(signed.fixed() catch unreachable));
             hasher.update(rr.rdata);
         }
     }
