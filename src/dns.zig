@@ -561,6 +561,12 @@ pub const OptRecord = struct {
     options: []const EdnsOption,
 };
 
+pub const Edns = struct {
+    udp_payload_size: u16,
+    version: u8,
+    do_bit: bool,
+};
+
 pub const Question = struct {
     name: Name,
     qtype: RType,
@@ -934,6 +940,22 @@ const Parser = struct {
         return .{ .labels = labels };
     }
 
+    fn skipName(self: *Parser) Error!void {
+        while (true) {
+            const len = try self.readU8();
+            switch (len & 0xC0) {
+                0x00 => if (len == 0) return else {
+                    _ = try self.readSlice(len);
+                },
+                0xC0 => {
+                    _ = try self.readU8();
+                    return;
+                },
+                else => return error.InvalidLabelType,
+            }
+        }
+    }
+
     /// An RRSIG keeps the week: binding levels it to its set (`dnssec.bindSets`).
     fn ttlCeiling(rtype: RType) u32 {
         return switch (rtype) {
@@ -1228,6 +1250,52 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
         .additionals = additionals,
         .opt = opt,
     };
+}
+
+pub const Query = struct {
+    header: Header,
+    question: ?Question,
+    edns: ?Edns,
+};
+
+/// The question may alias `bytes`. Records are framed, not read, but
+/// for the additional section's OPT: a pointer or rdata nothing reads
+/// is no error.
+pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
+    if (bytes.len < header_len) return error.EndOfData;
+    const hdr = Header.parse(bytes[0..12]);
+    var parser = Parser{ .msg = bytes, .pos = 12 };
+    if (hdr.qd_count > 1) return error.FormatError;
+    const question = if (hdr.qd_count == 1) try parser.parseQuestion(allocator) else null;
+
+    const before_additional = @as(usize, hdr.an_count) + hdr.ns_count;
+    var edns: ?Edns = null;
+    var opts: usize = 0;
+    for (0..before_additional + hdr.ar_count) |i| {
+        const owner = parser.pos;
+        try parser.skipName();
+        const rtype: RType = @fromBackingInt(try parser.readU16());
+        const class = try parser.readU16();
+        const ttl = try parser.readU32();
+        const rdata = try parser.readSlice(try parser.readU16());
+        if (rtype != .opt) continue;
+        // RFC 6891 §6.1.1: one OPT per message, whichever section holds it.
+        opts += 1;
+        if (opts > 1) return error.MultipleOptRecords;
+        if (i < before_additional) continue;
+        // §6.1.2: owned by the root.
+        var at = Parser{ .msg = bytes, .pos = owner };
+        if ((try at.parseName(allocator, .compressed)).labels.len != 0) return error.FormatError;
+        try frameEdnsOptions(rdata);
+        edns = .{ .udp_payload_size = class, .version = @intCast(ttl >> 16 & 0xFF), .do_bit = ttl & 0x8000 != 0 };
+    }
+    return .{ .header = hdr, .question = question, .edns = edns };
+}
+
+fn frameEdnsOptions(rdata: []const u8) Error!void {
+    var pos: usize = 0;
+    while (pos + 4 <= rdata.len) pos += 4 + @as(usize, mem.readInt(u16, rdata[pos + 2 ..][0..2], .big));
+    if (pos != rdata.len) return error.FormatError;
 }
 
 fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
@@ -1880,6 +1948,38 @@ test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     const wire = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\x00\x01\x00\x01" ++
         "\x01x\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00";
     try testing.expectError(error.FormatError, parseMessage(arena.allocator(), wire));
+}
+
+test "RFC 6891 §6.1.1: a query's OPT is the only one in the message, whatever section holds the other" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const opt = "\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00";
+    const header = "\x12\x34\x01\x00\x00\x01\x00\x01\x00\x00\x00\x01";
+    const wire = header ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ opt ++ opt;
+    try testing.expectError(error.MultipleOptRecords, readQuery(arena.allocator(), wire));
+}
+
+test "a query's other records are stepped, never built" {
+    // A 127-label question, then answers whose owner and rdata both point at it.
+    var buf: [max_message_len]u8 = undefined;
+    var n: usize = 12;
+    for (0..max_label_count) |_| {
+        @memcpy(buf[n..][0..2], "\x01a");
+        n += 2;
+    }
+    @memcpy(buf[n..][0..5], "\x00\x00\x0c\x00\x01");
+    n += 5;
+    const rr = "\xc0\x0c\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x02\xc0\x0c";
+    var answers: u16 = 0;
+    while (n + rr.len <= buf.len) : (answers += 1) {
+        @memcpy(buf[n..][0..rr.len], rr);
+        n += rr.len;
+    }
+    (Header{ .id = 1, .flags = mem.zeroes(Header.Flags), .qd_count = 1, .an_count = answers }).serialize(buf[0..12]);
+    var room: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&room);
+    const query = try readQuery(fixed.allocator(), buf[0..n]);
+    try testing.expectEqual(max_label_count, query.question.?.name.labels.len);
 }
 
 /// Single-allocation clone: labels slice and every label byte share one

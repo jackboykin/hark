@@ -187,8 +187,34 @@ fn pooledRR(s: *Smith) dns.ResourceRecord {
 
 const scrub_cfg: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
 
+/// The query reader agrees with the full parse on every message the
+/// latter accepts, but where an OPT outside the additional section
+/// makes a second (RFC 6891 §6.1.1).
+fn checkQuery(alloc: std.mem.Allocator, input: []const u8, msg: dns.Message) !void {
+    var opts: usize = @intFromBool(msg.opt != null);
+    for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities }) |sec| for (sec) |rr| {
+        if (rr.rtype == .opt) opts += 1;
+    };
+    const query = dns.readQuery(alloc, input) catch |err| {
+        if (err == error.MultipleOptRecords and opts > 1) return;
+        return error.QueryRefused;
+    };
+    if (opts > 1) return error.QueryAccepted;
+    if (msg.questions.len != @intFromBool(query.question != null)) return error.QueryDrift;
+    if (query.question) |q| {
+        const want = msg.questions[0];
+        if (!q.name.eqlExact(want.name) or q.qtype != want.qtype or q.qclass != want.qclass) return error.QueryDrift;
+    }
+    if ((msg.opt == null) != (query.edns == null)) return error.QueryDrift;
+    if (msg.opt) |o| {
+        const e = query.edns.?;
+        if (o.udp_payload_size != e.udp_payload_size or o.version != e.version or o.do_bit != e.do_bit) return error.QueryDrift;
+    }
+}
+
 fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     const msg = dns.parseMessage(alloc, input) catch return;
+    try checkQuery(alloc, input, msg);
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     for (msg.questions) |q| {
         try checkName(alloc, q.name);

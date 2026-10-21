@@ -37,16 +37,16 @@ pub const ResponseContext = struct {
     tcp_keepalive: ?u16 = null,
     rebinding: *const rebinding.Config = &rebinding.Config.off,
 
-    pub fn fromQuery(query: dns.Message, max_udp_payload: u16) ResponseContext {
-        const client_do = query.opt != null and query.opt.?.do_bit;
+    /// Borrows the question `validateQuery` made sure of.
+    pub fn fromQuery(query: *const dns.Query, max_udp_payload: u16) ResponseContext {
         return .{
             .query_id = query.header.id,
             .opcode = query.header.flags.opcode,
             .rd = query.header.flags.rd,
             .cd = query.header.flags.cd,
-            .questions = query.questions,
-            .client_edns = query.opt != null,
-            .client_do = client_do,
+            .questions = (&query.question.?)[0..1],
+            .client_edns = query.edns != null,
+            .client_do = query.edns != null and query.edns.?.do_bit,
             .max_udp_payload = max_udp_payload,
         };
     }
@@ -140,10 +140,10 @@ pub fn serializeErrorResponse(
     extended_rcode: u8,
     rd: bool,
     question: ?dns.Question,
-    client_opt: ?dns.OptRecord,
+    client: ?dns.Edns,
 ) []const u8 {
     // RFC 6891 §6.1.1: an OPT in the query obliges one in the response.
-    const opt: ?dns.OptRecord = if (client_opt) |o| .{
+    const opt: ?dns.OptRecord = if (client) |o| .{
         .udp_payload_size = dns.edns_udp_payload,
         .extended_rcode = extended_rcode,
         .version = 0,
@@ -174,17 +174,17 @@ pub fn serializeErrorResponse(
     return dns.serializeMessage(wire_buf, msg) catch unreachable;
 }
 
-pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
+pub fn validateQuery(query: dns.Query) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful
     // (UDP path drops silently before parse).
     if (query.header.flags.qr) return .{ .rcode = .format_error };
     if (query.header.flags.opcode != .query) return .{ .rcode = .not_implemented };
-    if (query.questions.len != 1) return .{ .rcode = .format_error };
+    const question = query.question orelse return .{ .rcode = .format_error };
     // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
     // version. Header RCODE bits = 0; OPT extended_rcode field = 1.
-    if (query.opt) |opt| if (opt.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
-    if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
+    if (query.edns) |edns| if (edns.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
+    if (question.qclass != .in) return .{ .rcode = .refused };
     return null;
 }
 
@@ -266,26 +266,22 @@ test "serializeErrorResponse produces valid DNS message" {
     try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
 }
 
+const test_query: dns.Query = .{
+    .header = .{ .id = 0, .flags = std.mem.zeroes(dns.Header.Flags), .qd_count = 1 },
+    .question = .{ .name = .{ .labels = &.{ "example", "com" } }, .qtype = .a, .qclass = .in },
+    .edns = null,
+};
+
 test "validateQuery rejects QR=1 (response posing as query)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var spoofed = try dns.buildQuery(arena.allocator(), 0, .{ .labels = &.{ "example", "com" } }, .a, .{});
+    var spoofed = test_query;
     spoofed.header.flags.qr = true;
 
     try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
 }
 
 test "validateQuery returns BADVERS for unsupported EDNS version" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var query = try dns.buildQuery(arena.allocator(), 0, .{ .labels = &.{ "example", "com" } }, .a, .{});
-    query.opt = .{
-        .udp_payload_size = 4096,
-        .extended_rcode = 0,
-        .version = 1,
-        .do_bit = false,
-        .options = &.{},
-    };
+    var query = test_query;
+    query.edns = .{ .udp_payload_size = 4096, .version = 1, .do_bit = false };
 
     const fail = validateQuery(query).?;
     try testing.expectEqual(dns.RCode.no_error, fail.rcode);
@@ -401,7 +397,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
 
 test "serializeErrorResponse answers an EDNS query with OPT (RFC 6891 §6.1.1)" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, null, .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 1, .do_bit = true, .options = &.{} });
+    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, null, .{ .udp_payload_size = 512, .version = 1, .do_bit = true });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

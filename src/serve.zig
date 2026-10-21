@@ -377,12 +377,12 @@ const Server = struct {
         if (reply == .udp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        const query = dns.parseMessage(arena, wire) catch {
+        const query = dns.readQuery(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
             return s.sendError(reply, id, .query, .format_error, 0, wire[2] & 1 != 0, null, null);
         };
-        if (response.validateQuery(query)) |v| return s.sendError(reply, query.header.id, query.header.flags.opcode, v.rcode, v.extended_rcode, query.header.flags.rd, if (query.questions.len == 1) query.questions[0] else null, query.opt);
-        const q = query.questions[0];
+        if (response.validateQuery(query)) |v| return s.sendError(reply, query.header.id, query.header.flags.opcode, v.rcode, v.extended_rcode, query.header.flags.rd, query.question, query.edns);
+        const q = query.question.?;
         const client = answer.Client.fromQuery(query);
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name = q.name.formatInto(&name_buf);
@@ -499,8 +499,8 @@ const Server = struct {
         }
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        const query = try dns.parseMessage(arena, p.wire);
-        const served = try s.shape(arena, p, query.questions[0], answer.Client.fromQuery(query)) orelse {
+        const query = try dns.readQuery(arena, p.wire);
+        const served = try s.shape(arena, p, query.question.?, answer.Client.fromQuery(query)) orelse {
             try s.reach(p.a.?);
             return s.link(i);
         };
@@ -607,8 +607,8 @@ const Server = struct {
         p.stale_tried = true;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        const query = try dns.parseMessage(arena, p.wire);
-        const q = query.questions[0];
+        const query = try dns.readQuery(arena, p.wire);
+        const q = query.question.?;
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
         s.clients.cache.miss += 1;
@@ -671,8 +671,8 @@ const Server = struct {
         return t.at_ns;
     }
 
-    fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64, leaves_ns: i64) !void {
-        const q = query.questions[0];
+    fn answered(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64, leaves_ns: i64) !void {
+        const q = query.question.?;
         _ = s.desk.derived(q, answer.Client.fromQuery(query), served) catch |err| {
             served.release(&s.g.store);
             return err;
@@ -726,26 +726,26 @@ const Server = struct {
     }
 
     /// Releases `served`.
-    fn send(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) void {
+    fn send(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) void {
         defer served.release(&s.g.store);
         const arena = s.scratch.allocator();
         var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
             .udp => blk: {
-                const claimed = if (query.opt) |o| o.udp_payload_size else dns.max_udp_payload;
+                const claimed = if (query.edns) |e| e.udp_payload_size else dns.max_udp_payload;
                 break :blk @min(@max(claimed, dns.max_udp_payload), s.cfg.max_udp_payload);
             },
             .tcp => dns.max_message_len,
         };
-        var ctx = response.ResponseContext.fromQuery(query, payload);
+        var ctx = response.ResponseContext.fromQuery(&query, payload);
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
         const wire = response.buildResponseWire(s.room(reply, &buf), ctx, served.reply(), arena) orelse
-            return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions[0], query.opt);
+            return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.question, query.edns);
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            const q = query.questions[0];
+            const q = query.question.?;
             const peer = switch (reply) {
                 .udp => |u| u.addr,
                 .tcp => |c| c.addr,
@@ -759,9 +759,9 @@ const Server = struct {
         s.write(reply, &buf, wire.len);
     }
 
-    fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, question: ?dns.Question, opt: ?dns.OptRecord) void {
+    fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, question: ?dns.Question, edns: ?dns.Edns) void {
         var buf: [2 + @as(usize, dns.max_udp_payload)]u8 = undefined;
-        const wire = response.serializeErrorResponse(s.room(reply, &buf)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, opt);
+        const wire = response.serializeErrorResponse(s.room(reply, &buf)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, edns);
         s.count(rcode, null);
         s.write(reply, &buf, wire.len);
     }

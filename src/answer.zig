@@ -19,8 +19,8 @@ pub const Client = struct {
     do_bit: bool = false,
     ad: bool = false,
 
-    pub fn fromQuery(m: dns.Message) Client {
-        return .{ .rd = m.header.flags.rd, .cd = m.header.flags.cd, .do_bit = m.opt != null and m.opt.?.do_bit, .ad = m.header.flags.ad };
+    pub fn fromQuery(q: dns.Query) Client {
+        return .{ .rd = q.header.flags.rd, .cd = q.header.flags.cd, .do_bit = q.edns != null and q.edns.?.do_bit, .ad = q.header.flags.ad };
     }
 };
 
