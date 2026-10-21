@@ -22,7 +22,7 @@ pub const Zone = struct {
 pub fn under(zones: []const Zone, name: dns.Name) ?*const Zone {
     var deepest: ?*const Zone = null;
     for (zones) |*z| {
-        if (deepest) |d| if (z.apex.labels.len <= d.apex.labels.len) continue;
+        if (deepest) |d| if (z.apex.depth() <= d.apex.depth()) continue;
         if (name.isSubdomainOf(z.apex)) deepest = z;
     }
     return if (deepest != null and special_use.fixed(name)) null else deepest;
@@ -31,8 +31,7 @@ pub fn under(zones: []const Zone, name: dns.Name) ?*const Zone {
 /// The stub zone a question belongs to: its name's, but for DS, which
 /// is its parent's data (RFC 4035 §2.4), the parent's.
 pub fn of(zones: []const Zone, name: dns.Name, qtype: dns.RType) ?*const Zone {
-    if (qtype != .ds or name.labels.len == 0) return under(zones, name);
-    return under(zones, .{ .labels = name.labels[1..] });
+    return under(zones, if (qtype == .ds) name.parent() orelse name else name);
 }
 
 pub const Scratch = struct {
@@ -69,6 +68,6 @@ pub fn run(g: *Graph, id: CellId) !void {
 }
 
 test "a stub zone never claims a name whose answer its RFC fixes" {
-    const zones = [_]Zone{.{ .apex = .{ .labels = &.{"arpa"} }, .servers = &.{} }};
-    try @import("std").testing.expectEqual(null, under(&zones, .{ .labels = &.{ "ipv4only", "arpa" } }));
+    const zones = [_]Zone{.{ .apex = .lit("arpa"), .servers = &.{} }};
+    try @import("std").testing.expectEqual(null, under(&zones, .lit("ipv4only.arpa")));
 }

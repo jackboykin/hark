@@ -447,7 +447,7 @@ fn parseStubZones(arena: Allocator, strs: []const []const u8) ConfigError![]stub
             return error.InvalidValue;
         }
         const apex = try parseZone(arena, fields[0]);
-        if (apex.labels.len == 0 or special_use.fixed(apex)) {
+        if (apex.isRoot() or special_use.fixed(apex)) {
             errLog("config: stub-zones cannot name '{s}'", .{fields[0]});
             return error.InvalidValue;
         }

@@ -84,9 +84,9 @@ pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns
     // §4.2.1).
     var zc = parent_zone;
     for (response.authorities) |rr| {
-        if (rr.rtype == .ns and target.isSubdomainOf(rr.name) and rr.name.labels.len > zc.labels.len) zc = rr.name;
+        if (rr.rtype == .ns and target.isSubdomainOf(rr.name) and rr.name.depth() > zc.depth()) zc = rr.name;
     }
-    if (zc.labels.len == parent_zone.labels.len) return null;
+    if (zc.depth() == parent_zone.depth()) return null;
 
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;

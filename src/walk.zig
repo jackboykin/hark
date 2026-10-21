@@ -36,7 +36,7 @@ pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport,
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
-    zone: dns.Name = .{ .labels = &.{} },
+    zone: dns.Name = .root,
     /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
     cut: OptionalCellId = .none,
     /// Every address gathered so far; a later gather appends what is new.
@@ -404,10 +404,9 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     // The axiom, re-derived after eviction.
-    if (name.labels.len == 0) return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
+    const parent_name = name.parent() orelse return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
     // Past minimising's reach only a referral places a cut.
     if (!probeable(g, name)) return g.fail(id, unplaced);
-    const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
     if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
         return g.fail(id, .unreachable_authority));
@@ -475,7 +474,7 @@ fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !bool {
 const unplaced: Failure = .{ .code = .no_reachable_authority, .text = "no probe placed the cut", .unplaced = true };
 
 fn probeable(g: *const Graph, name: dns.Name) bool {
-    return g.cfg.qmin and name.labels.len <= delegation.max_minimize_count;
+    return g.cfg.qmin and name.depth() <= delegation.max_minimize_count;
 }
 
 /// The cut a question for `qname` starts from, walking up from `from`:
@@ -484,9 +483,9 @@ fn probeable(g: *const Graph, name: dns.Name) bool {
 fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
     var kb: graph.KeyBuf = undefined;
     var n = from;
-    while (n.labels.len > 0) : (n = .{ .labels = n.labels[1..] }) {
+    while (n.parent()) |up| : (n = up) {
         if (g.holds(Key.of(&kb, .cut, n, .a))) return n;
-        if (probe and n.labels.len < qname.labels.len and probeable(g, n)) return n;
+        if (probe and n.depth() < qname.depth() and probeable(g, n)) return n;
     }
     return n;
 }
@@ -514,9 +513,9 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
 
 fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name, held: store.Entry } {
     var kb: graph.KeyBuf = undefined;
-    var i: usize = 1;
-    while (i + zone.labels.len < name.labels.len) : (i += 1) {
-        const n: dns.Name = .{ .labels = name.labels[i..] };
+    var up = name.parent();
+    while (up) |n| : (up = n.parent()) {
+        if (n.depth() <= zone.depth()) break;
         const h = g.held(Key.of(&kb, .rrset, n, .a)) orelse continue;
         const r: store.Rrset = .of(h.blob);
         if (r.kind == .nxdomain and named(r.target, n)) return .{ .at = n, .held = h };
@@ -641,7 +640,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 if (delegation.extractReferral(msg, name, zone)) |ref| {
                     // Each referral descends toward the name, so its depth
                     // bounds the walk.
-                    std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.labels.len > zone.labels.len);
+                    std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.depth() > zone.depth());
                     const cut = try absorbReferral(g, id, ref, msg, zone, s.ask.placed_until_ns);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
@@ -767,9 +766,9 @@ fn provable(b: *store.Blob) bool {
 /// did not judge.
 fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
     var kb: graph.KeyBuf = undefined;
-    var i: usize = 1;
-    while (i < name.labels.len) : (i += 1) {
-        const owner: dns.Name = .{ .labels = name.labels[i..] };
+    var up = name.parent();
+    while (up) |owner| : (up = owner.parent()) {
+        if (owner.isRoot()) break;
         const d = g.held(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
         const r: store.Rrset = .of(d.blob);
         if (r.kind != .answer) continue;
@@ -855,7 +854,7 @@ fn deepestDname(answers: []const dns.ResourceRecord, cur: dns.Name, zone: dns.Na
     var dname: ?dns.ResourceRecord = null;
     for (answers) |rr| {
         if (rr.rtype != .dname or !cur.isSubdomainOf(rr.name) or cur.eql(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
-        if (dname == null or rr.name.labels.len > dname.?.name.labels.len) dname = rr;
+        if (dname == null or rr.name.depth() > dname.?.name.depth()) dname = rr;
     }
     return dname;
 }
@@ -1161,9 +1160,9 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
 /// Servers hark is told rather than handed by a delegation: the root's
 /// hints, a stub zone's own.
 fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
-    if (zone.labels.len == 0) return g.cfg.root_hints;
+    if (zone.isRoot()) return g.cfg.root_hints;
     const z = stub.under(g.cfg.stub_zones, zone) orelse return null;
-    return if (z.apex.labels.len == zone.labels.len) z.servers else null;
+    return if (z.apex.depth() == zone.depth()) z.servers else null;
 }
 
 /// May `zone`'s servers hear the question? A stub zone's questions go to
