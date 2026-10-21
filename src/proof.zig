@@ -61,8 +61,9 @@ pub fn classifyDelegation(
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
     for (authorities) |rr| {
+        var next: dns.Name.Buf = undefined;
         if (rr.rtype == .nsec and rr.name.eql(child_zone))
-            return if (isInsecureDelegationProof(rr.rdata.nsec.type_bit_maps)) .unsigned else .unproven;
+            return if (isInsecureDelegationProof(rr.nsec(&next).type_bit_maps)) .unsigned else .unproven;
     }
 
     const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
@@ -73,7 +74,7 @@ pub fn classifyDelegation(
     for (authorities) |rr| {
         const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
         if (mem.eql(u8, &owner_hash, &child_hash))
-            return if (isInsecureDelegationProof(rr.rdata.nsec3.type_bit_maps)) .unsigned else .unproven;
+            return if (isInsecureDelegationProof(rr.nsec3().type_bit_maps)) .unsigned else .unproven;
     }
     // RFC 5155 §8.6: closest encloser, then an Opt-Out span over the next
     // closer. No wildcard step: delegations are never synthesized.
@@ -213,7 +214,7 @@ const nsec3_opt_out: u8 = 0x01;
 /// accusation, `0x03` read as Opt-Out-set hands over the weaker verdict.
 fn inChain(rr: dns.ResourceRecord, zone: dns.Name) bool {
     if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) return false;
-    return rr.rdata.nsec3.hash_algorithm == .sha1 and rr.rdata.nsec3.flags & ~nsec3_opt_out == 0;
+    return rr.nsec3().hash_algorithm == .sha1 and rr.nsec3().flags & ~nsec3_opt_out == 0;
 }
 
 /// Per-message NSEC/NSEC3 ceiling (Knot 5.7.1, Unbound NsecTrap). An honest
@@ -229,8 +230,8 @@ pub fn denialZone(authorities: []const dns.ResourceRecord, target: dns.Name) ?dn
     for (authorities) |rr| {
         const z = switch (rr.rtype) {
             .soa => rr.name,
-            .rrsig => switch (rr.rdata.rrsig.type_covered) {
-                .nsec, .nsec3 => rr.rdata.rrsig.signer_name,
+            .rrsig => switch (rr.rrsig().type_covered) {
+                .nsec, .nsec3 => rr.rrsig().signer_name,
                 else => continue,
             },
             else => continue,
@@ -420,21 +421,20 @@ fn validateNsecNegativeProof(
     var ent = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
+        var next: dns.Name.Buf = undefined;
+        const nsec = rr.nsec(&next);
         if (matching_nsec == null and rr.name.eql(qname)) matching_nsec = rr;
-        if (covering_nsec == null and
-            nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname))
-        {
-            covering_nsec = rr;
-        }
-        if (nsecProvesEnt(rr.name, rr.rdata.nsec, qname)) ent = true;
+        if (covering_nsec == null and nsecProvesNameNonexistence(rr.name, nsec, qname)) covering_nsec = rr;
+        if (nsecProvesEnt(rr.name, nsec, qname)) ent = true;
     }
+    var next: dns.Name.Buf = undefined;
 
     // NXDOMAIN requires both name denial AND wildcard denial at the closest
     // encloser. The CE is the longest label-suffix of qname that is also a
     // suffix of the covering NSEC's owner or next_domain_name.
     if (is_nxdomain) {
         const covering = covering_nsec orelse return .unchecked;
-        const ce = closestEncloser(qname, covering.name, covering.rdata.nsec.next_domain_name) orelse
+        const ce = closestEncloser(qname, covering.name, covering.nsec(&next).next_domain_name) orelse
             return .unchecked;
 
         // No separate CE-existence check: CE is by construction a label-
@@ -451,7 +451,8 @@ fn validateNsecNegativeProof(
         for (authorities) |rr| {
             if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
             if (rr.name.eql(wildcard)) return .bogus;
-            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) wildcard_denied = true;
+            var other: dns.Name.Buf = undefined;
+            if (nsecProvesNameNonexistence(rr.name, rr.nsec(&other), wildcard)) wildcard_denied = true;
         }
         return if (wildcard_denied) .secure else .unchecked;
     }
@@ -461,9 +462,9 @@ fn validateNsecNegativeProof(
         // Answered from the wrong side of its own cut: unusable, not
         // contradictory (RFC 6840 §4.1/§4.4). A parent-side NSEC owed us
         // a referral; a child-side one owed us nothing about DS.
-        if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
-            return .unchecked;
-        return if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype)) .bogus else .secure;
+        const types = rr.nsec(&next).type_bit_maps;
+        if (wrongSideOfCut(types, qname, qtype)) return .unchecked;
+        return if (bitmapContradictsNodata(types, qtype)) .bogus else .secure;
     }
 
     // ENT before wildcard (Unbound nsec_proves_nodata): every qmin step
@@ -471,7 +472,7 @@ fn validateNsecNegativeProof(
     if (ent) return .secure;
 
     const cov = covering_nsec orelse return .unchecked;
-    const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
+    const ce = closestEncloser(qname, cov.name, cov.nsec(&next).next_domain_name) orelse
         return .unchecked;
 
     var wc_buf: dns.Name.Buf = undefined;
@@ -479,20 +480,22 @@ fn validateNsecNegativeProof(
 
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
+        var other: dns.Name.Buf = undefined;
+        const nsec = rr.nsec(&other);
         if (rr.name.eql(wildcard)) {
             // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
             // A wildcard delegation's parent-side record denies
             // nothing (RFC 6840 §4.1).
-            if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
+            if (wrongSideOfCut(nsec.type_bit_maps, qname, qtype))
                 return .unchecked;
-            if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
+            if (bitmapContradictsNodata(nsec.type_bit_maps, qtype))
                 return .bogus;
             return .secure;
         }
         // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
         // A wildcard that is itself an ENT matches and owns nothing:
         // also NODATA.
-        if (nsecCovers(rr.name, rr.rdata.nsec, wildcard))
+        if (nsecCovers(rr.name, nsec, wildcard))
             return .secure;
     }
     return .unchecked;
@@ -514,7 +517,7 @@ fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nse
     var first: ?dns.Nsec3Data = null;
     for (authorities) |rr| {
         if (!inChain(rr, zone)) continue;
-        const n3 = rr.rdata.nsec3;
+        const n3 = rr.nsec3();
         if (first == null) first = n3;
         if (n3.iterations != first.?.iterations or !mem.eql(u8, n3.salt, first.?.salt)) return .{ .verdict = .bogus };
     }
@@ -556,7 +559,7 @@ fn nsec3ClosestEncloser(
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             if (!mem.eql(u8, &owner_hash, &ancestor_hash)) continue;
-            if (provesNothingBelowOwner(rr.rdata.nsec3.type_bit_maps)) return .{ .verdict = .unchecked };
+            if (provesNothingBelowOwner(rr.nsec3().type_bit_maps)) return .{ .verdict = .unchecked };
             return .{ .found = .{ .ce = ancestor, .next_closer_hash = below_hash } };
         }
         below_hash = ancestor_hash;
@@ -571,9 +574,9 @@ fn nsec3Cover(authorities: []const dns.ResourceRecord, zone: dns.Name, hash: *co
     var optout = false;
     for (authorities) |rr| {
         const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
-        if (!nsec3HashInRange(&owner_hash, rr.rdata.nsec3.next_hashed_owner, hash)) continue;
+        if (!nsec3HashInRange(&owner_hash, rr.nsec3().next_hashed_owner, hash)) continue;
         covered = true;
-        if (rr.rdata.nsec3.flags & nsec3_opt_out != 0) optout = true;
+        if (rr.nsec3().flags & nsec3_opt_out != 0) optout = true;
     }
     return if (covered) optout else null;
 }
@@ -606,7 +609,7 @@ pub const NoCloserMatch = union(enum) {
     pub fn restsOn(p: NoCloserMatch, rr: dns.ResourceRecord, zone: dns.Name) bool {
         return switch (p) {
             .nsec => |owner| rr.rtype == .nsec and rr.name.eql(owner),
-            .nsec3 => |nc| if (supportedNsec3OwnerHash(rr, zone)) |h| nsec3HashInRange(&h, rr.rdata.nsec3.next_hashed_owner, &nc) else false,
+            .nsec3 => |nc| if (supportedNsec3OwnerHash(rr, zone)) |h| nsec3HashInRange(&h, rr.nsec3().next_hashed_owner, &nc) else false,
             .verdict => false,
         };
     }
@@ -623,13 +626,15 @@ pub fn noCloserMatch(
     const ce = qname.ancestor(labels);
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
-        if (!nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) continue;
+        var next: dns.Name.Buf = undefined;
+        const nsec = rr.nsec(&next);
+        if (!nsecProvesNameNonexistence(rr.name, nsec, qname)) continue;
         // §5.3.4 asks for a cover of the next closer name; a cover of `qname`
         // whose closest encloser is `ce` is the same fact (both bounds fall
         // outside `ce`'s subtree on `qname`'s side, so the next closer sits
         // between them too). A cover bounded below `ce` instead proves a
         // deeper name exists: wrong wildcard.
-        const nsec_ce = closestEncloser(qname, rr.name, rr.rdata.nsec.next_domain_name) orelse continue;
+        const nsec_ce = closestEncloser(qname, rr.name, nsec.next_domain_name) orelse continue;
         if (nsec_ce.eql(ce)) return .{ .nsec = rr.name };
     }
 
@@ -664,7 +669,7 @@ fn validateNsec3NegativeProof(
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
-                const nsec3 = rr.rdata.nsec3;
+                const nsec3 = rr.nsec3();
                 // Same side-of-cut rule as the NSEC arm (RFC 6840 §4.1/§4.4).
                 if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
                 return if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) .bogus else .secure;
@@ -702,7 +707,7 @@ fn validateNsec3NegativeProof(
     var wc_contradicted = false;
     for (authorities) |rr| {
         const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
-        const nsec3 = rr.rdata.nsec3;
+        const nsec3 = rr.nsec3();
 
         // Every record, not the first: spans from two chain versions can
         // both verify, and the attacker orders them.

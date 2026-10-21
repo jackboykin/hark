@@ -891,9 +891,10 @@ test "minimal hark scenario" {
     try testing.expect(e.match.opcode and e.match.qname and !e.match.qtype);
     try testing.expect(e.flags.qr and e.flags.aa and e.flags.rcode == .no_error);
     try testing.expectEqual(2, e.answers.len);
-    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, e.answers[0].rdata.a);
-    try testing.expectEqualStrings("hello world", e.answers[1].rdata.txt.strings[0]);
-    try testing.expectEqualStrings("plain", e.answers[1].rdata.txt.strings[1]);
+    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, e.answers[0].a());
+    var strings = e.answers[1].txt();
+    try testing.expectEqualStrings("hello world", strings.next().?);
+    try testing.expectEqualStrings("plain", strings.next().?);
     try testing.expectEqual(4, s.steps.len);
     try testing.expectEqual(Step.Kind.query, s.steps[0].kind);
     try testing.expect(s.steps[0].entry.?.flags.rd);

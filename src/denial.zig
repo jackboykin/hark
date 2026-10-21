@@ -33,7 +33,8 @@ const Span = struct {
     }
 
     fn init(gpa: std.mem.Allocator, rr: RR, expires_ns: i64, judged: *store.Blob) !Span {
-        const n = rr.rdata.nsec;
+        var folded: dns.Name.Buf = undefined;
+        const n = rr.nsec(&folded);
         const owner = rr.name.wire;
         const next = n.next_domain_name.wire;
         const buf = try gpa.alloc(u8, owner.len + next.len + n.type_bit_maps.len);
@@ -210,13 +211,15 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
 /// Of the two NSECs at a cut, the child's is the one at its own apex,
 /// whatever either bitmap claims.
 fn delegated(rr: RR, zone: dns.Name) bool {
-    return !rr.name.eql(zone) and dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .ns);
+    var next: dns.Name.Buf = undefined;
+    return !rr.name.eql(zone) and dns.typeBitmapContains(rr.nsec(&next).type_bit_maps, .ns);
 }
 
 /// A range of one name (`owner NSEC \000.owner`, "black lies") denies
 /// nothing but types at its owner.
 fn minimal(rr: RR) bool {
-    const next = rr.rdata.nsec.next_domain_name;
+    var buf: dns.Name.Buf = undefined;
+    const next = rr.nsec(&buf).next_domain_name;
     const up = next.parent() orelse return false;
     return std.mem.eql(u8, next.leaf(), "\x00") and up.eql(rr.name);
 }
@@ -295,7 +298,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     reply.ttl = @min(walk.replyTtl(reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
     // RFC 2308 §5: the SOA's minimum may end it before its proofs do.
     const minimum = for (soa.answers) |rr| {
-        if (rr.rtype == .soa) break rr.rdata.soa.minimum;
+        if (rr.rtype == .soa) break rr.soa().minimum;
     } else 0;
     try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);

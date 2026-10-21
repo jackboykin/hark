@@ -305,7 +305,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const r = rs.state.fact.rrset;
     if (r.kind != .answer) return failChain(g, id, s.rrset.unwrap().?);
     var ds_data: std.ArrayList(dns.DsData) = .empty;
-    for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
+    for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.ds());
     const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -418,8 +418,8 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         if (c.slot < s.next) continue;
         const fault: ?Fault = f: switch (c.is) {
             .synthesised => |x| {
-                const target = try dns.substituteSuffix(g.scratch.allocator(), c.owner, x.dname.name, x.dname.rdata.dname) orelse break :f .bogus;
-                break :f if (target.eql(x.cname.rdata.cname)) null else .bogus;
+                const target = try dns.substituteSuffix(g.scratch.allocator(), c.owner, x.dname.name, x.dname.dname()) orelse break :f .bogus;
+                break :f if (target.eql(x.cname.cname())) null else .bogus;
             },
             .rrset, .proof, .denial => {
                 const signer = signerOf(r, c, within, s.below) orelse break :f .bogus;
@@ -650,7 +650,7 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const 
     while (it.next()) |c| {
         if (c.is != .proof) break;
         if (s.proved[c.slot] != signer.depth() or !c.owner.isSubdomainOf(signer)) continue;
-        for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rdata.rrsig.signer_name.eql(signer)) {
+        for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rrsig().signer_name.eql(signer)) {
             try keep.append(a, rr);
             try until.append(a, s.proved_until[c.slot]);
         };
@@ -698,7 +698,7 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     }
     var ttl: u32 = std.math.maxInt(u32);
     var proofs: std.ArrayList(RR) = .empty;
-    for (msg.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
+    for (msg.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype) {
         .nsec, .nsec3 => {
             try proofs.append(g.scratch.allocator(), rr);
             if (rr.rtype != .rrsig) ttl = @min(ttl, rr.ttl);

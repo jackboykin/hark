@@ -343,6 +343,17 @@ pub const SoaData = struct {
 
 pub const TxtData = struct {
     strings: []const []const u8,
+
+    pub const Strings = struct {
+        strings: []const []const u8,
+        i: usize = 0,
+
+        pub fn next(s: *Strings) ?[]const u8 {
+            if (s.i == s.strings.len) return null;
+            s.i += 1;
+            return s.strings[s.i - 1];
+        }
+    };
 };
 
 // ── DNSSEC types (RFC 4034, 5155) ──────────────────────────────────
@@ -578,6 +589,70 @@ pub const ResourceRecord = struct {
     rclass: RClass,
     ttl: u32,
     rdata: RData,
+
+    // Each reads the rdata of the type it is named for.
+
+    pub fn a(rr: ResourceRecord) [4]u8 {
+        return rr.rdata.a;
+    }
+
+    pub fn aaaa(rr: ResourceRecord) [16]u8 {
+        return rr.rdata.aaaa;
+    }
+
+    pub fn ns(rr: ResourceRecord) Name {
+        return rr.rdata.ns;
+    }
+
+    pub fn cname(rr: ResourceRecord) Name {
+        return rr.rdata.cname;
+    }
+
+    pub fn dname(rr: ResourceRecord) Name {
+        return rr.rdata.dname;
+    }
+
+    pub fn ptr(rr: ResourceRecord) Name {
+        return rr.rdata.ptr;
+    }
+
+    pub fn mx(rr: ResourceRecord) MxData {
+        return rr.rdata.mx;
+    }
+
+    pub fn soa(rr: ResourceRecord) SoaData {
+        return rr.rdata.soa;
+    }
+
+    pub fn txt(rr: ResourceRecord) TxtData.Strings {
+        return .{ .strings = rr.rdata.txt.strings };
+    }
+
+    pub fn rrsig(rr: ResourceRecord) RrsigData {
+        return rr.rdata.rrsig;
+    }
+
+    pub fn dnskey(rr: ResourceRecord) DnskeyData {
+        return rr.rdata.dnskey;
+    }
+
+    pub fn ds(rr: ResourceRecord) DsData {
+        return rr.rdata.ds;
+    }
+
+    /// The next name folded, into `buf` when it was signed with capitals.
+    pub fn nsec(rr: ResourceRecord, buf: *Name.Buf) NsecData {
+        _ = buf;
+        return rr.rdata.nsec;
+    }
+
+    pub fn nsec3(rr: ResourceRecord) Nsec3Data {
+        return rr.rdata.nsec3;
+    }
+
+    pub fn covers(rr: ResourceRecord) ?RType {
+        return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else null;
+    }
 };
 
 /// A record as the store keeps it: the owner uncompressed, then type,

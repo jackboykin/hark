@@ -109,7 +109,7 @@ pub const Signer = struct {
         var out: std.ArrayList(RR) = .empty;
         try out.appendSlice(self.arena, rrs);
         // Key tag 0: a placeholder DS.
-        for (out.items) |*rr| if (rr.rtype == .ds and rr.rdata.ds.key_tag == 0) {
+        for (out.items) |*rr| if (rr.rtype == .ds and rr.ds().key_tag == 0) {
             var zone = rr.name;
             for (ds_from) |d| if (d.owner.eql(rr.name)) {
                 zone = d.zone;
@@ -137,7 +137,7 @@ pub const Signer = struct {
             // (123-251, RFC 6014 §4), is stuffing, not the set's: the set
             // is still signed.
             var covered = false;
-            for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and o.rdata.rrsig.signer_name.eql(key.zone) and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
+            for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rrsig().type_covered == head.rtype and o.rrsig().signer_name.eql(key.zone) and !reservedAlgorithm(@backingInt(o.rrsig().algorithm)));
             if (covered) continue;
             var set: [rrsig.SignedData.max_entries]RR = undefined;
             var n: usize = 0;

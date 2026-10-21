@@ -195,6 +195,6 @@ test "synthesize localhost A produces 127.0.0.1" {
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     try testing.expectEqual(dns.RCode.no_error, msg.rcode);
     try testing.expect(!msg.aa);
-    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].a());
     try testing.expectEqualStrings("localhost", msg.answers[0].name.leaf());
 }

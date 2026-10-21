@@ -116,7 +116,7 @@ pub fn validateDnskeyRrset(
     var tried: usize = 0;
     for (dnskey_records) |rrsig_rr| {
         if (rrsig_rr.rtype != .rrsig) continue;
-        const sig = rrsig_rr.rdata.rrsig;
+        const sig = rrsig_rr.rrsig();
         if (sig.type_covered != .dnskey) continue;
         if (pq and sig.algorithm != .mldsa44) continue;
         if (!sig.signer_name.eql(zone_name) or !usable(sig, now_u32)) continue;
@@ -137,7 +137,7 @@ fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
 /// ML-DSA-44's 2420 B signatures outgrow a 1232 B UDP payload. Transport
 /// only: the zone signs with it whatever digest its DS names.
 pub fn dsExceedsUdp(rrs: []const dns.ResourceRecord) bool {
-    for (rrs) |rr| if (rr.rtype == .ds and rr.rdata.ds.algorithm == .mldsa44) return true;
+    for (rrs) |rr| if (rr.rtype == .ds and rr.ds().algorithm == .mldsa44) return true;
     return false;
 }
 
@@ -159,7 +159,7 @@ fn digestSupported(digest_type: dns.DigestType) bool {
 pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord, ds_records: []const dns.DsData) ![]const dns.ResourceRecord {
     if (!hasMlDsaDs(ds_records)) return records;
     var kept: std.ArrayList(dns.ResourceRecord) = .empty;
-    for (records) |rr| if (rr.rtype == .dnskey and rr.rdata.dnskey.algorithm == .mldsa44) try kept.append(allocator, rr);
+    for (records) |rr| if (rr.rtype == .dnskey and rr.dnskey().algorithm == .mldsa44) try kept.append(allocator, rr);
     return kept.items;
 }
 
@@ -193,7 +193,7 @@ fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) rrsig.
 pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     for (records) |rr| {
         if (rr.rtype != .ds) continue;
-        const ds = rr.rdata.ds;
+        const ds = rr.ds();
         if (rrsig.isSupportedAlgorithm(ds.algorithm) and digestSupported(ds.digest_type)) return true;
     }
     return false;
@@ -214,10 +214,10 @@ const Keyset = struct {
         for (records) |rr| {
             if (rr.rtype != .dnskey) continue;
             k.zone = k.zone orelse rr.name;
-            if (!isValidZoneKey(rr.rdata.dnskey)) continue;
+            if (!isValidZoneKey(rr.dnskey())) continue;
             if (k.len == k.keys.len) return false;
-            k.keys[k.len] = rr.rdata.dnskey;
-            k.tags[k.len] = rrsig.keyTag(rr.rdata.dnskey);
+            k.keys[k.len] = rr.dnskey();
+            k.tags[k.len] = rrsig.keyTag(rr.dnskey());
             k.len += 1;
         }
         return true;
@@ -245,8 +245,8 @@ fn rrsetVerifiesWithAnyKey(
 pub fn signerBelow(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType, below: usize) ?dns.Name {
     var best: ?dns.Name = null;
     for (rrs) |rr| {
-        if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != rtype or !rr.name.eql(owner)) continue;
-        const z = rr.rdata.rrsig.signer_name;
+        if (rr.rtype != .rrsig or rr.rrsig().type_covered != rtype or !rr.name.eql(owner)) continue;
+        const z = rr.rrsig().signer_name;
         if (z.depth() < below and (best == null or z.depth() > best.?.depth())) best = z;
     }
     return best;
@@ -254,7 +254,7 @@ pub fn signerBelow(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.
 
 pub fn signedBy(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType, signer: dns.Name) bool {
     for (rrs) |rr| {
-        if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == rtype and rr.name.eql(owner) and rr.rdata.rrsig.signer_name.eql(signer)) return true;
+        if (rr.rtype == .rrsig and rr.rrsig().type_covered == rtype and rr.name.eql(owner) and rr.rrsig().signer_name.eql(signer)) return true;
     }
     return false;
 }
@@ -290,7 +290,7 @@ pub const Weighed = struct {
             w.at += 1;
             const rr = w.rrs[i];
             if (rr.rtype != .rrsig) continue;
-            const sig = rr.rdata.rrsig;
+            const sig = rr.rrsig();
             if (sig.type_covered != w.rtype or !rr.name.eql(w.owner)) continue;
             if (w.n == max_sigs_per_set or !sig.signer_name.eql(w.zone) or !usable(sig, w.now) or
                 (w.unexpanded and sig.labels != rrsig.signedLabels(w.owner)))
@@ -351,7 +351,7 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bo
             const apex = proof.deepestApex(src[at[i]].name, covers(src[at[i]]));
             var ttl: u32 = std.math.maxInt(u32);
             for (at[i..j]) |k| {
-                if (src[k].rtype == .rrsig and !apex.isSubdomainOf(src[k].rdata.rrsig.signer_name)) continue;
+                if (src[k].rtype == .rrsig and !apex.isSubdomainOf(src[k].rrsig().signer_name)) continue;
                 ttl = @min(ttl, src[k].ttl);
                 at[hi] = k;
                 hi += 1;
@@ -387,7 +387,7 @@ pub fn setAt(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType)
 }
 
 pub fn covers(rr: dns.ResourceRecord) dns.RType {
-    return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
+    return if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype;
 }
 
 /// Validate the RRset at (`owner`, `covered_type`), trying every covering
@@ -426,7 +426,7 @@ pub fn validateRrset(
 
     var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32, .unexpanded = unexpanded };
     while (it.next()) |i| {
-        const sig = records[i].rdata.rrsig;
+        const sig = records[i].rrsig();
         if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) {
             while (it.next()) |_| {}
             return .{ .sig = sig, .unweighed = it.passed };
@@ -480,7 +480,7 @@ pub fn verifyAuthorityProofSigs(
 
         var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32, .unexpanded = true };
         const sig = while (it.next()) |j| {
-            const sig = authorities[j].rdata.rrsig;
+            const sig = authorities[j].rrsig();
             if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return null) break sig;
         } else return null;
         cap = cap.meet(.of(sig, now_u32));
@@ -1008,7 +1008,7 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     try testing.expectEqual(dual.len, (try usableKeys(arena.allocator(), &dual, &.{ed_ds})).len);
     const kept = try usableKeys(arena.allocator(), &dual, &.{ ed_ds, pq_ds });
     try testing.expectEqual(@as(usize, 1), kept.len);
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].rdata.dnskey.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].dnskey().algorithm);
 
     // No ML-DSA-44 DS: the key's presence in the DNSKEY RRset alone demands
     // nothing (RFC 6840 §5.11 MUST NOT; RFC 6781 §4.1.4 liberal rollover).

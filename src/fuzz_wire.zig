@@ -132,7 +132,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
                 if (sigs > 0) return error.DataAfterSignature;
                 continue;
             }
-            if (!apex.isSubdomainOf(rr.rdata.rrsig.signer_name)) return error.SignerHoldsNoSet;
+            if (!apex.isSubdomainOf(rr.rrsig().signer_name)) return error.SignerHoldsNoSet;
             sigs += 1;
         }
         var offered: usize = 0;
@@ -143,7 +143,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
                 floor = @min(floor, in.ttl);
                 continue;
             }
-            if (!apex.isSubdomainOf(in.rdata.rrsig.signer_name)) continue;
+            if (!apex.isSubdomainOf(in.rrsig().signer_name)) continue;
             offered += 1;
             floor = @min(floor, in.ttl);
         };
@@ -221,30 +221,35 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     }
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities, msg.additionals }) |sec| for (sec) |rr| {
         try checkName(alloc, rr.name);
-        switch (rr.rdata) {
-            .ns, .cname, .dname, .ptr => |n| try checkName(alloc, n),
-            .rrsig => |x| try checkName(alloc, x.signer_name),
-            .named => |x| for (x.names) |n| try checkName(alloc, n),
-            .mx => |x| try checkName(alloc, x.exchange),
-            .soa => |x| {
-                try checkName(alloc, x.mname);
-                try checkName(alloc, x.rname);
+        switch (rr.rtype) {
+            .ns => try checkName(alloc, rr.ns()),
+            .cname => try checkName(alloc, rr.cname()),
+            .dname => try checkName(alloc, rr.dname()),
+            .ptr => try checkName(alloc, rr.ptr()),
+            .rrsig => try checkName(alloc, rr.rrsig().signer_name),
+            .mx => try checkName(alloc, rr.mx().exchange),
+            .soa => {
+                try checkName(alloc, rr.soa().mname);
+                try checkName(alloc, rr.soa().rname);
             },
-            .nsec => |x| {
+            .nsec => {
+                var next: dns.Name.Buf = undefined;
+                const x = rr.nsec(&next);
                 try checkName(alloc, x.next_domain_name);
                 for (types) |t| _ = dns.typeBitmapContains(x.type_bit_maps, @fromBackingInt(@intCast(t)));
             },
-            .nsec3 => |x| {
+            .nsec3 => {
+                const x = rr.nsec3();
                 for (types) |t| _ = dns.typeBitmapContains(x.type_bit_maps, @fromBackingInt(@intCast(t)));
                 var eb: [256]u8 = undefined;
                 if (x.next_hashed_owner.len <= 40) _ = proof.base32HexEncode(&eb, x.next_hashed_owner);
             },
-            else => {},
+            else => if (rr.rdata == .named) for (rr.rdata.named.names) |n| try checkName(alloc, n),
         }
         var lb: dns.Name.Buf = undefined;
         if (dns.Name.child(&lb, "*", rr.name)) |wn| _ = wn.formatInto(&buf);
-        for (msg.answers) |o| if (o.rdata == .dname and rr.name.isSubdomainOf(o.name)) {
-            if (try dns.substituteSuffix(alloc, rr.name, o.name, o.rdata.dname)) |sub| _ = sub.formatInto(&buf);
+        for (msg.answers) |o| if (o.rtype == .dname and rr.name.isSubdomainOf(o.name)) {
+            if (try dns.substituteSuffix(alloc, rr.name, o.name, o.dname())) |sub| _ = sub.formatInto(&buf);
         };
     };
 

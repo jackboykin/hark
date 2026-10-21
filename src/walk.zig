@@ -678,9 +678,9 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     const a = g.scratch.allocator();
     const kept = try a.alloc(bool, reply.authorities.len);
     @memset(kept, false);
-    for (set) |sig| if (sig.rtype == .rrsig and sig.rdata.rrsig.labels < rrsig.signedLabels(name)) {
-        const zone = sig.rdata.rrsig.signer_name;
-        const p = proof.noCloserMatch(reply.authorities, name, sig.rdata.rrsig.labels, zone, &g.payer.validation);
+    for (set) |sig| if (sig.rtype == .rrsig and sig.rrsig().labels < rrsig.signedLabels(name)) {
+        const zone = sig.rrsig().signer_name;
+        const p = proof.noCloserMatch(reply.authorities, name, sig.rrsig().labels, zone, &g.payer.validation);
         // A hash the budget refused chose no proof, and an alias without
         // its own is no fact.
         if (p == .verdict and g.payer.validation.stopped != null) return;
@@ -697,7 +697,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .aa = reply.aa,
         .answers = set,
         .authorities = proofs.items,
-        .target = first.rdata.cname,
+        .target = first.cname(),
         .zone = reply.zone,
         .stored_ns = reply.stored_ns,
     };
@@ -779,7 +779,7 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     const dname = dnameAt(d.answers, g.cell(did).name).?;
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     try keep.appendSlice(g.scratch.allocator(), d.answers);
-    if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.rdata.dname)) |target| {
+    if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.dname())) |target| {
         try keep.append(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
         return .{ .kind = .alias, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
     }
@@ -896,7 +896,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
                 answered = true;
                 if (looped and dnssec.covers(rr) == .dname) continue;
                 try keep.append(g.scratch.allocator(), rr);
-                if (rr.rtype == .cname) asked_alias = rr.rdata.cname;
+                if (rr.rtype == .cname) asked_alias = rr.cname();
             }
         }
         if (answered) {
@@ -917,7 +917,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         }
         if (dname) |d| {
             try keepDname(g, &keep, msg.answers, d);
-            const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
+            const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.dname()) orelse {
                 overflow = true;
                 break;
             };
@@ -928,10 +928,10 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         try keepSigs(g, &keep, here, cur, .cname);
         if (qtype == .cname) {
             answered = true;
-            asked_alias = c.rdata.cname;
+            asked_alias = c.cname();
             break;
         }
-        cur = c.rdata.cname;
+        cur = c.cname();
     }
     const yx = msg.header.flags.rcode == .yx_domain;
     const left = !overflow and !answered and hops > 0 and !speaksFor(g, zone, cur);
@@ -977,22 +977,22 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
     const zone = if (negative) proof.denialZone(rrs, reply.target) else null;
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
-    for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rdata.rrsig.signer_name);
+    for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rrsig().labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rrsig().signer_name);
     // A denial's SOA, and the signatures over it, go out with the denial's
     // life (RFC 2308 §3), whatever TTL the server sent.
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
-        life = @min(rr.ttl, rr.rdata.soa.minimum, dns.max_negative_ttl);
+        life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);
     };
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
-    for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
+    for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype) {
         .soa => if (zone) |z| if (rr.name.eql(z)) {
             var levelled = rr;
             levelled.ttl = @min(rr.ttl, life);
             keep.appendAssumeCapacity(levelled);
         },
         .nsec, .nsec3 => for (signers.items) |sn| {
-            const signed = if (rr.rtype == .rrsig) rr.rdata.rrsig.signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
+            const signed = if (rr.rtype == .rrsig) rr.rrsig().signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
             if (signed) {
                 keep.appendAssumeCapacity(rr);
                 break;
@@ -1017,7 +1017,7 @@ fn speaksFor(g: *const Graph, zone: dns.Name, name: dns.Name) bool {
 }
 
 fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
-    for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
+    for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rrsig().type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
 }
 
 /// The answer's shortest TTL, signatures included (RFC 4034 §3), capped by
@@ -1036,7 +1036,7 @@ pub fn replyTtl(reply: Reply) u32 {
             if (reply.aa) for (reply.authorities) |rr| {
                 if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
                 if (!rr.name.isSubdomainOf(reply.zone) and !dnssec.signedBy(reply.authorities, rr.name, .soa, rr.name)) continue;
-                ttl = @min(ttl, rr.ttl, rr.rdata.soa.minimum);
+                ttl = @min(ttl, rr.ttl, rr.soa().minimum);
                 found = true;
             };
             ttl = if (found) @min(ttl, dns.max_negative_ttl) else 0;

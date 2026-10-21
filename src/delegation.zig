@@ -50,8 +50,8 @@ pub const AddrPolicy = struct {
 
     pub fn address(policy: AddrPolicy, rr: dns.ResourceRecord) ?na.AddressKey {
         return switch (rr.rtype) {
-            .a => .ip4(rr.rdata.a, policy.upstream_port),
-            .aaaa => .ip6(rr.rdata.aaaa, policy.upstream_port),
+            .a => .ip4(rr.a(), policy.upstream_port),
+            .aaaa => .ip6(rr.aaaa(), policy.upstream_port),
             else => null,
         };
     }
@@ -92,7 +92,7 @@ pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns
     var ns_names: [max_servers_per_level]dns.Name = undefined;
     for (response.authorities) |rr| {
         if (rr.rtype == .ns and rr.name.eql(zc) and ns_count < max_servers_per_level) {
-            ns_names[ns_count] = rr.rdata.ns;
+            ns_names[ns_count] = rr.ns();
             ns_count += 1;
         }
     }

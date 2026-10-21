@@ -168,10 +168,11 @@ const Zone = struct {
         for (z.recs[0..z.n_recs], 0..) |rr, i| {
             if (z.nsec3) {
                 const owner = &z.hashes[i];
-                const next = rr.rdata.nsec3.next_hashed_owner;
+                const next = rr.nsec3().next_hashed_owner;
                 if (std.mem.eql(u8, owner, &h) or between(std.mem.order(u8, owner, &h), std.mem.order(u8, &h, next), std.mem.order(u8, owner, next))) return i;
             } else {
-                const next = rr.rdata.nsec.next_domain_name;
+                var buf: dns.Name.Buf = undefined;
+                const next = rr.nsec(&buf).next_domain_name;
                 if (rr.name.eql(name) or between(rr.name.order(name), name.order(next), rr.name.order(next))) return i;
             }
         }
@@ -180,7 +181,7 @@ const Zone = struct {
 
     fn coverer(z: *const Zone, name: dns.Name) ?dns.Nsec3Data {
         if (!z.nsec3 or z.inChain(name)) return null;
-        return z.recs[z.relevant(name)].rdata.nsec3;
+        return z.recs[z.relevant(name)].nsec3();
     }
 
     /// The only honest source of an `.insecure` verdict.
@@ -354,9 +355,10 @@ fn dump(z: *const Zone, auth: []const dns.ResourceRecord, qname: dns.Name, qtype
     for (z.entries[0..z.n]) |*e| std.debug.print("  {s} {any}\n", .{ e.name().formatInto(&b), e.types });
     for (z.recs[0..z.n_recs], 0..) |rr, i| {
         std.debug.print("  rec{d} {s} ", .{ i, rr.name.formatInto(&b) });
-        switch (rr.rdata) {
-            .nsec => |x| std.debug.print("-> {s} bitmap={x}\n", .{ x.next_domain_name.formatInto(&b), x.type_bit_maps }),
-            .nsec3 => |x| std.debug.print("-> {x} flags={d} bitmap={x}\n", .{ x.next_hashed_owner, x.flags, x.type_bit_maps }),
+        var next: dns.Name.Buf = undefined;
+        switch (rr.rtype) {
+            .nsec => std.debug.print("-> {s} bitmap={x}\n", .{ rr.nsec(&next).next_domain_name.formatInto(&b), rr.nsec(&next).type_bit_maps }),
+            .nsec3 => std.debug.print("-> {x} flags={d} bitmap={x}\n", .{ rr.nsec3().next_hashed_owner, rr.nsec3().flags, rr.nsec3().type_bit_maps }),
             else => {},
         }
     }
