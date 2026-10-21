@@ -387,9 +387,7 @@ const Server = struct {
         if (response.validateQuery(query)) |v| return s.sendError(reply, query.header.id, query.header.flags.opcode, v.rcode, v.extended_rcode, query.header.flags.rd, query.question, query.edns);
         const q = query.question.?;
         const client = answer.Client.fromQuery(query);
-        var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const name = q.name.formatInto(&name_buf);
-        if (build_options.testing_enabled) if (advanceClockSeconds(dns.stripTrailingDot(name))) |secs| {
+        if (build_options.testing_enabled) if (advanceClockSeconds(q.name)) |secs| {
             monotonic.advanceTestClock(secs);
             return s.send(reply, query, .{ .rcode = .no_error, .question = q, .cacheable = false }, s.e.now_ns);
         };
@@ -1078,9 +1076,7 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
 }
 
 /// `_advance-clock.<seconds>.testharness.invalid`, the harness's clock jump.
-fn advanceClockSeconds(name: []const u8) ?i64 {
-    const prefix = "_advance-clock.";
-    const suffix = ".testharness.invalid";
-    if (!mem.startsWith(u8, name, prefix) or !mem.endsWith(u8, name, suffix)) return null;
-    return std.fmt.parseInt(i64, name[prefix.len .. name.len - suffix.len], 10) catch null;
+fn advanceClockSeconds(name: dns.Name) ?i64 {
+    if (name.depth() != 4 or !mem.eql(u8, name.leaf(), "_advance-clock") or !name.isSubdomainOf(.lit("testharness.invalid"))) return null;
+    return std.fmt.parseInt(i64, name.parent().?.leaf(), 10) catch null;
 }
