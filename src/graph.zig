@@ -101,20 +101,21 @@ pub const Edge = struct {
 /// alone: the child's answers there (RFC 4035 §5.3.2). Never a cell.
 pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
 
-/// Names are keyed by presentation form (`Name.formatInto`), which is
-/// injective.
-pub const KeyBuf = [dns.max_dotted_len + 1]u8;
-
 pub const Key = struct {
     kind: Kind,
     rtype: dns.RType,
+    /// The name's wire bytes; none for an exchange.
     name: []const u8,
     /// `name`'s, taken once: every key at the name mixes its own from it.
     name_hash: u32,
 
-    /// Borrows `buf`: whatever keeps a key dupes its name (`newCell`, `remember`).
-    pub fn of(buf: *KeyBuf, kind: Kind, name: dns.Name, rtype: dns.RType) Key {
-        return .init(kind, name.formatInto(buf), rtype);
+    /// Borrows `name`: whatever keeps a key dupes it (`newCell`, `remember`).
+    pub fn of(kind: Kind, name: dns.Name, rtype: dns.RType) Key {
+        return .init(kind, name.wire, rtype);
+    }
+
+    pub fn shown(k: Key, buf: *[dns.max_dotted_len + 1]u8) []const u8 {
+        return if (k.name.len == 0) "" else dns.Name.of(k.name).formatInto(buf);
     }
 
     pub fn init(kind: Kind, name: []const u8, rtype: dns.RType) Key {
@@ -643,7 +644,7 @@ pub const Graph = struct {
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
         if (cfg.trust_anchors != null and !forgoes) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
-        _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .root } }, std.math.maxInt(i64));
+        _ = try g.fact(.of(.cut, .root, .a), .{ .cut = .{ .zone = .root } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -702,8 +703,7 @@ pub const Graph = struct {
     /// `admit` does not allow. `Full`: anything unsettled past
     /// `max_work_bytes` (a joiner is work too), or new work past `max_flights`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !CellId {
-        var kb: KeyBuf = undefined;
-        const key = Key.of(&kb, .answer, name, qtype);
+        const key = Key.of(.answer, name, qtype);
         if (g.asking(.{ .key = key, .as_of = 0 })) |id| if (!g.cell(id).settled() or g.fresh(id)) {
             if (!g.cell(id).settled() and g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
             g.cell(id).holds += 1;
@@ -725,8 +725,7 @@ pub const Graph = struct {
 
     /// `dnskey(zone)` ahead of need.
     pub fn fetchKeys(g: *Graph, zone: dns.Name) !void {
-        var kb: KeyBuf = undefined;
-        _ = try g.ahead(Key.of(&kb, .rrset, zone, .dnskey), zone);
+        _ = try g.ahead(Key.of(.rrset, zone, .dnskey), zone);
     }
 
     /// One per key at a time, holding itself until its judge settles, on the
@@ -742,7 +741,8 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.ready.append(g.gpa, id);
         g.stats.resolver.detail.ahead += 1;
-        if (g.cfg.trace) std.debug.print("  ahead {s} {f}\n", .{ key.name, dns.tag(key.rtype) });
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        if (g.cfg.trace) std.debug.print("  ahead {s} {f}\n", .{ key.shown(&nb), dns.tag(key.rtype) });
         return id;
     }
 
@@ -763,7 +763,8 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.wake(id, at);
         g.stats.resolver.early.refresh += 1;
-        if (g.cfg.trace) std.debug.print("  refresh {s} {f} in {d} ms\n", .{ key.name, dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        if (g.cfg.trace) std.debug.print("  refresh {s} {f} in {d} ms\n", .{ key.shown(&nb), dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
     }
 
     pub fn drain(g: *Graph) !void {
@@ -946,10 +947,11 @@ pub const Graph = struct {
         var arena: Arena = .init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
-        var own_key = key;
-        own_key.name = try arena.allocator().dupe(u8, key.name);
+        std.debug.assert(key.kind == .exchange or mem.eql(u8, key.name, name.wire));
         const own_name = try name.clone(arena.allocator());
+        var own_key = key;
         if (key.kind != .exchange) {
+            own_key.name = own_name.wire;
             // In progress keeps the slot; a settled owner yields it.
             const gop = try g.index.getOrPutAdapted(g.gpa, Asked{ .key = key, .as_of = as_of }, Indexed{ .g = g });
             if (!gop.found_existing or g.cell(gop.key_ptr.*).settled()) gop.key_ptr.* = id;
@@ -1382,8 +1384,7 @@ pub const Graph = struct {
 
     /// `demandHop`, read from the store. Inline: it is a hit's lookup.
     pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?store.Entry {
-        var kb: KeyBuf = undefined;
-        const own = @call(.always_inline, Key.of, .{ &kb, kind, name, qtype });
+        const own = @call(.always_inline, Key.of, .{ kind, name, qtype });
         if (g.entry(own, age)) |e| return e;
         if (!walk.cnameAnswers(qtype)) return null;
         const e = g.entry(own.at(kind, .cname), age) orelse return null;
@@ -1729,7 +1730,6 @@ const Quiet = struct {
 };
 
 test "a cell replacing an expired one keeps the index entry when the old one goes" {
-    var kb: KeyBuf = undefined;
     const testing = std.testing;
     var q: Quiet = .{};
     var g = try q.graph(.{ .root_hints = &.{} });
@@ -1743,7 +1743,7 @@ test "a cell replacing an expired one keeps the index entry when the old one goe
     try testing.expect(first != second);
     g.unhold(first);
     try testing.expect(g.alive(first) == null);
-    try testing.expectEqual(second, g.indexed(Key.of(&kb, .answer, name, .a)).?);
+    try testing.expectEqual(second, g.indexed(Key.of(.answer, name, .a)).?);
     g.unhold(second);
 }
 
@@ -1771,7 +1771,7 @@ test "an evicted root cut is re-derived, not walked" {
     var q: Quiet = .{};
     var g = try q.graph(.{ .root_hints = &.{} });
     defer g.deinit();
-    const root_cut: Key = .init(.cut, "", .a);
+    const root_cut: Key = .of(.cut, .root, .a);
     g.store.drop(root_cut, g.store.any(root_cut).?.blob);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1782,7 +1782,6 @@ test "an evicted root cut is re-derived, not walked" {
 }
 
 test "a shared cell is paid by a waiting question with room, not its first demander" {
-    var kb: KeyBuf = undefined;
     const testing = std.testing;
     var q: Quiet = .{};
     var g = try q.graph(.{ .root_hints = &.{} });
@@ -1792,7 +1791,7 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
     const first = try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, .new);
     const second = try g.demandRoot(host, .a, .new);
-    const shared = try g.newCell(Key.of(&kb, .rrset, host, .a), host, 0);
+    const shared = try g.newCell(Key.of(.rrset, host, .a), host, 0);
     try g.pin(shared, first);
     try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
@@ -1814,8 +1813,8 @@ test "a shared cell is paid by a waiting question with room, not its first deman
 test "a key's name hash follows the process seed" {
     const saved = rand.hash_seed;
     defer rand.hash_seed = saved;
-    const a: Key = .init(.rrset, "www.example", .a);
+    const a: Key = .of(.rrset, .lit("www.example"), .a);
     rand.hash_seed = 0xdeadbeefcafef00d;
-    const b: Key = .init(.rrset, "www.example", .a);
+    const b: Key = .of(.rrset, .lit("www.example"), .a);
     try std.testing.expect(a.name_hash != b.name_hash);
 }

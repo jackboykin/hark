@@ -553,7 +553,7 @@ test "a fact survives the blob byte for byte" {
         .minimum = 5,
     } } }};
     const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
-    const key: Key = .init(.rrset, "www.example.com", .a);
+    const key: Key = .of(.rrset, .lit("www.example.com"), .a);
 
     const blob = try s.build(.{ .rrset = reply });
     try s.put(key, blob, 1000, 0);
@@ -602,7 +602,7 @@ test "a fact survives the blob byte for byte" {
 
     _ = blob.ref();
     const glue = [_]na.AddressKey{ .ip4(.{ 10, 0, 0, 1 }, 53), .ip6(@splat(1), 853) };
-    const newer = try s.build(.{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .init(.addr, "ns.example.com", .a), .glue = &glue }} } });
+    const newer = try s.build(.{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .of(.addr, .lit("ns.example.com"), .a), .glue = &glue }} } });
     try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
     const cut = (try Store.parse(arena, newer)).cut;
@@ -654,7 +654,7 @@ test "a replaced version leaves as one evicted" {
     defer w.store.deinit();
     w.store.on_evict = Watched.evicted;
     const zone: dns.Name = .lit("x");
-    const key: Key = .init(.cut, "x", .a);
+    const key: Key = .of(.cut, zone, .a);
     const first = try w.store.build(.{ .cut = .{ .zone = zone } });
     try w.store.put(key, first, 10, 0);
     try testing.expectEqual(0, w.n);

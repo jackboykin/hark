@@ -100,8 +100,9 @@ pub const Chaos = struct {
         if (c.told) |*told| {
             try told.ensureUnusedCapacity(c.gpa, 1);
             var buf: [64]u8 = undefined;
+            var nb: [dns.max_dotted_len + 1]u8 = undefined;
             told.appendAssumeCapacity(switch (about) {
-                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {f})", .{ site, k.kind, k.name, dns.tag(k.rtype) }),
+                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {f})", .{ site, k.kind, k.shown(&nb), dns.tag(k.rtype) }),
                 .server => |s| try std.fmt.allocPrint(c.gpa, "{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
                 .none => try std.fmt.allocPrint(c.gpa, "{t}", .{site}),
             });

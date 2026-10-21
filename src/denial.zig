@@ -122,10 +122,9 @@ pub const Index = struct {
 /// from `blob`.
 pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
     if (key.rtype != .nsec and key.rtype != .soa) return;
-    const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
+    const owner: dns.Name = .of(key.name);
     if (key.rtype == .soa) {
-        var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const i = g.denial.zones.getIndex(owner.formatInto(&buf)) orelse return;
+        const i = g.denial.zones.getIndex(owner.wire) orelse return;
         const soa = g.denial.zones.values()[i].soa orelse return;
         if (soa.judged != blob) return;
         g.denial.zones.values()[i].release(g);
@@ -134,8 +133,7 @@ pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
     }
     var up: ?dns.Name = owner;
     while (up) |zone| : (up = zone.parent()) {
-        var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const zi = g.denial.zones.getIndex(zone.formatInto(&buf)) orelse continue;
+        const zi = g.denial.zones.getIndex(zone.wire) orelse continue;
         const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
         if (pos < z.spans.items.len and z.spans.items[pos].judged == blob) {
@@ -172,9 +170,7 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
 /// its own proof holds (RFC 8198 §5.4). A flood never proved anything.
 pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const i64, keys_until: i64) !void {
     std.debug.assert(!proof.proofFlood(r.authorities));
-    var kb: graph.KeyBuf = undefined;
-    var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const zkey = signer.formatInto(&buf);
+    const zkey = signer.wire;
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
     for (r.authorities, 0..) |rr, i| {
@@ -186,7 +182,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         const kind: graph.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up after.
-        const judged = (try g.fact(graph.Key.of(&kb, kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
+        const judged = (try g.fact(graph.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {
             g.store.unref(judged);
             return e;
@@ -244,8 +240,7 @@ pub fn deny(g: *Graph, id: CellId) !bool {
     const name = g.cell(id).name;
     var up: ?dns.Name = name;
     while (up) |zone| : (up = zone.parent()) {
-        var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const z = g.denial.zones.getPtr(zone.formatInto(&buf)) orelse continue;
+        const z = g.denial.zones.getPtr(zone.wire) orelse continue;
         if (try denyIn(g, z, id, zone)) return true;
     }
     return false;
@@ -344,5 +339,5 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
 
     try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
-    try testing.expect(g.denial.zones.getPtr("example").?.soa != null);
+    try testing.expect(g.denial.zones.getPtr(zone.wire).?.soa != null);
 }

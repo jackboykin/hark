@@ -216,8 +216,7 @@ pub const Desk = struct {
     fn hold(d: *Desk, q: dns.Question, c: Client) !?dns.Ede {
         const ede = d.failures.get(q, c.cd, d.g.now()) orelse return null;
         if (!builtin.is_test) return ede;
-        var kb: graph.KeyBuf = undefined;
-        return if (try d.g.forgets(.forget, .of(&kb, .answer, q.name, q.qtype))) null else ede;
+        return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else ede;
     }
 
     /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.
@@ -662,8 +661,9 @@ pub const Failures = struct {
         f.map.deinit(gpa);
     }
 
-    fn key(buf: *[dns.max_dotted_len + 4]u8, q: dns.Question, cd: bool) []const u8 {
-        const name = q.name.formatInto(buf[0 .. dns.max_dotted_len + 1]);
+    fn key(buf: *[dns.max_name_wire_len + 3]u8, q: dns.Question, cd: bool) []const u8 {
+        const name = q.name.wire;
+        @memcpy(buf[0..name.len], name);
         std.mem.writeInt(u16, buf[name.len..][0..2], @backingInt(q.qtype), .little);
         buf[name.len + 2] = @intFromBool(cd);
         return buf[0 .. name.len + 3];
@@ -674,7 +674,7 @@ pub const Failures = struct {
     /// else is RFC 8914's cached error.
     pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?dns.Ede {
         if (f.map.count() == 0) return null;
-        var buf: [dns.max_dotted_len + 4]u8 = undefined;
+        var buf: [dns.max_name_wire_len + 3]u8 = undefined;
         const e = f.map.get(key(&buf, q, cd)) orelse return null;
         if (e.until_ns <= now_ns) return null;
         return switch (e.ede.code) {
@@ -690,7 +690,7 @@ pub const Failures = struct {
         if (served.theirs) return;
         const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
         if (forgets and f.map.count() == 0) return;
-        var buf: [dns.max_dotted_len + 4]u8 = undefined;
+        var buf: [dns.max_name_wire_len + 3]u8 = undefined;
         const k = key(&buf, q, cd);
         if (forgets) {
             if (f.map.fetchSwapRemove(k)) |kv| gpa.free(kv.key);

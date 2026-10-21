@@ -309,7 +309,6 @@ const into_stub: Failure = .{ .code = .no_reachable_authority, .text = "public c
 /// checks run at demand time; a chain that fails them is a resolution
 /// failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
@@ -348,7 +347,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         const from: ?graph.Kind = if (s.n == 0) null else g.cell(s.hops[s.n - 1].set).key.kind;
         const hop_kind = g.hopKind(from, next, qtype) orelse return failAnswer(g, id, into_stub);
         // The first step is at the answer's own name, keyed already.
-        const own = if (s.n == 0) g.cell(id).key.at(hop_kind, qtype) else Key.of(&kb, hop_kind, next, qtype);
+        const own = if (s.n == 0) g.cell(id).key.at(hop_kind, qtype) else Key.of(hop_kind, next, qtype);
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = .{ .set = try g.demandHop(id, own, next) orelse
             return failAnswer(g, id, .unreachable_authority) };
@@ -401,14 +400,13 @@ fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
 /// places no cut. Only strict ancestors of a question are probed; the
 /// question itself goes out as `rrset`.
 pub fn runCut(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     // The axiom, re-derived after eviction.
     const parent_name = name.parent() orelse return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
     // Past minimising's reach only a referral places a cut.
     if (!probeable(g, name)) return g.fail(id, unplaced);
     const s = g.cell(id).scratch.cut;
-    if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
+    if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(.cut, parent_name, .a), parent_name) orelse
         return g.fail(id, .unreachable_authority));
     const parent = g.cell(s.parent.unwrap().?);
     if (!parent.settled()) return;
@@ -418,7 +416,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     // every name below a denial would store one. A fact from below the
     // parent's zone says nothing about it.
     if (deniedAbove(g, name, pc.zone) != null) return settleInside(g, id, parent, g.now());
-    if (g.held(Key.of(&kb, .rrset, name, .a))) |known| if (named(store.Rrset.of(known.blob).zone, pc.zone))
+    if (g.held(Key.of(.rrset, name, .a))) |known| if (named(store.Rrset.of(known.blob).zone, pc.zone))
         return settleInside(g, id, parent, serving(g, known));
     if (!s.started) {
         s.ask.reset(pc.zone);
@@ -461,13 +459,12 @@ fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64)
 
 /// An authoritative NXDOMAIN at a probe name, published.
 fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !bool {
-    var kb: graph.KeyBuf = undefined;
     if (!kept.msg.header.flags.aa) return false;
     const reply = switch (kept.verdict) {
         .reply => |r| r,
         .loop, .none => return false,
     };
-    try g.publish(Key.of(&kb, .rrset, name, .a), name, id, .{ .rrset = reply }, replyExpiry(reply));
+    try g.publish(Key.of(.rrset, name, .a), name, id, .{ .rrset = reply }, replyExpiry(reply));
     return true;
 }
 
@@ -481,10 +478,9 @@ fn probeable(g: *const Graph, name: dns.Name) bool {
 /// the deepest one known, unless a strict ancestor of `qname` a probe may
 /// place comes first.
 fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
-    var kb: graph.KeyBuf = undefined;
     var n = from;
     while (n.parent()) |up| : (n = up) {
-        if (g.holds(Key.of(&kb, .cut, n, .a))) return n;
+        if (g.holds(Key.of(.cut, n, .a))) return n;
         if (probe and n.depth() < qname.depth() and probeable(g, n)) return n;
     }
     return n;
@@ -495,10 +491,9 @@ pub const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
 /// Waits on `startAt`'s cut, or on the deepest one known if no probe
 /// could place it.
 pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *OptionalCellId) !Start {
-    var kb: graph.KeyBuf = undefined;
     if (slot.* == .none) {
         const n = startAt(g, qname, from, true);
-        slot.* = .wrap(try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none);
+        slot.* = .wrap(try g.demand(id, Key.of(.cut, n, .a), n) orelse return .none);
     }
     while (true) {
         const c = g.cell(slot.*.unwrap().?);
@@ -507,16 +502,15 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
         if (!why.unplaced) return .{ .failed = why };
         const n = startAt(g, qname, from, false);
         if (n.eql(c.name)) return .{ .failed = .unreachable_authority };
-        slot.* = .wrap(try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none);
+        slot.* = .wrap(try g.demand(id, Key.of(.cut, n, .a), n) orelse return .none);
     }
 }
 
 fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name, held: store.Entry } {
-    var kb: graph.KeyBuf = undefined;
     var up = name.parent();
     while (up) |n| : (up = n.parent()) {
         if (n.depth() <= zone.depth()) break;
-        const h = g.held(Key.of(&kb, .rrset, n, .a)) orelse continue;
+        const h = g.held(Key.of(.rrset, n, .a)) orelse continue;
         const r: store.Rrset = .of(h.blob);
         if (r.kind == .nxdomain and named(r.target, n)) return .{ .at = n, .held = h };
     }
@@ -590,13 +584,12 @@ const OwnAddresses = struct {
 /// `rrset(name, type)`: from the deepest known cut at or above the name,
 /// ask its servers; follow referrals; settle on the first kept reply.
 pub fn runRrset(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
         if (s.cut == .none) {
-            if (s.above == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, s, Key.of(&kb, .rrset, owner, .dname), owner);
+            if (s.above == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, s, Key.of(.rrset, owner, .dname), owner);
             switch (aboveSays(g, s)) {
                 .waits => return,
                 .answers => {
@@ -676,7 +669,6 @@ pub fn ended(g: *const Graph, a: *const Ask) Failure {
 /// A chain starting with a CNAME at `name` is also the fact
 /// `rrset(name, CNAME)`, so any later type finds the hop.
 fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: Reply) !void {
-    var kb: graph.KeyBuf = undefined;
     if (qtype == .cname or reply.answers.len == 0) return;
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
@@ -710,17 +702,16 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .stored_ns = reply.stored_ns,
     };
     hop.ttl = replyTtl(hop);
-    try g.publish(Key.of(&kb, .rrset, name, .cname), name, by, .{ .rrset = hop }, replyExpiry(hop));
+    try g.publish(Key.of(.rrset, name, .cname), name, by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
 /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
 /// so later names under it redirect from memory.
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
-    var kb: graph.KeyBuf = undefined;
     for (reply.answers, 0..) |d, i| {
         if (d.rtype != .dname) continue;
         const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = dnssec.setFrom(reply.answers, i), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
-        try g.publish(Key.of(&kb, .rrset, d.name, .dname), d.name, by, .{ .rrset = dname }, replyExpiry(dname));
+        try g.publish(Key.of(.rrset, d.name, .dname), d.name, by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
 
@@ -740,7 +731,6 @@ fn aboveSays(g: *Graph, s: *const RrsetScratch) enum { waits, answers, silent } 
 /// or NSEC3 can never be judged secure (RFC 4035 §3.1.3.2), so it is not
 /// waited on.
 fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
-    var kb: graph.KeyBuf = undefined;
     if (!denial.denies(g, g.cell(id).key.rtype)) return false;
     const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
     if (!provable(d.held.blob)) return false;
@@ -750,7 +740,7 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
         try g.settleAs(id, d.held);
         return true;
     }
-    try watchAbove(g, id, s, Key.of(&kb, .rrset, d.at, .a), d.at);
+    try watchAbove(g, id, s, Key.of(.rrset, d.at, .a), d.at);
     return false;
 }
 
@@ -764,11 +754,10 @@ fn provable(b: *store.Blob) bool {
 /// hand it: the redirect never waits on a new ask nor reads a version it
 /// did not judge.
 fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
-    var kb: graph.KeyBuf = undefined;
     var up = name.parent();
     while (up) |owner| : (up = owner.parent()) {
         if (owner.isRoot()) break;
-        const d = g.held(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
+        const d = g.held(Key.of(.rrset, owner, .dname)) orelse continue;
         const r: store.Rrset = .of(d.blob);
         if (r.kind != .answer) continue;
         var it = r.sections[0].iterator();
@@ -802,7 +791,6 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
 /// its glue. Its placement never outlives the referring zone's: that is a
 /// ghost (Jiang et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name, zone_placed_until_ns: i64) !Graph.Fact {
-    var kb: graph.KeyBuf = undefined;
     const now = g.now();
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
@@ -813,8 +801,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     const sa = g.scratch.allocator();
     const servers = try sa.alloc(graph.Server, ref.ns_count);
     for (servers, ref.nsNames()) |*server, host| {
-        var key = Key.of(&kb, .addr, host, .a);
-        key.name = try sa.dupe(u8, key.name);
+        const key = Key.of(.addr, try host.clone(sa), .a);
         var glue: std.ArrayList(na.AddressKey) = .empty;
         // Glue is the parent's word only inside its own zone.
         if (speaksFor(g, zone, host)) for (msg.additionals) |rr| {
@@ -826,11 +813,11 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         server.* = .{ .key = key, .glue = glue.items };
     }
     const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
-    try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
+    try g.publish(Key.of(.cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchors != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-        if (ds.ttl > 0) try g.publish(Key.of(&kb, .rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
+        if (ds.ttl > 0) try g.publish(Key.of(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
         // A signed delegation from a zone signed all the way down: whatever
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
@@ -1178,8 +1165,7 @@ fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) b
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
-    var kb: graph.KeyBuf = undefined;
-    const key = Key.of(&kb, .rrset, zone, .ds);
+    const key = Key.of(.rrset, zone, .ds);
     const ds = (g.peek(key) catch return false) orelse return false;
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
@@ -1199,15 +1185,13 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
 }
 
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
-    var kb: graph.KeyBuf = undefined;
-    const sa = g.scratch.allocator();
     var found = a.gather(g);
     const zone = a.zone;
     if (told(g, zone)) |servers| {
         // Told, not handed over: config holds them to what it allows.
         for (servers) |h| a.hold(&found, .fromAddress(h));
     } else {
-        if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
+        if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(.cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
         if (cut.failure()) |why| {
@@ -1225,7 +1209,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         if (found.new == 0) {
             var pending = false;
             for (left.busy.items) |key| {
-                if (try g.demand(id, key, try dns.parseDottedName(sa, key.name)) != null) pending = true;
+                if (try g.demand(id, key, .of(key.name)) != null) pending = true;
             }
             a.more = a.more or pending;
             if (pending) return .pending;
@@ -1241,7 +1225,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             try g.shuffle(.gather, g.cell(id).key, Left.Unknown, unknown);
             var demanded = false;
             for (unknown[0..@min(limit, unknown.len)]) |u| {
-                const host = try dns.parseDottedName(sa, u.host.name);
+                const host: dns.Name = .of(u.host.name);
                 for (families, u.families) |family, wanted| {
                     if (!wanted) continue;
                     const aid = try g.demand(id, u.host.at(.addr, family), host) orelse continue;
