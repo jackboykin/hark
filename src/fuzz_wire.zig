@@ -106,9 +106,8 @@ fn genMessage(s: *Smith, w: *Wire) []const u8 {
 fn checkName(alloc: std.mem.Allocator, name: dns.Name) !void {
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     if (dns.parseDottedName(alloc, name.formatInto(&buf))) |rt| {
-        if (!rt.eqlExact(name)) return error.NotInjective;
+        if (!rt.eql(name)) return error.NotInjective;
     } else |_| {}
-    _ = name.formatLower(&buf);
 }
 
 fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bare: bool) !void {
@@ -203,7 +202,7 @@ fn checkQuery(alloc: std.mem.Allocator, input: []const u8, msg: dns.Message) !vo
     if (msg.questions.len != @intFromBool(query.question != null)) return error.QueryDrift;
     if (query.question) |q| {
         const want = msg.questions[0];
-        if (!q.name.eqlExact(want.name) or q.qtype != want.qtype or q.qclass != want.qclass) return error.QueryDrift;
+        if (!q.name.eql(want.name) or q.qtype != want.qtype or q.qclass != want.qclass) return error.QueryDrift;
     }
     if ((msg.opt == null) != (query.edns == null)) return error.QueryDrift;
     if (msg.opt) |o| {

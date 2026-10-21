@@ -129,8 +129,7 @@ pub fn synthesize(allocator: mem.Allocator, q: dns.Question, own: Own) !Synthesi
             const z = own.zone orelse return out;
             out.authorities = try records(allocator, z.apex, .soa, z.soa);
         },
-        // Lowercased, as every owner from upstream is.
-        .answer => |rdatas| out.answers = try records(allocator, try dns.cloneNameLower(allocator, q.name), q.qtype, rdatas),
+        .answer => |rdatas| out.answers = try records(allocator, q.name, q.qtype, rdatas),
     }
     return out;
 }

@@ -164,11 +164,9 @@ pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord,
 }
 
 /// RFC 4034 §5.1.4: digest of canonical owner name || DNSKEY RDATA.
-pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) error{BufferTooSmall}![Hash.digest_length]u8 {
-    var name_buf: [255]u8 = undefined;
-    const name_len = try rrsig.writeCanonicalNameWire(&name_buf, owner);
+pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) [Hash.digest_length]u8 {
     var h = Hash.init(.{});
-    h.update(name_buf[0..name_len]);
+    h.update(owner.wire);
     h.update(&mem.toBytes(mem.nativeToBig(u16, dnskey.flags)));
     h.update(&.{ dnskey.protocol, @backingInt(dnskey.algorithm) });
     h.update(dnskey.public_key);
@@ -177,9 +175,9 @@ pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) er
 
 fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) rrsig.VerifyError!void {
     const ok = switch (ds.digest_type) {
-        .sha1 => mem.eql(u8, &try dsDigest(Sha1, owner_name, dnskey), ds.digest),
-        .sha256 => mem.eql(u8, &try dsDigest(Sha256, owner_name, dnskey), ds.digest),
-        .sha384 => mem.eql(u8, &try dsDigest(Sha384, owner_name, dnskey), ds.digest),
+        .sha1 => mem.eql(u8, &dsDigest(Sha1, owner_name, dnskey), ds.digest),
+        .sha256 => mem.eql(u8, &dsDigest(Sha256, owner_name, dnskey), ds.digest),
+        .sha384 => mem.eql(u8, &dsDigest(Sha384, owner_name, dnskey), ds.digest),
         _ => return error.UnsupportedAlgorithm,
     };
     if (!ok) return error.InvalidSignature;
@@ -602,7 +600,7 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
     const resigned = try rrsig.testSignRrset(recs[0..64], .dnskey, rrsig.test_owner, .ed25519, &sig2, &signer_pub);
     recs[0] = dnskeyRr(rrsig.test_owner, resigned.dnskey);
 
-    var digest = try dsDigest(Sha256, rrsig.test_owner, resigned.dnskey);
+    var digest = dsDigest(Sha256, rrsig.test_owner, resigned.dnskey);
     const ds = dns.DsData{
         .key_tag = rrsig.keyTag(resigned.dnskey),
         .algorithm = .ed25519,
@@ -640,7 +638,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
     // verify cross-product. consumeVerify charges before any crypto, so the walk
     // halts at the ceiling however large N·M grows. Pins that against the walk's
     // next refactor.
-    var digest = try dsDigest(Sha256, rrsig.test_owner, test_dnskey);
+    var digest = dsDigest(Sha256, rrsig.test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = rrsig.keyTag(test_dnskey),
         .algorithm = .rsasha256,
@@ -977,8 +975,8 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const ed = try rrsig.testSignRrset(&keys, .dnskey, rrsig.test_owner, .ed25519, &ed_sig, &ed_pub);
     var pq_sig: [MlDsa44.Signature.encoded_length]u8 = undefined;
     const pq = try testSignMlDsa(&keys, .dnskey, rrsig.test_owner, pq_key, &pq_kp, &pq_sig);
-    var ed_digest = try dsDigest(Sha256, rrsig.test_owner, ed_key);
-    var pq_digest = try dsDigest(Sha256, rrsig.test_owner, pq_key);
+    var ed_digest = dsDigest(Sha256, rrsig.test_owner, ed_key);
+    var pq_digest = dsDigest(Sha256, rrsig.test_owner, pq_key);
     const ed_ds = dns.DsData{ .key_tag = rrsig.keyTag(ed_key), .algorithm = .ed25519, .digest_type = .sha256, .digest = &ed_digest };
     const pq_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha256, .digest = &pq_digest };
 
@@ -999,7 +997,7 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const odd_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
     var b4: rrsig.ValidationBudget = .{};
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, 1_700_000_000, &b4, &test_memo)).algorithm);
-    var pq_sha1 = try dsDigest(Sha1, rrsig.test_owner, pq_key);
+    var pq_sha1 = dsDigest(Sha1, rrsig.test_owner, pq_key);
     const sha1_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, 1_700_000_000, &b4, &test_memo)).algorithm);
 
@@ -1029,7 +1027,7 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     const signed = try rrsig.testSignRrset(recs[0..1], .dnskey, rrsig.test_owner, .rsasha256, &sig_bytes, &pub_bytes);
     recs[1] = .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
 
-    var digest = try dsDigest(Sha256, rrsig.test_owner, signed.dnskey);
+    var digest = dsDigest(Sha256, rrsig.test_owner, signed.dnskey);
     const ds = dns.DsData{
         .key_tag = rrsig.keyTag(signed.dnskey),
         .algorithm = .rsasha256,

@@ -11,11 +11,13 @@ const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 
 const apex = "example";
-const alphabet = [_][]const u8{ "a", "b", "*", "A" };
+const alphabet = [_][]const u8{ "a", "b", "*" };
 const qtypes = [_]dns.RType{ .a, .ns, .cname, .soa, .txt, .dname, .ds, .aaaa };
 const max_names = 6;
 const max_depth = 3;
 const max_chain = 32;
+/// Single-octet labels above the apex, the apex, the root.
+const max_wire = 2 * max_depth + 1 + apex.len + 1;
 
 const Types = packed struct(u8) {
     a: bool = false,
@@ -46,12 +48,18 @@ const Types = packed struct(u8) {
 const shapes = [_]Types{ .{ .a = true }, .{ .cname = true }, .{ .ns = true }, .{ .ns = true, .ds = true }, .{ .dname = true }, .{ .dname = true, .a = true } };
 
 const Entry = struct {
-    labels: [max_depth + 1][]const u8,
-    depth: usize,
+    wire: [max_wire]u8,
+    len: u8,
     types: Types,
 
+    fn of(n: dns.Name, types: Types) Entry {
+        var e: Entry = .{ .wire = undefined, .len = @intCast(n.wire.len), .types = types };
+        @memcpy(e.wire[0..n.wire.len], n.wire);
+        return e;
+    }
+
     fn name(e: *const Entry) dns.Name {
-        return .{ .labels = e.labels[0..e.depth] };
+        return .of(e.wire[0..e.len]);
     }
 };
 
@@ -156,7 +164,7 @@ const Zone = struct {
     /// around it. A circular chain leaves no name out.
     fn relevant(z: *const Zone, name: dns.Name) usize {
         var h: [20]u8 = undefined;
-        if (z.nsec3) h = proof.nsec3Hash(name, z.salt[0..z.salt_len], z.iterations) catch unreachable;
+        if (z.nsec3) h = proof.nsec3Hash(name, z.salt[0..z.salt_len], z.iterations);
         for (z.recs[0..z.n_recs], 0..) |rr, i| {
             if (z.nsec3) {
                 const owner = &z.hashes[i];
@@ -190,11 +198,21 @@ fn between(lo_vs_x: std.math.Order, x_vs_hi: std.math.Order, lo_vs_hi: std.math.
     return if (lo_vs_hi == .lt) lo_vs_x == .lt and x_vs_hi == .lt else lo_vs_x == .lt or x_vs_hi == .lt;
 }
 
-fn genName(s: *Smith, labels: *[max_depth + 1][]const u8) dns.Name {
-    const d = s.valueRangeAtMost(u8, 0, max_depth);
-    for (labels[0..d]) |*l| l.* = alphabet[s.index(alphabet.len)];
-    labels[d] = apex;
-    return .{ .labels = labels[0 .. d + 1] };
+fn genName(s: *Smith, buf: *[max_wire]u8) dns.Name {
+    return below(s, buf, s.valueRangeAtMost(u8, 0, max_depth));
+}
+
+fn below(s: *Smith, buf: *[max_wire]u8, d: u8) dns.Name {
+    var n: usize = 0;
+    for (0..d) |_| {
+        const label = alphabet[s.index(alphabet.len)];
+        buf[n] = @intCast(label.len);
+        @memcpy(buf[n + 1 ..][0..label.len], label);
+        n += 1 + label.len;
+    }
+    const top = dns.Name.lit(apex).wire;
+    @memcpy(buf[n..][0..top.len], top);
+    return .of(buf[0 .. n + top.len]);
 }
 
 fn bitmap(buf: *[9]u8, t: Types, chain: dns.RType) []const u8 {
@@ -212,14 +230,12 @@ fn set(buf: *[9]u8, rt: dns.RType) void {
 
 fn draw(z: *Zone, s: *Smith) void {
     var raw: [max_names + 1]Entry = undefined;
-    raw[0] = .{ .labels = .{ apex, "", "", "" }, .depth = 1, .types = .{ .soa = true, .ns = true, .dname = s.boolWeighted(15, 1) } };
+    raw[0] = .of(.lit(apex), .{ .soa = true, .ns = true, .dname = s.boolWeighted(15, 1) });
     var n: usize = 1;
     names: for (0..s.valueRangeAtMost(u8, 1, max_names)) |_| {
-        var e: Entry = undefined;
-        e.depth = s.valueRangeAtMost(u8, 1, max_depth) + 1;
-        for (e.labels[0 .. e.depth - 1]) |*l| l.* = alphabet[s.index(alphabet.len)];
-        e.labels[e.depth - 1] = apex;
-        e.types = shapes[s.index(shapes.len)];
+        var buf: [max_wire]u8 = undefined;
+        const at = below(s, &buf, s.valueRangeAtMost(u8, 1, max_depth));
+        const e: Entry = .of(at, shapes[s.index(shapes.len)]);
         for (raw[0..n]) |o| if (o.name().eql(e.name())) continue :names;
         raw[n] = e;
         n += 1;
@@ -238,12 +254,11 @@ fn draw(z: *Zone, s: *Smith) void {
     // Empty non-terminals exist too; NSEC3 chains give them records.
     for (0..z.n) |i| {
         const e = z.entries[i];
-        for (1..e.depth) |k| {
-            const anc = dns.Name{ .labels = e.name().labels[k..] };
-            if (anc.labels.len == 1) break;
+        var up = e.name().parent();
+        while (up) |anc| : (up = anc.parent()) {
+            if (anc.depth() == 1) break;
             if (z.find(anc) != null) continue;
-            z.entries[z.n] = .{ .labels = undefined, .depth = anc.labels.len, .types = .{} };
-            @memcpy(z.entries[z.n].labels[0..anc.labels.len], anc.labels);
+            z.entries[z.n] = .of(anc, .{});
             z.n += 1;
         }
     }
@@ -261,7 +276,7 @@ fn draw(z: *Zone, s: *Smith) void {
     z.n_recs = 0;
     for (0..z.n) |i| {
         const e = &z.entries[i];
-        if (z.nsec3) ehash[i] = proof.nsec3Hash(e.name(), z.salt[0..z.salt_len], z.iterations) catch unreachable;
+        if (z.nsec3) ehash[i] = proof.nsec3Hash(e.name(), z.salt[0..z.salt_len], z.iterations);
         if (z.omitted(e) or (!z.nsec3 and @as(u8, @bitCast(e.types)) == 0)) continue;
         order[z.n_recs] = i;
         z.n_recs += 1;
@@ -370,8 +385,8 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     var sec: Section = .{};
     var budget: rrsig.ValidationBudget = .{};
 
-    var ql: [max_depth + 1][]const u8 = undefined;
-    const qname = genName(s, &ql);
+    var qb: [max_wire]u8 = undefined;
+    const qname = genName(s, &qb);
     const qtype = qtypes[s.index(qtypes.len)];
     const t = z.truth(qname, qtype);
     const is_nxdomain = if (exact) t == .nxdomain else s.boolWeighted(1, 1);
@@ -411,8 +426,8 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     }
 
     budget = .{};
-    var cl: [max_depth + 1][]const u8 = undefined;
-    var child = genName(s, &cl);
+    var cb: [max_wire]u8 = undefined;
+    var child = genName(s, &cb);
     if (exact) {
         for (z.entries[0..z.n]) |*e| if (e.types.delegation()) {
             child = e.name();

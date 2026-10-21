@@ -664,7 +664,7 @@ pub const Failures = struct {
     }
 
     fn key(buf: *[dns.max_dotted_len + 4]u8, q: dns.Question, cd: bool) []const u8 {
-        const name = q.name.formatLower(buf[0 .. dns.max_dotted_len + 1]);
+        const name = q.name.formatInto(buf[0 .. dns.max_dotted_len + 1]);
         std.mem.writeInt(u16, buf[name.len..][0..2], @backingInt(q.qtype), .little);
         buf[name.len + 2] = @intFromBool(cd);
         return buf[0 .. name.len + 3];

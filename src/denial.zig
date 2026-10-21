@@ -24,7 +24,7 @@ const Span = struct {
     owner: dns.Name,
     nsec: dns.NsecData,
     expires_ns: i64,
-    buf: []align(8) u8,
+    buf: []u8,
     judged: *store.Blob,
 
     fn deinit(sp: Span, gpa: std.mem.Allocator, st: *store.Store) void {
@@ -34,14 +34,19 @@ const Span = struct {
 
     fn init(gpa: std.mem.Allocator, rr: RR, expires_ns: i64, judged: *store.Blob) !Span {
         const n = rr.rdata.nsec;
-        const owner_len = std.mem.alignForward(usize, dns.nameFlatSize(rr.name), 8);
-        const next_len = std.mem.alignForward(usize, dns.nameFlatSize(n.next_domain_name), 8);
-        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(8), owner_len + next_len + n.type_bit_maps.len);
-        const owner = dns.writeNameFlat(buf[0..owner_len], rr.name, false);
-        const next = dns.writeNameFlat(@alignCast(buf[owner_len..][0..next_len]), n.next_domain_name, false);
-        const bits = buf[owner_len + next_len ..];
-        @memcpy(bits, n.type_bit_maps);
-        return .{ .owner = owner, .nsec = .{ .next_domain_name = next, .type_bit_maps = bits }, .expires_ns = expires_ns, .buf = buf, .judged = judged };
+        const owner = rr.name.wire;
+        const next = n.next_domain_name.wire;
+        const buf = try gpa.alloc(u8, owner.len + next.len + n.type_bit_maps.len);
+        @memcpy(buf[0..owner.len], owner);
+        @memcpy(buf[owner.len..][0..next.len], next);
+        @memcpy(buf[owner.len + next.len ..], n.type_bit_maps);
+        return .{
+            .owner = .of(buf[0..owner.len]),
+            .nsec = .{ .next_domain_name = .of(buf[owner.len..][0..next.len]), .type_bit_maps = buf[owner.len + next.len ..] },
+            .expires_ns = expires_ns,
+            .buf = buf,
+            .judged = judged,
+        };
     }
 };
 
@@ -120,7 +125,7 @@ pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
     const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
     if (key.rtype == .soa) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const i = g.denial.zones.getIndex(owner.formatLower(&buf)) orelse return;
+        const i = g.denial.zones.getIndex(owner.formatInto(&buf)) orelse return;
         const soa = g.denial.zones.values()[i].soa orelse return;
         if (soa.judged != blob) return;
         g.denial.zones.values()[i].release(g);
@@ -130,7 +135,7 @@ pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
     var up: ?dns.Name = owner;
     while (up) |zone| : (up = zone.parent()) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const zi = g.denial.zones.getIndex(zone.formatLower(&buf)) orelse continue;
+        const zi = g.denial.zones.getIndex(zone.formatInto(&buf)) orelse continue;
         const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
         if (pos < z.spans.items.len and z.spans.items[pos].judged == blob) {
@@ -169,7 +174,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
     std.debug.assert(!proof.proofFlood(r.authorities));
     var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const zkey = signer.formatLower(&buf);
+    const zkey = signer.formatInto(&buf);
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
     for (r.authorities, 0..) |rr, i| {
@@ -240,7 +245,7 @@ pub fn deny(g: *Graph, id: CellId) !bool {
     var up: ?dns.Name = name;
     while (up) |zone| : (up = zone.parent()) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const z = g.denial.zones.getPtr(zone.formatLower(&buf)) orelse continue;
+        const z = g.denial.zones.getPtr(zone.formatInto(&buf)) orelse continue;
         if (try denyIn(g, z, id, zone)) return true;
     }
     return false;

@@ -188,7 +188,7 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const out = try renamePtr(a, &answers, qname);
     try testing.expectEqual(@as(usize, 1), out.len);
     var lower: [dns.max_name_len + 2]u8 = undefined;
-    const want = lower[0..try dns.writeNameWire(&lower, try dns.cloneNameLower(a, qname))];
+    const want = lower[0..try dns.writeNameWire(&lower, qname)];
     try testing.expectEqualSlices(u8, want, out[0].owner);
     try testing.expectEqualSlices(u8, answers[1].rest, out[0].rest);
 }

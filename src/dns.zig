@@ -104,7 +104,6 @@ pub const Error = error{
     EndOfData,
     LabelTooLong,
     NameTooLong,
-    TooManyLabels,
     CompressionPointerLoop,
     FormatError,
     InvalidLabelType,
@@ -211,128 +210,142 @@ test eqlIgnoreCase {
     };
 }
 
+/// RFC 4034 §6.2 canonical form: uncompressed wire labels, lowercase,
+/// at most 255 octets. Case someone wrote lives in `Question.spelled`
+/// and `NsecData.next_spelled`, never here.
 pub const Name = struct {
-    labels: []const []const u8,
+    wire: []const u8,
 
-    pub const root: Name = .{ .labels = &.{} };
+    pub const root: Name = .{ .wire = "\x00" };
 
-    pub const Buf = [max_label_count][]const u8;
+    pub const Buf = [max_name_wire_len]u8;
 
-    /// A name fixed in code, in presentation format (`parseDottedName`'s).
     pub fn lit(comptime dotted: []const u8) Name {
-        const labels = comptime blk: {
-            const s = stripTrailingDot(dotted);
-            var out: []const []const u8 = &.{};
-            var start: usize = 0;
-            while (start < s.len) {
-                const end = indexOfUnescapedDot(s, start) orelse s.len;
-                var buf: [max_label_len]u8 = undefined;
-                const len = unescapeLabel(s[start..end], &buf) catch |err| @compileError(@errorName(err));
-                if (len == 0) @compileError("empty label in " ++ dotted);
-                const label = buf[0..len].*;
-                out = out ++ .{&label};
-                start = end + 1;
-            }
-            const name: Name = .{ .labels = out };
-            if (name.wireLen() > max_name_wire_len) @compileError("too long: " ++ dotted);
-            break :blk out[0..out.len].*;
+        const wire = comptime blk: {
+            @setEvalBranchQuota(20_000);
+            var buf: Buf = undefined;
+            const w = wireOfDotted(&buf, dotted, false) catch |err| @compileError(@errorName(err) ++ ": " ++ dotted);
+            for (w) |b| if (std.ascii.isUpper(b)) @compileError("not lowercase: " ++ dotted);
+            break :blk w[0..w.len].*;
         };
-        return .{ .labels = &labels };
+        return .{ .wire = &wire };
+    }
+
+    pub fn of(wire: []const u8) Name {
+        if (std.debug.runtime_safety) std.debug.assert(canonical(wire));
+        return .{ .wire = wire };
+    }
+
+    fn canonical(wire: []const u8) bool {
+        if (wire.len == 0 or wire.len > max_name_wire_len) return false;
+        var i: usize = 0;
+        while (i < wire.len and wire[i] != 0) : (i += 1 + wire[i]) {
+            if (wire[i] > max_label_len or i + 1 + wire[i] >= wire.len) return false;
+            for (wire[i + 1 ..][0..wire[i]]) |b| if (std.ascii.isUpper(b)) return false;
+        }
+        return i == wire.len - 1;
+    }
+
+    pub fn clone(n: Name, allocator: Allocator) Allocator.Error!Name {
+        return .{ .wire = try allocator.dupe(u8, n.wire) };
     }
 
     pub fn isRoot(n: Name) bool {
-        return n.labels.len == 0;
+        return n.wire[0] == 0;
     }
 
     pub fn depth(n: Name) u8 {
-        return @intCast(n.labels.len);
+        var d: u8 = 0;
+        var i: usize = 0;
+        while (n.wire[i] != 0) : (i += 1 + n.wire[i]) d += 1;
+        return d;
     }
 
     pub fn leaf(n: Name) []const u8 {
-        return n.labels[0];
+        return n.wire[1..][0..n.wire[0]];
     }
 
     pub fn parent(n: Name) ?Name {
-        return if (n.isRoot()) null else .{ .labels = n.labels[1..] };
+        return if (n.isRoot()) null else .{ .wire = n.wire[1 + n.wire[0] ..] };
     }
 
     pub fn ancestor(n: Name, d: u8) Name {
-        return .{ .labels = n.labels[n.labels.len - d ..] };
+        var i: usize = 0;
+        for (0..n.depth() - d) |_| i += 1 + n.wire[i];
+        return .{ .wire = n.wire[i..] };
+    }
+
+    fn starts(n: Name, out: *[max_label_count]u8) []const u8 {
+        var k: usize = 0;
+        var i: usize = 0;
+        while (n.wire[i] != 0) : (i += 1 + n.wire[i]) {
+            out[k] = @intCast(i);
+            k += 1;
+        }
+        return out[0..k];
+    }
+
+    fn labelAt(n: Name, at: u8) []const u8 {
+        return n.wire[at + 1 ..][0..n.wire[at]];
     }
 
     pub fn shared(a: Name, b: Name) Name {
-        var d: u8 = 0;
-        while (d < @min(a.depth(), b.depth())) : (d += 1) {
-            if (!eqlIgnoreCase(a.labels[a.labels.len - 1 - d], b.labels[b.labels.len - 1 - d])) break;
+        var ab: [max_label_count]u8 = undefined;
+        var bb: [max_label_count]u8 = undefined;
+        const sa = a.starts(&ab);
+        const sb = b.starts(&bb);
+        var i = sa.len;
+        var j = sb.len;
+        while (i > 0 and j > 0 and mem.eql(u8, a.labelAt(sa[i - 1]), b.labelAt(sb[j - 1]))) {
+            i -= 1;
+            j -= 1;
         }
-        return a.ancestor(d);
+        return .{ .wire = a.wire[if (i == sa.len) a.wire.len - 1 else sa[i]..] };
     }
 
-    /// RFC 4034 §6.1: label by label from the root, each compared as
-    /// lowercase octets with a shorter label first; then fewer labels first.
+    /// RFC 4034 §6.1 canonical order.
     pub fn order(a: Name, b: Name) std.math.Order {
-        var i = a.labels.len;
-        var j = b.labels.len;
+        var ab: [max_label_count]u8 = undefined;
+        var bb: [max_label_count]u8 = undefined;
+        const sa = a.starts(&ab);
+        const sb = b.starts(&bb);
+        var i = sa.len;
+        var j = sb.len;
         while (i > 0 and j > 0) {
             i -= 1;
             j -= 1;
-            const o = orderLabels(a.labels[i], b.labels[j]);
+            const o = mem.order(u8, a.labelAt(sa[i]), b.labelAt(sb[j]));
             if (o != .eq) return o;
         }
-        return std.math.order(a.labels.len, b.labels.len);
+        return std.math.order(sa.len, sb.len);
     }
 
-    fn orderLabels(a: []const u8, b: []const u8) std.math.Order {
-        for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
-            const o = std.math.order(std.ascii.toLower(x), std.ascii.toLower(y));
-            if (o != .eq) return o;
-        }
-        return std.math.order(a.len, b.len);
+    pub fn child(buf: *Buf, label: []const u8, above: Name) ?Name {
+        const len = 1 + label.len + above.wire.len;
+        if (len > max_name_wire_len) return null;
+        buf[0] = @intCast(label.len);
+        @memcpy(buf[1..][0..label.len], label);
+        @memcpy(buf[1 + label.len ..][0..above.wire.len], above.wire);
+        return .of(buf[0..len]);
     }
 
-    /// `label` (lowercase) put before `of`, unless that passes 255 octets.
-    pub fn child(buf: *Buf, label: []const u8, of: Name) ?Name {
-        if (1 + label.len + of.wireLen() > max_name_wire_len) return null;
-        buf[0] = label;
-        @memcpy(buf[1..][0..of.labels.len], of.labels);
-        return .{ .labels = buf[0 .. 1 + of.labels.len] };
-    }
-
-    pub fn wireLen(n: Name) usize {
-        var len: usize = 1;
-        for (n.labels) |label| len += 1 + label.len;
-        return len;
-    }
-
-    /// Format `self` into `buf` as a dotted string in RFC 1035 §5.1 / RFC 4343
-    /// §2.1 presentation format: `.` and `\` escape to `\.` and `\\`, bytes
-    /// outside 0x21–0x7e to `\DDD`. Injective — distinct names render to
-    /// distinct strings, and `parseDottedName` round-trips the result — so the
-    /// output is safe as a cache/dedup key, not just for display. Returns the
-    /// written slice.
+    /// RFC 4343 §2.1 presentation form, which `parseDottedName` reads back.
     pub fn formatInto(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
-        return self.formatImpl(buf, false);
-    }
-
-    pub fn formatLower(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
-        return self.formatImpl(buf, true);
-    }
-
-    fn formatImpl(self: Name, buf: *[max_dotted_len + 1]u8, comptime lower: bool) []const u8 {
         var pos: usize = 0;
-        for (self.labels) |label| {
+        var i: usize = 0;
+        while (self.wire[i] != 0) : (i += 1 + self.wire[i]) {
             if (pos > 0) {
                 buf[pos] = '.';
                 pos += 1;
             }
-            for (label) |byte| switch (byte) {
+            for (self.wire[i + 1 ..][0..self.wire[i]]) |byte| switch (byte) {
                 '.', '\\' => {
                     buf[pos] = '\\';
                     buf[pos + 1] = byte;
                     pos += 2;
                 },
                 0x21...0x2d, 0x2f...0x5b, 0x5d...0x7e => {
-                    buf[pos] = if (lower) std.ascii.toLower(byte) else byte;
+                    buf[pos] = byte;
                     pos += 1;
                 },
                 else => {
@@ -348,31 +361,18 @@ pub const Name = struct {
     }
 
     pub fn eql(a: Name, b: Name) bool {
-        if (a.labels.len != b.labels.len) return false;
-        for (a.labels, b.labels) |la, lb| {
-            if (!eqlIgnoreCase(la, lb)) return false;
-        }
-        return true;
+        return mem.eql(u8, a.wire, b.wire);
     }
 
-    /// Strict byte-exact comparison — used to verify 0x20 echo
-    /// (RFC draft Vixie/Dagon "Use of Bit 0x20").
-    pub fn eqlExact(a: Name, b: Name) bool {
-        if (a.labels.len != b.labels.len) return false;
-        for (a.labels, b.labels) |la, lb| {
-            if (!mem.eql(u8, la, lb)) return false;
-        }
-        return true;
-    }
-
+    /// Its tail is `zone`'s bytes, starting on one of its labels: matching
+    /// bytes alone can start mid-label.
     pub fn isSubdomainOf(self: Name, zone: Name) bool {
-        if (zone.labels.len == 0) return true;
-        if (self.labels.len < zone.labels.len) return false;
-        const offset = self.labels.len - zone.labels.len;
-        for (zone.labels, 0..) |z_label, i| {
-            if (!eqlIgnoreCase(self.labels[offset + i], z_label)) return false;
-        }
-        return true;
+        if (zone.wire.len > self.wire.len) return false;
+        const at = self.wire.len - zone.wire.len;
+        if (!mem.eql(u8, self.wire[at..], zone.wire)) return false;
+        var i: usize = 0;
+        while (i < at) i += 1 + self.wire[i];
+        return i == at;
     }
 };
 
@@ -723,33 +723,6 @@ pub fn wireNameEql(a: []const u8, b: []const u8) bool {
     return eqlIgnoreCase(a, b);
 }
 
-/// An uncompressed wire name as a `Name` whose labels alias it.
-pub fn nameOfWire(wire: []const u8, labels: *[max_label_count][]const u8) Name {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (wire[i] != 0) : (i += 1 + wire[i]) {
-        labels[n] = wire[i + 1 ..][0..wire[i]];
-        n += 1;
-    }
-    return .{ .labels = labels[0..n] };
-}
-
-/// `wire` (uncompressed) is `zone` or below it, case folded.
-pub fn wireIsSubdomainOf(wire: []const u8, zone: Name) bool {
-    var starts: [max_label_count]u8 = undefined;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (wire[i] != 0) : (i += 1 + wire[i]) {
-        starts[n] = @intCast(i);
-        n += 1;
-    }
-    if (n < zone.labels.len) return false;
-    for (starts[n - zone.labels.len .. n], zone.labels) |at, label| {
-        if (!eqlIgnoreCase(wire[at + 1 ..][0..wire[at]], label)) return false;
-    }
-    return true;
-}
-
 pub fn wireNameLen(wire: []const u8) usize {
     var i: usize = 0;
     while (wire[i] != 0) i += 1 + wire[i];
@@ -841,42 +814,30 @@ fn unescapeLabel(label: []const u8, out: *[max_label_len]u8) Error!usize {
 }
 
 pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
+    var buf: Name.Buf = undefined;
+    const wire = try wireOfDotted(&buf, dotted, true);
+    if (wire.len == 1) return .root;
+    return .{ .wire = try allocator.dupe(u8, wire) };
+}
+
+fn wireOfDotted(buf: *Name.Buf, dotted: []const u8, comptime lower: bool) Error![]u8 {
     const name_str = stripTrailingDot(dotted);
-    if (name_str.len == 0) return .{ .labels = &.{} };
-
-    // Validate first (no allocations, so no cleanup needed on error)
-    var scratch: [max_label_len]u8 = undefined;
-    var total_len: usize = 0;
-    var label_count: usize = 0;
-    {
-        var start: usize = 0;
-        while (true) {
-            const end = indexOfUnescapedDot(name_str, start) orelse name_str.len;
-            const len = try unescapeLabel(name_str[start..end], &scratch);
-            if (len == 0) return error.InvalidLabelType;
-            total_len += len + 1;
-            if (total_len > max_name_len + 1) return error.NameTooLong;
-            label_count += 1;
-            if (end == name_str.len) break;
-            start = end + 1;
-        }
-    }
-
-    // Allocate and populate. errdefer unwinds a partial fill on dupe-OOM.
-    const labels = try allocator.alloc([]const u8, label_count);
-    errdefer allocator.free(labels);
-    var i: usize = 0;
-    errdefer for (labels[0..i]) |l| allocator.free(l);
+    var n: usize = 0;
     var start: usize = 0;
-    while (i < label_count) {
+    while (start < name_str.len) {
         const end = indexOfUnescapedDot(name_str, start) orelse name_str.len;
-        const len = unescapeLabel(name_str[start..end], &scratch) catch unreachable;
-        labels[i] = try allocator.dupe(u8, scratch[0..len]);
-        i += 1;
+        var scratch: [max_label_len]u8 = undefined;
+        const len = try unescapeLabel(name_str[start..end], &scratch);
+        if (len == 0) return error.InvalidLabelType;
+        if (n + 1 + len >= max_name_wire_len) return error.NameTooLong;
+        buf[n] = @intCast(len);
+        for (buf[n + 1 ..][0..len], scratch[0..len]) |*d, c| d.* = if (lower) std.ascii.toLower(c) else c;
+        n += 1 + len;
+        if (end == name_str.len) break;
         start = end + 1;
     }
-
-    return .{ .labels = labels };
+    buf[n] = 0;
+    return buf[0 .. n + 1];
 }
 
 /// Length octets sit below 'A', so only label bytes flip. RFC draft
@@ -912,7 +873,7 @@ const QueryOptions = struct {
 
 /// Borrows `qname`; its spelling is `allocator`'s.
 pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, options: QueryOptions) Allocator.Error!Message {
-    const spelled = try allocator.alloc(u8, qname.wireLen());
+    const spelled = try allocator.alloc(u8, qname.wire.len);
     _ = writeNameWire(spelled, qname) catch unreachable;
     if (options.case_rng) |rng| applyCase0x20(rng, spelled);
     const questions = try allocator.alloc(Question, 1);
@@ -979,63 +940,47 @@ const Parser = struct {
 
     const Form = enum { compressed, uncompressed };
 
-    /// Parse a wire-format Name. Labels alias the wire buffer directly —
-    /// the returned `Name.labels` outer slice is `allocator`-owned, but
-    /// each `labels[i]` byte slice points into `self.msg`. Caller must
-    /// keep the wire buffer alive for the lifetime of the parsed Name.
+    /// A name read whole, its pointers followed, into one lowercase copy:
+    /// 255 octets at most however few the message spent on it.
     fn parseName(self: *Parser, allocator: Allocator, comptime form: Form) Error!Name {
-        // Collect on the stack and dupe once at the end — N ArrayList grow
-        // allocs per name (4-5 typical) showed up at ~0.5% of CPU on miss.
-        var labels_buf: [max_label_count][]const u8 = undefined;
-        var labels_len: usize = 0;
-        var total_len: usize = 0;
+        var buf: Name.Buf = undefined;
+        var len: usize = 0;
         var jumps: usize = 0;
         const max_jumps = 32;
         var cursor = self.pos;
-        var saved_pos: ?usize = null;
+        var resume_at: ?usize = null;
 
         while (true) {
             if (cursor >= self.msg.len) return error.EndOfData;
             const len_byte = self.msg[cursor];
-
-            if (len_byte == 0) {
-                cursor += 1;
-                if (saved_pos == null) self.pos = cursor;
-                break;
-            }
-
-            const label_type = len_byte & 0xC0;
-            if (label_type == 0xC0) {
-                if (form == .uncompressed) return error.FormatError;
-                if (cursor + 1 >= self.msg.len) return error.EndOfData;
-                jumps += 1;
-                if (jumps > max_jumps) return error.CompressionPointerLoop;
-                if (saved_pos == null) saved_pos = cursor + 2;
-                const offset = (@as(u16, len_byte & 0x3F) << 8) | @as(u16, self.msg[cursor + 1]);
-                // RFC 1035 §4.1.4: pointers must reference prior occurrences
-                if (offset >= cursor) return error.FormatError;
-                cursor = offset;
-            } else if (label_type == 0x00) {
-                const label_len: usize = len_byte;
-                if (label_len > max_label_len) return error.LabelTooLong;
-                if (labels_len >= max_label_count) return error.TooManyLabels;
-                cursor += 1;
-                if (cursor + label_len > self.msg.len) return error.EndOfData;
-                labels_buf[labels_len] = self.msg[cursor..][0..label_len];
-                labels_len += 1;
-                cursor += label_len;
-                total_len += label_len + 1; // +1 for the dot separator
-                if (total_len > max_name_len + 1) return error.NameTooLong;
-                if (saved_pos == null) self.pos = cursor;
-            } else {
-                return error.InvalidLabelType;
+            switch (len_byte & 0xC0) {
+                0x00 => {
+                    const label_len: usize = len_byte;
+                    if (len + 1 + label_len > max_name_wire_len) return error.NameTooLong;
+                    if (cursor + 1 + label_len > self.msg.len) return error.EndOfData;
+                    buf[len] = len_byte;
+                    for (buf[len + 1 ..][0..label_len], self.msg[cursor + 1 ..][0..label_len]) |*d, c| d.* = std.ascii.toLower(c);
+                    len += 1 + label_len;
+                    cursor += 1 + label_len;
+                    if (label_len == 0) break;
+                },
+                0xC0 => {
+                    if (form == .uncompressed) return error.FormatError;
+                    if (cursor + 1 >= self.msg.len) return error.EndOfData;
+                    jumps += 1;
+                    if (jumps > max_jumps) return error.CompressionPointerLoop;
+                    if (resume_at == null) resume_at = cursor + 2;
+                    const offset = (@as(u16, len_byte & 0x3F) << 8) | @as(u16, self.msg[cursor + 1]);
+                    // RFC 1035 §4.1.4: pointers must reference prior occurrences
+                    if (offset >= cursor) return error.FormatError;
+                    cursor = offset;
+                },
+                else => return error.InvalidLabelType,
             }
         }
-
-        if (saved_pos) |sp| self.pos = sp;
-
-        const labels = try allocator.dupe([]const u8, labels_buf[0..labels_len]);
-        return .{ .labels = labels };
+        self.pos = resume_at orelse cursor;
+        if (len == 1) return .root;
+        return .{ .wire = try allocator.dupe(u8, buf[0..len]) };
     }
 
     fn skipName(self: *Parser) Error!void {
@@ -1303,7 +1248,7 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
             // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
             if (opt.* != null) return error.MultipleOptRecords;
             // RFC 6891 §6.1.2: OPT owner name MUST be root.
-            if (rr.name.labels.len != 0) return error.FormatError;
+            if (!rr.name.isRoot()) return error.FormatError;
             const options = try parseEdnsOptions(allocator, rr.rdata.unknown);
             opt.* = .{
                 .udp_payload_size = @backingInt(rr.rclass),
@@ -1388,7 +1333,7 @@ pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
         if (i < before_additional) continue;
         // §6.1.2: owned by the root.
         var at = Parser{ .msg = bytes, .pos = owner };
-        if ((try at.parseName(allocator, .compressed)).labels.len != 0) return error.FormatError;
+        if (!(try at.parseName(allocator, .compressed)).isRoot()) return error.FormatError;
         try frameEdnsOptions(rdata);
         edns = .{ .udp_payload_size = class, .version = @intCast(ttl >> 16 & 0xFF), .do_bit = ttl & 0x8000 != 0 };
     }
@@ -1487,26 +1432,9 @@ pub const Serializer = struct {
     }
 
     /// `compress` only for owner names and RFC 1035 rdata (RFC 3597 §4).
-    fn writeName(self: *Serializer, name: Name, compress: bool) Error!void {
-        if (compress and self.names != null) {
-            var wire: [max_name_len + 2]u8 = undefined;
-            var n: usize = 0;
-            for (name.labels) |label| {
-                if (label.len > max_label_len) return error.LabelTooLong;
-                if (n + 1 + label.len >= wire.len) return error.NameTooLong;
-                wire[n] = @intCast(label.len);
-                @memcpy(wire[n + 1 ..][0..label.len], label);
-                n += 1 + label.len;
-            }
-            wire[n] = 0;
-            return self.writeWireName(wire[0 .. n + 1]);
-        }
-        for (name.labels) |label| {
-            if (label.len > max_label_len) return error.LabelTooLong;
-            try self.writeU8(@intCast(label.len));
-            try self.writeSlice(label);
-        }
-        try self.writeU8(0);
+    fn writeName(self: *Serializer, wire: []const u8, compress: bool) Error!void {
+        if (compress and self.names != null) return self.writeWireName(wire);
+        try self.writeSlice(wire);
     }
 
     /// An uncompressed wire name, compressed against what is written.
@@ -1530,9 +1458,7 @@ pub const Serializer = struct {
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
-        if (q.spelled) |s| {
-            if (self.names != null) try self.writeWireName(s) else try self.writeSlice(s);
-        } else try self.writeName(q.name, true);
+        try self.writeName(q.spelled orelse q.name.wire, true);
         try self.writeU16(@backingInt(q.qtype));
         try self.writeU16(@backingInt(q.qclass));
     }
@@ -1558,7 +1484,7 @@ pub const Serializer = struct {
     }
 
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
-        try self.writeName(rr.name, true);
+        try self.writeName(rr.name.wire, true);
         try self.writeU16(@backingInt(rr.rtype));
         try self.writeU16(@backingInt(rr.rclass));
         try self.writeU32(rr.ttl);
@@ -1579,14 +1505,14 @@ pub const Serializer = struct {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
-            .ns, .cname, .ptr, .dname => |name| try self.writeName(name, compress),
+            .ns, .cname, .ptr, .dname => |name| try self.writeName(name.wire, compress),
             .mx => |mx| {
                 try self.writeU16(mx.preference);
-                try self.writeName(mx.exchange, compress);
+                try self.writeName(mx.exchange.wire, compress);
             },
             .soa => |soa| {
-                try self.writeName(soa.mname, compress);
-                try self.writeName(soa.rname, compress);
+                try self.writeName(soa.mname.wire, compress);
+                try self.writeName(soa.rname.wire, compress);
                 try self.writeU32(soa.serial);
                 try self.writeU32(soa.refresh);
                 try self.writeU32(soa.retry);
@@ -1607,7 +1533,7 @@ pub const Serializer = struct {
                 try self.writeU32(rrsig.sig_expiration);
                 try self.writeU32(rrsig.sig_inception);
                 try self.writeU16(rrsig.key_tag);
-                try self.writeName(rrsig.signer_name, compress);
+                try self.writeName(rrsig.signer_name.wire, compress);
                 try self.writeSlice(rrsig.signature);
             },
             .dnskey => |dnskey| {
@@ -1623,7 +1549,7 @@ pub const Serializer = struct {
                 try self.writeSlice(ds_data.digest);
             },
             .nsec => |nsec_data| {
-                if (nsec_data.next_spelled) |next| try self.writeSlice(next) else try self.writeName(nsec_data.next_domain_name, compress);
+                try self.writeName(nsec_data.next_spelled orelse nsec_data.next_domain_name.wire, compress);
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
@@ -1638,7 +1564,7 @@ pub const Serializer = struct {
             },
             .named => |d| {
                 try self.writeSlice(d.head);
-                for (d.names) |name| try self.writeName(name, false);
+                for (d.names) |name| try self.writeName(name.wire, false);
             },
             .unknown => |data| try self.writeSlice(data),
         }
@@ -1675,11 +1601,11 @@ pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
 /// Uncompressed, as a stored fact holds names and records.
 pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
     var ser: Serializer = .{ .buf = buf };
-    try ser.writeName(name, false);
+    try ser.writeName(name.wire, false);
     return ser.pos;
 }
 
-/// Labels alias `bytes`.
+/// One lowercase copy, `allocator`'s.
 pub fn readNameWire(allocator: Allocator, bytes: []const u8, pos: *usize) Error!Name {
     var parser = Parser{ .msg = bytes, .pos = pos.* };
     const name = try parser.parseName(allocator, .compressed);
@@ -1780,10 +1706,7 @@ test "name parsing - compressed" {
     var parser = Parser{ .msg = data, .pos = 13 };
     const name = try parser.parseName(arena.allocator(), .compressed);
 
-    try testing.expectEqual(@as(usize, 3), name.labels.len);
-    try testing.expectEqualStrings("foo", name.labels[0]);
-    try testing.expectEqualStrings("example", name.labels[1]);
-    try testing.expectEqualStrings("com", name.labels[2]);
+    try testing.expect(name.eql(.lit("foo.example.com")));
     // pos should advance past the pointer (13 + 3+1 + 2 = 19)
     try testing.expectEqual(@as(usize, 19), parser.pos);
 }
@@ -1811,8 +1734,7 @@ test "full query packet parse" {
     try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
     try testing.expect(msg.header.flags.rd);
     try testing.expectEqual(@as(usize, 1), msg.questions.len);
-    try testing.expectEqualStrings("example", msg.questions[0].name.labels[0]);
-    try testing.expectEqualStrings("com", msg.questions[0].name.labels[1]);
+    try testing.expect(msg.questions[0].name.eql(.lit("example.com")));
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
 }
@@ -1841,8 +1763,8 @@ test "SOA record parsing" {
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .soa, rd.slice(), rd.pos));
 
     const soa = msg.answers[0].rdata.soa;
-    try testing.expectEqualStrings("ns", soa.mname.labels[0]);
-    try testing.expectEqualStrings("admin", soa.rname.labels[0]);
+    try testing.expect(soa.mname.eql(.lit("ns.example.com")));
+    try testing.expect(soa.rname.eql(.lit("admin.example.com")));
     try testing.expectEqual(@as(u32, 2023010101), soa.serial);
     try testing.expectEqual(@as(u32, 3600), soa.refresh);
     try testing.expectEqual(@as(u32, 900), soa.retry);
@@ -1861,7 +1783,7 @@ test "MX record parsing" {
 
     const mx = msg.answers[0].rdata.mx;
     try testing.expectEqual(@as(u16, 10), mx.preference);
-    try testing.expectEqualStrings("mail", mx.exchange.labels[0]);
+    try testing.expect(mx.exchange.eql(.lit("mail.example.com")));
 }
 
 test "TXT record parsing" {
@@ -1912,9 +1834,9 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
     try testing.expectEqualSlices(u8, "\x07example\x03com\x00", wire[12 + 21 + 16 + 30 ..][0..13]);
 
     const parsed = try parseMessage(a, wire);
-    try testing.expect(parsed.answers[0].name.eqlExact(owner));
-    try testing.expect(parsed.answers[1].rdata.rrsig.signer_name.eqlExact(rrsig.signer_name));
-    try testing.expect(parsed.authorities[0].rdata.ns.eqlExact(ns1));
+    try testing.expect(parsed.answers[0].name.eql(owner));
+    try testing.expect(parsed.answers[1].rdata.rrsig.signer_name.eql(rrsig.signer_name));
+    try testing.expect(parsed.authorities[0].rdata.ns.eql(ns1));
 }
 
 test "name compression follows a pointer inside an earlier name" {
@@ -1929,7 +1851,7 @@ test "name compression follows a pointer inside an earlier name" {
     // The second owner is one pointer to "mail" + a pointer, itself.
     try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
     const back = try parseMessage(a, wire);
-    for (back.answers) |got| try testing.expect(got.name.eqlExact(mail));
+    for (back.answers) |got| try testing.expect(got.name.eql(mail));
 }
 
 test "a record written from its stored bytes is the record written from its fields" {
@@ -2013,7 +1935,7 @@ test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
 
     const max = header ++ "\x3f" ++ @as([63]u8, @splat('a')) ++ "\x00\x00\x01\x00\x01";
     const msg = try parseMessage(arena.allocator(), max);
-    try testing.expectEqual(@as(usize, 63), msg.questions[0].name.labels[0].len);
+    try testing.expectEqual(@as(usize, 63), msg.questions[0].name.leaf().len);
 
     // 64 is 0x40: top bits 01, a label type RFC 1035 never defined.
     const over = header ++ "\x40" ++ @as([64]u8, @splat('a'));
@@ -2035,7 +1957,7 @@ test "EDNS0: serialized OPT has correct wire format" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQuery(alloc, 0xABCD, .{ .labels = &.{ "x", "com" } }, .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
+    const msg = try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
 
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
@@ -2064,6 +1986,55 @@ test "RFC 6891 §6.1.1: a query's OPT is the only one in the message, whatever s
     try testing.expectError(error.MultipleOptRecords, readQuery(arena.allocator(), wire));
 }
 
+test "names are read lowercase, and the question as it was spelled" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // A reply to WwW.eXaMpLe whose answer's owner points at the question.
+    const wire = "\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" ++
+        "\x03WwW\x07eXaMpLe\x00\x00\x01\x00\x01" ++
+        "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
+    const msg = try parseMessage(arena.allocator(), wire);
+    try testing.expect(msg.questions[0].name.eql(.lit("www.example")));
+    try testing.expectEqualSlices(u8, "\x03WwW\x07eXaMpLe\x00", msg.questions[0].spelled.?);
+    try testing.expect(msg.answers[0].name.eql(.lit("www.example")));
+}
+
+test "a pointer flood costs each name its 255 octets, no more" {
+    // A 127-label question, then answers whose owner and rdata both point
+    // at it: 14 wire octets for two names of 255.
+    var buf: [max_message_len]u8 = undefined;
+    var n: usize = 12;
+    for (0..max_label_count) |_| {
+        @memcpy(buf[n..][0..2], "\x01a");
+        n += 2;
+    }
+    @memcpy(buf[n..][0..5], "\x00\x00\x0c\x00\x01");
+    n += 5;
+    const rr = "\xc0\x0c\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x02\xc0\x0c";
+    var answers: u16 = 0;
+    while (n + rr.len <= buf.len) : (answers += 1) {
+        @memcpy(buf[n..][0..rr.len], rr);
+        n += rr.len;
+    }
+    (Header{ .id = 1, .flags = mem.zeroes(Header.Flags), .qd_count = 1, .an_count = answers }).serialize(buf[0..12]);
+    const room = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(room);
+    var fixed = std.heap.FixedBufferAllocator.init(room);
+    const msg = try parseMessage(fixed.allocator(), buf[0..n]);
+    try testing.expectEqual(answers, msg.answers.len);
+}
+
+test "an NSEC's next name goes back out as signed (RFC 6840 §5.1)" {
+    const rdata = "\x04HoSt\x07example\x00\x00\x01\x40";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pkt: [max_udp_payload]u8 = undefined;
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rdata, rdata.len));
+    try testing.expect(msg.answers[0].rdata.nsec.next_domain_name.eql(.lit("host.example")));
+    var out: [max_udp_payload]u8 = undefined;
+    try testing.expect(mem.endsWith(u8, try buildResourceRecordWire(&out, msg.answers[0]), rdata));
+}
+
 test "a query's other records are stepped, never built" {
     // A 127-label question, then answers whose owner and rdata both point at it.
     var buf: [max_message_len]u8 = undefined;
@@ -2084,67 +2055,19 @@ test "a query's other records are stepped, never built" {
     var room: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&room);
     const query = try readQuery(fixed.allocator(), buf[0..n]);
-    try testing.expectEqual(max_label_count, query.question.?.name.labels.len);
+    try testing.expectEqual(max_label_count, query.question.?.name.depth());
 }
 
-/// Single-allocation clone: labels slice and every label byte share one
-/// contiguous buffer.
-pub fn cloneNameFlat(allocator: Allocator, name: Name, comptime lower: bool) !Name {
-    const buf = try allocator.alignedAlloc(u8, name_flat_align, nameFlatSize(name));
-    return writeNameFlat(buf, name, lower);
-}
-
-/// `cloneNameFlat` that lowercases ASCII letters in-flight. Used to scrub
-/// 0x20-randomized case off upstream RR owner names.
-pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
-    return cloneNameFlat(allocator, name, true);
-}
-
-const name_flat_align: std.mem.Alignment = .fromByteUnits(@alignOf([]const u8));
-
-pub fn nameFlatSize(name: Name) usize {
-    var total: usize = @sizeOf([]const u8) * name.labels.len;
-    for (name.labels) |label| total += label.len;
-    return total;
-}
-
-/// `buf` must hold `nameFlatSize(name)` bytes.
-pub fn writeNameFlat(buf: []align(name_flat_align.toByteUnits()) u8, name: Name, comptime lower: bool) Name {
-    const n = name.labels.len;
-    if (n == 0) return .{ .labels = &.{} };
-    const labels_ptr: [*]([]const u8) = @ptrCast(buf.ptr);
-    const labels: [][]const u8 = labels_ptr[0..n];
-    var offset: usize = @sizeOf([]const u8) * n;
-    for (name.labels, 0..) |label, i| {
-        if (comptime lower) {
-            for (label, 0..) |b, j| buf[offset + j] = std.ascii.toLower(b);
-        } else {
-            @memcpy(buf[offset..][0..label.len], label);
-        }
-        labels[i] = buf[offset..][0..label.len];
-        offset += label.len;
-    }
-    return .{ .labels = labels };
-}
-
-/// RFC 6672 §2.2 substitution: `owner` with its trailing `suffix` labels
-/// replaced by `target`. Null when the result would overflow a legal name —
-/// the same bound the parser enforces, so an overflowing substitution can
-/// never equal a name that arrived on the wire. Labels are borrowed; only
-/// the outer slice is allocated.
+/// RFC 6672 §2.2: `owner` with its `suffix` replaced by `target`. Null
+/// past 255 octets, where no name from the wire could match it.
 pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target: Name) Allocator.Error!?Name {
-    std.debug.assert(owner.labels.len >= suffix.labels.len);
-    const prefix = owner.labels[0 .. owner.labels.len - suffix.labels.len];
-    if (prefix.len + target.labels.len > max_label_count) return null;
-    var wire: usize = 0;
-    for (prefix) |label| wire += label.len + 1;
-    for (target.labels) |label| wire += label.len + 1;
-    if (wire > max_name_len + 1) return null;
-
-    const labels = try allocator.alloc([]const u8, prefix.len + target.labels.len);
-    @memcpy(labels[0..prefix.len], prefix);
-    @memcpy(labels[prefix.len..], target.labels);
-    return .{ .labels = labels };
+    std.debug.assert(owner.isSubdomainOf(suffix));
+    const prefix = owner.wire[0 .. owner.wire.len - suffix.wire.len];
+    if (prefix.len + target.wire.len > max_name_wire_len) return null;
+    const wire = try allocator.alloc(u8, prefix.len + target.wire.len);
+    @memcpy(wire[0..prefix.len], prefix);
+    @memcpy(wire[prefix.len..], target.wire);
+    return .of(wire);
 }
 
 /// RFC 5452 §9.1: the one question sent, at any rcode, its spelling byte
@@ -2185,30 +2108,6 @@ test "validateResponse: only the one question sent, at any rcode" {
     var notify = reply(&.{sent}, .no_error);
     notify.header.flags.opcode = @fromBackingInt(4);
     try std.testing.expectError(bad, validateResponse(notify, sent, .a, true));
-}
-
-/// Lowercase every embedded `Name` in `rdata` in place. Pre-scrub label
-/// bytes are abandoned, not freed; only safe under an arena.
-pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
-    switch (rdata.*) {
-        .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .unknown => {},
-        .ns, .cname, .dname, .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
-        .mx => |*m| m.exchange = try cloneNameLower(allocator, m.exchange),
-        .soa => |*s| {
-            s.mname = try cloneNameLower(allocator, s.mname);
-            s.rname = try cloneNameLower(allocator, s.rname);
-        },
-        .rrsig => |*r| r.signer_name = try cloneNameLower(allocator, r.signer_name),
-        .named => |*d| {
-            const names = try allocator.alloc(Name, d.names.len);
-            for (d.names, names) |name, *to| to.* = try cloneNameLower(allocator, name);
-            d.names = names;
-        },
-        // RFC 6840 §5.1: names in NSEC RDATA are not case-folded when
-        // canonicalizing (RRSIG RDATA names are). Still cloned: the scrub
-        // re-anchors label bytes off the wire buffer the message does not own.
-        .nsec => |*n| n.next_domain_name = try cloneNameFlat(allocator, n.next_domain_name, false),
-    }
 }
 
 test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a week, NSEC and NSEC3 at three hours" {
@@ -2253,12 +2152,15 @@ test "compression past its work budget writes names whole, and they read back" {
     defer arena.deinit();
     const a = arena.allocator();
     var rrs: [60]ResourceRecord = undefined;
-    const owner: Name = .{ .labels = &.{"x"} };
+    const owner: Name = .lit("x");
     for (&rrs, 0..) |*rr, i| {
-        const labels = try a.alloc([]const u8, 126);
-        for (labels[0..125]) |*l| l.* = "a";
-        labels[125] = try std.fmt.allocPrint(a, "b{d}", .{i});
-        rr.* = .{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .{ .labels = labels } } };
+        var w: std.ArrayList(u8) = .empty;
+        for (0..125) |_| try w.appendSlice(a, "\x01a");
+        const last = try std.fmt.allocPrint(a, "b{d}", .{i});
+        try w.append(a, @intCast(last.len));
+        try w.appendSlice(a, last);
+        try w.append(a, 0);
+        rr.* = .{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .of(w.items) } };
     }
     const q = [_]Question{.{ .name = owner, .qtype = .ptr, .qclass = .in }};
     var buf: [max_message_len]u8 = undefined;
@@ -2272,11 +2174,11 @@ test "parseDottedName: trailing dot optional, root is empty, bad labels refused"
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const want = Name{ .labels = &.{ "example", "com" } };
-    try testing.expect(want.eqlExact(try parseDottedName(a, "example.com")));
-    try testing.expect(want.eqlExact(try parseDottedName(a, "example.com.")));
-    try testing.expectEqual(@as(usize, 0), (try parseDottedName(a, ".")).labels.len);
-    try testing.expectEqual(@as(usize, 0), (try parseDottedName(a, "")).labels.len);
+    const want = Name.lit("example.com");
+    try testing.expect(want.eql(try parseDottedName(a, "example.com")));
+    try testing.expect(want.eql(try parseDottedName(a, "example.com.")));
+    try testing.expect((try parseDottedName(a, ".")).isRoot());
+    try testing.expect((try parseDottedName(a, "")).isRoot());
     try testing.expectError(error.InvalidLabelType, parseDottedName(a, "example..com"));
     const long_label = @as([64]u8, @splat('a')) ++ ".com".*;
     try testing.expectError(error.LabelTooLong, parseDottedName(a, &long_label));
@@ -2287,15 +2189,15 @@ test "substituteSuffix declines a substitution that overflows a legal name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const long_label: []const u8 = &@as([63]u8, @splat('x'));
+    const long_label = @as([63]u8, @splat('x')) ++ ".";
     // Four 63-octet labels is 257 wire octets — past the 255 limit.
-    const owner = Name{ .labels = &.{ long_label, long_label, "short" } };
-    const suffix = Name{ .labels = &.{"short"} };
-    const target = Name{ .labels = &.{ long_label, long_label } };
+    const owner: Name = .lit(long_label ++ long_label ++ "short");
+    const suffix: Name = .lit("short");
+    const target: Name = .lit(long_label ++ long_label);
     try testing.expect(try substituteSuffix(a, owner, suffix, target) == null);
 
-    const fits = try substituteSuffix(a, owner, suffix, .{ .labels = &.{"net"} });
-    try testing.expect(fits.?.eql(.{ .labels = &.{ long_label, long_label, "net" } }));
+    const fits = try substituteSuffix(a, owner, suffix, .lit("net"));
+    try testing.expect(fits.?.eql(.lit(long_label ++ long_label ++ "net")));
 }
 
 test "a name walks up to the root, label by label" {
@@ -2316,8 +2218,8 @@ test "RFC 4034 §6.1: names in canonical order" {
         .lit("example"),
         .lit("a.example"),
         .lit("yljkjljk.a.example"),
-        .lit("Z.a.example"),
-        .lit("zABC.a.EXAMPLE"),
+        .lit("z.a.example"),
+        .lit("zabc.a.example"),
         .lit("z.example"),
         .lit("\\001.z.example"),
         .lit("*.z.example"),
@@ -2340,17 +2242,19 @@ test "shared ancestors, and a child that would pass 255 octets is none" {
     const three = label ++ "." ++ label ++ "." ++ label ++ ".";
     const full = Name.lit(three ++ @as([61]u8, @splat('a')));
     const room = Name.lit(three ++ @as([59]u8, @splat('a')));
-    try testing.expectEqual(@as(usize, 255), full.wireLen());
+    try testing.expectEqual(@as(usize, 255), full.wire.len);
     try testing.expectEqual(null, Name.child(&buf, "*", full));
-    try testing.expectEqual(@as(usize, 255), Name.child(&buf, "*", room).?.wireLen());
+    try testing.expectEqual(@as(usize, 255), Name.child(&buf, "*", room).?.wire.len);
 }
 
-test "isSubdomainOf: self, descendants and the root; case-insensitive; never a sibling" {
-    const name = Name{ .labels = &.{ "example", "com" } };
+test "isSubdomainOf: self, descendants and the root; never a sibling, nor a label's tail" {
+    const name = Name.lit("example.com");
     try testing.expect(name.isSubdomainOf(name));
-    try testing.expect((Name{ .labels = &.{ "WWW", "EXAMPLE", "COM" } }).isSubdomainOf(name));
-    try testing.expect(name.isSubdomainOf(.{ .labels = &.{} }));
-    try testing.expect(!(Name{ .labels = &.{ "a", "example", "com" } }).isSubdomainOf(.{ .labels = &.{ "b", "example", "com" } }));
+    try testing.expect((Name.lit("www.example.com")).isSubdomainOf(name));
+    // Bytes `\x07example\x03com\x00` end this name inside its first label.
+    try testing.expect(!(Name.lit("a\\007example.com")).isSubdomainOf(name));
+    try testing.expect(name.isSubdomainOf(.root));
+    try testing.expect(!(Name.lit("a.example.com")).isSubdomainOf(.lit("b.example.com")));
 }
 
 fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Message {
@@ -2476,7 +2380,7 @@ test "RRSIG record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u32, 1700000000), rrsig.sig_expiration);
     try testing.expectEqual(@as(u32, 1699000000), rrsig.sig_inception);
     try testing.expectEqual(@as(u16, 12345), rrsig.key_tag);
-    try testing.expectEqualStrings("example", rrsig.signer_name.labels[0]);
+    try testing.expect(rrsig.signer_name.eql(.lit("example.com")));
     try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
 
     var rt_buf: [max_udp_payload]u8 = undefined;
@@ -2502,7 +2406,7 @@ test "NSEC record parse/serialize roundtrip" {
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rd.slice(), rd.pos));
 
     const nsec = msg.answers[0].rdata.nsec;
-    try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
+    try testing.expectEqualStrings("host", nsec.next_domain_name.leaf());
     try testing.expectEqualSlices(u8, bitmap, nsec.type_bit_maps);
 
     var rt_buf: [max_udp_payload]u8 = undefined;
@@ -2663,15 +2567,15 @@ test "formatInto is injective over hostile labels" {
 
     // The two wire names that motivated RFC 4343 §2.1 escaping: a literal
     // 0x2e inside a label must not render like the separator.
-    try testing.expectEqualStrings("e\\.d.com", (Name{ .labels = &.{ "e.d", "com" } }).formatInto(&buf));
-    try testing.expectEqualStrings("e.d.com", (Name{ .labels = &.{ "e", "d", "com" } }).formatInto(&buf));
+    try testing.expectEqualStrings("e\\.d.com", (Name.lit("e\\.d.com")).formatInto(&buf));
+    try testing.expectEqualStrings("e.d.com", (Name.lit("e.d.com")).formatInto(&buf));
 
     // Non-printables render as \DDD, so 0x07 no longer collides with '?'.
-    try testing.expectEqualStrings("\\007foo.com", (Name{ .labels = &.{ "\x07foo", "com" } }).formatInto(&buf));
-    try testing.expectEqualStrings("?foo.com", (Name{ .labels = &.{ "?foo", "com" } }).formatInto(&buf));
+    try testing.expectEqualStrings("\\007foo.com", (Name.lit("\\007foo.com")).formatInto(&buf));
+    try testing.expectEqualStrings("?foo.com", (Name.lit("?foo.com")).formatInto(&buf));
 
-    try testing.expectEqualStrings("a\\\\b", (Name{ .labels = &.{"a\\b"} }).formatInto(&buf));
-    try testing.expectEqualStrings("\\032.\\255", (Name{ .labels = &.{ " ", "\xff" } }).formatInto(&buf));
+    try testing.expectEqualStrings("a\\\\b", (Name.lit("a\\\\b")).formatInto(&buf));
+    try testing.expectEqualStrings("\\032.\\255", (Name.lit("\\032.\\255")).formatInto(&buf));
 }
 
 test "formatInto/parseDottedName round-trip every label byte" {
@@ -2681,21 +2585,22 @@ test "formatInto/parseDottedName round-trip every label byte" {
 
     var b: usize = 0;
     while (b < 256) : (b += 1) {
-        const label = [_]u8{ 'A', @intCast(b), 'z' };
-        const original = Name{ .labels = &.{ &label, "example", "com" } };
+        var wire = "\x03a?z\x07example\x03com\x00".*;
+        wire[2] = std.ascii.toLower(@intCast(b));
+        const original: Name = .of(&wire);
         var buf: [max_dotted_len + 1]u8 = undefined;
         const parsed = try parseDottedName(alloc, original.formatInto(&buf));
-        try testing.expect(original.eqlExact(parsed));
+        try testing.expect(original.eql(parsed));
     }
 
     // Worst case: a wire-maximal name of pure \DDD content (253 bytes over
     // four labels) renders to 4·250+3 = 1003 chars and still round-trips.
-    const wide: [max_label_len]u8 = @splat(0);
-    const last: [61]u8 = @splat(0);
-    const original = Name{ .labels = &.{ &wide, &wide, &wide, &last } };
+    const wide = [_]u8{max_label_len} ++ @as([max_label_len]u8, @splat(0));
+    const last = [_]u8{61} ++ @as([61]u8, @splat(0));
+    const original: Name = .of(&(wide ++ wide ++ wide ++ last ++ [_]u8{0}));
     var buf: [max_dotted_len + 1]u8 = undefined;
     const parsed = try parseDottedName(alloc, original.formatInto(&buf));
-    try testing.expect(original.eqlExact(parsed));
+    try testing.expect(original.eql(parsed));
 }
 
 test "parseDottedName decodes presentation escapes" {
@@ -2704,13 +2609,13 @@ test "parseDottedName decodes presentation escapes" {
     const alloc = arena.allocator();
 
     const escaped_dot = try parseDottedName(alloc, "e\\.d.com");
-    try testing.expect(escaped_dot.eqlExact(.{ .labels = &.{ "e.d", "com" } }));
+    try testing.expect(escaped_dot.eql(.lit("e\\.d.com")));
 
     // \DDD is a decimal byte, \X a literal, and a trailing escaped dot is
     // content rather than a stripped separator.
-    try testing.expect((try parseDottedName(alloc, "\\068")).eqlExact(.{ .labels = &.{"D"} }));
-    try testing.expect((try parseDottedName(alloc, "ex\\ample.com")).eqlExact(.{ .labels = &.{ "example", "com" } }));
-    try testing.expect((try parseDottedName(alloc, "a\\.")).eqlExact(.{ .labels = &.{"a."} }));
+    try testing.expect((try parseDottedName(alloc, "\\068")).eql(.lit("d")));
+    try testing.expect((try parseDottedName(alloc, "ex\\ample.com")).eql(.lit("example.com")));
+    try testing.expect((try parseDottedName(alloc, "a\\.")).eql(.lit("a\\.")));
 
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\"));
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\12"));

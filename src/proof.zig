@@ -250,18 +250,11 @@ pub fn proofFlood(authorities: []const dns.ResourceRecord) bool {
     return n > max_proof_records;
 }
 
-pub fn nsec3Hash(
-    name: dns.Name,
-    salt: []const u8,
-    iterations: u16,
-) error{BufferTooSmall}![Sha1.digest_length]u8 {
-    var name_wire: [dns.max_name_len + 2]u8 = undefined;
-    const name_len = try rrsig.writeCanonicalNameWire(&name_wire, name);
-
-    // IH(0) = H(name_wire || salt)
+pub fn nsec3Hash(name: dns.Name, salt: []const u8, iterations: u16) [Sha1.digest_length]u8 {
+    // IH(0) = H(name || salt)
     var hash: [Sha1.digest_length]u8 = undefined;
     var hasher = Sha1.init(.{});
-    hasher.update(name_wire[0..name_len]);
+    hasher.update(name.wire);
     hasher.update(salt);
     hasher.final(&hash);
 
@@ -303,21 +296,20 @@ fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest
     return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
 }
 
-/// An NSEC3 hash charged to the query's budget. Callers fail either error
-/// closed: an exhausted budget is CVE-2023-50868's attack signal, and a name
-/// too long to hash is a wildcard no zone can hold.
+/// Charged to the query's budget; callers fail closed when it is spent,
+/// CVE-2023-50868's attack signal.
 fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
     budget: *rrsig.ValidationBudget,
-) ![Sha1.digest_length]u8 {
+) error{ValidationBudgetExhausted}![Sha1.digest_length]u8 {
     try budget.consumeNsec3(nsec3HashBlocks(name, salt.len, iterations));
     return nsec3Hash(name, salt, iterations);
 }
 
 fn nsec3HashBlocks(name: dns.Name, salt_len: usize, iterations: u16) u32 {
-    return sha1Blocks(name.wireLen() + salt_len) + @as(u32, iterations) * sha1Blocks(Sha1.digest_length + salt_len);
+    return sha1Blocks(name.wire.len + salt_len) + @as(u32, iterations) * sha1Blocks(Sha1.digest_length + salt_len);
 }
 
 fn sha1Blocks(message_len: usize) u32 {
@@ -1172,7 +1164,7 @@ test "nsec3Hash RFC 5155 Appendix B" {
     const name = dns.Name.lit("example");
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var enc_buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", dns.base32HexEncode(&enc_buf, &try nsec3Hash(name, &salt, 12)));
+    try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", dns.base32HexEncode(&enc_buf, &nsec3Hash(name, &salt, 12)));
 }
 
 test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
@@ -1182,7 +1174,7 @@ test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
 
 test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 5155 §8.1)" {
     const qname = dns.Name.lit("example.com");
-    const owner_name = dns.Name.lit("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.com");
+    const owner_name = dns.Name.lit("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com");
     const next: [20]u8 = @splat(0xFF);
     const authorities = [_]dns.ResourceRecord{.{
         .name = owner_name,
@@ -1216,7 +1208,7 @@ test "NSEC3 rejects an ancestor-delegation record (RFC 6840 §4.1)" {
     const cut = dns.Name.lit("example.com");
     const below = dns.Name.lit("www.example.com");
 
-    const cut_hash = try nsec3Hash(cut, salt, 0);
+    const cut_hash = nsec3Hash(cut, salt, 0);
     var bufs: Nsec3OwnerBufs = .{};
     const cut_owner = makeNsec3OwnerName(cut_hash, zone_name, &bufs);
     const parent_side = [_]u8{ 0x00, 0x01, 0x20 }; // NS only
@@ -1254,7 +1246,7 @@ test "NSEC3 child-side apex cannot deny DS (RFC 6840 §4.4)" {
     // an authenticated downgrade of the whole child zone.
     const salt: []const u8 = &.{};
     const apex = dns.Name.lit("example.com");
-    const hash = try nsec3Hash(apex, salt, 0);
+    const hash = nsec3Hash(apex, salt, 0);
     var bufs: Nsec3OwnerBufs = .{};
     const owner = makeNsec3OwnerName(hash, apex, &bufs);
     // A NS SOA RRSIG NSEC DNSKEY — no DS.
@@ -1277,7 +1269,7 @@ test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
     // Mirrors NSEC arm: owner-match with CNAME in bitmap contradicts NODATA.
     const qname = dns.Name.lit("alias.com");
     const salt: []const u8 = &.{};
-    const hash = try nsec3Hash(qname, salt, 0);
+    const hash = nsec3Hash(qname, salt, 0);
 
     var bufs: Nsec3OwnerBufs = .{};
     const owner_name = makeNsec3OwnerName(hash, test_com, &bufs);
@@ -1295,10 +1287,10 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
+    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
 
     var bufs2: Nsec3OwnerBufs = .{};
-    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
+    const nc_rr = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
 
     const authorities = [_]dns.ResourceRecord{
         makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{}),
@@ -1339,7 +1331,7 @@ const OptOutProof = struct {
         const zone_name = dns.Name.lit("com");
         const salt: []const u8 = &.{};
         const ce = zone_name;
-        const ce_hash = try nsec3Hash(ce, salt, 0);
+        const ce_hash = nsec3Hash(ce, salt, 0);
         const ce_owner = makeNsec3OwnerName(ce_hash, zone_name, &self.ce_bufs);
         // The CE's range must stop just past its own owner, as `com`'s does.
         // Sibling tests use 0xFF… here; that would break these — one NSEC3 may
@@ -1350,13 +1342,13 @@ const OptOutProof = struct {
         self.rrs[0] = makeNsec3Rr(ce_owner, salt, &self.ce_next, &com_apex_bitmap);
         self.rrs[0].rdata.nsec3.flags = nsec3_opt_out;
 
-        self.rrs[1] = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_name, salt, &self.nc_bufs);
+        self.rrs[1] = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &self.nc_bufs);
         self.rrs[1].rdata.nsec3.type_bit_maps = &com_delegation_bitmap;
         self.rrs[1].rdata.nsec3.flags = if (opt_out) nsec3_opt_out else 0;
 
         var wc_buf: dns.Name.Buf = undefined;
         const wildcard = dns.Name.child(&wc_buf, "*", ce).?;
-        self.rrs[2] = makeCoveringNsec3(try nsec3Hash(wildcard, salt, 0), zone_name, salt, &self.wc_bufs);
+        self.rrs[2] = makeCoveringNsec3(nsec3Hash(wildcard, salt, 0), zone_name, salt, &self.wc_bufs);
     }
 
     /// The DS denial as captured: decisively nothing covers hash(*.com).
@@ -1481,7 +1473,7 @@ test "NSEC3 NODATA under Opt-Out outranks a wildcard CNAME at the encloser (RFC 
     var wl: dns.Name.Buf = undefined;
     const wc = dns.Name.child(&wl, "*", test_com).?;
     const cname_only = [_]u8{ 0x00, 0x01, 0x04 };
-    const wc_rr = makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(wc, &.{}, 0), test_com, &bufs), &.{}, &p.nc_bufs.high, &cname_only);
+    const wc_rr = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(wc, &.{}, 0), test_com, &bufs), &.{}, &p.nc_bufs.high, &cname_only);
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&.{ p.rrs[0], p.rrs[1], wc_rr }, qname, .ds, false, test_root, &b));
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&.{ p.rrs[0], p.rrs[1], wc_rr }, qname, .a, false, test_root, &b));
@@ -1532,12 +1524,12 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
+    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
     var bufs2: Nsec3OwnerBufs = .{};
-    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
+    const nc_rr = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
     // *.CE NSEC3 owner-match with bitmap = A(1) only; HTTPS(65) and CNAME(5) absent.
     var bufs3: Nsec3OwnerBufs = .{};
-    const wc_owner = makeNsec3OwnerName(try nsec3Hash(wc_name, salt, 0), zone_name, &bufs3);
+    const wc_owner = makeNsec3OwnerName(nsec3Hash(wc_name, salt, 0), zone_name, &bufs3);
 
     const authorities = [_]dns.ResourceRecord{
         makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
@@ -1560,11 +1552,11 @@ test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
     const salt: []const u8 = &.{};
 
     var bufs1: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
+    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
     var bufs2: Nsec3OwnerBufs = .{};
-    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
+    const nc_rr = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
     var bufs3: Nsec3OwnerBufs = .{};
-    const wc_rr = makeCoveringNsec3(try nsec3Hash(wc_name, salt, 0), zone_name, salt, &bufs3);
+    const wc_rr = makeCoveringNsec3(nsec3Hash(wc_name, salt, 0), zone_name, salt, &bufs3);
 
     const authorities = [_]dns.ResourceRecord{
         makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
@@ -1583,7 +1575,7 @@ test "classifyDelegation NSEC3 match" {
     const salt: []const u8 = &.{};
 
     var bufs: Nsec3OwnerBufs = .{};
-    const owner_name = makeNsec3OwnerName(try nsec3Hash(child_zone, salt, 0), zone_name, &bufs);
+    const owner_name = makeNsec3OwnerName(nsec3Hash(child_zone, salt, 0), zone_name, &bufs);
 
     // NS only (no DS)
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x20 })};
@@ -1596,10 +1588,10 @@ test "classifyDelegation NSEC3 signed below or beside the cut proves nothing" {
     const child_zone = dns.Name.lit("bank.com");
     const salt: []const u8 = &.{ 0xAA, 0xBB };
     var bufs: [2]Nsec3OwnerBufs = .{ .{}, .{} };
-    var span = makeCoveringNsec3(try nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
+    var span = makeCoveringNsec3(nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
     span.rdata.nsec3.flags = nsec3_opt_out;
     // Every Opt-Out referral carries the closest encloser `com` itself.
-    const ce = makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x22 });
+    const ce = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x22 });
 
     var b: rrsig.ValidationBudget = .{};
     for ([_]struct { dns.Name, Delegation }{
@@ -1619,10 +1611,10 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     const child_zone = dns.Name.lit("x.victim.com");
     const salt: []const u8 = &.{};
     var bufs: [4]Nsec3OwnerBufs = .{ .{}, .{}, .{}, .{} };
-    var span = makeCoveringNsec3(try nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
+    var span = makeCoveringNsec3(nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
     span.rdata.nsec3.flags = nsec3_opt_out;
-    const apex = makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x01, 0x22 });
-    const cut = makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(victim, salt, 0), test_com, &bufs[2]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x06, 0x20, 0x00, 0x00, 0x00, 0x00, 0x10 });
+    const apex = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x01, 0x22 });
+    const cut = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(victim, salt, 0), test_com, &bufs[2]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x06, 0x20, 0x00, 0x00, 0x00, 0x00, 0x10 });
 
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(Delegation.unproven, classifyDelegation(&.{ span, apex, cut }, child_zone, test_com, &b));
@@ -1630,7 +1622,7 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     try testing.expectEqual(Delegation.unproven, classifyDelegation(&.{span}, child_zone, test_com, &b));
     // A direct child of com in the same span is the honest Opt-Out shape.
     const direct = dns.Name.lit("unsigned.com");
-    var span2 = makeCoveringNsec3(try nsec3Hash(direct, salt, 0), test_com, salt, &bufs[3]);
+    var span2 = makeCoveringNsec3(nsec3Hash(direct, salt, 0), test_com, salt, &bufs[3]);
     span2.rdata.nsec3.flags = nsec3_opt_out;
     try testing.expectEqual(Delegation.unsigned, classifyDelegation(&.{ span2, apex }, direct, test_com, &b));
 }
@@ -1747,9 +1739,9 @@ test "an NSEC3 NXDOMAIN proof hashes its next closer once" {
     var bufs: [3]Nsec3OwnerBufs = .{ .{}, .{}, .{} };
     const ce_next: [20]u8 = @splat(0);
     const authorities = [_]dns.ResourceRecord{
-        makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(test_com, salt, 0), test_com, &bufs[0]), salt, &ce_next, &com_apex_bitmap),
-        makeCoveringNsec3(try nsec3Hash(next_closer, salt, 0), test_com, salt, &bufs[1]),
-        makeCoveringNsec3(try nsec3Hash(wildcard, salt, 0), test_com, salt, &bufs[2]),
+        makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[0]), salt, &ce_next, &com_apex_bitmap),
+        makeCoveringNsec3(nsec3Hash(next_closer, salt, 0), test_com, salt, &bufs[1]),
+        makeCoveringNsec3(nsec3Hash(wildcard, salt, 0), test_com, salt, &bufs[2]),
     };
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_com, &b));
@@ -1763,7 +1755,7 @@ test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
     // a roundtrip test would miss.
     const child_zone = dns.Name.lit("jsc.nasa.gov");
     const salt = [_]u8{ 0xA3, 0xB6, 0xC3, 0xF4, 0x96, 0x50, 0x04, 0xE9 };
-    const computed = try nsec3Hash(child_zone, &salt, 10);
+    const computed = nsec3Hash(child_zone, &salt, 10);
 
     var expected: [Sha1.digest_length]u8 = undefined;
     _ = try dns.base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
@@ -1798,14 +1790,14 @@ test "proveNoCloserMatch NSEC3" {
     const zone_name = dns.Name.lit("example.com");
     const salt: []const u8 = &.{};
     var bufs: Nsec3OwnerBufs = .{};
-    var nc = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_name, salt, &bufs);
+    var nc = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs);
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
     nc.rdata.nsec3.flags = nsec3_opt_out;
     try testing.expectEqual(SecurityStatus.insecure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
     // The CE's own record names the wildcard's parent and denies nothing.
     var ce_bufs: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce, salt, 0), zone_name, &ce_bufs);
+    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce, salt, 0), zone_name, &ce_bufs);
     const ce_only = [_]dns.ResourceRecord{makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{})};
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&ce_only, qname, 2, ce, &b));
 }

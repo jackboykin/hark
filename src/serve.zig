@@ -84,7 +84,7 @@ const Pending = struct {
     a: ?graph.CellId = null,
     query: dns.Query,
     /// The question's name and spelling, once parked; until then the read's.
-    question_bytes: []align(@alignOf([]const u8)) u8 = &.{},
+    question_bytes: []u8 = &.{},
     reply: Reply,
     asked_ns: i64,
     /// When the first client parked on the same cell asked.
@@ -434,12 +434,13 @@ const Server = struct {
                 try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
+            const canonical = q.name.wire;
             const spelled = q.spelled.?;
-            const flat = dns.nameFlatSize(q.name);
-            p.question_bytes = try s.g.work.allocator().alignedAlloc(u8, .of([]const u8), flat + spelled.len);
-            p.query.question.?.name = dns.writeNameFlat(p.question_bytes[0..flat], q.name, false);
-            @memcpy(p.question_bytes[flat..], spelled);
-            p.query.question.?.spelled = p.question_bytes[flat..];
+            p.question_bytes = try s.g.work.allocator().alloc(u8, canonical.len + spelled.len);
+            @memcpy(p.question_bytes[0..canonical.len], canonical);
+            @memcpy(p.question_bytes[canonical.len..], spelled);
+            p.query.question.?.name = .of(p.question_bytes[0..canonical.len]);
+            p.query.question.?.spelled = p.question_bytes[canonical.len..];
         }
         try s.hold(p);
     }

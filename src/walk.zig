@@ -530,8 +530,7 @@ fn serving(g: *const Graph, e: store.Entry) i64 {
 }
 
 fn named(wire: []const u8, n: dns.Name) bool {
-    var labels: [dns.max_label_count][]const u8 = undefined;
-    return dns.nameOfWire(wire, &labels).eql(n);
+    return dns.Name.of(wire).eql(n);
 }
 
 /// `addr(host, family)`: the addresses in the host's own A or AAAA set,

@@ -125,7 +125,7 @@ pub const Sim = struct {
         }
         // RFC 8109 root priming is not logged.
         if (!(q.name.isRoot() and q.qtype == .ns))
-            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try dns.cloneNameFlat(s.arena, q.name, false), .qtype = q.qtype, .transport = ex.transport });
+            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .transport = ex.transport });
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;
             try s.hear(q, silence);
@@ -208,7 +208,7 @@ pub const Sim = struct {
     fn hear(s: *Sim, q: dns.Question, content: u64) !void {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         var h = std.hash.Wyhash.init(content);
-        h.update(q.name.formatLower(&nb));
+        h.update(q.name.formatInto(&nb));
         h.update(mem.asBytes(&q.qtype));
         h.update(mem.asBytes(&s.step));
         const k = h.final();
@@ -232,7 +232,7 @@ pub const Sim = struct {
         var h = std.hash.Wyhash.init(0);
         hashServer(&h, server);
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
-        h.update(q.name.formatLower(&nb));
+        h.update(q.name.formatInto(&nb));
         h.update(mem.asBytes(&q.qtype));
         h.update(mem.asBytes(&transport));
         const nth = try s.sent.getOrPut(s.gpa, h.final());

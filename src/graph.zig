@@ -101,8 +101,8 @@ pub const Edge = struct {
 /// alone: the child's answers there (RFC 4035 §5.3.2). Never a cell.
 pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
 
-/// Names are keyed by lowercase presentation form (`Name.formatLower`),
-/// which is injective.
+/// Names are keyed by presentation form (`Name.formatInto`), which is
+/// injective.
 pub const KeyBuf = [dns.max_dotted_len + 1]u8;
 
 pub const Key = struct {
@@ -114,7 +114,7 @@ pub const Key = struct {
 
     /// Borrows `buf`: whatever keeps a key dupes its name (`newCell`, `remember`).
     pub fn of(buf: *KeyBuf, kind: Kind, name: dns.Name, rtype: dns.RType) Key {
-        return .init(kind, name.formatLower(buf), rtype);
+        return .init(kind, name.formatInto(buf), rtype);
     }
 
     pub fn init(kind: Kind, name: []const u8, rtype: dns.RType) Key {
@@ -873,15 +873,12 @@ pub const Graph = struct {
                 var msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
                 if (msg.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
-                // 0x20 case checked; every name is a lowercase fact from here.
                 // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &msg.answers, &msg.authorities, &msg.additionals }) |section| {
                     const rrs = @constCast(section.*);
                     var n: usize = 0;
                     for (rrs) |rr| if (rr.rclass == .in) {
                         rrs[n] = rr;
-                        rrs[n].name = try dns.cloneNameLower(arena, rr.name);
-                        try dns.lowercaseRDataNames(arena, &rrs[n].rdata);
                         n += 1;
                     };
                     section.* = rrs[0..n];
@@ -951,7 +948,7 @@ pub const Graph = struct {
         const scratch = try Scratch.init(key.kind, arena.allocator());
         var own_key = key;
         own_key.name = try arena.allocator().dupe(u8, key.name);
-        const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
+        const own_name = try name.clone(arena.allocator());
         if (key.kind != .exchange) {
             // In progress keeps the slot; a settled owner yields it.
             const gop = try g.index.getOrPutAdapted(g.gpa, Asked{ .key = key, .as_of = as_of }, Indexed{ .g = g });

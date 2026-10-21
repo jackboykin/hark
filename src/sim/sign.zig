@@ -26,7 +26,7 @@ pub const Key = struct {
     fn init(arena: Allocator, zone: dns.Name) !Key {
         var h = Sha256.init(.{});
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        h.update(zone.formatLower(&buf));
+        h.update(zone.formatInto(&buf));
         const pair = try Ecdsa.KeyPair.generateDeterministic(h.finalResult());
         // RFC 6605 §4: the uncompressed point without its 0x04 prefix.
         const sec1 = pair.public_key.toUncompressedSec1();
@@ -37,7 +37,7 @@ pub const Key = struct {
             .pair = pair,
             .dnskey = dnskey,
             .key_tag = tag,
-            .ds = .{ .key_tag = tag, .algorithm = .ecdsap256sha256, .digest_type = .sha256, .digest = try arena.dupe(u8, &try dnssec.dsDigest(Sha256, zone, dnskey)) },
+            .ds = .{ .key_tag = tag, .algorithm = .ecdsap256sha256, .digest_type = .sha256, .digest = try arena.dupe(u8, &dnssec.dsDigest(Sha256, zone, dnskey)) },
         };
     }
 };

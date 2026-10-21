@@ -74,7 +74,7 @@ fn shouldDrop(rr: dns.WireRecord, cfg: Config) bool {
     };
     if (!private) return false;
     for (cfg.allow_zones) |zone| {
-        if (dns.wireIsSubdomainOf(rr.owner, zone)) return false;
+        if (dns.Name.of(rr.owner).isSubdomainOf(zone)) return false;
     }
     return true;
 }
@@ -141,9 +141,8 @@ pub fn scrub(
         drop_count += @intFromBool(m.*);
     }
 
-    var labels: [dns.max_label_count][]const u8 = undefined;
     var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    log.info("scrub dropped={d} owner={s}", .{ drop_count, dns.nameOfWire(records[first].owner, &labels).formatLower(&name_buf) });
+    log.info("scrub dropped={d} owner={s}", .{ drop_count, dns.Name.of(records[first].owner).formatInto(&name_buf) });
 
     for (records, 0..) |rr, i| {
         if (marks[i]) continue;

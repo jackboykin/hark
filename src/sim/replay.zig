@@ -513,7 +513,7 @@ fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.Resource
 
 fn rrEql(a: dns.ResourceRecord, b: dns.ResourceRecord, compare_ttl: bool) bool {
     // Owners byte-exact: hark scrubs 0x20 case off every owner.
-    if (!a.name.eqlExact(b.name) or a.rtype != b.rtype) return false;
+    if (!a.name.eql(b.name) or a.rtype != b.rtype) return false;
     if (compare_ttl and @max(a.ttl, b.ttl) - @min(a.ttl, b.ttl) > ttl_slack) return false;
     return rdataEql(a.rdata, b.rdata);
 }

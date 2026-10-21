@@ -162,20 +162,15 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     return @truncate(ac);
 }
 
-// ── Canonical Name Wire Format (RFC 4034 §6.1) ──────────────────────
-
-pub fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
-    const len = dns.writeNameWire(buf, name) catch return error.BufferTooSmall;
-    // Length octets sit below 'A', so lowering the whole name lowers its labels.
-    for (buf[0..len]) |*b| b.* = std.ascii.toLower(b.*);
-    return len;
+/// A name is kept in canonical form (RFC 4034 §6.2), so it is copied as is.
+fn putName(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
+    if (name.wire.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[0..name.wire.len], name.wire);
+    return name.wire.len;
 }
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
 
-/// Write the RRSIG header (everything except the signature) in canonical
-/// wire form. Used by both RRSIG verification (buildSignedData) and RRSIG
-/// canonical serialization (writeCanonicalRData).
 fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!usize {
     if (buf.len < 18) return error.BufferTooSmall;
     mem.writeInt(u16, buf[0..2], @backingInt(rrsig.type_covered), .big);
@@ -185,7 +180,7 @@ fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!u
     mem.writeInt(u32, buf[8..12], rrsig.sig_expiration, .big);
     mem.writeInt(u32, buf[12..16], rrsig.sig_inception, .big);
     mem.writeInt(u16, buf[16..18], rrsig.key_tag, .big);
-    const name_len = try writeCanonicalNameWire(buf[18..], rrsig.signer_name);
+    const name_len = try putName(buf[18..], rrsig.signer_name);
     return 18 + name_len;
 }
 
@@ -233,7 +228,7 @@ pub fn buildSignedData(
         else
             rr.name;
 
-        const owner_len = try writeCanonicalNameWire(buf[temp_pos..], owner_name);
+        const owner_len = try putName(buf[temp_pos..], owner_name);
         temp_pos += owner_len;
 
         if (temp_pos + 10 > buf.len) return error.BufferTooSmall;
@@ -267,63 +262,13 @@ pub fn buildSignedData(
     return out;
 }
 
-/// Write canonical RDATA per RFC 4034 §6.2. Each name-bearing arm
-/// lowercases its names. The rest go out as the serializer writes them:
-/// types without names, and NSEC, whose next name is never folded (RFC
-/// 6840 §5.1) and goes out as signed.
-///
-/// Separate from `dns.Serializer.writeRData` (canonical/lowercased, not wire).
-/// Any new name-bearing RData arm MUST add a lowercasing arm here, or the
-/// fallback mis-canonicalizes its embedded name and DNSSEC validation breaks.
+/// Canonical RDATA (RFC 4034 §6.2) is the RDATA as kept: names were
+/// lowercased as read, and NSEC's next name, which RFC 6840 §5.1 never
+/// folds, goes out as signed.
 fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize {
-    switch (rdata) {
-        .ns => |name| return writeCanonicalNameWire(buf, name),
-        .cname => |name| return writeCanonicalNameWire(buf, name),
-        .dname => |name| return writeCanonicalNameWire(buf, name),
-        .ptr => |name| return writeCanonicalNameWire(buf, name),
-        .mx => |mx| {
-            if (buf.len < 2) return error.BufferTooSmall;
-            mem.writeInt(u16, buf[0..2], mx.preference, .big);
-            const name_len = try writeCanonicalNameWire(buf[2..], mx.exchange);
-            return 2 + name_len;
-        },
-        .soa => |soa| {
-            var pos: usize = 0;
-            pos += try writeCanonicalNameWire(buf[pos..], soa.mname);
-            pos += try writeCanonicalNameWire(buf[pos..], soa.rname);
-            if (pos + 20 > buf.len) return error.BufferTooSmall;
-            mem.writeInt(u32, buf[pos..][0..4], soa.serial, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], soa.refresh, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], soa.retry, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], soa.expire, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], soa.minimum, .big);
-            pos += 4;
-            return pos;
-        },
-        .rrsig => |rrsig| {
-            var pos: usize = try writeRrsigHeaderWire(buf, rrsig);
-            if (pos + rrsig.signature.len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos..][0..rrsig.signature.len], rrsig.signature);
-            pos += rrsig.signature.len;
-            return pos;
-        },
-        .named => |d| {
-            if (d.head.len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[0..d.head.len], d.head);
-            var pos = d.head.len;
-            for (d.names) |name| pos += try writeCanonicalNameWire(buf[pos..], name);
-            return pos;
-        },
-        else => {
-            var ser: dns.Serializer = .{ .buf = buf };
-            ser.writeRData(rdata) catch return error.BufferTooSmall;
-            return ser.pos;
-        },
-    }
+    var ser: dns.Serializer = .{ .buf = buf };
+    ser.writeRData(rdata) catch return error.BufferTooSmall;
+    return ser.pos;
 }
 
 // RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
@@ -650,19 +595,6 @@ test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
     try testing.expect(!isSupportedAlgorithm(.rsasha1_nsec3));
     try testing.expect(!isSupportedAlgorithm(.rsamd5));
     try testing.expect(!isSupportedAlgorithm(.dsasha1));
-}
-
-test "canonical name wire format" {
-    var buf: [256]u8 = undefined;
-
-    const name = dns.Name.lit("Example.COM");
-    const len = try writeCanonicalNameWire(&buf, name);
-    try testing.expectEqualSlices(u8, "\x07example\x03com\x00", buf[0..len]);
-
-    const root = dns.Name.root;
-    const root_len = try writeCanonicalNameWire(&buf, root);
-    try testing.expectEqual(@as(usize, 1), root_len);
-    try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
 pub const test_owner = dns.Name.lit("example.com");

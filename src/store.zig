@@ -567,7 +567,7 @@ test "a fact survives the blob byte for byte" {
     try testing.expectEqual(reply.ede, back.ede);
     try testing.expectEqual(reply.ttl, back.ttl);
     try testing.expectEqual(reply.stored_ns, back.stored_ns);
-    try testing.expect(back.target.eqlExact(owner) and back.zone.eqlExact(zone));
+    try testing.expect(back.target.eql(owner) and back.zone.eql(zone));
     try testing.expectEqual(0, back.additionals.len);
     for ([_][]const RR{ reply.answers, reply.authorities }, [_][]const RR{ back.answers, back.authorities }) |want, got| {
         try testing.expectEqual(want.len, got.len);
@@ -606,7 +606,7 @@ test "a fact survives the blob byte for byte" {
     try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
     const cut = (try Store.parse(arena, newer)).cut;
-    try testing.expect(cut.zone.eqlExact(zone));
+    try testing.expect(cut.zone.eql(zone));
     try testing.expect(cut.servers[0].glue.len == 2 and cut.servers[0].glue[1].eql(glue[1]));
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
