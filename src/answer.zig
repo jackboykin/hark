@@ -36,8 +36,7 @@ pub const Dns64 = struct {
     /// A PTR under the prefix becomes the embedded IPv4's in-addr.arpa PTR (§5.3.1).
     pub fn asked(d: Dns64, arena: Allocator, q: dns.Question) !dns.Question {
         if (q.qtype != .ptr) return q;
-        var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const v6 = dns64.parseIp6Arpa(q.name.formatInto(&buf)) orelse return q;
+        const v6 = dns64.parseIp6Arpa(q.name) orelse return q;
         if (!d.prefix.contains(&v6)) return q;
         const v4 = d.prefix.extract(&v6);
         const in_addr = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}.in-addr.arpa.", .{ v4[3], v4[2], v4[1], v4[0] });

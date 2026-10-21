@@ -87,27 +87,23 @@ pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: []const dns.WireRecord
     return out[0..n];
 }
 
-pub fn parseIp6Arpa(name: []const u8) ?[16]u8 {
-    const s = dns.stripTrailingDot(name);
-    const suffix = ".ip6.arpa";
-    if (s.len != 2 * 32 - 1 + suffix.len or !std.ascii.endsWithIgnoreCase(s, suffix)) return null;
+pub fn parseIp6Arpa(name: dns.Name) ?[16]u8 {
+    const w = name.wire;
+    const suffix = "\x03ip6\x04arpa\x00";
+    if (w.len != 2 * 32 + suffix.len or !mem.endsWith(u8, w, suffix)) return null;
     var out: [16]u8 = undefined;
     for (0..32) |i| {
-        if (s[2 * i + 1] != '.') return null;
-        const nib = std.fmt.charToDigit(s[2 * i], 16) catch return null;
+        if (w[2 * i] != 1) return null;
+        const nib = std.fmt.charToDigit(w[2 * i + 1], 16) catch return null;
         const byte = &out[15 - i / 2];
         if (i % 2 == 0) byte.* = nib else byte.* |= nib << 4;
     }
     return out;
 }
 
-/// The PTRs re-owned to `qname`, lowercased; CNAMEs (RFC 2317) and
-/// RRSIGs are untrue under the new owner.
+/// CNAMEs (RFC 2317) and RRSIGs are untrue under the new owner.
 pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.WireRecord, qname: dns.Name) ![]dns.WireRecord {
-    var buf: [dns.max_name_len + 2]u8 = undefined;
-    const owner = try alloc.dupe(u8, buf[0..try dns.writeNameWire(&buf, qname)]);
-    // Length bytes are below 'A': lowering the whole name lowers its labels.
-    for (owner) |*c| c.* = std.ascii.toLower(c.*);
+    const owner = try alloc.dupe(u8, qname.wire);
     const out = try alloc.alloc(dns.WireRecord, answers.len);
     var n: usize = 0;
     for (answers) |rr| {
@@ -143,13 +139,12 @@ test "embed/extract match every RFC 6052 §2.4 example" {
 
 test "parseIp6Arpa round-trips through the nibble order" {
     const addr = Prefix.well_known.embed(.{ 192, 0, 2, 1 });
-    const name = "1.0.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa.";
+    const name: dns.Name = .lit("1.0.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa.");
     try testing.expectEqualSlices(u8, &addr, &parseIp6Arpa(name).?);
-    try testing.expectEqualSlices(u8, &addr, &parseIp6Arpa(name[0 .. name.len - 1]).?);
-    try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa("1.0.0.127.in-addr.arpa."));
-    try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(name[2..]));
-    var upper: [name.len]u8 = undefined;
-    try testing.expectEqualSlices(u8, &addr, &parseIp6Arpa(std.ascii.upperString(&upper, name)).?);
+    try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(.lit("1.0.0.127.in-addr.arpa.")));
+    try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(name.parent().?));
+    // As long as 32 nibbles, but one label holds three.
+    try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(.lit("abc.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.")));
 }
 
 test "synthesizeAaaa embeds every A, drops its RRSIG and caps TTL by the SOA" {
@@ -187,8 +182,6 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const qname = try dns.parseDottedName(a, "1.0.2.0.0.0.0.C.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.B.9.F.F.4.6.0.0.ip6.arpa.");
     const out = try renamePtr(a, &answers, qname);
     try testing.expectEqual(@as(usize, 1), out.len);
-    var lower: [dns.max_name_len + 2]u8 = undefined;
-    const want = lower[0..try dns.writeNameWire(&lower, qname)];
-    try testing.expectEqualSlices(u8, want, out[0].owner);
+    try testing.expectEqualSlices(u8, qname.wire, out[0].owner);
     try testing.expectEqualSlices(u8, answers[1].rest, out[0].rest);
 }
