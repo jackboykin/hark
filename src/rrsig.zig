@@ -25,7 +25,7 @@ pub const VerifyError = error{
     InvalidSignature,
     UnsupportedAlgorithm,
     InvalidKey,
-    BufferTooSmall,
+    TooManyRecords,
     SignatureExpired,
     /// CVE-2023-50387 (KeyTrap) defense: per-resolution signature-verify budget
     /// exhausted. Callers map this to .bogus; the response SERVFAILs.
@@ -162,111 +162,67 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     return @truncate(ac);
 }
 
-/// A name is kept in canonical form (RFC 4034 §6.2), so it is copied as is.
-fn putName(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
-    if (name.wire.len > buf.len) return error.BufferTooSmall;
-    @memcpy(buf[0..name.wire.len], name.wire);
-    return name.wire.len;
-}
-
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
 
-fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!usize {
-    if (buf.len < 18) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[0..2], @backingInt(rrsig.type_covered), .big);
-    buf[2] = @backingInt(rrsig.algorithm);
-    buf[3] = rrsig.labels;
-    mem.writeInt(u32, buf[4..8], rrsig.original_ttl, .big);
-    mem.writeInt(u32, buf[8..12], rrsig.sig_expiration, .big);
-    mem.writeInt(u32, buf[12..16], rrsig.sig_inception, .big);
-    mem.writeInt(u16, buf[16..18], rrsig.key_tag, .big);
-    const name_len = try putName(buf[18..], rrsig.signer_name);
-    return 18 + name_len;
-}
-
 /// RFC 4034 §3.1.8.1 signed data: RRSIG_RDATA (sans signature) followed by
-/// the RRset in canonical form sorted by RDATA. Held as parts so verifiers
-/// stream it into their hash; nothing needs it contiguous.
+/// the RRset in canonical form sorted by RDATA. A record's rdata is kept
+/// canonical, so it is fed as it stands.
 pub const SignedData = struct {
-    const Entry = struct { wire: []const u8, rdata: []const u8 };
     pub const max_entries = 64;
 
-    header: []const u8,
-    entries: [max_entries]Entry = undefined,
+    header: [18 + dns.max_name_wire_len]u8 = undefined,
+    header_len: usize,
+    labels: u8 = 0,
+    original_ttl: u32 = 0,
+    records: [max_entries]dns.ResourceRecord = undefined,
     len: usize = 0,
 
     fn raw(bytes: []const u8) SignedData {
-        return .{ .header = bytes };
+        var d: SignedData = .{ .header_len = bytes.len };
+        @memcpy(d.header[0..bytes.len], bytes);
+        return d;
     }
 
     pub fn feed(self: *const SignedData, hasher: anytype) void {
-        hasher.update(self.header);
-        for (self.entries[0..self.len]) |e| hasher.update(e.wire);
+        hasher.update(self.header[0..self.header_len]);
+        for (self.records[0..self.len]) |rr| {
+            // RFC 4035 §5.3.2: fewer labels than the owner's sign the wildcard.
+            var wc: dns.Name.Buf = undefined;
+            const owner = if (self.labels < rr.name.depth()) dns.Name.child(&wc, "*", rr.name.ancestor(self.labels)).? else rr.name;
+            var fixed: [10]u8 = undefined;
+            mem.writeInt(u16, fixed[0..2], @backingInt(rr.rtype), .big);
+            mem.writeInt(u16, fixed[2..4], @backingInt(rr.rclass), .big);
+            mem.writeInt(u32, fixed[4..8], self.original_ttl, .big);
+            mem.writeInt(u16, fixed[8..10], @intCast(rr.rdata.len), .big);
+            hasher.update(owner.wire);
+            hasher.update(&fixed);
+            hasher.update(rr.rdata);
+        }
     }
 };
 
-/// Canonical entries are written into `buf` in RRset order and sorted by
-/// slice, so the buffer only ever holds one copy.
-pub fn buildSignedData(
-    buf: []u8,
-    rrsig: dns.RrsigData,
-    rrset: []const dns.ResourceRecord,
-) error{BufferTooSmall}!SignedData {
-    const pos: usize = try writeRrsigHeaderWire(buf, rrsig);
-    var out = SignedData{ .header = buf[0..pos], .len = rrset.len };
-    if (rrset.len > out.entries.len) return error.BufferTooSmall;
-    const entries = &out.entries;
-
-    var temp_pos = pos;
-
-    for (rrset, 0..) |rr, idx| {
-        const rr_start = temp_pos;
-
-        var wc_buf: dns.Name.Buf = undefined;
-        const owner_name = if (rrsig.labels < rr.name.depth())
-            dns.Name.child(&wc_buf, "*", rr.name.ancestor(rrsig.labels)).?
-        else
-            rr.name;
-
-        const owner_len = try putName(buf[temp_pos..], owner_name);
-        temp_pos += owner_len;
-
-        if (temp_pos + 10 > buf.len) return error.BufferTooSmall;
-        mem.writeInt(u16, buf[temp_pos..][0..2], @backingInt(rr.rtype), .big);
-        temp_pos += 2;
-        mem.writeInt(u16, buf[temp_pos..][0..2], @backingInt(rr.rclass), .big);
-        temp_pos += 2;
-        // Use RRSIG's original_ttl, not the RR's TTL
-        mem.writeInt(u32, buf[temp_pos..][0..4], rrsig.original_ttl, .big);
-        temp_pos += 4;
-
-        const rdlen_pos = temp_pos;
-        temp_pos += 2;
-
-        const rdata_start = temp_pos;
-        temp_pos += try writeCanonicalRData(buf[temp_pos..], rr.rdata);
-        const rdata_len = temp_pos - rdata_start;
-        mem.writeInt(u16, buf[rdlen_pos..][0..2], @intCast(rdata_len), .big);
-
-        entries[idx] = .{ .wire = buf[rr_start..temp_pos], .rdata = buf[rdata_start..temp_pos] };
-    }
-
+pub fn buildSignedData(rrsig: dns.RrsigData, rrset: []const dns.ResourceRecord) error{TooManyRecords}!SignedData {
+    if (rrset.len > SignedData.max_entries) return error.TooManyRecords;
+    var out: SignedData = .{ .header_len = 18 + rrsig.signer_name.wire.len, .labels = rrsig.labels, .original_ttl = rrsig.original_ttl, .len = rrset.len };
+    const h = &out.header;
+    mem.writeInt(u16, h[0..2], @backingInt(rrsig.type_covered), .big);
+    h[2] = @backingInt(rrsig.algorithm);
+    h[3] = rrsig.labels;
+    mem.writeInt(u32, h[4..8], rrsig.original_ttl, .big);
+    mem.writeInt(u32, h[8..12], rrsig.sig_expiration, .big);
+    mem.writeInt(u32, h[12..16], rrsig.sig_inception, .big);
+    mem.writeInt(u16, h[16..18], rrsig.key_tag, .big);
+    @memcpy(h[18..out.header_len], rrsig.signer_name.wire);
+    @memcpy(out.records[0..rrset.len], rrset);
     // RFC 4034 §6.3: within an RRset, sort by RDATA (owner/type/class/TTL
     // are identical). Must not include rdlength — it would mis-order records
     // of different sizes (e.g. mixed 1024/2048-bit DNSKEY).
-    mem.sortUnstable(SignedData.Entry, entries[0..rrset.len], {}, struct {
-        fn lessThan(_: void, a: SignedData.Entry, b: SignedData.Entry) bool {
+    mem.sortUnstable(dns.ResourceRecord, out.records[0..rrset.len], {}, struct {
+        fn lessThan(_: void, a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
             return mem.order(u8, a.rdata, b.rdata) == .lt;
         }
     }.lessThan);
     return out;
-}
-
-/// Canonical RDATA (RFC 4034 §6.2) is the RDATA as kept.
-fn writeCanonicalRData(buf: []u8, rdata: []const u8) error{BufferTooSmall}!usize {
-    if (rdata.len > buf.len) return error.BufferTooSmall;
-    @memcpy(buf[0..rdata.len], rdata);
-    return rdata.len;
 }
 
 // RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
@@ -337,15 +293,7 @@ pub fn verifyRrsig(
 
     if (!inWindow(rrsig, now_u32)) return error.SignatureExpired;
 
-    // A cold burst's largest signed data was 4.3 KiB (RSA DNSKEY rollover);
-    // spilling only TCP-sized sets keeps 64 KiB off every validating stack.
-    var canonical_buf: [8192]u8 = undefined;
-    var spill: []u8 = &.{};
-    defer std.heap.page_allocator.free(spill);
-    const data = buildSignedData(&canonical_buf, rrsig, rrset) catch data: {
-        spill = std.heap.page_allocator.alloc(u8, 65536) catch return error.BufferTooSmall;
-        break :data try buildSignedData(spill, rrsig, rrset);
-    };
+    const data = try buildSignedData(rrsig, rrset);
 
     switch (rrsig.algorithm) {
         inline .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => |alg| {
@@ -630,9 +578,8 @@ test "buildSignedData produces correct header" {
         .rdata = .{ .a = .{ 93, 184, 216, 34 } },
     })};
 
-    var buf: [4096]u8 = undefined;
     var flat = TestFlatten{};
-    (try buildSignedData(&buf, rrsig, &rrset)).feed(&flat);
+    (try buildSignedData(rrsig, &rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
@@ -684,9 +631,8 @@ test "buildSignedData reconstructs wildcard owner name" {
         .rdata = .{ .a = .{ 93, 184, 216, 34 } },
     })};
 
-    var buf: [4096]u8 = undefined;
     var flat = TestFlatten{};
-    (try buildSignedData(&buf, rrsig, &rrset)).feed(&flat);
+    (try buildSignedData(rrsig, &rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
     // After the RRSIG header (18 bytes) + signer name (13 bytes) = offset 31
@@ -975,21 +921,6 @@ test "verifyRrsig rejects labels below the signer's label count" {
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
 }
 
-test "verifyRrsig verifies signed data past its stack buffer" {
-    const chunk: [255]u8 = @splat('x');
-    const strings: [40][]const u8 = @splat(&chunk);
-    var recs = [_]dns.ResourceRecord{
-        .fixture(.{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = &strings } } }),
-    };
-    var sig_buf: [64]u8 = undefined;
-    var pub_buf: [32]u8 = undefined;
-    const signed = try testSignRrset(&recs, .txt, test_owner, .ed25519, &sig_buf, &pub_buf);
-    var budget: ValidationBudget = .{};
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
-    recs[0] = .fixture(.{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = strings[1..] } } });
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
-}
-
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
     // The signature is genuine and every other rule passes — RFC 4034 §3.1.3
     // is satisfied because the signer *is* an ancestor of the owner, which is
@@ -1092,8 +1023,7 @@ pub fn testSignRrsetBy(
         .signer_name = signer,
         .signature = &.{},
     };
-    var canonical_buf: [65536]u8 = undefined;
-    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
+    const data = try buildSignedData(rrsig, rrset);
     var sig = try kp.signer(null, testing.io);
     data.feed(&sig);
     sig_buf.* = sig.finalize().toBytes();

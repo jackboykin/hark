@@ -944,8 +944,7 @@ fn testSignMlDsa(
         .signer_name = signer,
         .signature = &.{},
     };
-    var canonical_buf: [65536]u8 = undefined;
-    const data = try rrsig.buildSignedData(&canonical_buf, sig, rrset);
+    const data = try rrsig.buildSignedData(sig, rrset);
     var s = try kp.signer(null);
     data.feed(&s);
     sig_buf.* = s.finalize().toBytes();

@@ -206,8 +206,7 @@ pub const Signer = struct {
             .signer_name = key.zone,
             .signature = &.{},
         };
-        var buf: [8192]u8 = undefined;
-        const data = try rrsig.buildSignedData(&buf, sig, set);
+        const data = try rrsig.buildSignedData(sig, set);
         var h = Sha256.init(.{});
         data.feed(&h);
         const minted = try self.mint.signatures.getOrPut(self.mint.arena, h.finalResult());
