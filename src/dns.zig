@@ -1059,7 +1059,8 @@ const Parser = struct {
                 const sig_inception = try self.readU32();
                 const key_tag = try self.readU16();
                 const name_start = self.pos;
-                const signer_name = try self.parseName(allocator, .compressed);
+                // RFC 4034 §3.1.7: a sender MUST NOT compress it.
+                const signer_name = try self.parseName(allocator, .uncompressed);
                 const name_len = self.pos - name_start;
                 if (18 + name_len > rdlength) return error.InvalidRDataLength;
                 const sig_len = rdlength - 18 - name_len;
@@ -1105,7 +1106,8 @@ const Parser = struct {
             .nsec => {
                 if (rdlength < 1) return error.InvalidRDataLength;
                 const name_start = self.pos;
-                const next_domain_name = try self.parseName(allocator, .compressed);
+                // RFC 4034 §4.1.1: a sender MUST NOT compress it.
+                const next_domain_name = try self.parseName(allocator, .uncompressed);
                 const name_len = self.pos - name_start;
                 if (name_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec = .{
@@ -2460,6 +2462,22 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
     defer arena.deinit();
     var pkt: [max_udp_payload]u8 = undefined;
     try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, next, 5)));
+}
+
+test "RFC 4034 §3.1.7, §4.1.1: an RRSIG's signer and an NSEC's next name hold no pointer" {
+    var rd = TestRdata{};
+    rd.put(u16, 1); // type covered
+    rd.put(u8, 13); // algorithm
+    rd.put(u8, 2); // labels
+    for ([_]u32{ 300, 1700000000, 1699000000 }) |v| rd.put(u32, v);
+    rd.put(u16, 12345); // key tag
+    rd.putBytes("\xc0\x0csig"); // the owner, example.com, by pointer
+    const nsec = "\xc0\x0c\x00\x01\x40";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pkt: [max_udp_payload]u8 = undefined;
+    try testing.expectError(error.FormatError, parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), @intCast(rd.slice().len))));
+    try testing.expectError(error.FormatError, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, nsec, nsec.len)));
 }
 
 test "applyCase0x20 only flips ASCII letters; round-trips eql" {
