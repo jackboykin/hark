@@ -1163,12 +1163,6 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
     return try options.toOwnedSlice(allocator);
 }
 
-fn parseQuestionSection(allocator: Allocator, parser: *Parser, count: u16, max_questions: usize) Error![]Question {
-    var list: ArrayList(Question) = try .initCapacity(allocator, @min(count, max_questions));
-    for (0..count) |_| try list.append(allocator, try parser.parseQuestion(allocator));
-    return list.items;
-}
-
 /// `opt_out` non-null marks the additional section: OPT records are
 /// extracted into it (RFC 6891) instead of appended. Null (answer /
 /// authority) keeps any OPT as an ordinary record.
@@ -1207,14 +1201,16 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const hdr = Header.parse(bytes[0..12]);
     var parser = Parser{ .msg = bytes, .pos = 12 };
 
+    // RFC 9619 §4: a second question is malformed, so none is read. Every
+    // pointer question would decompress into a name of its own.
+    if (hdr.qd_count > 1) return error.FormatError;
+    const questions = try allocator.alloc(Question, hdr.qd_count);
+    for (questions) |*q| q.* = try parser.parseQuestion(allocator);
+
     // Cap pre-allocation against what the wire can physically contain.
     // Prevents a small packet with inflated header counts from triggering
     // a large allocation (counts are attacker-controlled u16, max 65535).
-    const payload = bytes.len - header_len;
-    const max_questions = payload / 5; // min question: 1 name + 2 type + 2 class
-    const max_rrs = payload / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
-
-    const questions = try parseQuestionSection(allocator, &parser, hdr.qd_count, max_questions);
+    const max_rrs = (bytes.len - header_len) / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
     const answers = try parseRRSection(allocator, &parser, hdr.an_count, max_rrs, null);
     const authorities = try parseRRSection(allocator, &parser, hdr.ns_count, max_rrs, null);
     var opt: ?OptRecord = null;
@@ -1813,6 +1809,12 @@ test "edge case: truncated question" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), pkt));
+}
+
+test "RFC 9619 §4: two questions are malformed before either is read" {
+    const q = "\x01a\x00\x00\x01\x00\x01";
+    const pkt = "\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00" ++ q ++ q;
+    try testing.expectError(error.FormatError, parseMessage(testing.failing_allocator, pkt));
 }
 
 test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
