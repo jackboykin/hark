@@ -616,7 +616,7 @@ test "the cap holds by eviction and admission" {
     const testing = std.testing;
     var s = try Store.init(testing.allocator, 2048);
     defer s.deinit();
-    const zone: dns.Name = .{ .labels = &.{"x"} };
+    const zone: dns.Name = .lit("x");
     var names: [64][8]u8 = undefined;
     for (0..64) |i| {
         _ = try std.fmt.bufPrint(&names[i], "k{d}", .{i});
@@ -653,7 +653,7 @@ test "a replaced version leaves as one evicted" {
     var w: Watched = .{ .store = try Store.init(testing.allocator, 1 << 16) };
     defer w.store.deinit();
     w.store.on_evict = Watched.evicted;
-    const zone: dns.Name = .{ .labels = &.{"x"} };
+    const zone: dns.Name = .lit("x");
     const key: Key = .init(.cut, "x", .a);
     const first = try w.store.build(.{ .cut = .{ .zone = zone } });
     try w.store.put(key, first, 10, 0);

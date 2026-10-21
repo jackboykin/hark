@@ -203,7 +203,7 @@ fn matchesDefault(bytes: []const u8) bool {
     };
 }
 
-const public_name = dns.Name{ .labels = &.{ "attacker", "com" } };
+const public_name = dns.Name.lit("attacker.com");
 
 var test_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 

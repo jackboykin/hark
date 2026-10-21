@@ -69,7 +69,7 @@ const Zone = struct {
     n_recs: usize,
     hashes: [max_chain][20]u8,
     enc: [max_chain][32]u8,
-    owner_labels: [max_chain][2][]const u8,
+    owners: [max_chain]dns.Name.Buf,
     bitmaps: [max_chain][9]u8,
 
     fn find(z: *const Zone, name: dns.Name) ?*const Entry {
@@ -95,16 +95,19 @@ const Zone = struct {
     /// A proper ancestor that ends this zone's authority. Omitted delegations
     /// don't count: to the validator that cut is invisible.
     fn cutAbove(z: *const Zone, name: dns.Name) bool {
-        for (1..name.labels.len) |k| {
-            const e = z.find(.{ .labels = name.labels[k..] }) orelse continue;
+        var up = name.parent();
+        while (up) |anc| : (up = anc.parent()) {
+            if (anc.isRoot()) break;
+            const e = z.find(anc) orelse continue;
             if ((e.types.dname or e.types.delegation()) and !z.omitted(e)) return true;
         }
         return false;
     }
 
     fn closestEncloser(z: *const Zone, name: dns.Name) dns.Name {
-        for (1..name.labels.len) |k| {
-            const anc = dns.Name{ .labels = name.labels[k..] };
+        var up = name.parent();
+        while (up) |anc| : (up = anc.parent()) {
+            if (anc.isRoot()) break;
             if (z.inChain(anc)) return anc;
         }
         return name;
@@ -112,23 +115,25 @@ const Zone = struct {
 
     /// `name` or its nearest existing ancestor, in the chain or not.
     fn realEncloser(z: *const Zone, name: dns.Name) dns.Name {
-        for (0..name.labels.len) |k| {
-            const n = dns.Name{ .labels = name.labels[k..] };
+        var up: ?dns.Name = name;
+        while (up) |n| : (up = n.parent()) {
             if (z.find(n) != null) return n;
         }
         unreachable;
     }
 
     fn truth(z: *const Zone, qname: dns.Name, qtype: dns.RType) Truth {
-        for (1..qname.labels.len) |k| {
-            const e = z.find(.{ .labels = qname.labels[k..] }) orelse continue;
+        var up = qname.parent();
+        while (up) |anc| : (up = anc.parent()) {
+            if (anc.isRoot()) break;
+            const e = z.find(anc) orelse continue;
             if (e.types.dname or e.types.delegation()) return .referral;
         }
         if (z.find(qname)) |e| return answerAt(e.types, qtype);
         // RFC 4592 §2.2.1: the wildcard sits at the real closest encloser,
         // which an omitted ENT is even though the chain can't see it.
-        var wl: [dns.max_label_count + 1][]const u8 = undefined;
-        if (z.find(dns.makeWildcardName(&wl, z.realEncloser(qname)).?)) |e| return answerAt(e.types, qtype);
+        var wl: dns.Name.Buf = undefined;
+        if (z.find(dns.Name.child(&wl, "*", z.realEncloser(qname)).?)) |e| return answerAt(e.types, qtype);
         return .nxdomain;
     }
 
@@ -137,8 +142,8 @@ const Zone = struct {
     /// over that wildcard's data, so every validator refuses it (§8.4,
     /// Unbound "wildcard had qtype, bogus"). The signer's problem.
     fn shadowed(z: *const Zone, qname: dns.Name) bool {
-        var wl: [dns.max_label_count + 1][]const u8 = undefined;
-        return !z.inChain(z.realEncloser(qname)) and z.find(dns.makeWildcardName(&wl, z.closestEncloser(qname)).?) != null;
+        var wl: dns.Name.Buf = undefined;
+        return !z.inChain(z.realEncloser(qname)) and z.find(dns.Name.child(&wl, "*", z.closestEncloser(qname)).?) != null;
     }
 
     fn answerAt(t: Types, qtype: dns.RType) Truth {
@@ -177,8 +182,7 @@ const Zone = struct {
 
     /// The ancestor-or-self of `name` one label below its closest encloser.
     fn nextCloser(z: *const Zone, name: dns.Name) dns.Name {
-        const ce = z.closestEncloser(name);
-        return .{ .labels = name.labels[name.labels.len - @min(ce.labels.len + 1, name.labels.len) ..] };
+        return name.ancestor(@min(z.closestEncloser(name).depth() + 1, name.depth()));
     }
 };
 
@@ -224,8 +228,9 @@ fn draw(z: *Zone, s: *Smith) void {
     // Names under a cut or DNAME are occluded: the zone never serves them.
     z.n = 0;
     outer: for (raw[0..n]) |e| {
-        for (1..e.depth) |k| for (raw[0..n]) |o| {
-            if (o.name().eql(.{ .labels = e.name().labels[k..] }) and (o.types.dname or o.types.delegation())) continue :outer;
+        var up = e.name().parent();
+        while (up) |anc| : (up = anc.parent()) for (raw[0..n]) |o| {
+            if (o.name().eql(anc) and (o.types.dname or o.types.delegation())) continue :outer;
         };
         z.entries[z.n] = e;
         z.n += 1;
@@ -280,13 +285,13 @@ fn draw(z: *Zone, s: *Smith) void {
             } } };
             continue;
         }
-        z.owner_labels[r] = .{ dns.base32HexEncode(&z.enc[r], &z.hashes[r]), apex };
+        const owner = dns.Name.child(&z.owners[r], dns.base32HexEncode(&z.enc[r], &z.hashes[r]), .lit(apex)).?;
         // RFC 5155 §7.1: the flag marks spans hiding an unsigned delegation.
         var optout = all_optout;
         for (z.entries[0..z.n], 0..) |*o, j| if (z.omitted(o)) {
             if (between(std.mem.order(u8, &z.hashes[r], &ehash[j]), std.mem.order(u8, &ehash[j], &z.hashes[nr]), std.mem.order(u8, &z.hashes[r], &z.hashes[nr]))) optout = true;
         };
-        z.recs[r] = .{ .name = .{ .labels = &z.owner_labels[r] }, .rtype = .nsec3, .rclass = .in, .ttl = 300, .rdata = .{ .nsec3 = .{
+        z.recs[r] = .{ .name = owner, .rtype = .nsec3, .rclass = .in, .ttl = 300, .rdata = .{ .nsec3 = .{
             .hash_algorithm = .sha1,
             .flags = @intFromBool(optout),
             .iterations = z.iterations,
@@ -301,9 +306,13 @@ fn draw(z: *Zone, s: *Smith) void {
 /// ancestor, and the closest encloser's wildcard.
 fn honest(z: *const Zone, qname: dns.Name, mask: *[max_chain]bool) void {
     @memset(mask, false);
-    for (0..qname.labels.len) |k| mask[z.relevant(.{ .labels = qname.labels[k..] })] = true;
-    var wl: [dns.max_label_count + 1][]const u8 = undefined;
-    mask[z.relevant(dns.makeWildcardName(&wl, z.closestEncloser(qname)).?)] = true;
+    var up: ?dns.Name = qname;
+    while (up) |n| : (up = n.parent()) {
+        if (n.isRoot()) break;
+        mask[z.relevant(n)] = true;
+    }
+    var wl: dns.Name.Buf = undefined;
+    mask[z.relevant(dns.Name.child(&wl, "*", z.closestEncloser(qname)).?)] = true;
 }
 
 const Section = struct {
@@ -355,7 +364,7 @@ test "replay" {
 fn fuzzOne(_: void, s: *Smith) anyerror!void {
     var z: Zone = undefined;
     draw(&z, s);
-    const zone = dns.Name{ .labels = &.{apex} };
+    const zone: dns.Name = .lit(apex);
     const exact = s.boolWeighted(2, 1);
     var mask: [max_chain]bool = undefined;
     var sec: Section = .{};
@@ -370,8 +379,8 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     const auth = sec.pick(&z, s, &mask, exact);
     const ce = z.closestEncloser(qname);
     const nc = z.nextCloser(qname);
-    var wl: [dns.max_label_count + 1][]const u8 = undefined;
-    const wc = dns.makeWildcardName(&wl, ce).?;
+    var wl: dns.Name.Buf = undefined;
+    const wc = dns.Name.child(&wl, "*", ce).?;
     const v1 = proof.validateNegativeProof(auth, qname, qtype, is_nxdomain, zone, &budget);
     errdefer dump(&z, auth, qname, qtype, .{ t, is_nxdomain, exact, v1 });
     switch (v1) {
@@ -389,12 +398,12 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
 
     // Wildcard expansion: no closer match below the RRSIG's encloser.
     budget = .{};
-    const labels: u8 = if (exact) @intCast(ce.labels.len) else s.valueRangeAtMost(u8, 0, @intCast(qname.labels.len));
+    const labels: u8 = if (exact) ce.depth() else s.valueRangeAtMost(u8, 0, qname.depth());
     const v2 = proof.proveNoCloserMatch(auth, qname, labels, zone, &budget);
     errdefer std.debug.print("wildcard labels={d} {t}\n", .{ labels, v2 });
     switch (v2) {
         .secure, .insecure => |v| {
-            const closer = dns.Name{ .labels = qname.labels[qname.labels.len - labels - 1 ..] };
+            const closer = qname.ancestor(labels + 1);
             if (v == .secure and z.find(closer) != null) return error.UnsoundWildcard;
             if (v == .insecure and !z.optoutCovered(closer)) return error.UnsoundWildcard;
         },
@@ -418,7 +427,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     errdefer dump(&z, ref, child, .ds, .{ insecure_delegation, v3 });
     switch (v3) {
         .unsigned => {
-            if (child.labels.len == 1 or z.cutAbove(child)) return error.UnsoundDelegation;
+            if (child.depth() == 1 or z.cutAbove(child)) return error.UnsoundDelegation;
             // An omitted ENT hashes into an Opt-Out span: to a validator it
             // doesn't exist, and the clause below grants those §12.2's
             // forged-cut concession.

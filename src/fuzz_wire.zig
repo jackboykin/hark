@@ -164,8 +164,8 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
 /// Drawn from small pools so sets, rollovers and the cap come up; wire
 /// messages are too few and too random to reach them.
 fn pooledRR(s: *Smith) dns.ResourceRecord {
-    const owners = [_]dns.Name{ .{ .labels = &.{"example"} }, .{ .labels = &.{ "a", "example" } }, .{ .labels = &.{ "b", "example" } } };
-    const signers = [_]dns.Name{ .{ .labels = &.{ "a", "example" } }, .{ .labels = &.{"example"} }, .{ .labels = &.{"other"} }, .{ .labels = &.{} } };
+    const owners = [_]dns.Name{ .lit("example"), .lit("a.example"), .lit("b.example") };
+    const signers = [_]dns.Name{ .lit("a.example"), .lit("example"), .lit("other"), .root };
     const data = [_]dns.RType{ .a, .ns, .ds, .nsec };
     const algorithms = [_]dns.DnssecAlgorithm{ .ecdsap256sha256, .rsasha256, @fromBackingInt(200) };
     const ttls = [_]u32{ 0, 60, 300, 3600 };
@@ -175,7 +175,7 @@ fn pooledRR(s: *Smith) dns.ResourceRecord {
     return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
         .type_covered = data[s.index(data.len)],
         .algorithm = algorithms[s.index(algorithms.len)],
-        .labels = @intCast(owner.labels.len),
+        .labels = owner.depth(),
         .original_ttl = ttl,
         .sig_expiration = 0,
         .sig_inception = 0,
@@ -306,7 +306,7 @@ test "fuzz: store round trip" {
             const msg = dns.parseMessage(alloc, genMessage(s, &w)) catch return;
             if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
             const st = &shared_store.?;
-            const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name{ .labels = &.{} };
+            const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name.root;
             const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             var buf: [dns.max_dotted_len + 1]u8 = undefined;
             const key: graph.Key = .of(&buf, .rrset, owner, if (msg.questions.len > 0) msg.questions[0].qtype else .a);

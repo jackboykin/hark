@@ -124,7 +124,7 @@ pub const Sim = struct {
             return s.schedule(ex.id, s.now_ns, 0, .unsent);
         }
         // RFC 8109 root priming is not logged.
-        if (!(q.name.labels.len == 0 and q.qtype == .ns))
+        if (!(q.name.isRoot() and q.qtype == .ns))
             try s.log.append(s.gpa, .{ .server = ex.server, .qname = try dns.cloneNameFlat(s.arena, q.name, false), .qtype = q.qtype, .transport = ex.transport });
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;

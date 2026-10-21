@@ -164,7 +164,7 @@ pub const Signer = struct {
     /// synthesised from it: a set it signs below the wildcard's parent.
     fn expands(self: *const Signer, wildcard: ?dns.Name, owner: dns.Name, key: *const Key, forced: ?*const Key) bool {
         const w = wildcard orelse return false;
-        const parent: dns.Name = .{ .labels = w.labels[1..] };
+        const parent = w.parent().?;
         return owner.isSubdomainOf(parent) and !owner.eql(parent) and (forced != null or key == self.deepest(w, false));
     }
 
@@ -176,7 +176,7 @@ pub const Signer = struct {
         var best: ?*const Key = null;
         for (self.mint.keys) |*k| {
             if (!owner.isSubdomainOf(k.zone) or (strictly_above and k.zone.eql(owner))) continue;
-            if (best == null or k.zone.labels.len > best.?.zone.labels.len) best = k;
+            if (best == null or k.zone.depth() > best.?.zone.depth()) best = k;
         }
         return best;
     }

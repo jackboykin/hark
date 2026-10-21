@@ -949,7 +949,7 @@ test "unbound prelude is lifted" {
     try testing.expectEqual(false, s.minimal_responses.?);
     try testing.expectEqual(1, s.root_hints.len);
     try testing.expect(na.ipEqual(s.root_hints[0], s.ranges[0].address));
-    try testing.expectEqual(0, s.ranges[0].entries[0].answers[0].name.labels.len);
+    try testing.expect(s.ranges[0].entries[0].answers[0].name.isRoot());
     try testing.expectEqual(default_ttl, s.ranges[0].entries[0].answers[0].ttl);
     try testing.expect(s.steps[1].entry.?.match.all);
 }

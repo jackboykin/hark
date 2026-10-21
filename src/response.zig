@@ -268,7 +268,7 @@ test "serializeErrorResponse produces valid DNS message" {
 
 const test_query: dns.Query = .{
     .header = .{ .id = 0, .flags = std.mem.zeroes(dns.Header.Flags), .qd_count = 1 },
-    .question = .{ .name = .{ .labels = &.{ "example", "com" } }, .qtype = .a, .qclass = .in },
+    .question = .{ .name = .lit("example.com"), .qtype = .a, .qclass = .in },
     .edns = null,
 };
 
