@@ -25,6 +25,8 @@ fn Tag(comptime E: type) type {
 pub const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
+/// RFC 1035 §3.1, the root's length octet included.
+pub const max_name_wire_len = 255;
 /// Presentation-format ceiling: every content byte can escape to `\DDD`
 /// (4 chars), separators are free relative to the wire length budget.
 pub const max_dotted_len = 4 * max_name_len;
@@ -212,6 +214,96 @@ test eqlIgnoreCase {
 pub const Name = struct {
     labels: []const []const u8,
 
+    pub const root: Name = .{ .labels = &.{} };
+
+    pub const Buf = [max_label_count][]const u8;
+
+    /// A name fixed in code, in presentation format (`parseDottedName`'s).
+    pub fn lit(comptime dotted: []const u8) Name {
+        const labels = comptime blk: {
+            const s = stripTrailingDot(dotted);
+            var out: []const []const u8 = &.{};
+            var start: usize = 0;
+            while (start < s.len) {
+                const end = indexOfUnescapedDot(s, start) orelse s.len;
+                var buf: [max_label_len]u8 = undefined;
+                const len = unescapeLabel(s[start..end], &buf) catch |err| @compileError(@errorName(err));
+                if (len == 0) @compileError("empty label in " ++ dotted);
+                const label = buf[0..len].*;
+                out = out ++ .{&label};
+                start = end + 1;
+            }
+            const name: Name = .{ .labels = out };
+            if (name.wireLen() > max_name_wire_len) @compileError("too long: " ++ dotted);
+            break :blk out[0..out.len].*;
+        };
+        return .{ .labels = &labels };
+    }
+
+    pub fn isRoot(n: Name) bool {
+        return n.labels.len == 0;
+    }
+
+    pub fn depth(n: Name) u8 {
+        return @intCast(n.labels.len);
+    }
+
+    pub fn leaf(n: Name) []const u8 {
+        return n.labels[0];
+    }
+
+    pub fn parent(n: Name) ?Name {
+        return if (n.isRoot()) null else .{ .labels = n.labels[1..] };
+    }
+
+    pub fn ancestor(n: Name, d: u8) Name {
+        return .{ .labels = n.labels[n.labels.len - d ..] };
+    }
+
+    pub fn shared(a: Name, b: Name) Name {
+        var d: u8 = 0;
+        while (d < @min(a.depth(), b.depth())) : (d += 1) {
+            if (!eqlIgnoreCase(a.labels[a.labels.len - 1 - d], b.labels[b.labels.len - 1 - d])) break;
+        }
+        return a.ancestor(d);
+    }
+
+    /// RFC 4034 §6.1: label by label from the root, each compared as
+    /// lowercase octets with a shorter label first; then fewer labels first.
+    pub fn order(a: Name, b: Name) std.math.Order {
+        var i = a.labels.len;
+        var j = b.labels.len;
+        while (i > 0 and j > 0) {
+            i -= 1;
+            j -= 1;
+            const o = orderLabels(a.labels[i], b.labels[j]);
+            if (o != .eq) return o;
+        }
+        return std.math.order(a.labels.len, b.labels.len);
+    }
+
+    fn orderLabels(a: []const u8, b: []const u8) std.math.Order {
+        for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+            const o = std.math.order(std.ascii.toLower(x), std.ascii.toLower(y));
+            if (o != .eq) return o;
+        }
+        return std.math.order(a.len, b.len);
+    }
+
+    /// `label` (lowercase) put before `of`, unless that passes 255 octets.
+    pub fn child(buf: *Buf, label: []const u8, of: Name) ?Name {
+        if (1 + label.len + of.wireLen() > max_name_wire_len) return null;
+        buf[0] = label;
+        @memcpy(buf[1..][0..of.labels.len], of.labels);
+        return .{ .labels = buf[0 .. 1 + of.labels.len] };
+    }
+
+    pub fn wireLen(n: Name) usize {
+        var len: usize = 1;
+        for (n.labels) |label| len += 1 + label.len;
+        return len;
+    }
+
     /// Format `self` into `buf` as a dotted string in RFC 1035 §5.1 / RFC 4343
     /// §2.1 presentation format: `.` and `\` escape to `\.` and `\\`, bytes
     /// outside 0x21–0x7e to `\DDD`. Injective — distinct names render to
@@ -273,12 +365,12 @@ pub const Name = struct {
         return true;
     }
 
-    pub fn isSubdomainOf(self: Name, parent: Name) bool {
-        if (parent.labels.len == 0) return true;
-        if (self.labels.len < parent.labels.len) return false;
-        const offset = self.labels.len - parent.labels.len;
-        for (parent.labels, 0..) |p_label, i| {
-            if (!eqlIgnoreCase(self.labels[offset + i], p_label)) return false;
+    pub fn isSubdomainOf(self: Name, zone: Name) bool {
+        if (zone.labels.len == 0) return true;
+        if (self.labels.len < zone.labels.len) return false;
+        const offset = self.labels.len - zone.labels.len;
+        for (zone.labels, 0..) |z_label, i| {
+            if (!eqlIgnoreCase(self.labels[offset + i], z_label)) return false;
         }
         return true;
     }
@@ -493,7 +585,7 @@ pub fn base32HexDecode(dest: []u8, encoded: []const u8) error{InvalidBase32}!usi
 /// Encode bytes to base32hex (RFC 4648 §7) without padding.
 /// Returns a slice into `dest` with the encoded string.
 pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
-    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    const alphabet = "0123456789abcdefghijklmnopqrstuv";
     var bits: u32 = 0;
     var bit_count: u4 = 0;
     var out: usize = 0;
@@ -611,7 +703,7 @@ pub const WireRecord = struct {
 
     /// `rr` written into `allocator` as the store writes it, sent with its own TTL.
     pub fn from(allocator: Allocator, rr: ResourceRecord) !WireRecord {
-        const buf = try allocator.alloc(u8, max_name_len + 2 + 10 + std.math.maxInt(u16));
+        const buf = try allocator.alloc(u8, max_name_wire_len + 10 + std.math.maxInt(u16));
         const bytes = try allocator.realloc(buf, (try buildResourceRecordWire(buf, rr)).len);
         const n = wireNameLen(bytes);
         return .{ .owner = bytes[0..n], .rest = bytes[n..], .ttl = rr.ttl };
@@ -2200,6 +2292,53 @@ test "substituteSuffix declines a substitution that overflows a legal name" {
 
     const fits = try substituteSuffix(a, owner, suffix, .{ .labels = &.{"net"} });
     try testing.expect(fits.?.eql(.{ .labels = &.{ long_label, long_label, "net" } }));
+}
+
+test "a name walks up to the root, label by label" {
+    const name = Name.lit("www.example.com.");
+    try testing.expectEqual(@as(u8, 3), name.depth());
+    try testing.expectEqualStrings("www", name.leaf());
+    try testing.expect(name.ancestor(2).eql(.lit("example.com")));
+    try testing.expect(name.ancestor(3).eql(name));
+    try testing.expect(name.ancestor(0).isRoot());
+    var up: ?Name = name;
+    var seen: usize = 0;
+    while (up) |n| : (up = n.parent()) seen += 1;
+    try testing.expectEqual(@as(usize, 4), seen);
+}
+
+test "RFC 4034 §6.1: names in canonical order" {
+    const sorted = [_]Name{
+        .lit("example"),
+        .lit("a.example"),
+        .lit("yljkjljk.a.example"),
+        .lit("Z.a.example"),
+        .lit("zABC.a.EXAMPLE"),
+        .lit("z.example"),
+        .lit("\\001.z.example"),
+        .lit("*.z.example"),
+        .lit("\\200.z.example"),
+    };
+    for (sorted, 0..) |a, i| for (sorted, 0..) |b, j| {
+        try testing.expectEqual(std.math.order(i, j), a.order(b));
+    };
+}
+
+test "shared ancestors, and a child that would pass 255 octets is none" {
+    const q = Name.lit("a.b.example.com");
+    try testing.expect(q.shared(.lit("z.b.example.com")).eql(.lit("b.example.com")));
+    try testing.expect(q.shared(.lit("example.net")).isRoot());
+    try testing.expect(q.shared(.lit("x.a.b.example.com")).eql(q));
+
+    var buf: Name.Buf = undefined;
+    try testing.expect(Name.child(&buf, "*", q.parent().?).?.eql(.lit("*.b.example.com")));
+    const label: [63]u8 = @splat('a');
+    const three = label ++ "." ++ label ++ "." ++ label ++ ".";
+    const full = Name.lit(three ++ @as([61]u8, @splat('a')));
+    const room = Name.lit(three ++ @as([59]u8, @splat('a')));
+    try testing.expectEqual(@as(usize, 255), full.wireLen());
+    try testing.expectEqual(null, Name.child(&buf, "*", full));
+    try testing.expectEqual(@as(usize, 255), Name.child(&buf, "*", room).?.wireLen());
 }
 
 test "isSubdomainOf: self, descendants and the root; case-insensitive; never a sibling" {

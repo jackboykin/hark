@@ -1230,7 +1230,7 @@ test "nsec3Hash RFC 5155 Appendix B" {
     const name = dns.Name{ .labels = &.{"example"} };
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var enc_buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM", dns.base32HexEncode(&enc_buf, &try nsec3Hash(name, &salt, 12)));
+    try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", dns.base32HexEncode(&enc_buf, &try nsec3Hash(name, &salt, 12)));
 }
 
 test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
