@@ -581,13 +581,14 @@ const Keep = struct {
 /// `floor` and capped by `life`; a record past its TTL in a stale reply
 /// gets the hold (RFC 8767 §4).
 fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
+    try out.ensureUnusedCapacity(arena, records.len);
     var it = records.iterator();
     while (it.next()) |rr| {
         if (!keep.keeps(rr)) continue;
         if (seen) |s| if (!try s.add(arena, out.items, rr)) continue;
         var aged = rr;
         aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
-        try out.append(arena, aged);
+        out.appendAssumeCapacity(aged);
     }
 }
 
