@@ -318,9 +318,8 @@ test "fuzz: store round trip" {
             for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals }, [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals }) |want, have| {
                 try testing.expectEqual(want.len, have.len);
                 for (want, have) |a, b| {
-                    var wa: [4096]u8 = undefined;
-                    var wb: [4096]u8 = undefined;
-                    try testing.expectEqualSlices(u8, try dns.buildResourceRecordWire(&wa, a), try dns.buildResourceRecordWire(&wb, b));
+                    try testing.expect(a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and a.ttl == b.ttl);
+                    try testing.expectEqualSlices(u8, a.rdata, b.rdata);
                 }
             }
         }

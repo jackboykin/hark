@@ -1365,8 +1365,7 @@ pub const Graph = struct {
             if (g.awaitsVerdict(kind.?) and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
             const r: store.Rrset = .of(e.blob);
             try hops.append(arena, .{ .kind = kind.?, .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
-            var pos: usize = 0;
-            const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .root;
+            const target: dns.Name = if (r.kind == .alias) .of(r.target) else .root;
             var it = r.sections[0].iterator();
             while (it.next()) |rr| if (rr.rtype == .cname) {
                 if (links.pass(rr.name) != null) return null;

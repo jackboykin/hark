@@ -1023,8 +1023,7 @@ const QueryOptions = struct {
 
 /// Borrows `qname`; its spelling is `allocator`'s.
 pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, options: QueryOptions) Allocator.Error!Message {
-    const spelled = try allocator.alloc(u8, qname.wire.len);
-    _ = writeNameWire(spelled, qname) catch unreachable;
+    const spelled = try allocator.dupe(u8, qname.wire);
     if (options.case_rng) |rng| applyCase0x20(rng, spelled);
 
     return .{
@@ -1531,36 +1530,6 @@ pub const Serializer = struct {
     }
 };
 
-/// Uncompressed, as the store keeps a record.
-pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
-    var ser: Serializer = .{ .buf = buf };
-    try ser.writeResourceRecord(rr);
-    return ser.buf[0..ser.pos];
-}
-
-/// Uncompressed, as a stored fact holds names and records.
-pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
-    var ser: Serializer = .{ .buf = buf };
-    try ser.writeName(name.wire, false);
-    return ser.pos;
-}
-
-/// May alias `bytes`.
-pub fn readNameWire(allocator: Allocator, bytes: []const u8, pos: *usize) Error!Name {
-    var parser = Parser{ .msg = bytes, .pos = pos.* };
-    const name = try parser.parseName(allocator, .compressed);
-    pos.* = parser.pos;
-    return name;
-}
-
-/// Names and rdata alias `bytes`.
-pub fn readRecordsWire(allocator: Allocator, bytes: []const u8, pos: *usize, count: u16) Error![]ResourceRecord {
-    var parser = Parser{ .msg = bytes, .pos = pos.* };
-    const rrs = try parseRRSection(allocator, &parser, count, count, null);
-    pos.* = parser.pos;
-    return rrs;
-}
-
 /// Where each section ended, filled progressively by `serializeEnds`
 /// so a caller can rewind to a completed boundary after an overflow.
 /// 0 = never reached.
@@ -1962,9 +1931,8 @@ test "an NSEC's next name goes back out as signed (RFC 6840 §5.1)" {
     const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rdata, rdata.len));
     var next: Name.Buf = undefined;
     try testing.expect(msg.answers[0].nsec(&next).next_domain_name.eql(.lit("host.example")));
-    try testing.expectEqualStrings(rdata, msg.answers[0].rdata);
     var out: [max_udp_payload]u8 = undefined;
-    try testing.expect(mem.endsWith(u8, try buildResourceRecordWire(&out, msg.answers[0]), rdata));
+    try testing.expect(mem.endsWith(u8, try serializeMessage(&out, msg), rdata));
 }
 
 test "a query's other records are stepped, never built" {

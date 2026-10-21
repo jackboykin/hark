@@ -1,6 +1,6 @@
 //! Facts as immutable refcounted blobs keyed outside the graph: a header
-//! read in place, then scalars, uncompressed names and record wire parsed
-//! back through dns.zig. Blob identity is pointer identity.
+//! read in place, then scalars, canonical names and records as wire.
+//! Blob identity is pointer identity.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -304,7 +304,7 @@ pub const Store = struct {
         var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()) };
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
-                const zone = try r.name(arena);
+                const zone = try r.name();
                 const placed_until_ns = try r.int(i64);
                 const servers = try arena.alloc(graph.Server, try r.int(u16));
                 const glue = try arena.alloc(na.AddressKey, try r.int(u16));
@@ -330,8 +330,8 @@ pub const Store = struct {
                 if (flags & 2 != 0) reply.ede = @fromBackingInt(ede);
                 reply.ttl = try r.int(u32);
                 reply.stored_ns = try r.int(i64);
-                reply.target = try r.name(arena);
-                reply.zone = try r.name(arena);
+                reply.target = try r.name();
+                reply.zone = try r.name();
                 const an = try r.int(u16);
                 const ns = try r.int(u16);
                 const ar = try r.int(u16);
@@ -475,7 +475,7 @@ const Writer = struct {
     }
 
     fn name(w: *Writer, n: dns.Name) !void {
-        w.pos += try dns.writeNameWire(w.buf[w.pos..], n);
+        try w.slice(n.wire);
     }
 
     fn addr(w: *Writer, k: na.AddressKey) !void {
@@ -484,8 +484,18 @@ const Writer = struct {
         try w.slice(&k.addr);
     }
 
+    /// As `Records.Iterator` reads them.
     fn records(w: *Writer, rrs: []const RR) !void {
-        for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).len;
+        for (rrs) |rr| {
+            var fixed: [10]u8 = undefined;
+            mem.writeInt(u16, fixed[0..2], @backingInt(rr.rtype), .big);
+            mem.writeInt(u16, fixed[2..4], @backingInt(rr.rclass), .big);
+            mem.writeInt(u32, fixed[4..8], rr.ttl, .big);
+            mem.writeInt(u16, fixed[8..10], @intCast(rr.rdata.len), .big);
+            try w.slice(rr.name.wire);
+            try w.slice(&fixed);
+            try w.slice(rr.rdata);
+        }
     }
 };
 
@@ -505,8 +515,8 @@ const Reader = struct {
         return r.buf[r.pos..][0..n];
     }
 
-    fn name(r: *Reader, arena: Allocator) !dns.Name {
-        return dns.readNameWire(arena, r.buf, &r.pos);
+    fn name(r: *Reader) !dns.Name {
+        return .of(try r.wireName());
     }
 
     fn wireName(r: *Reader) ![]const u8 {
@@ -520,7 +530,11 @@ const Reader = struct {
     }
 
     fn records(r: *Reader, arena: Allocator, n: u16) ![]RR {
-        return dns.readRecordsWire(arena, r.buf, &r.pos, n);
+        const out = try arena.alloc(RR, n);
+        var it: Records.Iterator = .{ .bytes = r.buf, .pos = r.pos };
+        for (out) |*rr| rr.* = it.next() orelse return error.EndOfData;
+        r.pos = it.pos;
+        return out;
     }
 };
 
@@ -577,9 +591,8 @@ test "a fact survives the blob byte for byte" {
     for ([_][]const RR{ reply.answers, reply.authorities }, [_][]const RR{ back.answers, back.authorities }) |want, got| {
         try testing.expectEqual(want.len, got.len);
         for (want, got) |a, b| {
-            var wa: [4096]u8 = undefined;
-            var wb: [4096]u8 = undefined;
-            try testing.expectEqualSlices(u8, try dns.buildResourceRecordWire(&wa, a), try dns.buildResourceRecordWire(&wb, b));
+            try testing.expect(a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and a.ttl == b.ttl);
+            try testing.expectEqualSlices(u8, a.rdata, b.rdata);
         }
     }
 
