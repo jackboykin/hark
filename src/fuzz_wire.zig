@@ -242,8 +242,8 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
             },
             else => {},
         }
-        var lb: [dns.max_label_count + 1][]const u8 = undefined;
-        if (dns.makeWildcardName(&lb, rr.name)) |wn| _ = wn.formatInto(&buf);
+        var lb: dns.Name.Buf = undefined;
+        if (dns.Name.child(&lb, "*", rr.name)) |wn| _ = wn.formatInto(&buf);
         for (msg.answers) |o| if (o.rdata == .dname and rr.name.isSubdomainOf(o.name)) {
             if (try dns.substituteSuffix(alloc, rr.name, o.name, o.rdata.dname)) |sub| _ = sub.formatInto(&buf);
         };

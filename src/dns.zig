@@ -2116,15 +2116,6 @@ pub fn writeNameFlat(buf: []align(name_flat_align.toByteUnits()) u8, name: Name,
     return .{ .labels = labels };
 }
 
-pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser: Name) ?Name {
-    if (closest_encloser.labels.len >= buf.len) return null;
-    buf[0] = "*";
-    for (closest_encloser.labels, 0..) |label, i| {
-        buf[1 + i] = label;
-    }
-    return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
-}
-
 /// RFC 6672 §2.2 substitution: `owner` with its trailing `suffix` labels
 /// replaced by `target`. Null when the result would overflow a legal name —
 /// the same bound the parser enforces, so an overflowing substitution can
