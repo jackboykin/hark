@@ -497,6 +497,10 @@ pub const DsData = struct {
 pub const NsecData = struct {
     next_domain_name: Name,
     type_bit_maps: []const u8,
+    /// The next name as signed, case and all: RFC 6840 §5.1 never folds
+    /// it, so the signature covers these bytes and they are what goes on.
+    /// Null when that is `next_domain_name`.
+    next_spelled: ?[]const u8 = null,
 };
 
 pub const Nsec3Data = struct {
@@ -663,6 +667,9 @@ pub const Question = struct {
     name: Name,
     qtype: RType,
     qclass: RClass,
+    /// The name as its asker wrote it, for the echo and the 0x20 check.
+    /// Null when that is `name`.
+    spelled: ?[]const u8 = null,
 };
 
 pub const ResourceRecord = struct {
@@ -872,23 +879,20 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
-/// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels,
-/// which the caller owns. RFC draft Vixie/Dagon.
-fn applyCase0x20(rng: std.Random, name: Name) void {
+/// Length octets sit below 'A', so only label bytes flip. RFC draft
+/// Vixie/Dagon.
+fn applyCase0x20(rng: std.Random, wire: []u8) void {
     var pool: u64 = 0;
     var bits_left: u8 = 0;
-    for (name.labels) |label| {
-        const bytes = @constCast(label);
-        for (bytes) |*b| {
-            if (!std.ascii.isAlphabetic(b.*)) continue;
-            if (bits_left == 0) {
-                pool = rng.int(u64);
-                bits_left = 64;
-            }
-            if (pool & 1 == 1) b.* ^= 0x20;
-            pool >>= 1;
-            bits_left -= 1;
+    for (wire) |*b| {
+        if (!std.ascii.isAlphabetic(b.*)) continue;
+        if (bits_left == 0) {
+            pool = rng.int(u64);
+            bits_left = 64;
         }
+        if (pool & 1 == 1) b.* ^= 0x20;
+        pool >>= 1;
+        bits_left -= 1;
     }
 }
 
@@ -906,11 +910,13 @@ const QueryOptions = struct {
     case_rng: ?std.Random = null,
 };
 
+/// Borrows `qname`; its spelling is `allocator`'s.
 pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, options: QueryOptions) Allocator.Error!Message {
-    const name = try cloneNameFlat(allocator, qname, false);
-    if (options.case_rng) |rng| applyCase0x20(rng, name);
+    const spelled = try allocator.alloc(u8, qname.wireLen());
+    _ = writeNameWire(spelled, qname) catch unreachable;
+    if (options.case_rng) |rng| applyCase0x20(rng, spelled);
     const questions = try allocator.alloc(Question, 1);
-    questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
+    questions[0] = .{ .name = qname, .qtype = qtype, .qclass = .in, .spelled = spelled };
 
     return .{
         .header = .{
@@ -1058,10 +1064,12 @@ const Parser = struct {
 
     /// The first name in a message has no earlier name to point at.
     fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
+        const start = self.pos;
         const name = try self.parseName(allocator, .uncompressed);
+        const spelled = self.msg[start..self.pos];
         const qtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const qclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
-        return .{ .name = name, .qtype = qtype, .qclass = qclass };
+        return .{ .name = name, .qtype = qtype, .qclass = qclass, .spelled = spelled };
     }
 
     fn parseResourceRecord(self: *Parser, allocator: Allocator) Error!ResourceRecord {
@@ -1205,6 +1213,7 @@ const Parser = struct {
                 return .{ .nsec = .{
                     .next_domain_name = next_domain_name,
                     .type_bit_maps = try self.readSlice(rdlength - name_len),
+                    .next_spelled = self.msg[name_start..][0..name_len],
                 } };
             },
             .nsec3 => {
@@ -1521,7 +1530,9 @@ pub const Serializer = struct {
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
-        try self.writeName(q.name, true);
+        if (q.spelled) |s| {
+            if (self.names != null) try self.writeWireName(s) else try self.writeSlice(s);
+        } else try self.writeName(q.name, true);
         try self.writeU16(@backingInt(q.qtype));
         try self.writeU16(@backingInt(q.qclass));
     }
@@ -1612,7 +1623,7 @@ pub const Serializer = struct {
                 try self.writeSlice(ds_data.digest);
             },
             .nsec => |nsec_data| {
-                try self.writeName(nsec_data.next_domain_name, compress);
+                if (nsec_data.next_spelled) |next| try self.writeSlice(next) else try self.writeName(nsec_data.next_domain_name, compress);
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
@@ -2136,27 +2147,29 @@ pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target:
     return .{ .labels = labels };
 }
 
-/// RFC 5452 §9.1: the one question sent, at any rcode; byte for byte when
-/// `cased`. RFC 9619 lets a message carry none, but then nothing matches.
-pub fn validateResponse(response: Message, sent: Name, qtype: RType, cased: bool) error{Mismatch}!void {
+/// RFC 5452 §9.1: the one question sent, at any rcode, its spelling byte
+/// for byte when `cased`. RFC 9619 lets a message carry none, but then
+/// nothing matches.
+pub fn validateResponse(response: Message, sent: []const u8, qtype: RType, cased: bool) error{Mismatch}!void {
     const f = response.header.flags;
     if (!f.qr or f.opcode != .query or response.questions.len != 1) return error.Mismatch;
     const q = response.questions[0];
-    const same = if (cased) q.name.eqlExact(sent) else q.name.eql(sent);
+    const got = q.spelled orelse return error.Mismatch;
+    const same = if (cased) mem.eql(u8, got, sent) else wireNameEql(got, sent);
     if (!same or q.qtype != qtype or q.qclass != .in) return error.Mismatch;
 }
 
 test "validateResponse: only the one question sent, at any rcode" {
-    const sent = Name{ .labels = &.{ "eXaMpLe", "cOm" } };
-    const lower = Name{ .labels = &.{ "example", "com" } };
-    const other = Name{ .labels = &.{ "other", "net" } };
+    const sent = "\x07eXaMpLe\x03cOm\x00";
+    const lower = "\x07example\x03com\x00";
+    const other = "\x05other\x03net\x00";
     const reply = struct {
         // comptime so the questions array lands in static memory —
         // a runtime param would leave it dangling on this frame's stack.
-        fn make(comptime names: []const Name, rcode: RCode) Message {
+        fn make(comptime names: []const []const u8, rcode: RCode) Message {
             const f = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = rcode };
             comptime var qs: [names.len]Question = undefined;
-            inline for (names, 0..) |n, i| qs[i] = .{ .name = n, .qtype = .a, .qclass = .in };
+            inline for (names, 0..) |n, i| qs[i] = .{ .name = .root, .qtype = .a, .qclass = .in, .spelled = n };
             const final = qs;
             return .{ .header = .{ .id = 0, .flags = f }, .questions = &final };
         }
@@ -2610,46 +2623,31 @@ test "RFC 4034 §3.1.7, §4.1.1: an RRSIG's signer and an NSEC's next name hold 
     try testing.expectError(error.FormatError, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, nsec, nsec.len)));
 }
 
-test "applyCase0x20 only flips ASCII letters; round-trips eql" {
+test "applyCase0x20 only flips ASCII letters" {
     var prng: std.Random.DefaultPrng = .init(0x20);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const original: Name = .{ .labels = &.{ "Foo", "Bar123-baz", "com" } };
-    const randomized = try cloneNameFlat(alloc, original, false);
-
-    applyCase0x20(prng.random(), randomized);
-
-    for (randomized.labels, original.labels) |rl, ol| {
-        try testing.expectEqual(rl.len, ol.len);
-        for (rl, ol) |rb, ob| {
-            if (std.ascii.isAlphabetic(ob)) {
-                try testing.expectEqual(std.ascii.toLower(ob), std.ascii.toLower(rb));
-            } else {
-                try testing.expectEqual(ob, rb);
-            }
+    const original = "\x03Foo\x0aBar123-baz\x03com\x00";
+    var randomized = original.*;
+    applyCase0x20(prng.random(), &randomized);
+    for (randomized, original) |rb, ob| {
+        if (std.ascii.isAlphabetic(ob)) {
+            try testing.expectEqual(std.ascii.toLower(ob), std.ascii.toLower(rb));
+        } else {
+            try testing.expectEqual(ob, rb);
         }
     }
-
-    try testing.expect(original.eql(randomized));
 }
 
 test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
     var prng: std.Random.DefaultPrng = .init(0x20);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
     const iterations: usize = 10_000;
-    const letters = "abcdefghijklmnopqrstuvwxyz";
+    const letters = "\x1aabcdefghijklmnopqrstuvwxyz\x00";
     var upper_counts: [26]u32 = @splat(0);
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const n = try parseDottedName(alloc, letters);
-        applyCase0x20(prng.random(), n);
-        for (n.labels[0], 0..) |b, idx| {
+        var n = letters.*;
+        applyCase0x20(prng.random(), &n);
+        for (n[1..27], 0..) |b, idx| {
             if (std.ascii.isUpper(b)) upper_counts[idx] += 1;
         }
     }

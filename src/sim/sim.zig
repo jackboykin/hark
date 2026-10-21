@@ -168,10 +168,9 @@ pub const Sim = struct {
         switch (entry.echo) {
             .copy, .none => {},
             .upper => {
-                question.name = try dns.cloneNameFlat(s.arena, q.name, false);
-                for (question.name.labels) |l| for (@constCast(l)) |*c| {
-                    c.* = std.ascii.toUpper(c.*);
-                };
+                const spelled = try s.arena.dupe(u8, q.spelled.?);
+                for (spelled) |*c| c.* = std.ascii.toUpper(c.*);
+                question.spelled = spelled;
             },
         }
         const questions: []const dns.Question = if (entry.echo == .none) &.{} else try s.arena.dupe(dns.Question, &.{question});

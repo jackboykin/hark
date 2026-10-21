@@ -83,9 +83,8 @@ const Pending = struct {
     /// Under DNS64, the A behind an empty AAAA.
     a: ?graph.CellId = null,
     query: dns.Query,
-    /// Where the question's name lives once parked; until then the query
-    /// borrows it from the read.
-    name_bytes: []align(@alignOf([]const u8)) u8 = &.{},
+    /// The question's name and spelling, once parked; until then the read's.
+    question_bytes: []align(@alignOf([]const u8)) u8 = &.{},
     reply: Reply,
     asked_ns: i64,
     /// When the first client parked on the same cell asked.
@@ -435,8 +434,12 @@ const Server = struct {
                 try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
-            p.name_bytes = try s.g.work.allocator().alignedAlloc(u8, .of([]const u8), dns.nameFlatSize(q.name));
-            p.query.question.?.name = dns.writeNameFlat(p.name_bytes, q.name, false);
+            const spelled = q.spelled.?;
+            const flat = dns.nameFlatSize(q.name);
+            p.question_bytes = try s.g.work.allocator().alignedAlloc(u8, .of([]const u8), flat + spelled.len);
+            p.query.question.?.name = dns.writeNameFlat(p.question_bytes[0..flat], q.name, false);
+            @memcpy(p.question_bytes[flat..], spelled);
+            p.query.question.?.spelled = p.question_bytes[flat..];
         }
         try s.hold(p);
     }
@@ -714,7 +717,7 @@ const Server = struct {
     fn release(s: *Server, p: Pending) void {
         s.g.unhold(p.root);
         if (p.a) |a| s.g.unhold(a);
-        s.g.work.allocator().free(p.name_bytes);
+        s.g.work.allocator().free(p.question_bytes);
     }
 
     fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {

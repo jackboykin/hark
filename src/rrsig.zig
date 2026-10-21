@@ -165,14 +165,10 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
 // ── Canonical Name Wire Format (RFC 4034 §6.1) ──────────────────────
 
 pub fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
-    const len = try writeNameWire(buf, name);
+    const len = dns.writeNameWire(buf, name) catch return error.BufferTooSmall;
     // Length octets sit below 'A', so lowering the whole name lowers its labels.
     for (buf[0..len]) |*b| b.* = std.ascii.toLower(b.*);
     return len;
-}
-
-fn writeNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
-    return dns.writeNameWire(buf, name) catch error.BufferTooSmall;
 }
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
@@ -271,9 +267,10 @@ pub fn buildSignedData(
     return out;
 }
 
-/// Write canonical RDATA per RFC 4034 §6.2. Each name-bearing arm carries
-/// its own folding rule — most lowercase, NSEC is case-preserving per
-/// RFC 6840 §5.1. Types without embedded names are written as-is.
+/// Write canonical RDATA per RFC 4034 §6.2. Each name-bearing arm
+/// lowercases its names. The rest go out as the serializer writes them:
+/// types without names, and NSEC, whose next name is never folded (RFC
+/// 6840 §5.1) and goes out as signed.
 ///
 /// Separate from `dns.Serializer.writeRData` (canonical/lowercased, not wire).
 /// Any new name-bearing RData arm MUST add a lowercasing arm here, or the
@@ -312,15 +309,6 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
             if (pos + rrsig.signature.len > buf.len) return error.BufferTooSmall;
             @memcpy(buf[pos..][0..rrsig.signature.len], rrsig.signature);
             pos += rrsig.signature.len;
-            return pos;
-        },
-        .nsec => |nsec_data| {
-            var pos: usize = 0;
-            // RFC 6840 §5.1: NSEC next_domain_name is the one field never folded.
-            pos += try writeNameWire(buf[pos..], nsec_data.next_domain_name);
-            if (pos + nsec_data.type_bit_maps.len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos..][0..nsec_data.type_bit_maps.len], nsec_data.type_bit_maps);
-            pos += nsec_data.type_bit_maps.len;
             return pos;
         },
         .named => |d| {

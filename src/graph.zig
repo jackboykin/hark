@@ -437,7 +437,8 @@ pub const Tally = struct {
 
 const ExchangeScratch = struct {
     id: u16,
-    sent_name: dns.Name,
+    /// The question's spelling, 0x20 case and all.
+    sent: []const u8,
     qtype: dns.RType,
     server: na.Address,
     transport: Transport,
@@ -871,7 +872,7 @@ pub const Graph = struct {
                 const bytes = try arena.dupe(u8, borrowed);
                 var msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
                 if (msg.header.id != sc.id) break :blk .mismatch;
-                dns.validateResponse(msg, sc.sent_name, sc.qtype, sc.case == .random) catch break :blk .mismatch;
+                dns.validateResponse(msg, sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // 0x20 case checked; every name is a lowercase fact from here.
                 // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &msg.answers, &msg.authorities, &msg.additionals }) |section| {
@@ -895,7 +896,7 @@ pub const Graph = struct {
         if (g.cfg.trace) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            std.debug.print("  {s} {s} {f} {t} -> {t}\n", .{ na.format(sc.server, &ab), sc.sent_name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, std.meta.activeTag(outcome) });
+            std.debug.print("  {s} {s} {f} {t} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
                 const m = outcome.reply.msg;
                 std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
@@ -1702,7 +1703,7 @@ pub const Graph = struct {
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         const addr = server.toAddress();
-        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
+        sc.* = .{ .id = qid, .sent = msg.questions[0].spelled.?, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
