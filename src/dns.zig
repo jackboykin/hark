@@ -583,12 +583,32 @@ pub const Question = struct {
     spelled: ?[]const u8 = null,
 };
 
+var fixtures: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
 pub const ResourceRecord = struct {
     name: Name,
     rtype: RType,
     rclass: RClass,
     ttl: u32,
     rdata: RData,
+
+    pub const Parts = struct {
+        name: Name,
+        rtype: RType,
+        rclass: RClass,
+        ttl: u32,
+        rdata: RData,
+    };
+
+    pub fn init(gpa: Allocator, p: Parts) Allocator.Error!ResourceRecord {
+        _ = gpa;
+        return .{ .name = p.name, .rtype = p.rtype, .rclass = p.rclass, .ttl = p.ttl, .rdata = p.rdata };
+    }
+
+    /// For tests: memory the test binary never frees.
+    pub fn fixture(p: Parts) ResourceRecord {
+        return init(fixtures.allocator(), p) catch @panic("OOM");
+    }
 
     // Each reads the rdata of the type it is named for.
 
@@ -1794,10 +1814,10 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
         .header = mem.zeroes(Header),
         .question = .{ .name = owner, .qtype = .a, .qclass = .in },
         .answers = &.{
-            .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-            .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = rrsig } },
+            .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
+            .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = rrsig } }),
         },
-        .authorities = &.{.{ .name = try parseDottedName(a, "example.com"), .rtype = .ns, .rclass = .in, .ttl = 60, .rdata = .{ .ns = ns1 } }},
+        .authorities = &.{.fixture(.{ .name = try parseDottedName(a, "example.com"), .rtype = .ns, .rclass = .in, .ttl = 60, .rdata = .{ .ns = ns1 } })},
     };
 
     var buf: [512]u8 = undefined;
@@ -1818,7 +1838,7 @@ test "name compression follows a pointer inside an earlier name" {
     const a = arena.allocator();
     const www = try parseDottedName(a, "www.example.com");
     const mail = try parseDottedName(a, "mail.example.com");
-    const rr: ResourceRecord = .{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    const rr: ResourceRecord = .fixture(.{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
     var buf: [512]u8 = undefined;
     const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = .{ .name = www, .qtype = .a, .qclass = .in }, .answers = &.{ rr, rr } });
     // The second owner is one pointer to "mail" + a pointer, itself.
@@ -1852,7 +1872,7 @@ test "a record written from its stored bytes is the record written from its fiel
             .named, .unknown => unreachable,
             inline else => |_, field| @field(RType, @tagName(field)),
         };
-        const rr: ResourceRecord = .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d };
+        const rr: ResourceRecord = .fixture(.{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d });
         var stage: [512]u8 = undefined;
         const stored = try buildResourceRecordWire(&stage, rr);
         const n = wireNameLen(stored);
@@ -2150,7 +2170,7 @@ test "compression past its work budget writes names whole, and they read back" {
         try w.append(a, @intCast(last.len));
         try w.appendSlice(a, last);
         try w.append(a, 0);
-        rr.* = .{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .of(w.items) } };
+        rr.* = .fixture(.{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .of(w.items) } });
     }
     const q: Question = .{ .name = owner, .qtype = .ptr, .qclass = .in };
     var buf: [max_message_len]u8 = undefined;

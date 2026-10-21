@@ -780,7 +780,7 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     try keep.appendSlice(g.scratch.allocator(), d.answers);
     if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.dname())) |target| {
-        try keep.append(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
+        try keep.append(g.scratch.allocator(), try .init(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } }));
         return .{ .kind = .alias, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
     }
     // RFC 6672 §3.3: the substituted name is too long; YXDOMAIN.
@@ -921,7 +921,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
                 overflow = true;
                 break;
             };
-            cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
+            cname = try .init(g.scratch.allocator(), .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } });
         }
         const c = cname orelse break;
         try keep.append(g.scratch.allocator(), c);

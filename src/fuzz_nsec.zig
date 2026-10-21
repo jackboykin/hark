@@ -79,6 +79,7 @@ const Zone = struct {
     enc: [max_chain][32]u8,
     owners: [max_chain]dns.Name.Buf,
     bitmaps: [max_chain][9]u8,
+    rdata: [max_chain * (max_wire + 64)]u8,
 
     fn find(z: *const Zone, name: dns.Name) ?*const Entry {
         for (z.entries[0..z.n]) |*e| if (e.name().eql(name)) return e;
@@ -291,14 +292,15 @@ fn draw(z: *Zone, s: *Smith) void {
     }.lt);
     for (order[0..z.n_recs], 0..) |i, r| z.hashes[r] = ehash[i];
 
+    var rdata: std.heap.FixedBufferAllocator = .init(&z.rdata);
     for (order[0..z.n_recs], 0..) |i, r| {
         const e = &z.entries[i];
         const nr = (r + 1) % z.n_recs;
         if (!z.nsec3) {
-            z.recs[r] = .{ .name = e.name(), .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{
+            z.recs[r] = dns.ResourceRecord.init(rdata.allocator(), .{ .name = e.name(), .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{
                 .next_domain_name = z.entries[order[nr]].name(),
                 .type_bit_maps = bitmap(&z.bitmaps[r], e.types, .nsec),
-            } } };
+            } } }) catch unreachable;
             continue;
         }
         const owner = dns.Name.child(&z.owners[r], proof.base32HexEncode(&z.enc[r], &z.hashes[r]), .lit(apex)).?;
@@ -307,14 +309,14 @@ fn draw(z: *Zone, s: *Smith) void {
         for (z.entries[0..z.n], 0..) |*o, j| if (z.omitted(o)) {
             if (between(std.mem.order(u8, &z.hashes[r], &ehash[j]), std.mem.order(u8, &ehash[j], &z.hashes[nr]), std.mem.order(u8, &z.hashes[r], &z.hashes[nr]))) optout = true;
         };
-        z.recs[r] = .{ .name = owner, .rtype = .nsec3, .rclass = .in, .ttl = 300, .rdata = .{ .nsec3 = .{
+        z.recs[r] = dns.ResourceRecord.init(rdata.allocator(), .{ .name = owner, .rtype = .nsec3, .rclass = .in, .ttl = 300, .rdata = .{ .nsec3 = .{
             .hash_algorithm = .sha1,
             .flags = @intFromBool(optout),
             .iterations = z.iterations,
             .salt = z.salt[0..z.salt_len],
             .next_hashed_owner = &z.hashes[nr],
             .type_bit_maps = bitmap(&z.bitmaps[r], e.types, .nsec3),
-        } } };
+        } } }) catch unreachable;
     }
 }
 

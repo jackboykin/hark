@@ -224,8 +224,8 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
     const name = try dns.parseDottedName(a, "example.com");
     const question: dns.Question = .{ .name = name, .qtype = .a, .qclass = .in };
     const answers = [_]dns.WireRecord{
-        try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 168, 0, 1 } } }),
-        try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 93, 184, 216, 34 } } }),
+        try .from(a, .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 168, 0, 1 } } })),
+        try .from(a, .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 93, 184, 216, 34 } } })),
     };
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
 
@@ -315,21 +315,21 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
     for (&ns_authorities, 0..) |*rr, i| {
         const ns_label = try std.fmt.allocPrint(a, "ns{d}.long.example.com.", .{i});
         const ns_name = try dns.parseDottedName(a, ns_label);
-        rr.* = try .from(a, .{
+        rr.* = try .from(a, .fixture(.{
             .name = name,
             .rtype = .ns,
             .rclass = .in,
             .ttl = 300,
             .rdata = .{ .ns = ns_name },
-        });
+        }));
     }
-    const a_record: dns.WireRecord = try .from(a, .{
+    const a_record: dns.WireRecord = try .from(a, .fixture(.{
         .name = name,
         .rtype = .a,
         .rclass = .in,
         .ttl = 60,
         .rdata = .{ .a = .{ 192, 0, 2, 1 } },
-    });
+    }));
 
     const reply: Reply = .{
         .rcode = .no_error,
@@ -375,7 +375,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
-    const nsec: dns.WireRecord = try .from(a, .{ .name = name, .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{ .next_domain_name = name, .type_bit_maps = "" } } });
+    const nsec: dns.WireRecord = try .from(a, .fixture(.{ .name = name, .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{ .next_domain_name = name, .type_bit_maps = "" } } }));
     const authorities = try a.alloc(dns.WireRecord, 1 << 16);
     @memset(authorities, nsec);
 
@@ -420,7 +420,7 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
     const glue = try dns.parseDottedName(a, "ns.example.com");
     const reply: Reply = .{
         .rcode = .no_error,
-        .additionals = &.{try .from(a, .{ .name = glue, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 168, 1, 1 } } })},
+        .additionals = &.{try .from(a, .fixture(.{ .name = glue, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 168, 1, 1 } } }))},
     };
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     for ([_]*const rebinding.Config{ &rebinding.Config.off, &scrub_on }, [_]u16{ 1, 0 }) |rb, kept| {
@@ -447,7 +447,7 @@ test "buildResponseWire: a local answer bypasses the rebinding scrub; any other 
 
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const localhost = try dns.parseDottedName(a, "localhost");
-    const loopback: dns.WireRecord = try .from(a, .{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } });
+    const loopback: dns.WireRecord = try .from(a, .fixture(.{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } }));
     for ([_]bool{ true, false }) |local| {
         var buf: [dns.max_udp_payload]u8 = undefined;
         const wire = buildResponseWire(&buf, .{
@@ -473,7 +473,7 @@ test "buildResponseWire: a rebinding scrub clears AD" {
     const name = try dns.parseDottedName(a, "example.com");
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     for ([_][4]u8{ .{ 93, 184, 216, 34 }, .{ 192, 168, 1, 1 } }, [_]bool{ true, false }) |ip, ad| {
-        const answers = [_]dns.WireRecord{try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } })};
+        const answers = [_]dns.WireRecord{try .from(a, .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } }))};
         var buf: [dns.max_udp_payload]u8 = undefined;
         const wire = buildResponseWire(&buf, .{
             .query_id = 0,

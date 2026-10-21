@@ -211,15 +211,15 @@ fn wire(rr: dns.ResourceRecord) dns.WireRecord {
 }
 
 fn rrA(name: dns.Name, ip: [4]u8) dns.WireRecord {
-    return wire(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } });
+    return wire(.fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } }));
 }
 
 fn rrAAAA(name: dns.Name, ip: [16]u8) dns.WireRecord {
-    return wire(.{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 60, .rdata = .{ .aaaa = ip } });
+    return wire(.fixture(.{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 60, .rdata = .{ .aaaa = ip } }));
 }
 
 fn rrHttps(name: dns.Name, rdata: []const u8) dns.WireRecord {
-    return wire(.{ .name = name, .rtype = .https, .rclass = .in, .ttl = 60, .rdata = .{ .unknown = rdata } });
+    return wire(.fixture(.{ .name = name, .rtype = .https, .rclass = .in, .ttl = 60, .rdata = .{ .unknown = rdata } }));
 }
 
 /// SvcPriority 1 · TargetName "."
@@ -231,7 +231,7 @@ fn svcParam(comptime key: u16, comptime value: []const u8) []const u8 {
 }
 
 fn rrsigOver(covered: dns.RType) dns.WireRecord {
-    return wire(.{ .name = public_name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = .{
+    return wire(.fixture(.{ .name = public_name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = .{
         .type_covered = covered,
         .algorithm = .ecdsap256sha256,
         .labels = 2,
@@ -241,7 +241,7 @@ fn rrsigOver(covered: dns.RType) dns.WireRecord {
         .key_tag = 0,
         .signer_name = public_name,
         .signature = &.{},
-    } } });
+    } } }));
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {

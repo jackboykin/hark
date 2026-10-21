@@ -136,7 +136,7 @@ pub fn synthesize(allocator: mem.Allocator, q: dns.Question, own: Own) !Synthesi
 
 fn records(allocator: mem.Allocator, owner: dns.Name, rtype: dns.RType, rdatas: []const dns.RData) ![]const dns.ResourceRecord {
     const rrs = try allocator.alloc(dns.ResourceRecord, rdatas.len);
-    for (rrs, rdatas) |*rr, rdata| rr.* = .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = ttl, .rdata = rdata };
+    for (rrs, rdatas) |*rr, rdata| rr.* = try .init(allocator, .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = ttl, .rdata = rdata });
     return rrs;
 }
 

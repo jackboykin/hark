@@ -143,7 +143,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const anchors = g.cfg.trust_anchors orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
     const parent_name = zone.parent() orelse {
         const rrs = try g.scratch.allocator().alloc(RR, anchors.len);
-        for (rrs, anchors) |*rr, ds| rr.* = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = ds } };
+        for (rrs, anchors) |*rr, ds| rr.* = try .init(g.scratch.allocator(), .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = ds } });
         return g.settle(id, .{ .ds = .{ .status = .secure, .records = rrs } }, std.math.maxInt(i64));
     };
     const parent_zone = switch (try walk.start(g, id, zone, parent_name, &s.parent)) {

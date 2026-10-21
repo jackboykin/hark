@@ -624,13 +624,13 @@ test "buildSignedData produces correct header" {
 
     const owner_name = dns.Name.lit("www.example.com");
 
-    const rrset = [_]dns.ResourceRecord{.{
+    const rrset = [_]dns.ResourceRecord{.fixture(.{
         .name = owner_name,
         .rtype = .a,
         .rclass = .in,
         .ttl = 200, // different from original_ttl — signed data should use original_ttl
         .rdata = .{ .a = .{ 93, 184, 216, 34 } },
-    }};
+    })};
 
     var buf: [4096]u8 = undefined;
     var flat = TestFlatten{};
@@ -678,13 +678,13 @@ test "buildSignedData reconstructs wildcard owner name" {
     // Owner has 3 labels but RRSIG says 2 — wildcard expansion
     const owner_name = dns.Name.lit("foo.example.com");
 
-    const rrset = [_]dns.ResourceRecord{.{
+    const rrset = [_]dns.ResourceRecord{.fixture(.{
         .name = owner_name,
         .rtype = .a,
         .rclass = .in,
         .ttl = 200,
         .rdata = .{ .a = .{ 93, 184, 216, 34 } },
-    }};
+    })};
 
     var buf: [4096]u8 = undefined;
     var flat = TestFlatten{};
@@ -743,7 +743,7 @@ test "ECDSA P-384 signature verification" {
 
 test "VerifyMemo: a remembered signature binds its key and still expires" {
     const recs = [_]dns.ResourceRecord{
-        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .fixture(.{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
@@ -925,7 +925,7 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
         .signature = &.{},
     };
     const rrset = [_]dns.ResourceRecord{
-        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .fixture(.{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var budget: ValidationBudget = .{};
     try testing.expectError(
@@ -966,7 +966,7 @@ test "verifyRrsig rejects labels below the signer's label count" {
     // owner would sit above the zone. Unbound: "RRSIG label count too low for signer".
     const owner = dns.Name.lit("foo.example.com");
     const recs = [_]dns.ResourceRecord{
-        .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
+        .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
     };
     var sig_buf: [64]u8 = undefined;
     var pub_buf: [32]u8 = undefined;
@@ -981,14 +981,14 @@ test "verifyRrsig verifies signed data past its stack buffer" {
     const chunk: [255]u8 = @splat('x');
     const strings: [40][]const u8 = @splat(&chunk);
     var recs = [_]dns.ResourceRecord{
-        .{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = &strings } } },
+        .fixture(.{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = &strings } } }),
     };
     var sig_buf: [64]u8 = undefined;
     var pub_buf: [32]u8 = undefined;
     const signed = try testSignRrset(&recs, .txt, test_owner, .ed25519, &sig_buf, &pub_buf);
     var budget: ValidationBudget = .{};
     try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
-    recs[0].rdata.txt.strings = strings[1..];
+    recs[0] = .fixture(.{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = strings[1..] } } });
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
 }
 
@@ -1022,7 +1022,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         var sig_buf: [64]u8 = undefined;
         var pub_buf: [32]u8 = undefined;
         const below = [_]dns.ResourceRecord{
-            .{ .name = child, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
+            .fixture(.{ .name = child, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata }),
         };
         const signed = try testSignRrset(&below, rtype, parent, .ed25519, &sig_buf, &pub_buf);
         try testing.expectError(
@@ -1035,7 +1035,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         var apex_sig_buf: [64]u8 = undefined;
         var apex_pub_buf: [32]u8 = undefined;
         const at_apex = [_]dns.ResourceRecord{
-            .{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
+            .fixture(.{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata }),
         };
         const apex = try testSignRrset(&at_apex, rtype, parent, .ed25519, &apex_sig_buf, &apex_pub_buf);
         try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget, &test_memo);

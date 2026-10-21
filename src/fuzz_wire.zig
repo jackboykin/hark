@@ -162,7 +162,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
 
 /// Drawn from small pools so sets, rollovers and the cap come up; wire
 /// messages are too few and too random to reach them.
-fn pooledRR(s: *Smith) dns.ResourceRecord {
+fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
     const owners = [_]dns.Name{ .lit("example"), .lit("a.example"), .lit("b.example") };
     const signers = [_]dns.Name{ .lit("a.example"), .lit("example"), .lit("other"), .root };
     const data = [_]dns.RType{ .a, .ns, .ds, .nsec };
@@ -170,8 +170,8 @@ fn pooledRR(s: *Smith) dns.ResourceRecord {
     const ttls = [_]u32{ 0, 60, 300, 3600 };
     const owner = owners[s.index(owners.len)];
     const ttl = ttls[s.index(ttls.len)];
-    if (s.boolWeighted(1, 1)) return .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = "" } };
-    return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
+    if (s.boolWeighted(1, 1)) return .init(arena, .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = "" } });
+    return .init(arena, .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
         .type_covered = data[s.index(data.len)],
         .algorithm = algorithms[s.index(algorithms.len)],
         .labels = owner.depth(),
@@ -181,7 +181,7 @@ fn pooledRR(s: *Smith) dns.ResourceRecord {
         .key_tag = s.value(u16),
         .signer_name = signers[s.index(signers.len)],
         .signature = "",
-    } } };
+    } } });
 }
 
 const scrub_cfg: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
@@ -279,7 +279,7 @@ test "fuzz: pooled sections bind" {
             defer arena.deinit();
             var rrs: [40]dns.ResourceRecord = undefined;
             const n = s.valueRangeAtMost(u8, 0, rrs.len);
-            for (rrs[0..n]) |*rr| rr.* = pooledRR(s);
+            for (rrs[0..n]) |*rr| rr.* = try pooledRR(arena.allocator(), s);
             try checkBound(arena.allocator(), rrs[0..n], s.boolWeighted(1, 3));
         }
     }.one, .{});

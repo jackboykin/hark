@@ -530,8 +530,8 @@ test "a fact survives the blob byte for byte" {
     const owner = try dns.parseDottedName(arena, "www.example.com.");
     const zone = try dns.parseDottedName(arena, "example.com.");
     const rrs = [_]RR{
-        .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
-        .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
+        .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
+        .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
             .type_covered = .a,
             .algorithm = @fromBackingInt(13),
             .labels = 3,
@@ -541,9 +541,9 @@ test "a fact survives the blob byte for byte" {
             .key_tag = 7,
             .signer_name = zone,
             .signature = "sig",
-        } } },
+        } } }),
     };
-    const soa = [_]RR{.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 60, .rdata = .{ .soa = .{
+    const soa = [_]RR{.fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 60, .rdata = .{ .soa = .{
         .mname = owner,
         .rname = zone,
         .serial = 1,
@@ -551,7 +551,7 @@ test "a fact survives the blob byte for byte" {
         .retry = 3,
         .expire = 4,
         .minimum = 5,
-    } } }};
+    } } })};
     const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
     const key: Key = .of(.rrset, .lit("www.example.com"), .a);
 

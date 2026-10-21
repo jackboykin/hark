@@ -758,7 +758,7 @@ pub const test_com = dns.Name.lit("com");
 test "classifyDelegation with DS present" {
     const child_zone = dns.Name.lit("example.com");
 
-    const authorities = [_]dns.ResourceRecord{.{
+    const authorities = [_]dns.ResourceRecord{.fixture(.{
         .name = child_zone,
         .rtype = .ds,
         .rclass = .in,
@@ -769,7 +769,7 @@ test "classifyDelegation with DS present" {
             .digest_type = .sha256,
             .digest = &@as([32]u8, @splat(0xAA)),
         } },
-    }};
+    })};
 
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, test_com, &b));
@@ -1069,14 +1069,20 @@ test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
+fn setNsec3(rr: *dns.ResourceRecord, comptime field: []const u8, value: anytype) void {
+    var d = rr.nsec3();
+    @field(d, field) = value;
+    rr.* = .fixture(.{ .name = rr.name, .rtype = .nsec3, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = .{ .nsec3 = d } });
+}
+
 fn nsecRrWithBitmap(owner: dns.Name, next: dns.Name, bitmap: []const u8) dns.ResourceRecord {
-    return .{
+    return .fixture(.{
         .name = owner,
         .rtype = .nsec,
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = bitmap } },
-    };
+    });
 }
 
 test "validateNegativeProof NSEC NXDOMAIN at an empty non-terminal is refused" {
@@ -1184,7 +1190,7 @@ pub fn makeNsec3Rr(
     next_hashed_owner: []const u8,
     type_bit_maps: []const u8,
 ) dns.ResourceRecord {
-    return .{
+    return .fixture(.{
         .name = owner_name,
         .rtype = .nsec3,
         .rclass = .in,
@@ -1197,7 +1203,7 @@ pub fn makeNsec3Rr(
             .next_hashed_owner = next_hashed_owner,
             .type_bit_maps = type_bit_maps,
         } },
-    };
+    });
 }
 
 /// Build an NSEC3 RR whose range covers `target_hash` (owner = hash-1, next = hash+1).
@@ -1231,7 +1237,7 @@ test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 51
     const qname = dns.Name.lit("example.com");
     const owner_name = dns.Name.lit("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com");
     const next: [20]u8 = @splat(0xFF);
-    const authorities = [_]dns.ResourceRecord{.{
+    const authorities = [_]dns.ResourceRecord{.fixture(.{
         .name = owner_name,
         .rtype = .nsec3,
         .rclass = .in,
@@ -1246,7 +1252,7 @@ test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 51
                 .type_bit_maps = &.{},
             },
         },
-    }};
+    })};
 
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
@@ -1395,11 +1401,11 @@ const OptOutProof = struct {
         self.ce_next = ce_hash;
         self.ce_next[Sha1.digest_length - 1] +|= 1;
         self.rrs[0] = makeNsec3Rr(ce_owner, salt, &self.ce_next, &com_apex_bitmap);
-        self.rrs[0].rdata.nsec3.flags = nsec3_opt_out;
+        setNsec3(&self.rrs[0], "flags", nsec3_opt_out);
 
         self.rrs[1] = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &self.nc_bufs);
-        self.rrs[1].rdata.nsec3.type_bit_maps = &com_delegation_bitmap;
-        self.rrs[1].rdata.nsec3.flags = if (opt_out) nsec3_opt_out else 0;
+        setNsec3(&self.rrs[1], "type_bit_maps", &com_delegation_bitmap);
+        setNsec3(&self.rrs[1], "flags", if (opt_out) nsec3_opt_out else 0);
 
         var wc_buf: dns.Name.Buf = undefined;
         const wildcard = dns.Name.child(&wc_buf, "*", ce).?;
@@ -1460,7 +1466,7 @@ test "NSEC3 reserved Flag bits make a record invisible (RFC 5155 §8.2)" {
     {
         var p: OptOutProof = .{};
         try p.init(qname, true);
-        p.rrs[1].rdata.nsec3.flags = nsec3_opt_out | 0x02;
+        setNsec3(&p.rrs[1], "flags", nsec3_opt_out | 0x02);
         try testing.expectEqual(
             SecurityStatus.unchecked,
             validateNegativeProof(p.ds(), qname, .ds, false, test_root, &b),
@@ -1471,7 +1477,7 @@ test "NSEC3 reserved Flag bits make a record invisible (RFC 5155 §8.2)" {
     {
         var p: OptOutProof = .{};
         try p.init(qname, true);
-        p.rrs[1].rdata.nsec3.flags = 0x02;
+        setNsec3(&p.rrs[1], "flags", 0x02);
         try testing.expectEqual(
             SecurityStatus.unchecked,
             validateNegativeProof(p.ds(), qname, .ds, false, test_root, &b),
@@ -1485,7 +1491,7 @@ test "NSEC3 proof mixing two parameter sets is bogus (RFC 5155 §8.2)" {
     const qname = dns.Name.lit("amazon.com");
     var p: OptOutProof = .{};
     try p.init(qname, true);
-    p.rrs[1].rdata.nsec3.salt = "X";
+    setNsec3(&p.rrs[1], "salt", "X");
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
@@ -1543,7 +1549,7 @@ test "NSEC3 wildcard coverer with Opt-Out counts wherever it sits in the section
     var p: OptOutProof = .{};
     try p.init(qname, false);
     var stale_first = p.rrs ++ [_]dns.ResourceRecord{p.rrs[2]};
-    stale_first[3].rdata.nsec3.flags = nsec3_opt_out;
+    setNsec3(&stale_first[3], "flags", nsec3_opt_out);
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&stale_first, qname, .a, true, test_root, &b));
 }
@@ -1644,7 +1650,7 @@ test "classifyDelegation NSEC3 signed below or beside the cut proves nothing" {
     const salt: []const u8 = &.{ 0xAA, 0xBB };
     var bufs: [2]Nsec3OwnerBufs = .{ .{}, .{} };
     var span = makeCoveringNsec3(nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
-    span.rdata.nsec3.flags = nsec3_opt_out;
+    setNsec3(&span, "flags", nsec3_opt_out);
     // Every Opt-Out referral carries the closest encloser `com` itself.
     const ce = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x22 });
 
@@ -1667,7 +1673,7 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     const salt: []const u8 = &.{};
     var bufs: [4]Nsec3OwnerBufs = .{ .{}, .{}, .{}, .{} };
     var span = makeCoveringNsec3(nsec3Hash(child_zone, salt, 0), test_com, salt, &bufs[0]);
-    span.rdata.nsec3.flags = nsec3_opt_out;
+    setNsec3(&span, "flags", nsec3_opt_out);
     const apex = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[1]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x01, 0x22 });
     const cut = makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(victim, salt, 0), test_com, &bufs[2]), salt, &bufs[0].high, &[_]u8{ 0x00, 0x06, 0x20, 0x00, 0x00, 0x00, 0x00, 0x10 });
 
@@ -1678,7 +1684,7 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     // A direct child of com in the same span is the honest Opt-Out shape.
     const direct = dns.Name.lit("unsigned.com");
     var span2 = makeCoveringNsec3(nsec3Hash(direct, salt, 0), test_com, salt, &bufs[3]);
-    span2.rdata.nsec3.flags = nsec3_opt_out;
+    setNsec3(&span2, "flags", nsec3_opt_out);
     try testing.expectEqual(Delegation.unsigned, classifyDelegation(&.{ span2, apex }, direct, test_com, &b));
 }
 
@@ -1707,14 +1713,14 @@ test "NSEC3 iterations cost budget, never a verdict (RFC 9276 §3.2)" {
     const zone_name = dns.Name.lit("com");
     const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_name, &bufs);
     var authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, &.{}, &@as([20]u8, @splat(0x43)), &.{})};
-    authorities[0].rdata.nsec3.iterations = 200;
+    setNsec3(&authorities[0], "iterations", 200);
 
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
     try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, zone_name, test_root, &b));
     try testing.expect(!b.exhausted());
 
-    authorities[0].rdata.nsec3.iterations = 65535;
+    setNsec3(&authorities[0], "iterations", 65535);
     b = .{};
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
     try testing.expect(b.stopped == .nsec3);
@@ -1848,7 +1854,7 @@ test "proveNoCloserMatch NSEC3" {
     var nc = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs);
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
-    nc.rdata.nsec3.flags = nsec3_opt_out;
+    setNsec3(&nc, "flags", nsec3_opt_out);
     try testing.expectEqual(SecurityStatus.insecure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
     // The CE's own record names the wildcard's parent and denies nothing.
     var ce_bufs: Nsec3OwnerBufs = .{};

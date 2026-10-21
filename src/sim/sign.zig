@@ -115,7 +115,7 @@ pub const Signer = struct {
                 zone = d.zone;
             };
             const key = self.keyNamed(zone) orelse return error.PlaceholderDsWithoutKey;
-            rr.rdata = .{ .ds = key.ds };
+            rr.* = try .init(self.arena, .{ .name = rr.name, .rtype = .ds, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = .{ .ds = key.ds } });
         };
         // Signing appends to `out`, which may move it.
         const originals = try self.arena.dupe(RR, out.items);
@@ -217,7 +217,7 @@ pub const Signer = struct {
             minted.value_ptr.* = (try s.finalize()).toBytes();
         }
         sig.signature = try self.arena.dupe(u8, minted.value_ptr);
-        return .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } };
+        return .init(self.arena, .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } });
     }
 
     /// An unmatched DNSKEY question: the zone's key, self-signed, from an
@@ -227,7 +227,7 @@ pub const Signer = struct {
         for (self.served.items) |s| {
             if (!na.ipEqual(s.address, address) or !s.key.zone.eql(q.name)) continue;
             const rrs = try self.arena.alloc(RR, 2);
-            rrs[0] = .{ .name = s.key.zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = s.key.dnskey } };
+            rrs[0] = try .init(self.arena, .{ .name = s.key.zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = s.key.dnskey } });
             rrs[1] = try self.sign(s.key, rrs[0..1], null);
             return rrs;
         }

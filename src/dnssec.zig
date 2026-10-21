@@ -551,7 +551,7 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
     const zero_digest: [32]u8 = @splat(0);
     const ds_rr = struct {
         fn make(algo: dns.DnssecAlgorithm, digest_type: dns.DigestType) dns.ResourceRecord {
-            return .{
+            return .fixture(.{
                 .name = rrsig.test_owner,
                 .rtype = .ds,
                 .rclass = .in,
@@ -562,7 +562,7 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
                     .digest_type = digest_type,
                     .digest = &zero_digest,
                 } },
-            };
+            });
         }
     }.make;
 
@@ -607,13 +607,13 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
         .digest_type = .sha256,
         .digest = &digest,
     };
-    const sig_rr = dns.ResourceRecord{
+    const sig_rr = dns.ResourceRecord.fixture(.{
         .name = rrsig.test_owner,
         .rtype = .rrsig,
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .rrsig = resigned.rrsig },
-    };
+    });
 
     // Control: the signed 64 plus their RRSIG validate.
     var ok: [65]dns.ResourceRecord = undefined;
@@ -649,8 +649,8 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
     // 3 anchored copies of the DS-matching key × 40 tag-matching RRSIGs with
     // unverifiable signatures = 120 candidate attempts; the budget permits 8.
     var records: [43]dns.ResourceRecord = undefined;
-    for (records[0..3]) |*r| r.* = .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
-    for (records[3..43]) |*r| r.* = .{
+    for (records[0..3]) |*r| r.* = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } });
+    for (records[3..43]) |*r| r.* = .fixture(.{
         .name = rrsig.test_owner,
         .rtype = .rrsig,
         .rclass = .in,
@@ -666,7 +666,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
             .signer_name = rrsig.test_owner,
             .signature = &.{ 0xDE, 0xAD, 0xBE, 0xEF },
         } },
-    };
+    });
 
     const cap: u32 = 8;
     var budget: rrsig.ValidationBudget = .{ .max_sig_verify = cap };
@@ -762,13 +762,13 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
     _ = try std.fmt.hexToBytes(&digest, "812cb1a22af04380e2f72d91c06c14eb1a918cf30037a8a9c67497e9264b4bfa");
     try verifyDs(.{ .key_tag = 59829, .algorithm = .mldsa44, .digest_type = .sha256, .digest = &digest }, dnskey, rrsig.test_owner);
 
-    const mx = [_]dns.ResourceRecord{.{
+    const mx = [_]dns.ResourceRecord{.fixture(.{
         .name = rrsig.test_owner,
         .rtype = .mx,
         .rclass = .in,
         .ttl = 3600,
         .rdata = .{ .mx = .{ .preference = 10, .exchange = .lit("mail.example.com") } },
-    }};
+    })};
     var sig = dns.RrsigData{
         .type_covered = .mx,
         .algorithm = .mldsa44,
@@ -794,14 +794,14 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
     // Every RRSIG's tag matches the key, so each one tried draws on the budget.
     const zone: dns.Name = .lit("example.com");
     const next_owner: [20]u8 = @splat(0xFF);
-    const key: dns.ResourceRecord = .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } };
+    const key: dns.ResourceRecord = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } });
     var bufs: [2 * (proof.max_proof_records + 1)]proof.Nsec3OwnerBufs = undefined;
     var rrs: [2 * (proof.max_proof_records + 1)]dns.ResourceRecord = undefined;
     for (0..proof.max_proof_records + 1) |i| {
         bufs[i] = .{};
         const owner = proof.makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone, &bufs[i]);
         rrs[2 * i] = proof.makeNsec3Rr(owner, &.{}, &next_owner, &.{});
-        rrs[2 * i + 1] = .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
+        rrs[2 * i + 1] = .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
             .type_covered = .nsec3,
             .algorithm = .rsasha256,
             .labels = 3,
@@ -811,7 +811,7 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
             .key_tag = rrsig.keyTag(test_dnskey),
             .signer_name = rrsig.test_owner,
             .signature = &.{ 0xDE, 0xAD },
-        } } };
+        } } });
     }
     var at_cap: rrsig.ValidationBudget = .{};
     try testing.expect(verifyAuthorityProofSigs(rrs[0 .. 2 * proof.max_proof_records], &.{key}, 1700000000, &at_cap, &test_memo) == null);
@@ -822,11 +822,11 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
 }
 
 fn dnskeyRr(owner: dns.Name, dnskey: dns.DnskeyData) dns.ResourceRecord {
-    return .{ .name = owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } };
+    return .fixture(.{ .name = owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } });
 }
 
 fn rrsigRr(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
-    return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } };
+    return .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } });
 }
 
 test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" {
@@ -850,7 +850,7 @@ test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" 
 test "verifyAuthorityProofSigs: a set past the buffer is refused, not a verified prefix" {
     const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .lit("a.example.com"))};
     var soas: [17]dns.ResourceRecord = undefined;
-    for (&soas, 0..) |*r, i| r.* = .{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
+    for (&soas, 0..) |*r, i| r.* = .fixture(.{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
         .mname = rrsig.test_owner,
         .rname = rrsig.test_owner,
         .serial = @intCast(i),
@@ -858,7 +858,7 @@ test "verifyAuthorityProofSigs: a set past the buffer is refused, not a verified
         .retry = 0,
         .expire = 0,
         .minimum = 300,
-    } } };
+    } } });
     var sig_bufs: [2][64]u8 = undefined;
     var pub_bufs: [2][32]u8 = undefined;
     const n = try rrsig.testSignRrset(&nsec, .nsec, rrsig.test_owner, .ed25519, &sig_bufs[0], &pub_bufs[0]);
@@ -875,7 +875,7 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
     // record carrying it moved.
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
@@ -883,7 +883,7 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
     const sig_at = struct {
         fn f(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
-            return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } };
+            return .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } });
         }
     }.f;
 
@@ -907,20 +907,21 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     var pub_buf: [32]u8 = undefined;
     const signed = try rrsig.testSignRrset(&real, .nsec, rrsig.test_owner, .ed25519, &sig_buf, &pub_buf);
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
-    const sig_rr = dns.ResourceRecord{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+    const sig_rr = dns.ResourceRecord.fixture(.{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const replayed = [_]dns.ResourceRecord{ proof.nsecRr(v, a), sig_rr };
     var budget: rrsig.ValidationBudget = .{};
     try testing.expect(verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 
-    const own_sig = dns.ResourceRecord{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+    const own_sig = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: rrsig.ValidationBudget = .{};
     try testing.expect(verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
 
     // A stray naming fewer labels is no signature over the set, and the
     // one that is still proves it (RFC 6840 §5.4).
-    var stray = own_sig;
-    stray.rdata.rrsig.labels -= 1;
+    var fewer = signed.rrsig;
+    fewer.labels -= 1;
+    const stray = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = fewer } });
     const strayed = [_]dns.ResourceRecord{ real[0], stray, own_sig };
     var budget3: rrsig.ValidationBudget = .{};
     try testing.expect(verifyAuthorityProofSigs(&strayed, &dnskeys, 1_700_000_000, &budget3, &test_memo) != null);
@@ -963,10 +964,10 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const ed_key = dns.DnskeyData{ .flags = 256, .protocol = 3, .algorithm = .ed25519, .public_key = &ed_pub };
     const key = struct {
         fn rr(dk: dns.DnskeyData) dns.ResourceRecord {
-            return .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dk } };
+            return .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dk } });
         }
         fn sig(s: dns.RrsigData) dns.ResourceRecord {
-            return .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = s } };
+            return .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = s } });
         }
     };
     // ed_pub is undefined until testSignRrset fills it, so the Ed25519 signature
@@ -1025,7 +1026,7 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     var recs: [2]dns.ResourceRecord = undefined;
     recs[0] = dnskeyRr(rrsig.test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &pub_bytes });
     const signed = try rrsig.testSignRrset(recs[0..1], .dnskey, rrsig.test_owner, .rsasha256, &sig_bytes, &pub_bytes);
-    recs[1] = .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+    recs[1] = .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
 
     var digest = dsDigest(Sha256, rrsig.test_owner, signed.dnskey);
     const ds = dns.DsData{
@@ -1050,7 +1051,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     // edited after the fact — the junk RRSIG carries the hostile ones instead.
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
@@ -1066,8 +1067,8 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
     const answers = [_]dns.ResourceRecord{
         recs[0],
-        .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = junk } },
-        .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
+        .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = junk } }),
+        .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } }),
     };
     var budget: rrsig.ValidationBudget = .{};
     const sig = validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo).?.sig;
@@ -1080,23 +1081,23 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     // verifies over answers[0..64] must not authenticate a 70-record answer
     // section — the 6 appended records would ship authenticated.
     var recs: [70]dns.ResourceRecord = undefined;
-    for (&recs, 0..) |*r, i| r.* = .{
+    for (&recs, 0..) |*r, i| r.* = .fixture(.{
         .name = rrsig.test_owner,
         .rtype = .a,
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .a = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } },
-    };
+    });
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
     const signed = try rrsig.testSignRrset(recs[0..64], .a, rrsig.test_owner, .ed25519, &sig_bytes, &pub_bytes);
-    const sig_rr = dns.ResourceRecord{
+    const sig_rr = dns.ResourceRecord.fixture(.{
         .name = rrsig.test_owner,
         .rtype = .rrsig,
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .rrsig = signed.rrsig },
-    };
+    });
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
 
     var answers: [71]dns.ResourceRecord = undefined;

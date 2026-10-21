@@ -154,10 +154,10 @@ test "synthesizeAaaa embeds every A, drops its RRSIG and caps TTL by the SOA" {
     const host = try dns.parseDottedName(al, "host.example.com.");
     const sig: dns.RrsigData = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 0, .sig_expiration = 0, .sig_inception = 0, .key_tag = 0, .signer_name = host, .signature = "" };
     const a = [_]dns.WireRecord{
-        try .from(al, .{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
-        try .from(al, .{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } }),
+        try .from(al, .fixture(.{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })),
+        try .from(al, .fixture(.{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } })),
     };
-    const soa = [_]dns.WireRecord{try .from(al, .{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } })};
+    const soa = [_]dns.WireRecord{try .from(al, .fixture(.{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } }))};
     try testing.expect(wantsSynthesis(.no_error, &.{}));
     const out = (try synthesizeAaaa(al, Prefix.well_known, &a, &soa)).?;
     try testing.expectEqual(@as(usize, 1), out.len);
@@ -176,8 +176,8 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const classless = try dns.parseDottedName(a, "1.0-25.2.0.192.in-addr.arpa.");
     const host = try dns.parseDottedName(a, "host.example.com.");
     const answers = [_]dns.WireRecord{
-        try .from(a, .{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } }),
-        try .from(a, .{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } }),
+        try .from(a, .fixture(.{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } })),
+        try .from(a, .fixture(.{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } })),
     };
     const qname = try dns.parseDottedName(a, "1.0.2.0.0.0.0.C.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.B.9.F.F.4.6.0.0.ip6.arpa.");
     const out = try renamePtr(a, &answers, qname);
