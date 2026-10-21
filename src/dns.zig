@@ -881,10 +881,13 @@ const Parser = struct {
 
     const Form = enum { compressed, uncompressed };
 
-    /// A name read whole, its pointers followed, into one lowercase copy:
-    /// 255 octets at most however few the message spent on it.
+    /// Read in place when it lies whole in the message, lowercase; else one
+    /// lowercase copy, 255 octets at most however few the message spent.
     fn parseName(self: *Parser, allocator: Allocator, comptime form: Form) Error!Name {
         var buf: Name.Buf = undefined;
+        // Where the name lies whole: no label before a pointer.
+        var whole: ?usize = self.pos;
+        var upper = false;
         var len: usize = 0;
         var jumps: usize = 0;
         const max_jumps = 32;
@@ -900,7 +903,10 @@ const Parser = struct {
                     if (len + 1 + label_len > max_name_wire_len) return error.NameTooLong;
                     if (cursor + 1 + label_len > self.msg.len) return error.EndOfData;
                     buf[len] = len_byte;
-                    for (buf[len + 1 ..][0..label_len], self.msg[cursor + 1 ..][0..label_len]) |*d, c| d.* = std.ascii.toLower(c);
+                    for (buf[len + 1 ..][0..label_len], self.msg[cursor + 1 ..][0..label_len]) |*d, c| {
+                        upper = upper or std.ascii.isUpper(c);
+                        d.* = std.ascii.toLower(c);
+                    }
                     len += 1 + label_len;
                     cursor += 1 + label_len;
                     if (label_len == 0) break;
@@ -914,6 +920,7 @@ const Parser = struct {
                     const offset = (@as(u16, len_byte & 0x3F) << 8) | @as(u16, self.msg[cursor + 1]);
                     // RFC 1035 §4.1.4: pointers must reference prior occurrences
                     if (offset >= cursor) return error.FormatError;
+                    whole = if (len == 0) offset else null;
                     cursor = offset;
                 },
                 else => return error.InvalidLabelType,
@@ -921,6 +928,7 @@ const Parser = struct {
         }
         self.pos = resume_at orelse cursor;
         if (len == 1) return .root;
+        if (whole) |at| if (!upper) return .{ .wire = self.msg[at..cursor] };
         return .{ .wire = try allocator.dupe(u8, buf[0..len]) };
     }
 
@@ -1546,7 +1554,7 @@ pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
     return ser.pos;
 }
 
-/// One lowercase copy, `allocator`'s.
+/// May alias `bytes`.
 pub fn readNameWire(allocator: Allocator, bytes: []const u8, pos: *usize) Error!Name {
     var parser = Parser{ .msg = bytes, .pos = pos.* };
     const name = try parser.parseName(allocator, .compressed);
@@ -1940,18 +1948,39 @@ test "names are read lowercase, and the question as it was spelled" {
     try testing.expect(msg.answers[0].name.eql(.lit("www.example")));
 }
 
+test "a name lying whole in the message, lowercase, is read in place" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a_rr = "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
+    const wire = "\x00\x01\x81\x80\x00\x01\x00\x03\x00\x00\x00\x00" ++
+        "\x07example\x03com\x00\x00\x01\x00\x01" ++
+        "\xc0\x0c" ++ a_rr ++ "\x03www\xc0\x0c" ++ a_rr ++ "\x03WWW\x07example\x03com\x00" ++ a_rr;
+    const msg = try parseMessage(arena.allocator(), wire);
+    const in = struct {
+        fn place(n: Name, bytes: []const u8) bool {
+            return @intFromPtr(n.wire.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(n.wire.ptr) < @intFromPtr(bytes.ptr) + bytes.len;
+        }
+    }.place;
+    try testing.expect(in(msg.questions[0].name, wire));
+    try testing.expect(in(msg.answers[0].name, wire));
+    try testing.expect(!in(msg.answers[1].name, wire));
+    try testing.expect(!in(msg.answers[2].name, wire));
+    try testing.expect(msg.answers[1].name.eql(.lit("www.example.com")));
+    try testing.expect(msg.answers[2].name.eql(.lit("www.example.com")));
+}
+
 test "a pointer flood costs each name its 255 octets, no more" {
-    // A 127-label question, then answers whose owner and rdata both point
-    // at it: 14 wire octets for two names of 255.
+    // A 126-label question, then answers whose owner and rdata are each a
+    // label and a pointer to it: 18 wire octets for two names of 255.
     var buf: [max_message_len]u8 = undefined;
     var n: usize = 12;
-    for (0..max_label_count) |_| {
+    for (0..max_label_count - 1) |_| {
         @memcpy(buf[n..][0..2], "\x01a");
         n += 2;
     }
     @memcpy(buf[n..][0..5], "\x00\x00\x0c\x00\x01");
     n += 5;
-    const rr = "\xc0\x0c\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x02\xc0\x0c";
+    const rr = "\x01b\xc0\x0c\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x04\x01b\xc0\x0c";
     var answers: u16 = 0;
     while (n + rr.len <= buf.len) : (answers += 1) {
         @memcpy(buf[n..][0..rr.len], rr);
