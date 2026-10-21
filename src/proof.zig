@@ -269,6 +269,56 @@ pub fn nsec3Hash(name: dns.Name, salt: []const u8, iterations: u16) [Sha1.digest
     return hash;
 }
 
+/// Decode base32hex (RFC 4648 §7) without padding.
+/// Returns the number of bytes written to `dest`.
+pub fn base32HexDecode(dest: []u8, encoded: []const u8) error{InvalidBase32}!usize {
+    var bits: u32 = 0;
+    var bit_count: u4 = 0;
+    var out: usize = 0;
+
+    for (encoded) |c| {
+        const val: u5 = switch (c) {
+            '0'...'9' => @intCast(c - '0'),
+            'A'...'V' => @intCast(c - 'A' + 10),
+            'a'...'v' => @intCast(c - 'a' + 10),
+            else => return error.InvalidBase32,
+        };
+        bits = (bits << 5) | val;
+        bit_count += 5;
+        if (bit_count >= 8) {
+            bit_count -= 8;
+            if (out >= dest.len) return error.InvalidBase32;
+            dest[out] = @intCast((bits >> bit_count) & 0xFF);
+            out += 1;
+        }
+    }
+    return out;
+}
+
+/// Encode bytes to base32hex (RFC 4648 §7) without padding.
+/// Returns a slice into `dest` with the encoded string.
+pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
+    const alphabet = "0123456789abcdefghijklmnopqrstuv";
+    var bits: u32 = 0;
+    var bit_count: u4 = 0;
+    var out: usize = 0;
+
+    for (data) |b| {
+        bits = (bits << 8) | b;
+        bit_count += 8;
+        while (bit_count >= 5) {
+            bit_count -= 5;
+            dest[out] = alphabet[@intCast((bits >> bit_count) & 0x1F)];
+            out += 1;
+        }
+    }
+    if (bit_count > 0) {
+        dest[out] = alphabet[@intCast((bits << (5 - bit_count)) & 0x1F)];
+        out += 1;
+    }
+    return dest[0..out];
+}
+
 fn nsec3HashInRange(
     owner_hash: []const u8,
     next_hash: []const u8,
@@ -286,7 +336,7 @@ fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     const label = name.leaf();
     if (label.len != 32) return null; // SHA-1 = 20 bytes = 32 base32hex chars
     var result: [Sha1.digest_length]u8 = undefined;
-    const n = dns.base32HexDecode(&result, label) catch return null;
+    const n = base32HexDecode(&result, label) catch return null;
     if (n != Sha1.digest_length) return null;
     return result;
 }
@@ -1112,7 +1162,7 @@ test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unche
 }
 
 pub fn makeNsec3OwnerName(hash: [Sha1.digest_length]u8, zone: dns.Name, bufs: *Nsec3OwnerBufs) dns.Name {
-    return dns.Name.child(&bufs.name, dns.base32HexEncode(&bufs.enc, &hash), zone).?;
+    return dns.Name.child(&bufs.name, base32HexEncode(&bufs.enc, &hash), zone).?;
 }
 
 pub const Nsec3OwnerBufs = struct {
@@ -1164,7 +1214,7 @@ test "nsec3Hash RFC 5155 Appendix B" {
     const name = dns.Name.lit("example");
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var enc_buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", dns.base32HexEncode(&enc_buf, &nsec3Hash(name, &salt, 12)));
+    try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", base32HexEncode(&enc_buf, &nsec3Hash(name, &salt, 12)));
 }
 
 test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
@@ -1758,7 +1808,7 @@ test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
     const computed = nsec3Hash(child_zone, &salt, 10);
 
     var expected: [Sha1.digest_length]u8 = undefined;
-    _ = try dns.base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
+    _ = try base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
     try testing.expectEqualSlices(u8, &expected, &computed);
 }
 
@@ -1800,4 +1850,13 @@ test "proveNoCloserMatch NSEC3" {
     const ce_owner = makeNsec3OwnerName(nsec3Hash(ce, salt, 0), zone_name, &ce_bufs);
     const ce_only = [_]dns.ResourceRecord{makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{})};
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&ce_only, qname, 2, ce, &b));
+}
+
+test "base32hex decode ignores case and refuses characters outside the alphabet" {
+    var buf1: [20]u8 = undefined;
+    var buf2: [20]u8 = undefined;
+    const n1 = try base32HexDecode(&buf1, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM");
+    const n2 = try base32HexDecode(&buf2, "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
+    try testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
+    try testing.expectError(error.InvalidBase32, base32HexDecode(&buf1, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
 }

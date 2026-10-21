@@ -300,7 +300,7 @@ fn draw(z: *Zone, s: *Smith) void {
             } } };
             continue;
         }
-        const owner = dns.Name.child(&z.owners[r], dns.base32HexEncode(&z.enc[r], &z.hashes[r]), .lit(apex)).?;
+        const owner = dns.Name.child(&z.owners[r], proof.base32HexEncode(&z.enc[r], &z.hashes[r]), .lit(apex)).?;
         // RFC 5155 §7.1: the flag marks spans hiding an unsigned delegation.
         var optout = all_optout;
         for (z.entries[0..z.n], 0..) |*o, j| if (z.omitted(o)) {

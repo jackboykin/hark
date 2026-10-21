@@ -237,7 +237,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
             .nsec3 => |x| {
                 for (types) |t| _ = dns.typeBitmapContains(x.type_bit_maps, @fromBackingInt(@intCast(t)));
                 var eb: [256]u8 = undefined;
-                if (x.next_hashed_owner.len <= 40) _ = dns.base32HexEncode(&eb, x.next_hashed_owner);
+                if (x.next_hashed_owner.len <= 40) _ = proof.base32HexEncode(&eb, x.next_hashed_owner);
             },
             else => {},
         }

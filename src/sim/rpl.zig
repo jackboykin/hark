@@ -10,6 +10,7 @@ const testing = std.testing;
 const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const dns64 = @import("../dns64.zig");
+const proof = @import("../proof.zig");
 const stub = @import("../stub.zig");
 
 /// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
@@ -633,7 +634,7 @@ const Parser = struct {
                 const salt = try p.word(toks);
                 const next_text = try p.word(toks);
                 const hashed = try p.arena.alloc(u8, next_text.len * 5 / 8);
-                const n = dns.base32HexDecode(hashed, next_text) catch return p.fail("bad base32hex");
+                const n = proof.base32HexDecode(hashed, next_text) catch return p.fail("bad base32hex");
                 return .{ .nsec3 = .{
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
