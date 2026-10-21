@@ -873,11 +873,13 @@ const Parser = struct {
         return slice;
     }
 
+    const Form = enum { compressed, uncompressed };
+
     /// Parse a wire-format Name. Labels alias the wire buffer directly —
     /// the returned `Name.labels` outer slice is `allocator`-owned, but
     /// each `labels[i]` byte slice points into `self.msg`. Caller must
     /// keep the wire buffer alive for the lifetime of the parsed Name.
-    fn parseName(self: *Parser, allocator: Allocator) Error!Name {
+    fn parseName(self: *Parser, allocator: Allocator, comptime form: Form) Error!Name {
         // Collect on the stack and dupe once at the end — N ArrayList grow
         // allocs per name (4-5 typical) showed up at ~0.5% of CPU on miss.
         var labels_buf: [max_label_count][]const u8 = undefined;
@@ -900,6 +902,7 @@ const Parser = struct {
 
             const label_type = len_byte & 0xC0;
             if (label_type == 0xC0) {
+                if (form == .uncompressed) return error.FormatError;
                 if (cursor + 1 >= self.msg.len) return error.EndOfData;
                 jumps += 1;
                 if (jumps > max_jumps) return error.CompressionPointerLoop;
@@ -939,15 +942,16 @@ const Parser = struct {
         };
     }
 
+    /// The first name in a message has no earlier name to point at.
     fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
-        const name = try self.parseName(allocator);
+        const name = try self.parseName(allocator, .uncompressed);
         const qtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const qclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         return .{ .name = name, .qtype = qtype, .qclass = qclass };
     }
 
     fn parseResourceRecord(self: *Parser, allocator: Allocator) Error!ResourceRecord {
-        const name = try self.parseName(allocator);
+        const name = try self.parseName(allocator, .compressed);
         const rtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const rclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         // RFC 2181 §8: top bit set is zero. OPT's field is not a TTL (RFC 6891 §6.1.3).
@@ -986,14 +990,14 @@ const Parser = struct {
             .mx => {
                 const rdata_end = self.pos + rdlength;
                 const preference = try self.readU16();
-                const exchange = try self.parseName(allocator);
+                const exchange = try self.parseName(allocator, .compressed);
                 if (self.pos != rdata_end) return error.FormatError;
                 return .{ .mx = .{ .preference = preference, .exchange = exchange } };
             },
             .soa => {
                 const rdata_end = self.pos + rdlength;
-                const mname = try self.parseName(allocator);
-                const rname = try self.parseName(allocator);
+                const mname = try self.parseName(allocator, .compressed);
+                const rname = try self.parseName(allocator, .compressed);
                 const serial = try self.readU32();
                 const refresh = try self.readU32();
                 const retry = try self.readU32();
@@ -1033,7 +1037,7 @@ const Parser = struct {
                 const sig_inception = try self.readU32();
                 const key_tag = try self.readU16();
                 const name_start = self.pos;
-                const signer_name = try self.parseName(allocator);
+                const signer_name = try self.parseName(allocator, .compressed);
                 const name_len = self.pos - name_start;
                 if (18 + name_len > rdlength) return error.InvalidRDataLength;
                 const sig_len = rdlength - 18 - name_len;
@@ -1079,7 +1083,7 @@ const Parser = struct {
             .nsec => {
                 if (rdlength < 1) return error.InvalidRDataLength;
                 const name_start = self.pos;
-                const next_domain_name = try self.parseName(allocator);
+                const next_domain_name = try self.parseName(allocator, .compressed);
                 const name_len = self.pos - name_start;
                 if (name_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec = .{
@@ -1130,7 +1134,7 @@ const Parser = struct {
         var names: [2]Name = undefined;
         var n: usize = 0;
         for (0..layout.names) |_| {
-            names[n] = try self.parseName(allocator);
+            names[n] = try self.parseName(allocator, .compressed);
             n += 1;
         }
         if (self.pos != rdata_end) return error.FormatError;
@@ -1139,7 +1143,7 @@ const Parser = struct {
 
     fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
         const rdata_end = self.pos + rdlength;
-        const name = try self.parseName(allocator);
+        const name = try self.parseName(allocator, .compressed);
         if (self.pos != rdata_end) return error.FormatError;
         return name;
     }
@@ -1505,7 +1509,7 @@ pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
 /// Labels alias `bytes`.
 pub fn readNameWire(allocator: Allocator, bytes: []const u8, pos: *usize) Error!Name {
     var parser = Parser{ .msg = bytes, .pos = pos.* };
-    const name = try parser.parseName(allocator);
+    const name = try parser.parseName(allocator, .compressed);
     pos.* = parser.pos;
     return name;
 }
@@ -1601,7 +1605,7 @@ test "name parsing - compressed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var parser = Parser{ .msg = data, .pos = 13 };
-    const name = try parser.parseName(arena.allocator());
+    const name = try parser.parseName(arena.allocator(), .compressed);
 
     try testing.expectEqual(@as(usize, 3), name.labels.len);
     try testing.expectEqualStrings("foo", name.labels[0]);
@@ -1615,14 +1619,14 @@ test "name parsing - forward pointer rejection" {
     // Forward pointer at position 0 pointing to offset 2 — rejected per RFC 1035 §4.1.4
     const data = [_]u8{ 0xC0, 0x02, 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
-    try testing.expectError(error.FormatError, parser.parseName(testing.allocator));
+    try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
 }
 
 test "name parsing - self pointer rejection" {
     // Self-pointer: offset == cursor, rejected as non-backward
     const data = [_]u8{ 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
-    try testing.expectError(error.FormatError, parser.parseName(testing.allocator));
+    try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
 }
 
 test "full query packet parse" {
@@ -1815,6 +1819,18 @@ test "RFC 9619 §4: two questions are malformed before either is read" {
     const q = "\x01a\x00\x00\x01\x00\x01";
     const pkt = "\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00" ++ q ++ q;
     try testing.expectError(error.FormatError, parseMessage(testing.failing_allocator, pkt));
+}
+
+test "RFC 1035 §4.1.4: a question's name holds no pointer, even one that would decode" {
+    const header = "\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00";
+    // A label of bytes 01 62 00, then a pointer into it: "\001b\000.b."
+    const into_label = header ++ "\x03\x01b\x00\xc0\x0d\x00\x01\x00\x01";
+    // Offset 4 is QDCOUNT's high byte, 00: the root.
+    const into_header = header ++ "\xc0\x04\x00\x01\x00\x01";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.FormatError, parseMessage(arena.allocator(), into_label));
+    try testing.expectError(error.FormatError, parseMessage(arena.allocator(), into_header));
 }
 
 test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
