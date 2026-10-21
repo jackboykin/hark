@@ -11,13 +11,13 @@
     {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.go_1_27 ];
+          packages = [ pkgs.zig_0_17 pkgs.go_1_27 ];
         };
         bench = pkgs.mkShell {
           packages = with pkgs; [
             nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck strace
             unbound pdns-recursor knot-resolver_6 bind
-            python3 go_1_27
+            python3 go_1_27 zig_0_17
           ];
         };
       });
