@@ -1,3 +1,6 @@
+//! The DNS wire format (RFC 1035 §4): names in canonical wire form, and
+//! messages with their records and EDNS (RFC 6891) parsed and serialized.
+
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
