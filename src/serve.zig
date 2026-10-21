@@ -744,7 +744,7 @@ const Server = struct {
             },
             .tcp => dns.max_message_len,
         };
-        var ctx = response.ResponseContext.fromQuery(&query, payload);
+        var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
         const wire = response.buildResponseWire(s.room(reply, &buf), ctx, served.reply(), arena) orelse

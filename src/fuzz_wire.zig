@@ -199,9 +199,9 @@ fn checkQuery(alloc: std.mem.Allocator, input: []const u8, msg: dns.Message) !vo
         return error.QueryRefused;
     };
     if (opts > 1) return error.QueryAccepted;
-    if (msg.questions.len != @intFromBool(query.question != null)) return error.QueryDrift;
+    if ((msg.question == null) != (query.question == null)) return error.QueryDrift;
     if (query.question) |q| {
-        const want = msg.questions[0];
+        const want = msg.question.?;
         if (!q.name.eql(want.name) or q.qtype != want.qtype or q.qclass != want.qclass) return error.QueryDrift;
     }
     if ((msg.opt == null) != (query.edns == null)) return error.QueryDrift;
@@ -215,7 +215,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     const msg = dns.parseMessage(alloc, input) catch return;
     try checkQuery(alloc, input, msg);
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    for (msg.questions) |q| {
+    if (msg.question) |q| {
         try checkName(alloc, q.name);
         _ = special_use.classify(q.name, q.qtype, true);
     }
@@ -305,9 +305,9 @@ test "fuzz: store round trip" {
             const msg = dns.parseMessage(alloc, genMessage(s, &w)) catch return;
             if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
             const st = &shared_store.?;
-            const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name.root;
+            const owner = if (msg.question) |q| q.name else dns.Name.root;
             const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
-            const key: graph.Key = .of(.rrset, owner, if (msg.questions.len > 0) msg.questions[0].qtype else .a);
+            const key: graph.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
             const blob = st.build(.{ .rrset = reply }) catch return;
             st.put(key, blob, 10, 0) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;

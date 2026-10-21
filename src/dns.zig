@@ -694,7 +694,7 @@ fn embeddedNames(rtype: RType) ?struct { skip: u8, strings: u8 = 0, names: u8 } 
 
 pub const Message = struct {
     header: Header,
-    questions: []const Question,
+    question: ?Question,
     answers: []const ResourceRecord = &.{},
     authorities: []const ResourceRecord = &.{},
     additionals: []const ResourceRecord = &.{},
@@ -817,8 +817,6 @@ pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, opti
     const spelled = try allocator.alloc(u8, qname.wire.len);
     _ = writeNameWire(spelled, qname) catch unreachable;
     if (options.case_rng) |rng| applyCase0x20(rng, spelled);
-    const questions = try allocator.alloc(Question, 1);
-    questions[0] = .{ .name = qname, .qtype = qtype, .qclass = .in, .spelled = spelled };
 
     return .{
         .header = .{
@@ -836,7 +834,7 @@ pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, opti
                 .rcode = .no_error,
             },
         },
-        .questions = questions,
+        .question = .{ .name = qname, .qtype = qtype, .qclass = .in, .spelled = spelled },
         .opt = if (options.edns) |edns| .{
             .udp_payload_size = edns.udp_payload_size,
             .extended_rcode = 0,
@@ -1219,16 +1217,7 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
 /// `allocator` must be an arena: nothing in the Message can be freed
 /// piece by piece, on success or on error.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
-    if (bytes.len < header_len) return error.EndOfData;
-
-    const hdr = Header.parse(bytes[0..12]);
-    var parser = Parser{ .msg = bytes, .pos = 12 };
-
-    // RFC 9619 §4: a second question is malformed, so none is read. Every
-    // pointer question would decompress into a name of its own.
-    if (hdr.qd_count > 1) return error.FormatError;
-    const questions = try allocator.alloc(Question, hdr.qd_count);
-    for (questions) |*q| q.* = try parser.parseQuestion(allocator);
+    const hdr, var parser, const question = try readHead(allocator, bytes);
 
     // Cap pre-allocation against what the wire can physically contain.
     // Prevents a small packet with inflated header counts from triggering
@@ -1241,12 +1230,23 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
 
     return .{
         .header = hdr,
-        .questions = questions,
+        .question = question,
         .answers = answers,
         .authorities = authorities,
         .additionals = additionals,
         .opt = opt,
     };
+}
+
+/// RFC 9619 §4: a second question is malformed, so none is read. Every
+/// pointer question would decompress into a name of its own.
+fn readHead(allocator: Allocator, bytes: []const u8) Error!struct { Header, Parser, ?Question } {
+    if (bytes.len < header_len) return error.EndOfData;
+    const hdr = Header.parse(bytes[0..12]);
+    var parser = Parser{ .msg = bytes, .pos = 12 };
+    if (hdr.qd_count > 1) return error.FormatError;
+    const question = if (hdr.qd_count == 1) try parser.parseQuestion(allocator) else null;
+    return .{ hdr, parser, question };
 }
 
 pub const Query = struct {
@@ -1259,11 +1259,7 @@ pub const Query = struct {
 /// for the additional section's OPT: a pointer or rdata nothing reads
 /// is no error.
 pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
-    if (bytes.len < header_len) return error.EndOfData;
-    const hdr = Header.parse(bytes[0..12]);
-    var parser = Parser{ .msg = bytes, .pos = 12 };
-    if (hdr.qd_count > 1) return error.FormatError;
-    const question = if (hdr.qd_count == 1) try parser.parseQuestion(allocator) else null;
+    const hdr, var parser, const question = try readHead(allocator, bytes);
 
     const before_additional = @as(usize, hdr.an_count) + hdr.ns_count;
     var edns: ?Edns = null;
@@ -1573,12 +1569,12 @@ pub fn readRecordsWire(allocator: Allocator, bytes: []const u8, pos: *usize, cou
 /// Where each section ended, filled progressively by `serializeEnds`
 /// so a caller can rewind to a completed boundary after an overflow.
 /// 0 = never reached.
-pub const SectionEnds = struct { questions: usize = 0, answers: usize = 0, authorities: usize = 0 };
+pub const SectionEnds = struct { question: usize = 0, answers: usize = 0, authorities: usize = 0 };
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ends: SectionEnds = .{};
     const sections: Sections(ResourceRecord) = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
-    return serializeEnds(buf, msg.header, msg.questions, ResourceRecord, sections, msg.opt, &ends);
+    return serializeEnds(buf, msg.header, msg.question, ResourceRecord, sections, msg.opt, &ends);
 }
 
 /// A message's record sections, parsed (`ResourceRecord`) or as stored (`WireRecord`).
@@ -1588,9 +1584,9 @@ pub fn Sections(comptime R: type) type {
         authorities: []const R = &.{},
         additionals: []const R = &.{},
 
-        pub fn header(s: @This(), hdr: Header, questions: usize, opt: bool) Header {
+        pub fn header(s: @This(), hdr: Header, question: bool, opt: bool) Header {
             var out = hdr;
-            out.qd_count = @intCast(questions);
+            out.qd_count = @intFromBool(question);
             out.an_count = @intCast(s.answers.len);
             out.ns_count = @intCast(s.authorities.len);
             out.ar_count = @intCast(s.additionals.len + @intFromBool(opt));
@@ -1601,15 +1597,15 @@ pub fn Sections(comptime R: type) type {
 
 /// The header goes last and counts only records that fit in one message,
 /// so each count fits a u16.
-pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
+pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
     var ser: Serializer = .{ .buf = buf[0..@min(buf.len, max_message_len)], .names = &names };
     const write = if (R == WireRecord) Serializer.writeWireRecord else Serializer.writeResourceRecord;
 
     try ser.ensureSpace(12);
     ser.pos = 12;
-    for (questions) |q| try ser.writeQuestion(q);
-    ends.questions = ser.pos;
+    if (question) |q| try ser.writeQuestion(q);
+    ends.question = ser.pos;
     for (sections.answers) |rr| try write(&ser, rr);
     ends.answers = ser.pos;
     for (sections.authorities) |rr| try write(&ser, rr);
@@ -1617,7 +1613,7 @@ pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, compti
     for (sections.additionals) |rr| try write(&ser, rr);
     if (opt) |o| try ser.writeOpt(o);
 
-    sections.header(hdr, questions.len, opt != null).serialize(buf[0..12]);
+    sections.header(hdr, question != null, opt != null).serialize(buf[0..12]);
     return buf[0..ser.pos];
 }
 
@@ -1682,10 +1678,10 @@ test "full query packet parse" {
 
     try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
     try testing.expect(msg.header.flags.rd);
-    try testing.expectEqual(@as(usize, 1), msg.questions.len);
-    try testing.expect(msg.questions[0].name.eql(.lit("example.com")));
-    try testing.expectEqual(RType.a, msg.questions[0].qtype);
-    try testing.expectEqual(RClass.in, msg.questions[0].qclass);
+    const q = msg.question.?;
+    try testing.expect(q.name.eql(.lit("example.com")));
+    try testing.expectEqual(RType.a, q.qtype);
+    try testing.expectEqual(RClass.in, q.qclass);
 }
 
 test "A record parsing" {
@@ -1768,7 +1764,7 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
     };
     const msg = Message{
         .header = mem.zeroes(Header),
-        .questions = &.{.{ .name = owner, .qtype = .a, .qclass = .in }},
+        .question = .{ .name = owner, .qtype = .a, .qclass = .in },
         .answers = &.{
             .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
             .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = rrsig } },
@@ -1796,7 +1792,7 @@ test "name compression follows a pointer inside an earlier name" {
     const mail = try parseDottedName(a, "mail.example.com");
     const rr: ResourceRecord = .{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
     var buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .questions = &.{.{ .name = www, .qtype = .a, .qclass = .in }}, .answers = &.{ rr, rr } });
+    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = .{ .name = www, .qtype = .a, .qclass = .in }, .answers = &.{ rr, rr } });
     // The second owner is one pointer to "mail" + a pointer, itself.
     try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
     const back = try parseMessage(a, wire);
@@ -1836,10 +1832,10 @@ test "a record written from its stored bytes is the record written from its fiel
         try testing.expectEqual(rtype, wr.rtype());
         var aged = rr;
         aged.ttl = 42;
-        const q: []const Question = &.{.{ .name = zone, .qtype = rtype, .qclass = .in }};
+        const q: Question = .{ .name = zone, .qtype = rtype, .qclass = .in };
         var want_buf: [512]u8 = undefined;
         var got_buf: [512]u8 = undefined;
-        const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } });
+        const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .question = q, .answers = &.{ aged, aged } });
         var ends: SectionEnds = .{};
         const got = try serializeEnds(&got_buf, mem.zeroes(Header), q, WireRecord, .{ .answers = &.{ wr, wr } }, null, &ends);
         try testing.expectEqualSlices(u8, want, got);
@@ -1884,7 +1880,7 @@ test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
 
     const max = header ++ "\x3f" ++ @as([63]u8, @splat('a')) ++ "\x00\x00\x01\x00\x01";
     const msg = try parseMessage(arena.allocator(), max);
-    try testing.expectEqual(@as(usize, 63), msg.questions[0].name.leaf().len);
+    try testing.expectEqual(@as(usize, 63), msg.question.?.name.leaf().len);
 
     // 64 is 0x40: top bits 01, a label type RFC 1035 never defined.
     const over = header ++ "\x40" ++ @as([64]u8, @splat('a'));
@@ -1943,8 +1939,8 @@ test "names are read lowercase, and the question as it was spelled" {
         "\x03WwW\x07eXaMpLe\x00\x00\x01\x00\x01" ++
         "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
     const msg = try parseMessage(arena.allocator(), wire);
-    try testing.expect(msg.questions[0].name.eql(.lit("www.example")));
-    try testing.expectEqualSlices(u8, "\x03WwW\x07eXaMpLe\x00", msg.questions[0].spelled.?);
+    try testing.expect(msg.question.?.name.eql(.lit("www.example")));
+    try testing.expectEqualSlices(u8, "\x03WwW\x07eXaMpLe\x00", msg.question.?.spelled.?);
     try testing.expect(msg.answers[0].name.eql(.lit("www.example")));
 }
 
@@ -1961,7 +1957,7 @@ test "a name lying whole in the message, lowercase, is read in place" {
             return @intFromPtr(n.wire.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(n.wire.ptr) < @intFromPtr(bytes.ptr) + bytes.len;
         }
     }.place;
-    try testing.expect(in(msg.questions[0].name, wire));
+    try testing.expect(in(msg.question.?.name, wire));
     try testing.expect(in(msg.answers[0].name, wire));
     try testing.expect(!in(msg.answers[1].name, wire));
     try testing.expect(!in(msg.answers[2].name, wire));
@@ -2045,8 +2041,8 @@ pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target:
 /// nothing matches.
 pub fn validateResponse(response: Message, sent: []const u8, qtype: RType, cased: bool) error{Mismatch}!void {
     const f = response.header.flags;
-    if (!f.qr or f.opcode != .query or response.questions.len != 1) return error.Mismatch;
-    const q = response.questions[0];
+    if (!f.qr or f.opcode != .query) return error.Mismatch;
+    const q = response.question orelse return error.Mismatch;
     const got = q.spelled orelse return error.Mismatch;
     // Length octets sit below 'A', so only label bytes fold.
     const same = if (cased) mem.eql(u8, got, sent) else std.ascii.eqlIgnoreCase(got, sent);
@@ -2058,25 +2054,20 @@ test "validateResponse: only the one question sent, at any rcode" {
     const lower = "\x07example\x03com\x00";
     const other = "\x05other\x03net\x00";
     const reply = struct {
-        // comptime so the questions array lands in static memory —
-        // a runtime param would leave it dangling on this frame's stack.
-        fn make(comptime names: []const []const u8, rcode: RCode) Message {
+        fn make(spelled: ?[]const u8, rcode: RCode) Message {
             const f = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = rcode };
-            comptime var qs: [names.len]Question = undefined;
-            inline for (names, 0..) |n, i| qs[i] = .{ .name = .root, .qtype = .a, .qclass = .in, .spelled = n };
-            const final = qs;
-            return .{ .header = .{ .id = 0, .flags = f }, .questions = &final };
+            const q: ?Question = if (spelled) |s| .{ .name = .root, .qtype = .a, .qclass = .in, .spelled = s } else null;
+            return .{ .header = .{ .id = 0, .flags = f }, .question = q };
         }
     }.make;
     const bad = error.Mismatch;
 
-    try validateResponse(reply(&.{sent}, .no_error), sent, .a, true);
-    try validateResponse(reply(&.{lower}, .no_error), sent, .a, false);
-    try std.testing.expectError(bad, validateResponse(reply(&.{lower}, .refused), sent, .a, true));
-    try std.testing.expectError(bad, validateResponse(reply(&.{other}, .refused), sent, .a, false));
-    try std.testing.expectError(bad, validateResponse(reply(&.{}, .format_error), sent, .a, false));
-    try std.testing.expectError(bad, validateResponse(reply(&.{ sent, sent }, .refused), sent, .a, true));
-    var notify = reply(&.{sent}, .no_error);
+    try validateResponse(reply(sent, .no_error), sent, .a, true);
+    try validateResponse(reply(lower, .no_error), sent, .a, false);
+    try std.testing.expectError(bad, validateResponse(reply(lower, .refused), sent, .a, true));
+    try std.testing.expectError(bad, validateResponse(reply(other, .refused), sent, .a, false));
+    try std.testing.expectError(bad, validateResponse(reply(null, .format_error), sent, .a, false));
+    var notify = reply(sent, .no_error);
     notify.header.flags.opcode = @fromBackingInt(4);
     try std.testing.expectError(bad, validateResponse(notify, sent, .a, true));
 }
@@ -2133,9 +2124,9 @@ test "compression past its work budget writes names whole, and they read back" {
         try w.append(a, 0);
         rr.* = .{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .of(w.items) } };
     }
-    const q = [_]Question{.{ .name = owner, .qtype = .ptr, .qclass = .in }};
+    const q: Question = .{ .name = owner, .qtype = .ptr, .qclass = .in };
     var buf: [max_message_len]u8 = undefined;
-    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .questions = &q, .answers = &rrs });
+    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = q, .answers = &rrs });
     const back = try parseMessage(a, wire);
     try testing.expectEqual(rrs.len, back.answers.len);
     for (rrs, back.answers) |want, got| try testing.expect(want.rdata.ptr.eql(got.rdata.ptr));

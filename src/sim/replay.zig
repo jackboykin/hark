@@ -219,10 +219,10 @@ fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scena
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
-        const q = query.entry.?.questions[0];
+        const q = query.entry.?.question.?;
         var superseded = false;
         for (steps[i + 2 ..]) |st| if (st.kind == .query) {
-            const lq = st.entry.?.questions[0];
+            const lq = st.entry.?.question.?;
             superseded = superseded or (lq.name.eql(q.name) and lq.qtype == q.qtype);
         };
         if (superseded) continue;
@@ -329,7 +329,7 @@ fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
 fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !?Sent {
-    const q = entry.questions[0];
+    const q = entry.question.?;
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     var limited = false;
     const served = switch (try desk.early(arena, q, client)) {
@@ -363,7 +363,7 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
         .opcode = .query,
         .rd = client.rd,
         .cd = client.cd,
-        .questions = try arena.dupe(dns.Question, &.{q}),
+        .question = q,
         .client_edns = edns,
         .client_do = client.do_bit,
         .max_udp_payload = dns.max_message_len,
@@ -466,8 +466,8 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) 
     if ((m.rcode or m.flags) and af.rcode != ef.rcode) return "rcode mismatch";
     if (m.flags and (af.qr != ef.qr or af.aa != ef.aa or af.tc != ef.tc or af.ra != ef.ra or af.ad != ef.ad)) return "flags mismatch";
     if (m.question) {
-        if (actual.questions.len != e.questions.len) return "QUESTION mismatch";
-        for (actual.questions, e.questions) |a, b| if (!a.name.eql(b.name) or a.qtype != b.qtype) return "QUESTION mismatch";
+        if ((actual.question == null) != (e.question == null)) return "QUESTION mismatch";
+        if (actual.question) |a| if (!a.name.eql(e.question.?.name) or a.qtype != e.question.?.qtype) return "QUESTION mismatch";
     }
     if (m.answer and !sectionEql(actual.answers, e.answers, m.ttl)) return "ANSWER mismatch";
     if (m.authority and !sectionEql(actual.authorities, e.authorities, m.ttl)) return "AUTHORITY mismatch";
@@ -581,10 +581,9 @@ fn queryLogMismatch(log: []const sim.LogRow, e: rpl.Entry) ?[]const u8 {
 }
 
 fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
-    if (e.questions.len == 0) return "CHECK_OUT_QUERY entry has no QUESTION";
+    const eq = e.question orelse return "CHECK_OUT_QUERY entry has no QUESTION";
     var m = e.match;
     if (m.isEmpty()) m.question = true;
-    const eq = e.questions[0];
     if ((m.question or m.qname) and !rec.qname.eql(eq.name)) return "out query qname mismatch";
     if ((m.question or m.qtype) and rec.qtype != eq.qtype) return "out query qtype mismatch";
     return null;
@@ -1051,7 +1050,7 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
 fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted: Siblings) !Walked {
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, text, &diag);
-    const q = scenario.steps[0].entry.?.questions[0];
+    const q = scenario.steps[0].entry.?.question.?;
     const ns1 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 3 }, 53));
     const ns2 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 4 }, 53));
     const ns3 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 6 }, 53));
@@ -1225,7 +1224,7 @@ test "the door counts exchanges in flight" {
     const arena = arena_state.allocator();
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, one_hop_rpl, &diag);
-    const q = scenario.steps[0].entry.?.questions[0];
+    const q = scenario.steps[0].entry.?.question.?;
     const other = try dns.parseDottedName(arena, "other.example.com.");
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
@@ -1253,7 +1252,7 @@ test "an exchange that never left the host writes no estimate" {
     const arena = arena_state.allocator();
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, one_hop_rpl, &diag);
-    const q = scenario.steps[0].entry.?.questions[0];
+    const q = scenario.steps[0].entry.?.question.?;
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
     defer s.deinit();

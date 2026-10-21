@@ -116,5 +116,5 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
         else => return true,
     }
     if (!flags.ra or flags.aa) return false;
-    return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.questions[0].name, parent_zone) == null;
+    return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.question.?.name, parent_zone) == null;
 }

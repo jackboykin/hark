@@ -26,7 +26,7 @@ pub const ResponseContext = struct {
     opcode: dns.OpCode,
     rd: bool,
     cd: bool,
-    questions: []const dns.Question,
+    question: dns.Question,
     client_edns: bool,
     client_do: bool,
     max_udp_payload: u16,
@@ -37,14 +37,14 @@ pub const ResponseContext = struct {
     tcp_keepalive: ?u16 = null,
     rebinding: *const rebinding.Config = &rebinding.Config.off,
 
-    /// Borrows the question `validateQuery` made sure of.
-    pub fn fromQuery(query: *const dns.Query, max_udp_payload: u16) ResponseContext {
+    /// Takes the question `validateQuery` made sure of.
+    pub fn fromQuery(query: dns.Query, max_udp_payload: u16) ResponseContext {
         return .{
             .query_id = query.header.id,
             .opcode = query.header.flags.opcode,
             .rd = query.header.flags.rd,
             .cd = query.header.flags.cd,
-            .questions = (&query.question.?)[0..1],
+            .question = query.question.?,
             .client_edns = query.edns != null,
             .client_do = query.edns != null and query.edns.?.do_bit,
             .max_udp_payload = max_udp_payload,
@@ -107,7 +107,7 @@ pub fn buildResponseWire(
 
     // Nothing past the client's payload is sent, so none is built; the rewind drops an overrun.
     var ends: dns.SectionEnds = .{};
-    if (dns.serializeEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], hdr, ctx.questions, dns.WireRecord, sections, opt, &ends) catch null) |wire| return wire;
+    if (dns.serializeEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], hdr, ctx.question, dns.WireRecord, sections, opt, &ends) catch null) |wire| return wire;
 
     // Sections are laid down in order and a name pointer only reaches
     // backward (RFC 1035 §4.1.4), so a response minus its tail sections is a
@@ -116,7 +116,7 @@ pub fn buildResponseWire(
     // (RFC 1035 §4.2.1: advisory); dropping authority (negative SOA, referral
     // NS) sets TC=1 so the client retries over TCP (RFC 1035 §4.2.1, RFC 2181
     // §9). Last resort drops answers too and hard-clips the bytes.
-    for ([_]usize{ ends.authorities, ends.answers, ends.questions }, 1..) |end, dropped| {
+    for ([_]usize{ ends.authorities, ends.answers, ends.question }, 1..) |end, dropped| {
         if (end == 0) continue;
         var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
         if (opt) |o| ser.writeOpt(o) catch continue;
@@ -124,7 +124,7 @@ pub fn buildResponseWire(
             .answers = if (dropped < 3) answers else &.{},
             .authorities = if (dropped < 2) authorities else &.{},
         };
-        var cut = kept.header(hdr, ctx.questions.len, opt != null);
+        var cut = kept.header(hdr, true, opt != null);
         cut.flags.tc = dropped >= 2;
         cut.serialize(wire_buf[0..12]);
         if (ser.pos <= ctx.max_udp_payload or dropped == 3) return wire_buf[0..@min(ser.pos, ctx.max_udp_payload)];
@@ -167,7 +167,7 @@ pub fn serializeErrorResponse(
                 .rcode = rcode,
             },
         },
-        .questions = if (question) |*q| q[0..1] else &.{},
+        .question = question,
         .opt = opt,
     };
     // RFC 9619 §4: one question at most, so 12 + 259 + 11 bytes at most.
@@ -193,14 +193,14 @@ test "buildResponseWire carries EDE only to an EDNS client" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const questions = [_]dns.Question{.{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in }};
+    const question: dns.Question = .{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in };
     const servfail: Reply = .{ .rcode = .server_failure, .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" } };
     var ctx: ResponseContext = .{
         .query_id = 1,
         .opcode = .query,
         .rd = true,
         .cd = false,
-        .questions = &questions,
+        .question = question,
         .client_edns = true,
         .client_do = false,
         .max_udp_payload = dns.max_udp_payload,
@@ -222,7 +222,7 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
-    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
+    const question: dns.Question = .{ .name = name, .qtype = .a, .qclass = .in };
     const answers = [_]dns.WireRecord{
         try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 168, 0, 1 } } }),
         try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 93, 184, 216, 34 } } }),
@@ -238,7 +238,7 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
         .opcode = .query,
         .rd = true,
         .cd = false,
-        .questions = questions,
+        .question = question,
         .client_edns = false,
         .client_do = false,
         .max_udp_payload = dns.max_udp_payload,
@@ -309,7 +309,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
-    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
+    const question: dns.Question = .{ .name = name, .qtype = .a, .qclass = .in };
 
     var ns_authorities: [12]dns.WireRecord = undefined;
     for (&ns_authorities, 0..) |*rr, i| {
@@ -353,7 +353,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
             .opcode = .query,
             .rd = false,
             .cd = false,
-            .questions = questions,
+            .question = question,
             .client_edns = true,
             .client_do = false,
             .max_udp_payload = row.max,
@@ -385,7 +385,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
         .opcode = .query,
         .rd = true,
         .cd = false,
-        .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
+        .question = .{ .name = name, .qtype = .a, .qclass = .in },
         .client_edns = false,
         .client_do = true,
         .max_udp_payload = dns.max_message_len,
@@ -430,7 +430,7 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
             .opcode = .query,
             .rd = true,
             .cd = false,
-            .questions = &.{.{ .name = zone, .qtype = .a, .qclass = .in }},
+            .question = .{ .name = zone, .qtype = .a, .qclass = .in },
             .client_edns = false,
             .client_do = false,
             .max_udp_payload = dns.max_udp_payload,
@@ -455,7 +455,7 @@ test "buildResponseWire: a local answer bypasses the rebinding scrub; any other 
             .opcode = .query,
             .rd = true,
             .cd = false,
-            .questions = &.{.{ .name = localhost, .qtype = .a, .qclass = .in }},
+            .question = .{ .name = localhost, .qtype = .a, .qclass = .in },
             .client_edns = false,
             .client_do = false,
             .max_udp_payload = dns.max_udp_payload,
@@ -480,7 +480,7 @@ test "buildResponseWire: a rebinding scrub clears AD" {
             .opcode = .query,
             .rd = true,
             .cd = false,
-            .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
+            .question = .{ .name = name, .qtype = .a, .qclass = .in },
             .client_edns = true,
             .client_do = true,
             .max_udp_payload = dns.max_udp_payload,

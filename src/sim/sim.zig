@@ -116,8 +116,7 @@ pub const Sim = struct {
     /// depends on later steps.
     pub fn send(s: *Sim, ex: Exchange) !void {
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
-        if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
-        const q = query.questions[0];
+        const q = query.question orelse return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         if (s.pending_unsent > 0) {
             s.pending_unsent -= 1;
             try s.hear(q, silence);
@@ -173,10 +172,9 @@ pub const Sim = struct {
                 question.spelled = spelled;
             },
         }
-        const questions: []const dns.Question = if (entry.echo == .none) &.{} else try s.arena.dupe(dns.Question, &.{question});
         const msg: dns.Message = .{
             .header = .{ .id = query.header.id, .flags = flags },
-            .questions = questions,
+            .question = if (entry.echo == .none) null else question,
             .answers = entry.answers,
             .authorities = entry.authorities,
             .additionals = entry.additionals,
@@ -187,16 +185,16 @@ pub const Sim = struct {
     fn deliver(s: *Sim, ex: Exchange, query: dns.Message, msg: dns.Message, latency_ns: i64, tie: u64) !void {
         var said = msg;
         said.header.id = 0;
-        said.questions = &.{};
+        said.question = null;
         const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
-        try s.hear(query.questions[0], std.hash.Wyhash.hash(0, content));
+        try s.hear(query.question.?, std.hash.Wyhash.hash(0, content));
         var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         // A UDP reply past the advertised payload arrives truncated.
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
         if (ex.transport == .udp and wire.len > payload) {
             var hdr = msg.header;
             hdr.flags.tc = true;
-            wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .questions = msg.questions }) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+            wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .question = msg.question }) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
@@ -299,7 +297,7 @@ pub const Sim = struct {
 
     /// An empty MATCH means `question` (qname, qtype, qclass).
     fn entryMatches(e: *const rpl.Entry, q: dns.Question, transport: Transport) bool {
-        if (e.questions.len == 0) return false;
+        const eq = e.question orelse return false;
         var m = e.match;
         if (m.isEmpty()) m.question = true;
         if (m.question) {
@@ -307,7 +305,6 @@ pub const Sim = struct {
             m.qtype = true;
             m.qclass = true;
         }
-        const eq = e.questions[0];
         if (m.tcp and transport != .tcp) return false;
         if (m.udp and transport != .udp) return false;
         if (m.qtype and eq.qtype != q.qtype) return false;

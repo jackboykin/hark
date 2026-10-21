@@ -72,7 +72,7 @@ pub const Entry = struct {
     sign_as: ?dns.Name = null,
     wildcard: ?dns.Name = null,
     ds_from: []const DsFrom = &.{},
-    questions: []const dns.Question = &.{},
+    question: ?dns.Question = null,
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
     additionals: []const dns.ResourceRecord = &.{},
@@ -389,7 +389,6 @@ const Parser = struct {
     fn entry(p: *Parser) Error!Entry {
         var e: Entry = .{};
         var section: ?Section = null;
-        var questions: std.ArrayList(dns.Question) = .empty;
         var answers: std.ArrayList(dns.ResourceRecord) = .empty;
         var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
         var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -398,7 +397,6 @@ const Parser = struct {
         while (try p.peek()) |line| {
             p.advance();
             if (mem.eql(u8, line, "ENTRY_END")) {
-                e.questions = questions.items;
                 e.answers = answers.items;
                 e.authorities = authorities.items;
                 e.additionals = additionals.items;
@@ -438,7 +436,11 @@ const Parser = struct {
                 if (toks.next() != null) return p.fail("bad SECTION");
                 section = enumIgnoreCase(Section, s) orelse return p.fail("bad SECTION");
             } else switch (section orelse return p.fail("RR outside SECTION")) {
-                .question => try questions.append(p.arena, try p.question(line)),
+                .question => {
+                    // RFC 9619 §4: one question a message.
+                    if (e.question != null) return p.fail("a second QUESTION");
+                    e.question = try p.question(line);
+                },
                 .query_log => try query_log.append(p.arena, try p.queryLogRow(line)),
                 .answer => try answers.append(p.arena, try p.parseRr(line, &ds_from)),
                 .authority => try authorities.append(p.arena, try p.parseRr(line, &ds_from)),
