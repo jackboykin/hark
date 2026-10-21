@@ -149,7 +149,7 @@ pub fn scrub(
         const covered = rr.covers() orelse continue;
         for (records, 0..) |other, k| {
             if (!marks[k] or other.rtype() != covered) continue;
-            if (!dns.wireNameEql(other.owner, rr.owner)) continue;
+            if (!std.mem.eql(u8, other.owner, rr.owner)) continue;
             marks[i] = true;
             drop_count += 1;
             break;

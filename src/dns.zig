@@ -157,59 +157,6 @@ pub const Header = struct {
     }
 };
 
-pub inline fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    return a.len == b.len and (a.ptr == b.ptr or eqlFolded(a, b));
-}
-
-fn eqlFolded(a: []const u8, b: []const u8) bool {
-    const n = a.len;
-    if (n >= 8) {
-        var i: usize = 0;
-        while (i + 8 < n) : (i += 8) if (!eqlWord(u64, a[i..][0..8], b[i..][0..8])) return false;
-        return eqlWord(u64, a[n - 8 ..][0..8], b[n - 8 ..][0..8]);
-    }
-    if (n >= 4) return eqlWord(u32, a[0..4], b[0..4]) and eqlWord(u32, a[n - 4 ..][0..4], b[n - 4 ..][0..4]);
-    if (n == 0) return true;
-    // First, middle and last cover one to three bytes.
-    const x = @as(u32, a[0]) | @as(u32, a[n / 2]) << 8 | @as(u32, a[n - 1]) << 16;
-    const y = @as(u32, b[0]) | @as(u32, b[n / 2]) << 8 | @as(u32, b[n - 1]) << 16;
-    return x == y or lowerWord(u32, x) == lowerWord(u32, y);
-}
-
-fn eqlWord(comptime T: type, a: *const [@sizeOf(T)]u8, b: *const [@sizeOf(T)]u8) bool {
-    const x: T = @bitCast(a.*);
-    const y: T = @bitCast(b.*);
-    return x == y or lowerWord(T, x) == lowerWord(T, y);
-}
-
-/// 'A' to 'Z' lowered in every byte. A byte's low seven bits plus a bias
-/// reach bit 7 from 'A' and past 'Z', and never carry into the next byte.
-fn lowerWord(comptime T: type, x: T) T {
-    const ones = std.math.maxInt(T) / 0xff;
-    const low = x & (0x7f * ones);
-    const from_a = low + (0x80 - 'A') * ones;
-    const past_z = low + (0x80 - 'Z' - 1) * ones;
-    const upper = from_a & ~past_z & ~x & (0x80 * ones);
-    return x | (upper >> 2);
-}
-
-test eqlIgnoreCase {
-    var a: [17]u8 = undefined;
-    var b: [17]u8 = undefined;
-    for (1..a.len + 1) |n| for (0..n) |at| for (0..256) |x| for ([_]u8{ 0, 0x20, 0x01, 0x80 }) |flip| {
-        @memset(a[0..n], 'q');
-        @memset(b[0..n], 'Q');
-        a[at] = @intCast(x);
-        b[at] = @as(u8, @intCast(x)) ^ flip;
-        try testing.expectEqual(std.ascii.eqlIgnoreCase(a[0..n], b[0..n]), eqlIgnoreCase(a[0..n], b[0..n]));
-    };
-    for (0..256) |x| for (0..256) |y| {
-        const p: [8]u8 = @splat(@intCast(x));
-        const q: [8]u8 = @splat(@intCast(y));
-        try testing.expectEqual(std.ascii.eqlIgnoreCase(&p, &q), eqlIgnoreCase(&p, &q));
-    };
-}
-
 /// RFC 4034 §6.2 canonical form: uncompressed wire labels, lowercase,
 /// at most 255 octets. Case someone wrote lives in `Question.spelled`
 /// and `NsecData.next_spelled`, never here.
@@ -716,12 +663,6 @@ pub const WireRecord = struct {
         return .{ .owner = bytes[0..n], .rest = bytes[n..], .ttl = rr.ttl };
     }
 };
-
-/// Two uncompressed wire names, ASCII case folded. Length bytes are
-/// below 64, so folding them changes nothing.
-pub fn wireNameEql(a: []const u8, b: []const u8) bool {
-    return eqlIgnoreCase(a, b);
-}
 
 pub fn wireNameLen(wire: []const u8) usize {
     var i: usize = 0;
@@ -2078,7 +2019,8 @@ pub fn validateResponse(response: Message, sent: []const u8, qtype: RType, cased
     if (!f.qr or f.opcode != .query or response.questions.len != 1) return error.Mismatch;
     const q = response.questions[0];
     const got = q.spelled orelse return error.Mismatch;
-    const same = if (cased) mem.eql(u8, got, sent) else wireNameEql(got, sent);
+    // Length octets sit below 'A', so only label bytes fold.
+    const same = if (cased) mem.eql(u8, got, sent) else std.ascii.eqlIgnoreCase(got, sent);
     if (!same or q.qtype != qtype or q.qclass != .in) return error.Mismatch;
 }
 

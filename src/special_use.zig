@@ -110,7 +110,7 @@ pub fn fixed(name: dns.Name) bool {
 }
 
 fn is(label: []const u8, word: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(label, word);
+    return std.mem.eql(u8, label, word);
 }
 
 /// hark's own reply to a special-use name.

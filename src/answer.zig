@@ -623,9 +623,8 @@ const Seen = struct {
     }
 
     fn hash(rr: dns.WireRecord) usize {
-        var lower: [255]u8 = undefined;
         var h: std.hash.Wyhash = .init(rand.hash_seed);
-        h.update(std.ascii.lowerString(&lower, rr.owner));
+        h.update(rr.owner);
         h.update(rr.rest[0..4]);
         h.update(rr.rest[8..]);
         return @truncate(h.final());
@@ -634,7 +633,7 @@ const Seen = struct {
 
 /// Owner, type, class and data alike; TTLs aside.
 fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
-    return dns.eqlIgnoreCase(a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
+    return std.mem.eql(u8, a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
 }
 
 /// RFC 9520 §3.2's failure cache: a question that failed is answered here,
@@ -777,7 +776,7 @@ test "a client is sent what Keep keeps" {
     }
 }
 
-test "a proof two hops share goes out once, owners case-folded" {
+test "a proof two hops share goes out once" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -786,7 +785,7 @@ test "a proof two hops share goes out once, owners case-folded" {
     const nsec = "\x00\x2f\x00\x01\x00\x00\x0e\x10\x00\x04\x00\x00\x01\x40";
     const hops = [_]store.Records{
         .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec, .len = 2 },
-        .{ .bytes = "\x01A\x00" ++ nsec ++ "\x01c\x00" ++ nsec, .len = 2 },
+        .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec, .len = 2 },
     };
     var out: std.ArrayList(dns.WireRecord) = .empty;
     var seen: Seen = .{ .bound = 4 };
