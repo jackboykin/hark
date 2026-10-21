@@ -142,12 +142,11 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.ds;
     const anchors = g.cfg.trust_anchors orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
-    if (zone.labels.len == 0) {
+    const parent_name = zone.parent() orelse {
         const rrs = try g.scratch.allocator().alloc(RR, anchors.len);
         for (rrs, anchors) |*rr, ds| rr.* = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = ds } };
         return g.settle(id, .{ .ds = .{ .status = .secure, .records = rrs } }, std.math.maxInt(i64));
-    }
-    const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
+    };
     const parent_zone = switch (try walk.start(g, id, zone, parent_name, &s.parent)) {
         .pending => return,
         .none => return g.fail(id, .unreachable_authority),
@@ -198,7 +197,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             if (keys.failure() != null) return .{ .input = kid };
             // A signer proven no zone holds nothing: the set sits higher.
             if (r.kind != .answer or keys.state.fact.dnskey.status != .absent) break keys;
-            below = keys.name.labels.len;
+            below = keys.name.depth();
         }
         const signer = switch (r.kind) {
             .answer => dnssec.signerBelow(r.answers, zone, .ds, below),
@@ -277,7 +276,7 @@ pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
     var z = zone;
     while (true) {
         if (try g.peek(graph.Key.of(&kb, .ds, z, .a))) |f| return f.value.ds.status == .secure;
-        if (z.labels.len == 0) return true;
+        if (z.isRoot()) return true;
         const ds = try g.peek(graph.Key.of(&kb, .rrset, z, .ds)) orelse return false;
         if (ds.value.rrset.kind != .answer or !dnssec.anySupportedDs(ds.value.rrset.answers)) return false;
         // The DS came from the zone above, whichever cut lies between.
@@ -454,7 +453,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     // above it, and a denial that named it is forged.
                     .absent => {
                         if (c.is == .denial) break :f .bogus;
-                        s.below = @intCast(signer.labels.len);
+                        s.below = signer.depth();
                         continue :f c.is;
                     },
                 }
@@ -479,7 +478,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 s.expires = @min(s.expires, cap);
                 s.proven = @min(s.proven, cap);
                 if (c.is == .proof) {
-                    s.proved[c.slot] = @intCast(signer.labels.len);
+                    s.proved[c.slot] = signer.depth();
                     s.proved_until[c.slot] = cap;
                     if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
                     break :f null;
@@ -579,7 +578,7 @@ const Claims = struct {
             // §2.4); of several, the deepest, as classify takes.
             var dname: ?RR = null;
             if (rr.rtype == .cname) for (answers) |d| {
-                if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.labels.len > dname.?.name.labels.len)) dname = d;
+                if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
             };
             if (dname) |d| return it.claim(rr.name, rr.rtype, i, .{ .synthesised = .{ .cname = rr, .dname = d } });
             return it.claim(rr.name, rr.rtype, i, .rrset);
@@ -640,9 +639,9 @@ const Probe = struct {
                 } else if (c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
                 p.cell = .none;
             }
-            p.depth = @max(p.depth, @as(u8, @intCast(above.labels.len))) + 1;
-            if (p.depth > deepest.labels.len) return .none;
-            const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - p.depth ..] };
+            p.depth = @max(p.depth, above.depth()) + 1;
+            if (p.depth > deepest.depth()) return .none;
+            const candidate = deepest.ancestor(p.depth);
             p.cell = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .{ .stopped = .unreachable_authority });
         }
     }
@@ -659,7 +658,7 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const 
     var it: Claims = .{ .r = r, .qtype = qtype };
     while (it.next()) |c| {
         if (c.is != .proof) break;
-        if (s.proved[c.slot] != signer.labels.len or !c.owner.isSubdomainOf(signer)) continue;
+        if (s.proved[c.slot] != signer.depth() or !c.owner.isSubdomainOf(signer)) continue;
         for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rdata.rrsig.signer_name.eql(signer)) {
             try keep.append(a, rr);
             try until.append(a, s.proved_until[c.slot]);
@@ -686,7 +685,7 @@ fn keepWeighed(g: *Graph, target: CellId, r: *const graph.Reply, c: *const Claim
 }
 
 fn synthesisedUnder(rr: RR, dname: RR) bool {
-    return rr.rtype == .cname and rr.name.labels.len > dname.name.labels.len and rr.name.isSubdomainOf(dname.name);
+    return rr.rtype == .cname and rr.name.depth() > dname.name.depth() and rr.name.isSubdomainOf(dname.name);
 }
 
 /// A reply's sets sit together: a record heads its set unless the one
