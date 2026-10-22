@@ -52,13 +52,23 @@ nsd_up() { # name cpus zone addr...
   taskset -c "$c" nsd -c "$R/nsd-$n.conf" -d 2>"$R/nsd-$n.err" &
 }
 
+queries() { # hit|miss|mix [n=2000000] [seed=42]: dnsperf's "name type" lines
+  awk -v w="$1" -v n="${2:-2000000}" -v seed="${3:-42}" '
+    function miss(  s, j) { for (j = 0; j < 14; j++) s = s substr("abcdefghijklmnopqrstuvwxyz0123456789", int(rand() * 36) + 1, 1); return s }
+    BEGIN {
+      srand(seed)
+      if (w == "hit") for (i = 1; i <= 8; i++) print "host" i ".bench. A"
+      else for (i = 0; i < n; i++) print (w == "mix" && rand() < 0.5 ? "host" int(rand() * 8 + 1) : miss()) ".bench. A"
+    }'
+}
+
 # The root's nsd on 198.41.0.4 delegates bench. to a second nsd on the
 # addresses in zones/bench.ns, so a miss starts at a cached 26-server cut, as
 # under com. Query files land in $R.
 rig_up() {
   R=$(mktemp -d)
   trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$R"' EXIT
-  for w in hit miss mix; do python3 "$B/gen_queries.py" $w >"$R/$w.txt"; done
+  for w in hit miss mix; do queries $w >"$R/$w.txt"; done
   ip link set lo up
   ip addr add 198.41.0.4/32 dev lo
   local a addrs
