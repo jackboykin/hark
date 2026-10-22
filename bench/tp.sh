@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# usage (in nix develop .#bench): tp.sh <rounds> <workload> side... > out.txt; an.py out.txt
+# usage (in nix develop .#bench): tp.sh <rounds> <workload> side... > out.txt; bench an out.txt
 # A side is label=<hark binary|layouts dir> or a peer (unbound pdns kresd
 # bind) at N threads. Every run is a fresh resolver on freshly drawn cores
 # under LEN (10) s of load, closed loop with N times the queries in flight:
