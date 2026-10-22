@@ -4,7 +4,7 @@
 # resperf instances with disjoint names, and an open-loop cached-name probe
 # (dnsperf -Q PROBE_QPS, 2000) beside it, on a fresh hark per run for LEN (8)
 # s. The ceiling is measured closed loop (-c 4 -T 4 -q 1000) unless CEILING is
-# given. Runs land in OUT; overload.py prints the verdict.
+# given. Runs land in OUT; bench overload prints the verdict.
 set -uo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -53,4 +53,4 @@ for level in $LEVELS; do
     echo "${level}x run $i" >&2
   done
 done
-python3 "$B/overload.py" "$OUT"
+bench overload "$OUT"
