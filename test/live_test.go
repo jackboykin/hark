@@ -74,7 +74,7 @@ func stats(t *testing.T, h *hark, names ...string) []int {
 	}
 	out := make([]int, len(names))
 	for i, name := range names {
-		m := regexp.MustCompile(`stats ` + regexp.QuoteMeta(name) + ` +(\d+)`).FindAllStringSubmatch(log, -1)
+		m := regexp.MustCompile(`stats `+regexp.QuoteMeta(name)+` +(\d+)`).FindAllStringSubmatch(log, -1)
 		if m == nil {
 			t.Fatalf("no %s counter in log:\n%s", name, log)
 		}
