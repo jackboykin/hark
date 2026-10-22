@@ -73,6 +73,9 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const fmt = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("bench"), b.path("build.zig"), b.path("build.zig.zon") }, .check = true });
+    b.step("fmt", "Check that every zig file is formatted").dependOn(&fmt.step);
 }
 
 fn declareInputs(b: *std.Build, run: *std.Build.Step.Run, root: []const u8) !void {
