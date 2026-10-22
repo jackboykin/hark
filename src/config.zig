@@ -27,36 +27,32 @@ fn errLog(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
 }
 
-// IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
-// Source: https://www.internic.net/domain/named.root
+/// a.root-servers.net through m.root-servers.net, in order, as
+/// https://www.internic.net/domain/named.root lists them.
+const root_servers = [_]struct { ip4: []const u8, ip6: []const u8 }{
+    .{ .ip4 = "198.41.0.4", .ip6 = "2001:503:ba3e::2:30" },
+    .{ .ip4 = "170.247.170.2", .ip6 = "2801:1b8:10::b" },
+    .{ .ip4 = "192.33.4.12", .ip6 = "2001:500:2::c" },
+    .{ .ip4 = "199.7.91.13", .ip6 = "2001:500:2d::d" },
+    .{ .ip4 = "192.203.230.10", .ip6 = "2001:500:a8::e" },
+    .{ .ip4 = "192.5.5.241", .ip6 = "2001:500:2f::f" },
+    .{ .ip4 = "192.112.36.4", .ip6 = "2001:500:12::d0d" },
+    .{ .ip4 = "198.97.190.53", .ip6 = "2001:500:1::53" },
+    .{ .ip4 = "192.36.148.17", .ip6 = "2001:7fe::53" },
+    .{ .ip4 = "192.58.128.30", .ip6 = "2001:503:c27::2:30" },
+    .{ .ip4 = "193.0.14.129", .ip6 = "2001:7fd::1" },
+    .{ .ip4 = "199.7.83.42", .ip6 = "2001:500:9f::42" },
+    .{ .ip4 = "202.12.27.33", .ip6 = "2001:dc3::35" },
+};
 
-const root_hints_default: [26]Address = .{
-    net_addr.initIp4(.{ 198, 41, 0, 4 }, 53), // a
-    net_addr.initIp4(.{ 170, 247, 170, 2 }, 53), // b
-    net_addr.initIp4(.{ 192, 33, 4, 12 }, 53), // c
-    net_addr.initIp4(.{ 199, 7, 91, 13 }, 53), // d
-    net_addr.initIp4(.{ 192, 203, 230, 10 }, 53), // e
-    net_addr.initIp4(.{ 192, 5, 5, 241 }, 53), // f
-    net_addr.initIp4(.{ 192, 112, 36, 4 }, 53), // g
-    net_addr.initIp4(.{ 198, 97, 190, 53 }, 53), // h
-    net_addr.initIp4(.{ 192, 36, 148, 17 }, 53), // i
-    net_addr.initIp4(.{ 192, 58, 128, 30 }, 53), // j
-    net_addr.initIp4(.{ 193, 0, 14, 129 }, 53), // k
-    net_addr.initIp4(.{ 199, 7, 83, 42 }, 53), // l
-    net_addr.initIp4(.{ 202, 12, 27, 33 }, 53), // m
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
-    net_addr.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d }, 53, 0, 0), // d
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e }, 53, 0, 0), // e
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f }, 53, 0, 0), // f
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d, 0x0d }, 53, 0, 0), // g
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // h
-    net_addr.initIp6(.{ 0x20, 0x01, 0x07, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // i
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0x0c, 0x27, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // j
-    net_addr.initIp6(.{ 0x20, 0x01, 0x07, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 }, 53, 0, 0), // k
-    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 }, 53, 0, 0), // l
-    net_addr.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
+const root_hints_default: [2 * root_servers.len]Address = hints: {
+    @setEvalBranchQuota(100_000);
+    var hints: [2 * root_servers.len]Address = undefined;
+    for (root_servers, hints[0..root_servers.len], hints[root_servers.len..]) |r, *v4, *v6| {
+        v4.* = net_addr.initIp4((std.Io.net.Ip4Address.parse(r.ip4, 53) catch unreachable).bytes, 53);
+        v6.* = net_addr.initIp6((std.Io.net.Ip6Address.parse(r.ip6, 53) catch unreachable).bytes, 53, 0, 0);
+    }
+    break :hints hints;
 };
 
 /// Each default is the value `hark.toml.example` shows.
