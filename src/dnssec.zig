@@ -96,7 +96,8 @@ pub fn validateDnskeyRrset(
     const filtered = dnskey_only[0..dnskey_count];
 
     var anchored: Keyset = undefined;
-    _ = anchored.init(filtered); // Fits: at most 64 DNSKEYs.
+    const fits = anchored.init(filtered);
+    std.debug.assert(fits);
     var n: usize = 0;
     for (anchored.keys[0..anchored.len], anchored.tags[0..anchored.len]) |dk, tag| {
         for (ds_records) |ds| {

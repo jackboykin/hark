@@ -335,7 +335,8 @@ fn nsec3HashInRange(
 fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     if (name.isRoot()) return null;
     const label = name.leaf();
-    if (label.len != 32) return null; // SHA-1 = 20 bytes = 32 base32hex chars
+    // Base32hex carries five bits a character.
+    if (label.len != Sha1.digest_length * 8 / 5) return null;
     var result: [Sha1.digest_length]u8 = undefined;
     const n = base32HexDecode(&result, label) catch return null;
     if (n != Sha1.digest_length) return null;

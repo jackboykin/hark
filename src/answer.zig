@@ -500,7 +500,8 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         add.section = .additional;
         if (!secure) try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
     }
-    const ede: ?dns.Ede = if (stale_any) // any hop: a stale alias still redirected
+    // Any hop counts: a stale alias still redirected.
+    const ede: ?dns.Ede = if (stale_any)
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
     else if (r.ede) |code|
         .{ .code = code }
