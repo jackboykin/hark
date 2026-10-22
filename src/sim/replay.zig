@@ -667,15 +667,16 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     return r;
 }
 
-/// Take jobs until none are left. Debug catches leaks per thread, without
-/// stack traces: each unwinds under a lock every thread shares. A leak's
-/// site shows under -Dscenario, on testing.allocator. The tally wants the
-/// production allocator.
+/// Take jobs until none are left. Leaks are counted, not traced, so the
+/// replays run on the production allocator; a leak's site shows under
+/// -Dscenario, on testing.allocator.
 fn replayJobs(jobs: []Job, next: *std.atomic.Value(usize), leaked: *std.atomic.Value(bool)) void {
-    const debug = @import("builtin").mode == .debug;
-    var da: std.heap.DebugAllocator(.{ .thread_safe = false, .stack_trace_frames = 0 }) = .init;
-    defer if (debug and da.deinit() == .leak) leaked.store(true, .monotonic);
-    const gpa = if (debug) da.allocator() else std.heap.smp_allocator;
+    var counted: std.testing.FailingAllocator = .init(std.heap.smp_allocator, .{});
+    defer if (counted.allocated_bytes != counted.freed_bytes) {
+        std.debug.print("replays leaked {d} bytes; -Dscenario shows where\n", .{counted.allocated_bytes - counted.freed_bytes});
+        leaked.store(true, .monotonic);
+    };
+    const gpa = counted.allocator();
     while (true) {
         const i = next.fetchAdd(1, .monotonic);
         if (i >= jobs.len) return;
