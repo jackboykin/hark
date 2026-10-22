@@ -2,10 +2,8 @@
 //! carried is the fact `rrset(owner, NSEC)`, or `parental(owner, NSEC)`
 //! where its zone delegates the owner; its SOA the fact
 //! `rrset(zone, SOA)`. This index orders the spans by owner within their
-//! signing zone, each holding the very bytes that were judged, so a later
-//! question inside a known span is denied from memory and no later reply
-//! can change what the span says. The index only finds candidates: the
-//! verdict is `validateNegativeProof`'s.
+//! signing zone, to find the candidates that deny a later question from
+//! memory; the verdict is `validateNegativeProof`'s.
 const std = @import("std");
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
@@ -19,7 +17,8 @@ const Graph = graph.Graph;
 const CellId = graph.CellId;
 const RR = dns.ResourceRecord;
 
-/// One NSEC's geometry, and the judged bytes it was cut from.
+/// One NSEC's geometry, and the judged bytes it was cut from, so no later
+/// reply can change what the span says.
 const Span = struct {
     owner: dns.Name,
     nsec: dns.NsecData,

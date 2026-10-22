@@ -1,6 +1,5 @@
-//! Structured wire fuzzing. Random bytes die in the first parseName, so Smith
-//! draws headers, hostile labels, backward compression pointers and lying
-//! rdlengths field by field, where coverage guidance can steer.
+//! Structured wire fuzzing: Smith draws headers, hostile labels, backward
+//! compression pointers and lying rdlengths field by field.
 const std = @import("std");
 const testing = std.testing;
 const Smith = testing.Smith;
@@ -86,6 +85,8 @@ fn genRR(s: *Smith, w: *Wire) void {
     if (rdlen_at + 2 <= w.len) std.mem.writeInt(u16, w.buf[rdlen_at..][0..2], declared, .big);
 }
 
+/// Field by field, where coverage guidance can steer: random bytes die in
+/// the first parseName.
 fn genMessage(s: *Smith, w: *Wire) []const u8 {
     w.len = 0;
     w.u16be(s.value(u16));

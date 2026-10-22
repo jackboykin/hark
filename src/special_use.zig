@@ -1,30 +1,16 @@
-/// RFC 6761 special-use domain names: short-circuit resolution before any
-/// upstream traffic. Names that the spec reserves to never reach DNS leak
-/// queries (and DNS metadata) to the root if not intercepted.
-///
-/// Coverage:
-///   localhost.            RFC 6761 §6.3   → 127.0.0.1 / ::1 / NODATA
-///   *.localhost.          RFC 6761 §6.3   → same as parent
-///   invalid.              RFC 6761 §6.4   → NXDOMAIN
-///   test.                 RFC 6761 §6.2   → NXDOMAIN
-///   home.arpa.            RFC 8375 §4.4.B → RFC 6303 §3 empty zone; DS with
-///                                           DO real
-///   service.arpa.         RFC 9665 §8.4   → the same
-///   onion.                RFC 7686 §2     → NXDOMAIN
-///   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
-///                                           (DS real, subdomains NXDOMAIN)
-///
-/// Only home.arpa and service.arpa are specified as zones. The rest are
-/// hark's own synthesis, AA clear and SOA-less: their RFCs want answers
-/// (RFC 6761 §6.3, RFC 7686 §2, RFC 8880 §7.2) no SOA could agree with.
-///
-/// Only forwarders must pass `ipv4only.arpa` to an upstream DNS64; hark
-/// never forwards, and NODATA for AAAA means "no NAT64" to a stub.
-///
-/// Deliberately *not* short-circuited:
-///   example. / example.{com,net,org}   IANA-hosted; authoritative answers
-///                                      already correct, intercepting
-///                                      breaks documentation tests.
+//! RFC 6761 special-use domain names, answered by hark before any upstream
+//! traffic:
+//!   localhost.            RFC 6761 §6.3   → 127.0.0.1 / ::1 / NODATA
+//!   *.localhost.          RFC 6761 §6.3   → same as parent
+//!   invalid.              RFC 6761 §6.4   → NXDOMAIN
+//!   test.                 RFC 6761 §6.2   → NXDOMAIN
+//!   home.arpa.            RFC 8375 §4.4.B → RFC 6303 §3 empty zone; DS with
+//!                                           DO real
+//!   service.arpa.         RFC 9665 §8.4   → the same
+//!   onion.                RFC 7686 §2     → NXDOMAIN
+//!   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
+//!                                           (DS real, subdomains NXDOMAIN)
+
 const std = @import("std");
 const mem = std.mem;
 const dns = @import("dns.zig");
@@ -35,6 +21,10 @@ pub const Own = struct {
         nodata,
         answer: []const dns.RData,
     },
+    /// Only home.arpa and service.arpa are specified as zones. The rest
+    /// are hark's own synthesis, AA clear and SOA-less: their RFCs want
+    /// answers (RFC 6761 §6.3, RFC 7686 §2, RFC 8880 §7.2) no SOA could
+    /// agree with.
     zone: ?*const Zone = null,
 };
 
@@ -61,7 +51,10 @@ const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]
 /// RFC 7050 §8.
 const ipv4only: []const dns.RData = &.{ .{ .a = .{ 192, 0, 0, 170 } }, .{ .a = .{ 192, 0, 0, 171 } } };
 
-/// hark's own answer to the question, or null: ask the DNS.
+/// hark's own answer to the question, or null: ask the DNS. Names the spec
+/// reserves from the DNS would leak queries, and their metadata, to the
+/// root. example. and example.{com,net,org} are not among them: IANA serves
+/// them correctly, and intercepting them breaks documentation tests.
 pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     const n = name.depth();
     if (n == 0) return null;
@@ -85,6 +78,8 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
             else => .{ .is = .nodata, .zone = z },
         };
     };
+    // Only forwarders must pass ipv4only.arpa to an upstream DNS64; hark
+    // never forwards, and NODATA for AAAA tells a stub there is no NAT64.
     if (is(second, "ipv4only")) {
         if (n > 2) return .{ .is = .nxdomain };
         return switch (qtype) {

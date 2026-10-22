@@ -1,6 +1,6 @@
-/// Draws from the calling thread's ChaCha CSPRNG, so `thread` copies across
-/// threads. Not `io.random`: its global mutex on threads Io.Threaded didn't
-/// spawn cost ~6% CPU on misses.
+//! Each thread's ChaCha CSPRNG, as `thread`, and the seed of every hash over
+//! what a stranger picks.
+
 const std = @import("std");
 const linux = std.os.linux;
 
@@ -15,6 +15,9 @@ pub fn randomizeHashSeed() void {
     hash_seed = thread.int(u64);
 }
 
+/// Draws from the calling thread's own CSPRNG, so it copies across threads.
+/// Not `io.random`: its global mutex on threads Io.Threaded didn't spawn
+/// cost ~6% CPU on misses.
 pub const thread: std.Random = .{ .ptr = undefined, .fillFn = fill };
 
 fn fill(_: *anyopaque, buf: []u8) void {

@@ -1,3 +1,6 @@
+//! Builds hark, runs its tests (the unit tests and every scenario
+//! replayed), and checks that its files are formatted.
+
 const std = @import("std");
 const zon = @import("build.zig.zon");
 

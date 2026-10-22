@@ -1,7 +1,8 @@
-/// The client's reply on the wire: header, EDNS0 OPT, the rebinding
-/// scrub, the truncation cascade, error responses, and per-RFC query
-/// validation. Pure (no I/O); serve.zig does the I/O. Which records a
-/// client is owed is answer.zig's (`Keep`); this only writes them.
+//! The client's reply on the wire: header, EDNS0 OPT, the rebinding
+//! scrub, the truncation cascade, error responses, and per-RFC query
+//! validation. Pure (no I/O); serve.zig does the I/O. Which records a
+//! client is owed is answer.zig's (`Keep`); this only writes them.
+
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -60,9 +61,11 @@ pub fn buildResponseWire(
 ) ?[]const u8 {
     const rb = (if (reply.local) &rebinding.Config.off else ctx.rebinding).*;
 
-    // Every section: negatives pass authority and additional through, and
-    // RFC 9460 §4.2 steers clients to Additional-section SVCB/A/AAAA. OOM
-    // is null, which the caller sends as SERVFAIL, never an unscrubbed reply.
+    // Here, so fresh resolution, cache hits and TTL=0 answers (which a
+    // cache-insertion filter would miss) are scrubbed alike. Every section:
+    // negatives pass authority and additional through, and RFC 9460 §4.2
+    // steers clients to Additional-section SVCB/A/AAAA. OOM is null, which
+    // the caller sends as SERVFAIL, never an unscrubbed reply.
     const answers = rebinding.scrub(alloc, reply.answers, rb) catch return null;
     const authorities = rebinding.scrub(alloc, reply.authorities, rb) catch return null;
     const additionals = rebinding.scrub(alloc, reply.additionals, rb) catch return null;
@@ -78,6 +81,9 @@ pub fn buildResponseWire(
     }
     var ede_bufs: [2][64]u8 = undefined;
     if (reply.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
+    // A scrubbed reply goes out with what is left, never SERVFAIL or
+    // REFUSED: REFUSED pushes a stub to the next resolver in resolv.conf,
+    // asking one that may not scrub and handing the attacker the rebind.
     if (scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         // RFC 6891 §6.2.3: our own receive limit, not the send budget.

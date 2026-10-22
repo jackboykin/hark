@@ -1,3 +1,6 @@
+//! The TOML that hark.toml needs: tables of strings, integers, booleans,
+//! string arrays and tables.
+
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;

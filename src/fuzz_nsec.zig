@@ -1,8 +1,6 @@
 //! Model-based denial fuzzing. Smith draws a small signed zone and its honest
 //! NSEC or NSEC3 chain, then as attacker picks which genuine records reach
-//! the validator and what the query claims. The zone is the oracle: a verdict
-//! contradicting it is a replay hole, and an honest proof failing to verify
-//! is a SERVFAIL on a real zone.
+//! the validator and what the query claims; the zone judges the verdict.
 const std = @import("std");
 const testing = std.testing;
 const Smith = testing.Smith;
@@ -380,6 +378,8 @@ test "replay" {
     try fuzzOne({}, &smith);
 }
 
+/// The zone is the oracle: a verdict contradicting it is a replay hole, and
+/// an honest proof failing to verify is a SERVFAIL on a real zone.
 fn fuzzOne(_: void, s: *Smith) anyerror!void {
     var z: Zone = undefined;
     draw(&z, s);

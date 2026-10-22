@@ -1,3 +1,6 @@
+//! Each server's round-trip estimate, and what it decides: the timeout and
+//! hedge stagger an exchange gets, and when a silent server counts as dead.
+
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

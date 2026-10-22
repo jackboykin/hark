@@ -1,12 +1,6 @@
 //! Linux syscall wrappers with error unions. Reach them through
 //! sys_union.zig; import this file directly only for what has no meaning
 //! off Linux (signalfd).
-//!
-//! sendto/write retry on EINTR internally. SIGINT/SIGTERM are blocked
-//! and delivered via signalfd, but other unblocked signals (SIGPIPE,
-//! profilers, etc.) can still interrupt blocking syscalls; looping avoids
-//! dropping in-flight queries. connect surfaces Interrupted because
-//! retry semantics are context-dependent.
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -38,6 +32,7 @@ pub fn bind(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !
     };
 }
 
+/// Surfaces Interrupted: whether to retry depends on the caller.
 pub fn connect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
     return switch (linux.errno(linux.connect(fd, addr, len))) {
         .SUCCESS => {},
@@ -72,6 +67,9 @@ pub fn listen(fd: posix.fd_t, backlog: u31) !void {
     };
 }
 
+/// Retries EINTR. SIGINT and SIGTERM are blocked and come by signalfd, but
+/// other signals (SIGPIPE, profilers) still interrupt, and giving up would
+/// drop a query in flight.
 pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, len: posix.socklen_t) !usize {
     while (true) {
         const rc = linux.sendto(fd, buf.ptr, buf.len, flags, addr, len);
@@ -99,6 +97,7 @@ pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t)
     };
 }
 
+/// Retries EINTR, as `sendto` does.
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     while (true) {
         const rc = linux.write(fd, buf.ptr, buf.len);

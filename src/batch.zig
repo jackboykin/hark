@@ -1,8 +1,5 @@
-//! UDP by the batch: a syscall a datagram pays the kernel's entry and exit
-//! each time, so what is already queued moves in one. Nothing waits to
-//! fill a batch.
-//!
-//! Its headers point into it, so a batch lives on the heap and never moves.
+//! UDP by the batch: the datagrams already queued, received or sent in one
+//! syscall. Nothing waits to fill a batch.
 const Batch = @This();
 const std = @import("std");
 const linux = std.os.linux;
@@ -11,7 +8,8 @@ const Allocator = std.mem.Allocator;
 const na = @import("net_address.zig");
 const sys = @import("sys_union.zig");
 
-/// Eight takes most of the saving.
+/// A syscall a datagram pays the kernel's entry and exit each time; eight
+/// to a call takes most of the saving.
 pub const max = 8;
 
 hdrs: [max]linux.mmsghdr,
@@ -22,6 +20,7 @@ size: usize,
 n: usize = 0,
 fd: posix.fd_t = -1,
 
+/// Its headers point into it, so a batch lives on the heap and never moves.
 pub fn create(gpa: Allocator, size: usize) !*Batch {
     const b = try gpa.create(Batch);
     errdefer gpa.destroy(b);

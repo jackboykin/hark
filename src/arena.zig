@@ -1,9 +1,4 @@
-//! A bump arena for one thread. std.heap.ArenaAllocator is lock-free and
-//! pays atomics on every allocation; each of hark's arenas belongs to one
-//! thread.
-//!
-//! A chunk ends in its foot and the arena points at the newest, so an
-//! allocation that fits touches the arena alone.
+//! A bump arena for one thread, its chunks linked newest first.
 const Arena = @This();
 const std = @import("std");
 const mem = std.mem;
@@ -15,6 +10,8 @@ child: Allocator,
 at: usize = 0,
 foot: ?*Foot = null,
 
+/// Each chunk ends in its foot, and the arena points at the newest, so an
+/// allocation that fits touches the arena alone.
 const Foot = struct {
     older: ?*Foot,
     base: [*]u8,
@@ -68,6 +65,8 @@ fn open(a: *Arena, size: usize, ra: usize) ?usize {
     return a.at;
 }
 
+/// No atomics: each of hark's arenas belongs to one thread, where
+/// std.heap.ArenaAllocator, lock-free, pays them on every allocation.
 fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     const a: *Arena = @ptrCast(@alignCast(ctx));
     const p = alignment.forward(a.at);

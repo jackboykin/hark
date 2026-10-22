@@ -1,3 +1,6 @@
+//! hark.toml: its sections and keys parsed and checked into a ServerConfig,
+//! and the defaults each key starts from.
+
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;

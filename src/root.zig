@@ -1,3 +1,5 @@
+//! The hark module: every source file, for main, the fuzzers and the tests.
+
 pub const acl = @import("acl.zig");
 pub const answer = @import("answer.zig");
 pub const arena = @import("arena.zig");

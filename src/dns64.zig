@@ -1,10 +1,6 @@
-//! RFC 6147 DNS64, on when `dns64-prefix` is set; applied by answer.zig.
-//! AAAA NODATA → resolve A and embed. PTR under
-//! the prefix → the in-addr.arpa PTRs re-owned (Unbound's rename, not the
-//! §5.3.1 CNAME). CD=1 disables it. A SERVFAILed AAAA stays SERVFAIL: §5.1.2
-//! says treat as empty, §5.5 forbids laundering a bogus one, and bogus is
-//! indistinguishable from lame here. Mixed real+`::ffff` sets pass through
-//! untouched; stripping members would orphan the RRSIG.
+//! RFC 6147 DNS64, on when `dns64-prefix` is set; applied by answer.zig. An
+//! AAAA NODATA is answered from the A, each address embedded under the
+//! prefix, and a PTR under the prefix from the in-addr.arpa PTRs.
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -51,7 +47,11 @@ pub const Prefix = struct {
     }
 };
 
-/// §5.1.2, §5.1.4: NOERROR with no AAAA beyond `::ffff:0:0/96`.
+/// §5.1.2, §5.1.4: NOERROR with no AAAA beyond `::ffff:0:0/96`. A
+/// SERVFAILed AAAA stays SERVFAIL: §5.1.2 says treat it as empty, §5.5
+/// forbids laundering a bogus one, and bogus is indistinguishable from lame
+/// here. A set mixing real and `::ffff` members passes untouched: stripping
+/// members would orphan its RRSIG.
 pub fn wantsSynthesis(rcode: dns.RCode, answers: []const dns.ResourceRecord) bool {
     if (rcode != .no_error) return false;
     for (answers) |rr| if (rr.rtype == .aaaa and !na.isIp4Mapped(rr.rdata)) return false;
@@ -96,7 +96,9 @@ pub fn parseIp6Arpa(name: dns.Name) ?[16]u8 {
     return out;
 }
 
-/// CNAMEs (RFC 2317) and RRSIGs are untrue under the new owner.
+/// The PTRs re-owned under the client's name, as Unbound renames, not
+/// §5.3.1's CNAME. CNAMEs (RFC 2317) and RRSIGs are untrue under the new
+/// owner.
 pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.ResourceRecord, qname: dns.Name) ![]dns.ResourceRecord {
     const owner = try qname.clone(alloc);
     const out = try alloc.alloc(dns.ResourceRecord, answers.len);

@@ -1,7 +1,7 @@
-//! hark's allocator. Each `Tenant` serves one lifetime and never shares a
-//! slab with another, so long-lived facts and bursty work can't pin each
-//! other's memory. A slab that empties goes back to the `Reserve`, where
-//! any size class or tenant can take it, or the OS gets it back.
+//! hark's allocator: size classes on 64 KiB slabs, each slab one `Tenant`'s,
+//! a tenant per lifetime, and the `Reserve` a slab goes back to when it
+//! empties, where any size class or tenant can take it, or the OS gets it
+//! back.
 const std = @import("std");
 const mem = std.mem;
 const posix = std.posix;
@@ -155,6 +155,8 @@ pub const Reserve = struct {
     }
 };
 
+/// One lifetime's memory, on slabs no other tenant shares, so long-lived
+/// facts and bursty work can't pin each other's memory.
 pub const Tenant = struct {
     reserve: *Reserve,
     current: [class_count]?*Slab = @splat(null),

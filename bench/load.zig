@@ -2,8 +2,8 @@
 //!
 //! DNS load for the bench over batched kernel UDP sockets, a flow each,
 //! from dnsperf's "name type" file. Closed loop keeps INFLIGHT out; -Q sends
-//! on a schedule and times each query from when it was due, so a stalled
-//! sender cannot flatter the server. Unanswered after TIMEOUT (3) s is lost.
+//! on a schedule and times each query from when it was due. Unanswered
+//! after TIMEOUT (3) s is lost.
 //! Prints "key value" lines: sent completed lost qps, rcodes, p50 p99 p999 µs.
 const std = @import("std");
 const linux = std.os.linux;
@@ -72,7 +72,8 @@ const Stats = struct {
     }
 };
 
-/// `due[id]` is when the query with that id was due, 0 if none is out;
+/// `due[id]` is when the query with that id was due, 0 if none is out: a
+/// query is timed from then, so a stalled sender cannot flatter the server.
 /// `ring` holds (id, due) in send order, so timeouts are found at its head
 /// and entries already answered are stale.
 const Sock = struct {

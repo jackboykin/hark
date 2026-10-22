@@ -1,29 +1,8 @@
-/// DNS rebinding protection: strip A/AAAA answers carrying private,
-/// loopback, link-local, or otherwise non-routable addresses from public
-/// zones, so a browser-side attacker can't point `attacker.com` at the
-/// victim's `127.0.0.1:8765` and call the local dev server cross-origin.
-///
-/// Filter site: `response.buildResponseWire`, over every section, so
-/// fresh resolution, cache hits and TTL=0 answers (which would skip a
-/// cache-insertion filter) are filtered in one place.
-///
-/// What we *don't* do, and why:
-///   • SERVFAIL or REFUSED on a scrub. REFUSED tends to push stubs to the
-///     next resolver in resolv.conf, leaking the same query to an
-///     unprotected upstream and giving the attacker their rebind anyway.
-///   • Rewrite SVCB/HTTPS hints in place. RFC 9460 §7.3: modifying the
-///     hints breaks DNSSEC validation. The whole RR drops instead,
-///     matching Unbound's 1.25.0 rebinding fix.
-///   • 6to4 (`2002::/16`) and NAT64 prefixes other than `dns64-prefix`.
-///     The configured prefix is unwrapped and its inner v4 judged; add any
-///     other translation prefix to `extra_block`.
-///
-/// Owner-name allowlist matching: each RR carries its own owner name on
-/// the wire. For a CNAME chain `home.example.com → box.lan.example → A
-/// 192.168.1.1`, the terminal A's `name` is `box.lan.example`, so a
-/// `lan.example` allowlist entry passes the chain through unmolested
-/// — as in Unbound and BIND. A public CNAME into an allowlisted zone
-/// passes too; hark has no deny-answer-aliases.
+//! DNS rebinding protection: the scrub that drops A and AAAA records, and
+//! SVCB and HTTPS records by their hints, carrying private, loopback,
+//! link-local or otherwise non-routable addresses from public zones'
+//! answers.
+
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -42,7 +21,12 @@ pub const Config = struct {
     /// of any entry bypass the filter entirely. Use for split-horizon
     /// zones like `homelab.lan` whose authoritative legitimately returns
     /// RFC 1918 space. `home.arpa` is intercepted by `special_use.zig`
-    /// upstream of recursion, so including it here is a no-op.
+    /// upstream of recursion, so including it here is a no-op. Each RR is
+    /// judged by its own owner: for `home.example.com → box.lan.example →
+    /// A 192.168.1.1` the A's owner is `box.lan.example`, so a
+    /// `lan.example` entry passes the chain, as in Unbound and BIND. A
+    /// public CNAME into an allowlisted zone passes too; hark has no
+    /// deny-answer-aliases.
     allow_zones: []const dns.Name,
     /// Additive block CIDRs on top of the built-in default set.
     extra_block: []const acl.Cidr,
@@ -69,6 +53,8 @@ fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     if (!cfg.enabled) return false;
     const private = switch (rr.rtype) {
         .a, .aaaa => isPrivate(rr.rdata, cfg),
+        // The whole RR, as Unbound 1.25.0 drops it: rewriting its hints in
+        // place breaks its signature (RFC 9460 §7.3).
         .svcb, .https => svcbHintsPrivate(rr.rdata, cfg),
         else => false,
     };
@@ -120,7 +106,9 @@ fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
 
 /// The section without what `shouldDrop` marks, nor the RRSIGs over a set
 /// that lost a member: they no longer match it. A section that loses
-/// nothing is returned as is, allocating nothing.
+/// nothing is returned as is, allocating nothing. Without it a
+/// browser-side attacker could point `attacker.com` at the victim's
+/// `127.0.0.1:8765` and call the local dev server cross-origin.
 pub fn scrub(
     alloc: mem.Allocator,
     records: []const dns.ResourceRecord,
@@ -187,6 +175,8 @@ fn isPrivate(bytes: []const u8, cfg: Config) bool {
     return false;
 }
 
+/// Only `dns64-prefix` is unwrapped: 6to4 (`2002::/16`) and any other
+/// translation prefix are the operator's to add to `extra_block`.
 fn embeddedIp4(bytes: []const u8, cfg: Config) ?[4]u8 {
     if (bytes.len != 16) return null;
     if (na.isIp4Mapped(bytes)) return bytes[12..16].*;

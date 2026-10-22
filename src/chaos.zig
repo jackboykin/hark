@@ -1,9 +1,5 @@
-//! Draws are keyed by the event they decide, not by draw order, so a run
-//! that decides one thing differently decides no other live site's
-//! differently. A site that is off and random by design (pick, gather,
-//! prefetch) draws from the edge's rng in order, as without chaos.
-//! A draw of 0 is what hark does without chaos, or, where hark draws
-//! too, the first.
+//! The simulator's chaos: seeded draws over the choices hark is free to
+//! make, at each `Site`, and the events that drew, for shrinking a failure.
 const std = @import("std");
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
@@ -45,7 +41,9 @@ pub const Chaos = struct {
     }
 
     /// Each site is on or off for the whole run (swarm testing): a
-    /// feature left off cannot hide a bug the others reach.
+    /// feature left off cannot hide a bug the others reach. A site that is
+    /// off and random by design (pick, gather, prefetch) draws from the
+    /// edge's rng in order, as without chaos.
     pub fn live(c: *const Chaos, site: Site) bool {
         return std.hash.Wyhash.hash(c.seed, std.mem.asBytes(&site)) & 1 == 1;
     }
@@ -63,7 +61,9 @@ pub const Chaos = struct {
     }
 
     /// The event at `site` that `name` stands for: a key's nth decision,
-    /// or what a draw no key decides is about.
+    /// or what a draw no key decides is about. Draws are keyed by the event
+    /// they decide, not by draw order, so a run that decides one thing
+    /// differently decides no other live site's differently.
     pub fn named(c: *const Chaos, site: Site, name: u64) u64 {
         var h = std.hash.Wyhash.init(c.seed);
         h.update(std.mem.asBytes(&site));
@@ -80,7 +80,9 @@ pub const Chaos = struct {
         return h.final();
     }
 
-    /// One of `n` for `event`, unnoted; the bias, n / 2^64, never shows.
+    /// One of `n` for `event`, unnoted; the bias, n / 2^64, never shows. A
+    /// draw of 0 is what hark does without chaos, or, where hark draws too,
+    /// the first.
     pub fn draw(c: *const Chaos, event: u64, n: u64) u64 {
         if (c.only) |only| if (!only.contains(event)) return 0;
         return @intCast(std.math.mulWide(u64, std.hash.Wyhash.hash(event, "draw"), n) >> 64);

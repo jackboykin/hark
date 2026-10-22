@@ -1,7 +1,5 @@
 //! CIDR prefixes: `[server].allow-from`, which the server's UDP and TCP
-//! front-ends enforce, and the rebinding scrub's extra sets. An empty
-//! allow-from lets every client in: fine on loopback, the default, and an
-//! open resolver and reflection amplifier anywhere else (BCP 140).
+//! front-ends enforce, and the rebinding scrub's extra sets.
 const std = @import("std");
 const mem = std.mem;
 const na = @import("net_address.zig");
@@ -50,7 +48,8 @@ pub fn parse(s: []const u8) ?Cidr {
     return .{ .address = address, .prefix = prefix };
 }
 
-/// Empty allows every client.
+/// Empty allows every client: fine on loopback, the default, and an open
+/// resolver and reflection amplifier anywhere else (BCP 140).
 pub fn allow(entries: []const Cidr, addr: na.Address) bool {
     if (entries.len == 0) return true;
     for (entries) |e| if (e.matches(addr)) return true;

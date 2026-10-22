@@ -1,3 +1,6 @@
+//! The hark executable: its arguments, the config it loads and its log,
+//! then the server.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");

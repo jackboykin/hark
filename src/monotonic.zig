@@ -1,12 +1,12 @@
-//! The clocks: boot time for ages and deadlines, immune to NTP jumps; wall
-//! time for signature windows (RFC 4034 §3.1.5) and log stamps. Under
-//! -Dtesting both run ahead by an offset the live harness advances, so a
-//! scenario sees TTLs lapse without sleeping; otherwise the offset is a
-//! comptime 0.
+//! The clocks: boot time for ages and deadlines, wall time for signature
+//! windows (RFC 4034 §3.1.5) and log stamps, both run ahead under -Dtesting
+//! by an offset the live harness advances.
 const std = @import("std");
 const linux = std.os.linux;
 const build_options = @import("build_options");
 
+/// So a scenario sees TTLs lapse without sleeping; a comptime 0 unless
+/// -Dtesting.
 var test_offset_secs: i64 = 0;
 
 inline fn testOffsetSec() i64 {
@@ -17,6 +17,7 @@ pub fn advanceTestClock(secs: i64) void {
     if (build_options.testing_enabled) test_offset_secs += secs;
 }
 
+/// Boot time, immune to NTP jumps.
 pub fn nowNs() i64 {
     var ts: std.posix.timespec = undefined;
     if (linux.errno(linux.clock_gettime(.BOOTTIME, &ts)) != .SUCCESS) return 0;
