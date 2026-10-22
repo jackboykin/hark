@@ -312,7 +312,7 @@ pub const Value = union(Kind) {
     pub fn reply(v: Value) Reply {
         return switch (v) {
             .rrset, .stub => |r| r,
-            else => unreachable,
+            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
         };
     }
 };
@@ -911,7 +911,7 @@ pub const Graph = struct {
                 if (!sc.cut_short) g.observeTimeout(sc.server);
             },
             .unsent => g.stats.resolver.faults.unsent += 1,
-            else => {},
+            .mismatch, .malformed, .oversized => {},
         }
         c.holds -= 1;
         g.flights -= 1;
@@ -1065,7 +1065,7 @@ pub const Graph = struct {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
                 std.debug.print("  {t}({s}) -> {t} for {d} s\n", .{ std.meta.activeTag(value), c.name.formatInto(&nb), chain.status, @divTrunc(expires_ns - g.now(), std.time.ns_per_s) });
             },
-            else => {},
+            .cut, .addr, .rrset, .stub, .answer, .exchange, .refresh, .ahead, .parental => {},
         };
         c.expires_ns = expires_ns;
         switch (value) {
@@ -1131,7 +1131,7 @@ pub const Graph = struct {
         if (try g.forgets(.keep, c.key)) return;
         const at = switch (c.state.fact.*) {
             .rrset, .stub => |r| r.stored_ns,
-            else => g.now(),
+            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .parental => g.now(),
         };
         g.store.put(c.key, blob.ref(), c.expires_ns, at) catch |err| {
             g.store.unref(blob);
@@ -1487,7 +1487,7 @@ pub const Graph = struct {
         return switch (c.scratch) {
             .answer => |a| a.budget,
             .ahead => |k| k.budget,
-            else => null,
+            .none, .cut, .addr, .rrset, .stub, .ds, .dnskey, .secure, .exchange => null,
         };
     }
 

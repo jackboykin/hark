@@ -377,7 +377,7 @@ const Parser = struct {
                 if (toks.next() != null) return p.fail("CHECK_MAX_* takes one integer");
                 return .{ .n = n, .kind = kind, .bound = bound };
             },
-            else => {
+            .query, .check_answer, .check_query_log, .check_out_query => {
                 const line = try p.next();
                 if (!mem.eql(u8, line, "ENTRY_BEGIN")) return p.fail("STEP requires an ENTRY block");
                 return .{ .n = n, .kind = kind, .entry = try p.entry() };

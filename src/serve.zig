@@ -365,7 +365,7 @@ const Server = struct {
         while (i < s.watched.items.len) : (i += 1) {
             const c = switch (s.watched.items[i].w) {
                 .conn => |c| c,
-                else => continue,
+                .udp, .listen, .signal, .free => continue,
             };
             // A client owed an answer gets the resolve deadline on top.
             const since = if (c.out.items.len != 0) c.blocked_ns else c.last_ns;

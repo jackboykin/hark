@@ -140,7 +140,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         report.step = st.n;
         if (opts.chaos != 0) switch (st.kind) {
             .check_answer, .check_query_log, .check_out_query, .check_max_queries, .check_max_verifies, .check_max_runs => continue,
-            else => {},
+            .query, .timeout, .unsent, .time_passes => {},
         };
         switch (st.kind) {
             .query => {

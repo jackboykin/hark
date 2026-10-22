@@ -199,7 +199,7 @@ pub const Desk = struct {
             switch (ede.code) {
                 // A hold with nothing left to serve asks afresh.
                 .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
-                else => return .{ .held = servfail(q, ede) },
+                .other, .dnssec_bogus, .cached_error, .blocked, .not_supported, .no_reachable_authority, .unsupported_nsec3_iterations, .synthesized, .over_quota => return .{ .held = servfail(q, ede) },
             }
         }
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };
@@ -673,7 +673,7 @@ pub const Failures = struct {
         if (e.until_ns <= now_ns) return null;
         return switch (e.ede.code) {
             .dnssec_bogus, .unsupported_nsec3_iterations, .stale_answer, .stale_nxdomain_answer => e.ede,
-            else => .{ .code = .cached_error },
+            .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota => .{ .code = .cached_error },
         };
     }
 

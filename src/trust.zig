@@ -241,7 +241,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                         try g.keep(s.rrset.unwrap().?);
                         try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
                     },
-                    else => try g.fail(id, g.payer.validationStop() orelse no_cut),
+                    .unchecked, .insecure, .bogus => try g.fail(id, g.payer.validationStop() orelse no_cut),
                 },
                 .bogus => try g.fail(id, g.payer.validationStop() orelse no_cut),
             }
@@ -579,7 +579,7 @@ const Claims = struct {
         it.ended = true;
         return switch (it.r.kind) {
             .nodata, .nxdomain => it.claim(it.r.target, it.qtype, 0, .denial),
-            else => null,
+            .answer, .alias, .yxdomain => null,
         };
     }
 

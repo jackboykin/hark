@@ -959,7 +959,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     switch (reply.kind) {
         .nxdomain => if (!delegation.soaAbove(msg.authorities, cur)) return null,
         .nodata => if (!delegation.soaAbove(msg.authorities, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
-        else => {},
+        .answer, .alias, .yxdomain => {},
     }
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, authorities, reply);

@@ -496,7 +496,7 @@ pub const RData = union(enum) {
         switch (rdata) {
             .ns, .cname, .dname, .ptr => |n| return n.wire,
             .unknown => |bytes| return bytes,
-            else => {},
+            .a, .aaaa, .mx, .soa, .txt, .rrsig, .dnskey, .ds, .nsec, .nsec3 => {},
         }
         var w: std.Io.Writer.Allocating = .init(gpa);
         errdefer w.deinit();

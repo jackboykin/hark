@@ -193,7 +193,7 @@ fn validateSchema(root: toml.Table) ConfigError!void {
         };
         const table = switch (entry.value_ptr.*) {
             .table => |t| t,
-            else => {
+            .string, .integer, .boolean, .string_array => {
                 errLog("config: top-level key '{s}' — every setting lives under a [section]", .{section_name});
                 return error.UnknownConfigKey;
             },
