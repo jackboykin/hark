@@ -5,6 +5,7 @@ const posix = std.posix;
 const mem = std.mem;
 const sys = @import("sys_union.zig");
 const rand = @import("rand.zig");
+const acl = @import("acl.zig");
 
 pub const Address = std.Io.net.IpAddress;
 
@@ -174,57 +175,123 @@ pub fn isNonRoutableNs(addr: AddressKey) bool {
 }
 
 fn isNonRoutableIp4(b: [4]u8) bool {
-    return isSpecialUseIp4(b) or b[0] >= 224; // + 224.0.0.0/4 multicast
+    return isSpecialUseIp4(b) or multicast_ip4.holds(mem.readInt(u32, &b, .big));
 }
 
 fn isNonRoutableIp6(b: [16]u8) bool {
-    return switch (b[0]) {
-        0 => if (isIp4Mapped(&b)) isNonRoutableIp4(b[12..16].*) else isSpecialUseIp6(b),
-        0xff => true, // + ff00::/8 multicast
-        else => isSpecialUseIp6(b),
-    };
+    if (isIp4Mapped(&b)) return isNonRoutableIp4(b[12..16].*);
+    return isSpecialUseIp6(b) or multicast_ip6.holds(mem.readInt(u128, &b, .big));
 }
 
-/// Shared special-use IPv4 set: Knot's set + the IANA special-use registries
-/// (RFC 6890): CGNAT (RFC 6598), IETF protocol assignments, TEST-NET 1/2/3
-/// (RFC 5737), benchmarking (RFC 2544), reserved (RFC 1112), broadcast.
-/// Multicast 224.0.0.0/4 is deliberately *not* here — a recursive resolver
-/// returning multicast to a stub is not a rebinding-attack primitive, so the
-/// answer scrub serves it; NS egress re-adds it above.
+/// The special-purpose blocks a public answer has no business pointing
+/// into: Knot's set and the IANA registries (RFC 6890). Multicast is
+/// deliberately not here: a recursive resolver returning multicast to a
+/// stub is not a rebinding-attack primitive, so the answer scrub serves
+/// it; NS egress refuses it beside these.
+const special_use_ip4: Prefixes(u32) = .of(&.{
+    // RFC 1122: this network, and loopback.
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    // RFC 1918.
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    // RFC 6598: shared address space (CGNAT).
+    "100.64.0.0/10",
+    // RFC 3927: link-local.
+    "169.254.0.0/16",
+    // RFC 6890: IETF protocol assignments.
+    "192.0.0.0/24",
+    // RFC 5737: documentation (TEST-NET-1, -2 and -3).
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    // RFC 2544: benchmarking.
+    "198.18.0.0/15",
+    // RFC 1112: reserved, with the limited broadcast address.
+    "240.0.0.0/4",
+});
+
+const special_use_ip6: Prefixes(u128) = .of(&.{
+    // RFC 4291: unspecified, loopback, and the deprecated IPv4-compatible.
+    "::/96",
+    // RFC 3849: documentation.
+    "2001:db8::/32",
+    // RFC 4193: unique local.
+    "fc00::/7",
+    // RFC 4291: link-local.
+    "fe80::/10",
+});
+
+const multicast_ip4 = Prefix(u32).of("224.0.0.0/4");
+const multicast_ip6 = Prefix(u128).of("ff00::/8");
+
 pub fn isSpecialUseIp4(b: [4]u8) bool {
-    return switch (b[0]) {
-        0 => true, // 0.0.0.0/8 (this network, RFC 1122)
-        10 => true, // 10.0.0.0/8 (RFC 1918)
-        100 => (b[1] & 0xc0) == 64, // 100.64.0.0/10 (CGNAT, RFC 6598)
-        127 => true, // 127.0.0.0/8 (loopback, RFC 1122)
-        169 => b[1] == 254, // 169.254.0.0/16 (link-local, RFC 3927)
-        172 => (b[1] & 0xf0) == 16, // 172.16.0.0/12 (RFC 1918)
-        // 192.0.0.0/24 (IETF, RFC 6890), 192.0.2.0/24 (TEST-NET-1),
-        // 192.168.0.0/16 (RFC 1918)
-        192 => (b[1] == 0 and (b[2] == 0 or b[2] == 2)) or b[1] == 168,
-        // 198.18.0.0/15 (benchmarking), 198.51.100.0/24 (TEST-NET-2)
-        198 => (b[1] & 0xfe) == 18 or (b[1] == 51 and b[2] == 100),
-        203 => b[1] == 0 and b[2] == 113, // 203.0.113.0/24 (TEST-NET-3)
-        240...255 => true, // 240.0.0.0/4 (reserved, includes 255.255.255.255)
-        else => false,
+    return special_use_ip4.holds(mem.readInt(u32, &b, .big));
+}
+
+/// An IPv4-mapped address is judged as IPv4, so a mapped 127.0.0.1
+/// doesn't slip through as a v6 address the v6 set has no opinion on.
+pub fn isSpecialUseIp6(b: [16]u8) bool {
+    if (isIp4Mapped(&b)) return isSpecialUseIp4(b[12..16].*);
+    return special_use_ip6.holds(mem.readInt(u128, &b, .big));
+}
+
+fn Prefix(comptime Int: type) type {
+    return struct {
+        net: Int,
+        mask: Int,
+
+        fn of(comptime cidr: []const u8) @This() {
+            @setEvalBranchQuota(10_000);
+            const c = acl.parse(cidr).?;
+            const bytes = switch (c.address) {
+                .ip4 => |a| a.bytes,
+                .ip6 => |a| a.bytes,
+            };
+            const mask: Int = if (c.prefix == 0) 0 else ~@as(Int, 0) << @intCast(@bitSizeOf(Int) - c.prefix);
+            return .{ .net = mem.readInt(Int, &bytes, .big), .mask = mask };
+        }
+
+        fn holds(p: @This(), a: Int) bool {
+            return a & p.mask == p.net;
+        }
     };
 }
 
-/// ::/96, ULA, link-local, 2001:db8::/32, and IPv4-mapped judged as v4; no multicast.
-pub fn isSpecialUseIp6(b: [16]u8) bool {
-    return switch (b[0]) {
-        0 => mem.readInt(u64, b[0..8], .big) == 0 and switch (mem.readInt(u32, b[8..12], .big)) {
-            0 => true, // ::/96
-            // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped
-            // 127.0.0.1 doesn't slip through as a "v6 address" the v6 set
-            // has no opinion on.
-            0xffff => isSpecialUseIp4(b[12..16].*),
-            else => false,
-        },
-        0x20 => mem.readInt(u32, b[0..4], .big) == 0x20010db8, // 2001:db8::/32 (RFC 3849)
-        0xfc, 0xfd => true, // fc00::/7 (ULA, RFC 4193)
-        0xfe => (b[1] & 0xc0) == 0x80, // fe80::/10 (link-local)
-        else => false,
+/// Up to 16 prefixes, indexed by the leading octet an address must have
+/// to fall in each, so most addresses are cleared by one load.
+fn Prefixes(comptime Int: type) type {
+    return struct {
+        all: []const Prefix(Int),
+        by_lead: [256]u16,
+
+        fn of(comptime cidrs: []const []const u8) @This() {
+            @setEvalBranchQuota(100_000);
+            var all: [cidrs.len]Prefix(Int) = undefined;
+            var by_lead: [256]u16 = @splat(0);
+            for (&all, cidrs, 0..) |*p, c, i| {
+                p.* = .of(c);
+                const net = lead(p.net);
+                const mask = lead(p.mask);
+                for (&by_lead, 0..) |*may, l| {
+                    if ((l ^ net) & mask == 0) may.* |= 1 << i;
+                }
+            }
+            const final = all;
+            return .{ .all = &final, .by_lead = by_lead };
+        }
+
+        fn holds(comptime set: @This(), a: Int) bool {
+            const may = set.by_lead[lead(a)];
+            if (may == 0) return false;
+            inline for (set.all, 0..) |p, i| if (may & (1 << i) != 0 and p.holds(a)) return true;
+            return false;
+        }
+
+        fn lead(a: Int) u8 {
+            return @truncate(a >> (@bitSizeOf(Int) - 8));
+        }
     };
 }
 
