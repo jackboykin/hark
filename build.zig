@@ -1,5 +1,5 @@
 //! Builds hark, runs its tests (the unit tests and every scenario
-//! replayed), and checks that its files are formatted.
+//! replayed), and checks its files: their format, and lint.zig.
 
 const std = @import("std");
 const zon = @import("build.zig.zon");
@@ -77,8 +77,20 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
 
-    const fmt = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("bench"), b.path("build.zig"), b.path("build.zig.zon") }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("bench"), b.path("build.zig"), b.path("build.zig.zon"), b.path("lint.zig") }, .check = true });
     b.step("fmt", "Check that every zig file is formatted").dependOn(&fmt.step);
+
+    const lint_exe = b.addExecutable(.{
+        .name = "lint",
+        .root_module = b.createModule(.{ .root_source_file = b.path("lint.zig"), .target = b.graph.host }),
+    });
+    const lint = b.addRunArtifact(lint_exe);
+    lint.addDirectoryArg(.zig_lib);
+    lint.addArgs(&.{ "src", "bench", "build.zig", "lint.zig" });
+    lint.setCwd(b.path("."));
+    // It reads its own file list, which the build cannot see change.
+    lint.has_side_effects = true;
+    b.step("lint", "Check what zig fmt leaves alone (lint.zig)").dependOn(&lint.step);
 }
 
 fn declareInputs(b: *std.Build, run: *std.Build.Step.Run, root: []const u8) !void {
