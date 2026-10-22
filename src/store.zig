@@ -104,7 +104,7 @@ pub const OnEvict = *const fn (*Store, Key, *Blob) void;
 
 pub const Store = struct {
     gpa: Allocator,
-    map: std.ArrayHashMapUnmanaged(Key, Entry, Key.Context, true) = .empty,
+    map: std.array_hash_map.Custom(Key, Entry, Key.Context, true) = .empty,
     /// Every live blob's bytes, whoever holds it.
     bytes: usize = 0,
     /// A blob once per key holding it. The cap is on this, so names
@@ -113,7 +113,7 @@ pub const Store = struct {
     /// Each blob the map holds, once.
     kept: usize = 0,
     cap: usize,
-    visited: std.DynamicBitSetUnmanaged = .{},
+    visited: std.bit_set.Dynamic = .{},
     hand: usize = 0,
     /// Over the cap a key is turned away the first time and admitted the
     /// next, so a flood of names never seen twice evicts nothing.
@@ -629,7 +629,7 @@ test "the cap holds by eviction and admission" {
     const zone: dns.Name = .lit("x");
     var names: [64][8]u8 = undefined;
     for (0..64) |i| {
-        _ = try std.fmt.bufPrint(&names[i], "k{d}", .{i});
+        _ = try std.mem.print(&names[i], "k{d}", .{i});
         const key: Key = .init(.cut, std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3], .a);
         const blob = try s.build(.{ .cut = .{ .zone = zone } });
         s.put(key, blob, 10, 0) catch |err| {

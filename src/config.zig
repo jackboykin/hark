@@ -480,7 +480,7 @@ fn parseAddressList(arena: Allocator, strs: []const []const u8, comptime err: Co
 
 fn parseAddress(s: []const u8, default_port: u16) ?Address {
     if (s.len > 0 and s[0] == '[') {
-        const close = mem.indexOfScalar(u8, s, ']') orelse return null;
+        const close = mem.findScalar(u8, s, ']') orelse return null;
         const ip6_str = s[1..close];
         if (close + 1 < s.len and s[close + 1] != ':') return null;
         const port = if (close + 1 < s.len)
@@ -495,8 +495,8 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     //   no colons     → bare IPv4
     //   one colon     → IPv4:port (first == last)
     //   many colons   → bare IPv6 (first != last)
-    const first = mem.indexOfScalar(u8, s, ':');
-    const last = mem.lastIndexOfScalar(u8, s, ':');
+    const first = mem.findScalar(u8, s, ':');
+    const last = mem.findScalarLast(u8, s, ':');
 
     if (first) |f| {
         if (f == last.?) {
@@ -756,7 +756,7 @@ test "stub-zones names a zone's servers, and refuses what no operator may name" 
         "internal not-an-address",
     }) |entry| {
         var buf: [256]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "[resolver]\nstub-zones = [\"{s}\"]\n", .{entry});
+        const text = try std.mem.print(&buf, "[resolver]\nstub-zones = [\"{s}\"]\n", .{entry});
         try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, text));
     }
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
@@ -765,7 +765,7 @@ test "stub-zones names a zone's servers, and refuses what no operator may name" 
     ));
     for ([_][]const u8{ "127.0.0.1:53", "127.0.0.1:5335", "[::1]:5335", "[::]:5335" }) |server| {
         var buf: [256]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "[server]\nlisten = [\"127.0.0.1:53\", \"0.0.0.0:5335\", \"[::]:5335\"]\n[resolver]\nstub-zones = [\"internal {s}\"]\n", .{server});
+        const text = try std.mem.print(&buf, "[server]\nlisten = [\"127.0.0.1:53\", \"0.0.0.0:5335\", \"[::]:5335\"]\n[resolver]\nstub-zones = [\"internal {s}\"]\n", .{server});
         try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, text));
     }
     var other = try parseConfig(testing.allocator,

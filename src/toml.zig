@@ -44,7 +44,7 @@ pub fn parse(arena: Allocator, input: []const u8) ParseError!Table {
         if (line.len == 0) continue;
 
         if (line[0] == '[') {
-            const close = mem.indexOfScalar(u8, line, ']') orelse return error.InvalidSyntax;
+            const close = mem.findScalar(u8, line, ']') orelse return error.InvalidSyntax;
             const section_name = mem.trim(u8, line[1..close], &std.ascii.whitespace);
 
             if (!isValidBareKey(section_name)) return error.InvalidBareKey;
@@ -57,7 +57,7 @@ pub fn parse(arena: Allocator, input: []const u8) ParseError!Table {
             entry.value_ptr.* = .{ .table = .{ .map = .empty } };
             section = &entry.value_ptr.table.map;
         } else {
-            const eq_pos = mem.indexOfScalar(u8, line, '=') orelse return error.InvalidSyntax;
+            const eq_pos = mem.findScalar(u8, line, '=') orelse return error.InvalidSyntax;
             const key = mem.trim(u8, line[0..eq_pos], &std.ascii.whitespace);
             var raw_val = mem.trim(u8, line[eq_pos + 1 ..], &std.ascii.whitespace);
 
@@ -152,7 +152,7 @@ fn parseString(arena: Allocator, raw: []const u8) ParseError![]const u8 {
 
 /// Only arrays of strings.
 fn parseArray(arena: Allocator, raw: []const u8) ParseError![]const []const u8 {
-    const close = mem.lastIndexOfScalar(u8, raw, ']') orelse return error.InvalidSyntax;
+    const close = mem.findScalarLast(u8, raw, ']') orelse return error.InvalidSyntax;
     // Trailing garbage, as in `key = ["x"] junk`, is a typo, not a comment.
     for (raw[close + 1 ..]) |c| if (!std.ascii.isWhitespace(c)) return error.InvalidSyntax;
     const inner = raw[1..close];

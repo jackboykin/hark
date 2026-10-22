@@ -75,7 +75,7 @@ pub const Sim = struct {
     chaos: ?*chaos.Chaos = null,
     reply_buf: [65535]u8 = undefined,
 
-    pub const Heard = std.AutoArrayHashMapUnmanaged(u64, void);
+    pub const Heard = std.array_hash_map.Auto(u64, void);
 
     pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, seed: u64) !Sim {
         var s: Sim = .{

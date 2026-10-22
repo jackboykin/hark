@@ -2,6 +2,7 @@
 //! messages with their records and EDNS (RFC 6891) parsed and serialized.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
@@ -182,7 +183,7 @@ pub const Name = struct {
     }
 
     pub fn of(wire: []const u8) Name {
-        if (std.debug.runtime_safety) std.debug.assert(canonical(wire));
+        if (builtin.mode.runtimeSafety()) std.debug.assert(canonical(wire));
         return .{ .wire = wire };
     }
 
@@ -2049,7 +2050,7 @@ test "compression past its work budget writes names whole, and they read back" {
     for (&rrs, 0..) |*rr, i| {
         var w: std.ArrayList(u8) = .empty;
         for (0..125) |_| try w.appendSlice(a, "\x01a");
-        const last = try std.fmt.allocPrint(a, "b{d}", .{i});
+        const last = try a.print("b{d}", .{i});
         try w.append(a, @intCast(last.len));
         try w.appendSlice(a, last);
         try w.append(a, 0);
@@ -2330,9 +2331,9 @@ test "typeBitmapContains" {
 
 test "an unnamed wire value prints as its number" {
     var buf: [16]u8 = undefined;
-    try testing.expectEqualStrings("aaaa", try std.fmt.bufPrint(&buf, "{f}", .{tag(RType.aaaa)}));
-    try testing.expectEqualStrings("999", try std.fmt.bufPrint(&buf, "{f}", .{tag(@as(RType, @fromBackingInt(999)))}));
-    try testing.expectEqualStrings("9", try std.fmt.bufPrint(&buf, "{f}", .{tag(@as(RCode, @fromBackingInt(9)))}));
+    try testing.expectEqualStrings("aaaa", try std.mem.print(&buf, "{f}", .{tag(RType.aaaa)}));
+    try testing.expectEqualStrings("999", try std.mem.print(&buf, "{f}", .{tag(@as(RType, @fromBackingInt(999)))}));
+    try testing.expectEqualStrings("9", try std.mem.print(&buf, "{f}", .{tag(@as(RCode, @fromBackingInt(9)))}));
 }
 
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {

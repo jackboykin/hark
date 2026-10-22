@@ -313,7 +313,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
 
     var ns_authorities: [12]dns.ResourceRecord = undefined;
     for (&ns_authorities, 0..) |*rr, i| {
-        const ns_label = try std.fmt.allocPrint(a, "ns{d}.long.example.com.", .{i});
+        const ns_label = try a.print("ns{d}.long.example.com.", .{i});
         const ns_name = try dns.parseDottedName(a, ns_label);
         rr.* = .fixture(.{
             .name = name,

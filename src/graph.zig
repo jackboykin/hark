@@ -613,12 +613,12 @@ pub const Graph = struct {
     /// Work that failed, refused at `demand` rather than tried again
     /// (RFC 9520 §3.2): an upstream fetch, a zone's DS or keys. Policy,
     /// outside cells.
-    failed: std.ArrayHashMapUnmanaged(Key, Refusal, Key.Context, true) = .empty,
+    failed: std.array_hash_map.Custom(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
     /// Live cells by key and instant. An entry is the id alone, so every call is
     /// adapted, and stored hashes spare the map from hashing one.
-    index: std.ArrayHashMapUnmanaged(CellId, void, struct {}, true) = .empty,
+    index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
     ready: std.ArrayList(CellId) = .empty,
     /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,

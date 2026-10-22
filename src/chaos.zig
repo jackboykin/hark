@@ -11,7 +11,7 @@ const na = @import("net_address.zig");
 
 pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep };
 
-pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
+pub const Events = std.array_hash_map.Auto(u64, void);
 
 /// What an event decided about, for a shrunk failure's report.
 pub const About = union(enum) {
@@ -102,9 +102,9 @@ pub const Chaos = struct {
             var buf: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             told.appendAssumeCapacity(switch (about) {
-                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {f})", .{ site, k.kind, k.shown(&nb), dns.tag(k.rtype) }),
-                .server => |s| try std.fmt.allocPrint(c.gpa, "{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
-                .none => try std.fmt.allocPrint(c.gpa, "{t}", .{site}),
+                .key => |k| try c.gpa.print("{t} {t}({s} {f})", .{ site, k.kind, k.shown(&nb), dns.tag(k.rtype) }),
+                .server => |s| try c.gpa.print("{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
+                .none => try c.gpa.print("{t}", .{site}),
             });
         }
         c.left.putAssumeCapacity(event, {});

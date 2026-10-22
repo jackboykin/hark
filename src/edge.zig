@@ -65,7 +65,7 @@ now_ns: i64 = 0,
 wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
-flights: std.AutoArrayHashMapUnmanaged(CellId, Flight) = .empty,
+flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
 /// Events that own nothing.
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,

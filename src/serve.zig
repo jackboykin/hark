@@ -627,7 +627,7 @@ const Server = struct {
         const now = s.e.now_ns;
         summaryLine("total", .{ .now = s.clients, .then = .{}, .ns = now - s.started_ns }, "");
         var rb: [32]u8 = undefined;
-        const rss = std.fmt.bufPrint(&rb, ", rss {d}MiB", .{(rssBytes() orelse 0) >> 20}) catch unreachable;
+        const rss = std.mem.print(&rb, ", rss {d}MiB", .{(rssBytes() orelse 0) >> 20}) catch unreachable;
         summaryLine("window", .{ .now = s.clients, .then = s.window.clients, .ns = now - s.window.at_ns }, rss);
         s.window = .{ .at_ns = now, .clients = s.clients };
     }
@@ -759,7 +759,7 @@ const Server = struct {
             };
             const rcode = served.rcode;
             var rb: [24]u8 = undefined;
-            const outcome = if (rcode == .no_error) "" else std.fmt.bufPrint(&rb, " {f}", .{dns.tag(rcode)}) catch "";
+            const outcome = if (rcode == .no_error) "" else std.mem.print(&rb, " {f}", .{dns.tag(rcode)}) catch "";
             log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
         s.count(served.rcode, served.ede);
@@ -916,7 +916,7 @@ fn logCounts(comptime path: []const u8, v: anytype) void {
         return;
     }
     var buf: [32]u8 = undefined;
-    const text = if (@typeInfo(T) == .@"struct") std.fmt.bufPrint(&buf, "{f}", .{v}) else std.fmt.bufPrint(&buf, "{d}", .{@as(u64, v)});
+    const text = if (@typeInfo(T) == .@"struct") std.mem.print(&buf, "{f}", .{v}) else std.mem.print(&buf, "{d}", .{@as(u64, v)});
     stat(path, text catch unreachable);
 }
 
@@ -934,7 +934,7 @@ fn sum(group: anytype) u64 {
 /// Padded so both lines' figures line up.
 fn summaryLine(comptime what: []const u8, summary: Summary, tail: []const u8) void {
     var buf: [32]u8 = undefined;
-    const head = std.fmt.bufPrint(&buf, what ++ " ({f}):", .{Span{ .ns = summary.ns }}) catch unreachable;
+    const head = std.mem.print(&buf, what ++ " ({f}):", .{Span{ .ns = summary.ns }}) catch unreachable;
     log.info("stats {s: <17}{f}{s}", .{ head, summary, tail });
 }
 

@@ -218,7 +218,7 @@ const Parser = struct {
         if (!mem.startsWith(u8, rest, "hark")) return;
         rest = mem.trimStart(u8, rest[4..], " \t");
         if (rest.len == 0 or rest[0] != ':') return;
-        const eq = mem.indexOfScalar(u8, rest, '=') orelse return p.fail("hark directive without '='");
+        const eq = mem.findScalar(u8, rest, '=') orelse return p.fail("hark directive without '='");
         const key = mem.trim(u8, rest[1..eq], " \t");
         const val = mem.trim(u8, rest[eq + 1 ..], " \t");
         try p.applyDirective(key, val);
@@ -314,9 +314,9 @@ const Parser = struct {
 
     /// Skip the corpus prelude to CONFIG_END, reading the two knobs it sets.
     fn lift(p: *Parser, text: []const u8) Error!void {
-        const end = mem.indexOf(u8, text, "CONFIG_END") orelse return;
+        const end = mem.find(u8, text, "CONFIG_END") orelse return;
         const prelude = text[0..end];
-        if (mem.indexOf(u8, prelude, "server:") == null) return;
+        if (mem.find(u8, prelude, "server:") == null) return;
         if (findKnob(prelude, "qname-minimisation:")) |v| p.scenario.qmin = yes(v);
         if (findKnob(prelude, "minimal-responses:")) |v| p.scenario.minimal_responses = yes(v);
         while (p.lines.next()) |raw| {
@@ -670,7 +670,7 @@ const Parser = struct {
                 continue;
             }
             const start = @intFromPtr(t.ptr) - @intFromPtr(toks.buffer.ptr) + 1;
-            const close = mem.indexOfScalarPos(u8, toks.buffer, start, '"') orelse return p.fail("unterminated quoted string");
+            const close = mem.findScalarPos(u8, toks.buffer, start, '"') orelse return p.fail("unterminated quoted string");
             try strings.append(p.arena, toks.buffer[start..close]);
             toks.index = close + 1;
         }
@@ -781,9 +781,9 @@ fn enumIgnoreCase(comptime E: type, s: []const u8) ?E {
 }
 
 fn findKnob(prelude: []const u8, key: []const u8) ?[]const u8 {
-    const at = mem.indexOf(u8, prelude, key) orelse return null;
+    const at = mem.find(u8, prelude, key) orelse return null;
     const rest = prelude[at + key.len ..];
-    const end = mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const end = mem.findScalar(u8, rest, '\n') orelse rest.len;
     return mem.trim(u8, rest[0..end], " \t\r\"");
 }
 

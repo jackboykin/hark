@@ -28,7 +28,7 @@ fn logFn(
     const md = yd.calculateMonthDay();
 
     var buf: [4096]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z " ++ level.asText() ++ scope_prefix ++ format ++ "\n", .{
+    const line = std.mem.print(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z " ++ level.asText() ++ scope_prefix ++ format ++ "\n", .{
         yd.year,              md.month.numeric(),      @as(u9, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     } ++ args) catch return;

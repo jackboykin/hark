@@ -1308,6 +1308,6 @@ fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const gra
             }
             u.* = true;
         }
-        if (mem.indexOfScalar(bool, &unknown, true) != null) try left.unknown.append(sa, .{ .host = server.key, .families = unknown });
+        if (mem.findScalar(bool, &unknown, true) != null) try left.unknown.append(sa, .{ .host = server.key, .families = unknown });
     }
 }

@@ -39,7 +39,7 @@ pub const Dns64 = struct {
         const v6 = dns64.parseIp6Arpa(q.name) orelse return q;
         if (!d.prefix.contains(&v6)) return q;
         const v4 = d.prefix.extract(&v6);
-        const in_addr = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}.in-addr.arpa.", .{ v4[3], v4[2], v4[1], v4[0] });
+        const in_addr = try arena.print("{d}.{d}.{d}.{d}.in-addr.arpa.", .{ v4[3], v4[2], v4[1], v4[0] });
         return .{ .name = try dns.parseDottedName(arena, in_addr), .qtype = .ptr, .qclass = q.qclass };
     }
 
@@ -636,7 +636,7 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 pub const Failures = struct {
     /// Array-backed: every answer removes, and a tombstoning map's misses
     /// would probe ever longer.
-    map: std.ArrayHashMapUnmanaged([]const u8, Entry, Seeded, true) = .empty,
+    map: std.array_hash_map.Custom([]const u8, Entry, Seeded, true) = .empty,
 
     const Entry = struct { until_ns: i64, window_s: u32, ede: dns.Ede };
     const Seeded = struct {

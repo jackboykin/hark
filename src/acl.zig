@@ -33,9 +33,9 @@ pub const Cidr = struct {
 /// Parse "192.168.1.0/24" or "2001:db8::/32" into a Cidr. Bare addresses
 /// take an implied /32 (v4) or /128 (v6).
 pub fn parse(s: []const u8) ?Cidr {
-    const slash = mem.indexOfScalar(u8, s, '/');
+    const slash = mem.findScalar(u8, s, '/');
     const addr_str = s[0 .. slash orelse s.len];
-    var address: na.Address = if (mem.indexOfScalar(u8, addr_str, ':') != null)
+    var address: na.Address = if (mem.findScalar(u8, addr_str, ':') != null)
         na.initIp6((std.Io.net.Ip6Address.parse(addr_str, 0) catch return null).bytes, 0, 0, 0)
     else
         na.initIp4((std.Io.net.Ip4Address.parse(addr_str, 0) catch return null).bytes, 0);
