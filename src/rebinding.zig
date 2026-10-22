@@ -65,24 +65,29 @@ fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     return true;
 }
 
+/// RFC 9460 §14.3.2.
+const SvcParamKey = enum(u16) { ipv4hint = 4, ipv6hint = 6, _ };
+
 /// SVCB/HTTPS RDATA (RFC 9460 §2.2): SvcPriority u16 · uncompressed
 /// TargetName · SvcParams as (key u16, len u16, value) triples. Scan
-/// ipv4hint (key 4) and ipv6hint (key 6) for blocked addresses.
+/// the ipv4hint and ipv6hint params for blocked addresses.
 ///
 /// Malformation bias follows Unbound's rebinding fix: past the
 /// TargetName, a length overrun is clamped and the bytes inspected
 /// anyway — a lenient client must never out-parse the scrubber. The
-/// TargetName itself is strict: a compression pointer or invalid label
-/// makes the hints unlocatable, so the RR is treated as carrying one.
+/// TargetName itself is strict: one truncated, compressed or with an
+/// invalid label makes the hints unlocatable, so the RR is treated as
+/// carrying one. Rdata too short to begin a TargetName holds nothing a
+/// client could read as an address.
 fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
-    if (rdata.len < 3) return false; // too short to hold an address
-    var pos: usize = 2; // SvcPriority
+    if (rdata.len < 3) return false;
+    var pos: usize = @sizeOf(u16);
     while (true) {
-        if (pos >= rdata.len) return true; // truncated TargetName
+        if (pos >= rdata.len) return true;
         const label_len = rdata[pos];
         pos += 1;
         if (label_len == 0) break;
-        if (label_len > dns.max_label_len) return true; // pointer or junk
+        if (label_len > dns.max_label_len) return true;
         pos += label_len;
     }
     while (pos + 4 <= rdata.len) {
@@ -90,10 +95,10 @@ fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
         const declared_len = mem.readInt(u16, rdata[pos + 2 ..][0..2], .big);
         pos += 4;
         const value = rdata[pos..][0..@min(declared_len, rdata.len - pos)];
-        const addr_size: usize = switch (key) {
-            4 => 4, // ipv4hint
-            6 => 16, // ipv6hint
-            else => 0,
+        const addr_size: usize = switch (@as(SvcParamKey, @fromBackingInt(key))) {
+            .ipv4hint => 4,
+            .ipv6hint => 16,
+            _ => 0,
         };
         var off: usize = 0;
         while (addr_size != 0 and off + addr_size <= value.len) : (off += addr_size) {
