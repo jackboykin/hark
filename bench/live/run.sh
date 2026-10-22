@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage (in nix develop .#bench): run.sh <rounds> <label=side> <label=side> [names] [rate/s]
 # A side is a hark binary or `unbound`. Each round starts both fresh and asks
-# them every name at once, paced open-loop, cold then hot; then compare.py.
+# them every name at once, paced open-loop, cold then hot; then bench compare.
 # Start order alternates by round and ask rotates its send order by name,
 # so neither side always goes first.
 # env: OUT, PASSES (default "cold hot")
@@ -40,4 +40,4 @@ for r in $(seq "$ROUNDS"); do
   wait "${PIDS[@]}" 2>/dev/null
   echo "round $r done"
 done
-python3 "$D/compare.py" "$OUT" "${A%%=*}" "${B%%=*}" | tee "$OUT/compare.txt"
+bench compare "$OUT" "${A%%=*}" "${B%%=*}" | tee "$OUT/compare.txt"

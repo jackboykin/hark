@@ -31,7 +31,7 @@
           packages = with pkgs; [
             nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck strace
             unbound pdns-recursor knot-resolver_6 bind
-            python3 go_1_27 zig_0_17
+            go_1_27 zig_0_17
             self.packages.${pkgs.stdenv.hostPlatform.system}.bench
           ];
         };
