@@ -7,9 +7,9 @@
 # on the resolver core for W (10) s, from outside the namespace (inside it
 # perf_event_open is refused). Sides alternate by round on one core. Then
 # strace -c counts each side's syscalls per query at 1000 qps.
-# Results land in bench/out/sys-*; sys.py reports each side's parts and
+# Results land in bench/out/sys-*; bench sys reports each side's parts and
 # hark's own functions per query, then each side against the first
-# (again: sys.py report <dir> <W>).
+# (again: bench sys report <dir> <W>).
 # Unstripped binaries (-Dstrip=false) name hark's functions.
 set -uo pipefail
 B=$(cd "$(dirname "$0")" && pwd)
@@ -36,9 +36,9 @@ if [[ ! ${SYS_DIR:-} ]]; then
   done
   wait "$inner" || exit 1
   for t in "${tags[@]}"; do
-    perf script -i "$S/$t.data" -F comm,event,period,ip,sym --no-inline 2>/dev/null | python3 "$B/sys.py" fold hark >"$OUT/$t.json"
+    perf script -i "$S/$t.data" -F comm,event,period,ip,sym --no-inline 2>/dev/null | bench sys fold hark >"$OUT/$t.json"
   done
-  python3 "$B/sys.py" report "$OUT" "$W"
+  bench sys report "$OUT" "$W"
   exit
 fi
 
