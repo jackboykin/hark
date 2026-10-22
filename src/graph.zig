@@ -872,26 +872,25 @@ pub const Graph = struct {
                 defer clock.stop();
                 g.tally.parses += 1;
                 const bytes = try arena.dupe(u8, borrowed);
-                var msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
-                if (msg.header.id != sc.id) break :blk .mismatch;
-                dns.validateResponse(msg, sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
+                var p = dns.parse(arena, bytes) catch break :blk .malformed;
+                if (p.header.id != sc.id) break :blk .mismatch;
+                dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // After the match, so a forger gains nothing over a mismatch.
                 if (sc.transport == .udp and bytes.len > dns.edns_udp_payload) break :blk .oversized;
                 // Asked in IN, a record of another class answers nothing.
-                inline for (.{ &msg.answers, &msg.authorities, &msg.additionals }) |section| {
-                    const rrs = @constCast(section.*);
+                inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
                     var n: usize = 0;
-                    for (rrs) |rr| if (rr.rclass == .in) {
-                        rrs[n] = rr;
+                    for (section.*) |rr| if (rr.rclass == .in) {
+                        section.*[n] = rr;
                         n += 1;
                     };
-                    section.* = rrs[0..n];
+                    section.* = section.*[0..n];
                 }
                 const scratch = g.scratch.allocator();
-                msg.answers = try dnssec.bindSets(scratch, @constCast(msg.answers), sc.qtype == .rrsig);
-                msg.authorities = try dnssec.bindSets(scratch, @constCast(msg.authorities), false);
-                msg.additionals = try dnssec.bindSets(scratch, @constCast(msg.additionals), false);
-                break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
+                p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
+                p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
+                p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
+                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns } };
             },
         };
         if (g.cfg.trace) {

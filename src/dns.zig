@@ -1301,12 +1301,31 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
     return list.items;
 }
 
-/// Parse a DNS wire message. Names and rdata alias `bytes`, which must
-/// outlive the Message.
-///
-/// `allocator` must be an arena: nothing in the Message can be freed
-/// piece by piece, on success or on error.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
+    return (try parse(allocator, bytes)).message();
+}
+
+/// A message as parsed: its sections are fresh arrays, the caller's to
+/// trim or reorder before reading them as a `Message`.
+pub const Parsed = struct {
+    header: Header,
+    question: ?Question,
+    answers: []ResourceRecord,
+    authorities: []ResourceRecord,
+    additionals: []ResourceRecord,
+    opt: ?OptRecord,
+
+    pub fn message(p: Parsed) Message {
+        return .{ .header = p.header, .question = p.question, .answers = p.answers, .authorities = p.authorities, .additionals = p.additionals, .opt = p.opt };
+    }
+};
+
+/// Parse a DNS wire message. Names and rdata alias `bytes`, which must
+/// outlive what is parsed.
+///
+/// `allocator` must be an arena: nothing parsed can be freed piece by
+/// piece, on success or on error.
+pub fn parse(allocator: Allocator, bytes: []const u8) Error!Parsed {
     const hdr, var parser, const question = try readHead(allocator, bytes);
 
     // Cap pre-allocation against what the wire can physically contain.
