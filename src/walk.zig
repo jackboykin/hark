@@ -1085,6 +1085,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 // nothing of it.
                 .timeout => a.cut_short = a.cut_short or (!a.retried and ex.scratch.exchange.cut_short),
                 .unsent => a.local = true,
+                // The server's breach: no TCP retry, only a sibling.
+                .oversized => {},
                 // Over TCP a forger cannot follow, and a server that
                 // normalizes case answers; a garbled datagram gets the
                 // same second chance.

@@ -270,6 +270,7 @@ pub const Outcome = union(enum) {
     mismatch,
     /// Does not parse.
     malformed,
+    oversized,
 };
 
 /// Plain goes only over TCP, where a forger cannot follow.
@@ -874,6 +875,8 @@ pub const Graph = struct {
                 var msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
                 if (msg.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
+                // After the match, so a forger gains nothing over a mismatch.
+                if (sc.transport == .udp and bytes.len > dns.edns_udp_payload) break :blk .oversized;
                 // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &msg.answers, &msg.authorities, &msg.additionals }) |section| {
                     const rrs = @constCast(section.*);
