@@ -1004,7 +1004,7 @@ pub fn testSignRrsetBy(
 ) !TestSigned {
     pub_buf.* = kp.public_key.toBytes();
     const dnskey = dns.DnskeyData{
-        .flags = 256, // ZONE, not SEP
+        .flags = dns.DnskeyData.zone_flag,
         .protocol = 3,
         .algorithm = key_algo,
         .public_key = pub_buf,

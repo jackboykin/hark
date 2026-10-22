@@ -30,7 +30,7 @@ pub const Key = struct {
         const pair = try Ecdsa.KeyPair.generateDeterministic(h.finalResult());
         // RFC 6605 §4: the uncompressed point without its 0x04 prefix.
         const sec1 = pair.public_key.toUncompressedSec1();
-        const dnskey: dns.DnskeyData = .{ .flags = 256, .protocol = 3, .algorithm = .ecdsap256sha256, .public_key = try arena.dupe(u8, sec1[1..]) };
+        const dnskey: dns.DnskeyData = .{ .flags = dns.DnskeyData.zone_flag, .protocol = 3, .algorithm = .ecdsap256sha256, .public_key = try arena.dupe(u8, sec1[1..]) };
         const tag = rrsig.keyTag(dnskey);
         return .{
             .zone = zone,

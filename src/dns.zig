@@ -27,14 +27,17 @@ fn Tag(comptime E: type) type {
 }
 
 pub const max_label_len = 63;
-pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
 /// RFC 1035 §3.1, the root's length octet included.
 pub const max_name_wire_len = 255;
+/// Every label one octet long, beside the root's zero.
+pub const max_label_count = (max_name_wire_len - 1) / 2;
 /// Presentation-format ceiling: every content byte can escape to `\DDD`
 /// (4 chars), separators are free relative to the wire length budget.
 pub const max_dotted_len = 4 * max_name_len;
 const header_len = 12;
+/// A root owner, then type, class, TTL and rdlength.
+const min_rr_len = 1 + 2 + 2 + 4 + 2;
 pub const max_udp_payload = 512;
 /// A week (BIND's max-cache-ttl): a chosen 0xFFFFFFFF would outlive its delegation.
 const max_ttl: u32 = 604_800;
@@ -438,8 +441,11 @@ pub const DnskeyData = struct {
     algorithm: DnssecAlgorithm,
     public_key: []const u8,
 
+    /// RFC 4034 §2.1.1: bit 7, counting from the most significant.
+    pub const zone_flag: u16 = 0x100;
+
     pub fn isZoneKey(self: DnskeyData) bool {
-        return (self.flags & 0x100) != 0; // bit 7 (ZONE flag)
+        return self.flags & zone_flag != 0;
     }
 
     /// RFC 5011 §2.1: bit 8 (REVOKE). A revoked key MUST NOT be used to
@@ -673,8 +679,8 @@ fn checkRdata(rtype: RType, d: []const u8) Error!void {
 /// Used by NSEC and NSEC3 records.
 pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
     const type_num = @backingInt(rtype);
-    const window = type_num >> 8; // high byte = window number
-    const bit_offset: u8 = @intCast(type_num & 0xFF); // low byte = offset within window
+    const window = type_num >> 8;
+    const bit_offset: u8 = @intCast(type_num & 0xFF);
     const byte_in_window = bit_offset >> 3;
     const bit_in_byte: u3 = @intCast(bit_offset & 0x07);
 
@@ -695,9 +701,11 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
 
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
 
-pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
+/// RFC 7828.
+pub const edns_opt_tcp_keepalive: u16 = 11;
 
-pub const edns_opt_ede: u16 = 15; // RFC 8914
+/// RFC 8914.
+pub const edns_opt_ede: u16 = 15;
 
 /// RFC 8914 Extended DNS Error.
 pub const Ede = struct {
@@ -1304,7 +1312,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     // Cap pre-allocation against what the wire can physically contain.
     // Prevents a small packet with inflated header counts from triggering
     // a large allocation (counts are attacker-controlled u16, max 65535).
-    const max_rrs = (bytes.len - header_len) / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
+    const max_rrs = (bytes.len - header_len) / min_rr_len;
     const answers = try parseRRSection(allocator, &parser, hdr.an_count, max_rrs, null);
     const authorities = try parseRRSection(allocator, &parser, hdr.ns_count, max_rrs, null);
     var opt: ?OptRecord = null;
@@ -1508,10 +1516,11 @@ pub const Serializer = struct {
     }
 
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
-        try self.writeU8(0); // root name
-        try self.writeU16(41); // type OPT
-        try self.writeU16(opt.udp_payload_size); // class = UDP payload size
-        // TTL = extended_rcode(8) | version(8) | DO(1) | Z(15)
+        try self.writeSlice(Name.root.wire);
+        try self.writeU16(@backingInt(RType.opt));
+        // CLASS carries the payload size (RFC 6891 §6.1.2), and TTL the
+        // extended rcode (8), version (8), DO (1) and Z (15) (§6.1.3).
+        try self.writeU16(opt.udp_payload_size);
         const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
             (@as(u32, opt.version) << 16) |
             (@as(u32, @intFromBool(opt.do_bit)) << 15);
