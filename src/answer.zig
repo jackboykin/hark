@@ -466,8 +466,7 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     // asked for it or its signatures: it goes out once (RFC 2181 §5).
     var once: Seen = .{ .bound = n };
     const repeats = hops.len > 1 and (q.qtype == .dname or q.qtype == .rrsig);
-    for (hops, held) |hop, *h| {
-        h.* = hop.blob.ref();
+    for (hops) |hop| {
         last = hop;
         age = walk.ageOf(hop.rrset.stored_ns, g.now());
         life = hop.life;
@@ -507,6 +506,7 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         .{ .code = code }
     else
         null;
+    for (hops, held) |hop, *h| h.* = hop.blob.ref();
     return .{
         .rcode = r.kind.rcode(),
         .ad = secure and (c.do_bit or c.ad),
