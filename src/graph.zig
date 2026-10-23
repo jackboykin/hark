@@ -1073,12 +1073,17 @@ pub const Graph = struct {
                 defer clock.stop();
                 const blob = try g.store.build(value);
                 c.blob = blob;
-                c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), blob)) };
+                const owned = try c.own(try store.Store.parse(c.arena.allocator(), blob));
+                c.state = .{ .fact = owned };
                 if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
             },
-            .addr, .answer, .exchange, .refresh, .ahead, .parental => c.state = .{ .fact = try c.own(value) },
+            .addr, .answer, .exchange, .refresh, .ahead, .parental => {
+                const owned = try c.own(value);
+                c.state = .{ .fact = owned };
+            },
             .secure => |v| {
-                c.state = .{ .fact = try c.own(value) };
+                const owned = try c.own(value);
+                c.state = .{ .fact = owned };
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
                 const t = c.scratch.secure.target;
                 if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
@@ -1096,7 +1101,8 @@ pub const Graph = struct {
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
         std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.blob.verdict.judged());
         g.tally.settles += 1;
-        c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), v.blob)) };
+        const owned = try c.own(try store.Store.parse(c.arena.allocator(), v.blob));
+        c.state = .{ .fact = owned };
         c.blob = v.blob.ref();
         c.expires_ns = v.life().end_ns;
         try g.woken(id, false);
@@ -1149,7 +1155,8 @@ pub const Graph = struct {
             std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
         }
         if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
-        c.state = .{ .failure = try c.own(why) };
+        const owned = try c.own(why);
+        c.state = .{ .failure = owned };
         c.expires_ns = g.now();
         try g.woken(id, false);
     }
@@ -1338,7 +1345,8 @@ pub const Graph = struct {
         const id = try g.newCell(key, name, g.as_of);
         errdefer g.free(id);
         const c = g.cell(id);
-        c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), e.blob)) };
+        const owned = try c.own(try store.Store.parse(c.arena.allocator(), e.blob));
+        c.state = .{ .fact = owned };
         c.blob = e.blob.ref();
         c.expires_ns = e.expires_ns;
         return id;
