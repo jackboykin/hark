@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -80,3 +81,18 @@ func TestLateUDPIsSilentAndTCPIsAnswered(t *testing.T) {
 		t.Errorf("the remembered failure took %v", d)
 	}
 }
+
+func TestAResetTCPClientLeavesTheLoopFree(t *testing.T) {
+	t.Parallel()
+	_, h := launchText(t, twoSilent, func(c *config) { c.serveStaleTTL = 60 })
+	c := dial(t, h)
+	send(t, c, framed(t, "a.example.com.", 1))
+	time.Sleep(200 * time.Millisecond)
+	if err := c.(*net.TCPConn).SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	time.Sleep(2200 * time.Millisecond)
+	wantRcode(t, h.addr, "after.invalid.", dns.RcodeNameError, time.Second)
+}
+

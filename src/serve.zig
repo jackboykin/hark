@@ -610,8 +610,9 @@ const Server = struct {
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
     /// the resolution goes on without it.
     fn impatient(s: *Server, p: *Pending) !bool {
-        if (left(p.*) or p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
+        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
         p.stale_tried = true;
+        if (left(p.*)) return false;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = p.query;
