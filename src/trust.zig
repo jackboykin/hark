@@ -338,7 +338,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
         return sid;
     };
     try g.pin(rid, sid);
-    try g.ready.append(g.gpa, sid);
+    try g.enqueue(sid);
     return sid;
 }
 

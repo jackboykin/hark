@@ -619,7 +619,7 @@ pub const Graph = struct {
     /// Live cells by key and instant. An entry is the id alone, so every call is
     /// adapted, and stored hashes spare the map from hashing one.
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
-    ready: std.ArrayList(CellId) = .empty,
+    ready: std.ArrayList(Queued) = .empty,
     /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,
     /// Per-server estimate, capped.
@@ -715,7 +715,7 @@ pub const Graph = struct {
         const id = try g.newRoot(key, name, 0, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
-        try g.ready.append(g.gpa, id);
+        try g.enqueue(id);
         return id;
     }
 
@@ -740,7 +740,7 @@ pub const Graph = struct {
         g.payer.refs += 1;
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
-        try g.ready.append(g.gpa, id);
+        try g.enqueue(id);
         g.stats.resolver.detail.ahead += 1;
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         if (g.cfg.trace) std.debug.print("  ahead {s} {f}\n", .{ key.shown(&nb), dns.tag(key.rtype) });
@@ -768,26 +768,29 @@ pub const Graph = struct {
         if (g.cfg.trace) std.debug.print("  refresh {s} {f} in {d} ms\n", .{ key.shown(&nb), dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
     }
 
+    const Queued = struct { id: CellId, gen: u32 };
+
+    pub fn enqueue(g: *Graph, id: CellId) !void {
+        try g.ready.append(g.gpa, .{ .id = id, .gen = g.gen(id) });
+    }
+
     pub fn drain(g: *Graph) !void {
-        while (try g.nextReady()) |id| try g.run(id);
+        while (try g.nextReady()) |q| if (g.gen(q.id) == q.gen) try g.run(q.id);
     }
 
     /// A cell with nothing left to run goes first: its slot may hold no key.
     /// Among two or more, every priority drawn is a decision, the LIFO
     /// top's too: replayed without it, another cell would win.
-    fn nextReady(g: *Graph) !?CellId {
+    fn nextReady(g: *Graph) !?Queued {
         const ch = g.chaosAt(.settle) orelse return g.ready.pop();
         const n = g.ready.items.len;
         if (n == 0) return null;
-        for (g.ready.items, 0..) |id, i| {
-            const c = g.alive(id) orelse return g.ready.orderedRemove(i);
-            if (c.settled()) return g.ready.orderedRemove(i);
-        }
+        for (g.ready.items, 0..) |q, i| if (g.gen(q.id) != q.gen or g.cell(q.id).settled()) return g.ready.orderedRemove(i);
         var pick = n - 1;
         if (n > 1) {
             var top: u64 = 0;
-            for (g.ready.items, 0..) |id, i| {
-                const key = g.cell(id).key;
+            for (g.ready.items, 0..) |q, i| {
+                const key = g.cell(q.id).key;
                 const draw = try ch.choose(.settle, ch.peek(.settle, key), std.math.maxInt(u64), .{ .key = key });
                 if (draw >= top) {
                     pick = i;
@@ -795,9 +798,9 @@ pub const Graph = struct {
                 }
             }
         }
-        const id = g.ready.orderedRemove(pick);
-        try ch.spend(.settle, g.cell(id).key);
-        return id;
+        const q = g.ready.orderedRemove(pick);
+        try ch.spend(.settle, g.cell(q.id).key);
+        return q;
     }
 
     /// Null outside tests, so serve's every site folds to hark's own.
@@ -855,7 +858,7 @@ pub const Graph = struct {
                 // A refresh's budget runs from its first wake.
                 const c = g.cell(id);
                 if (c.key.kind == .refresh and c.scratch.answer.budget.deadline_ns == 0) c.scratch.answer.budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
-                try g.ready.append(g.gpa, id);
+                try g.enqueue(id);
             }
             return g.drain();
         }
@@ -1164,7 +1167,7 @@ pub const Graph = struct {
     fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
         const c = g.cell(id);
         var it = c.waiterIds();
-        while (it.next()) |w| try g.ready.append(g.gpa, w);
+        while (it.next()) |w| try g.enqueue(w);
         if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
         // An answer serves from its hops; everything else has copied out.
         if (!keep_inputs) g.unpinAll(c);
@@ -1450,7 +1453,7 @@ pub const Graph = struct {
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name, g.as_of);
         try g.pin(id, by);
-        if (try g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
+        if (try g.refused(key)) |why| try g.fail(id, why) else try g.enqueue(id);
         return id;
     }
 
@@ -1603,7 +1606,7 @@ pub const Graph = struct {
     /// Held for the run: what it publishes may settle and free its own
     /// readers while the rule still has the cell in hand.
     fn run(g: *Graph, id: CellId) !void {
-        const c = g.alive(id) orelse return;
+        const c = g.cell(id);
         if (c.settled()) return;
         c.holds += 1;
         defer {
@@ -1753,6 +1756,24 @@ test "a cell replacing an expired one keeps the index entry when the old one goe
     try testing.expect(g.alive(first) == null);
     try testing.expectEqual(second, g.indexed(Key.of(.answer, name, .a)).?);
     g.unhold(second);
+}
+
+test "a cell freed while queued leaves its slot's next tenant waiting" {
+    const testing = std.testing;
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const name = try dns.parseDottedName(arena.allocator(), "example.");
+    const gone = try g.demandRoot(name, .a, .new);
+    g.unhold(gone);
+    try testing.expect(g.alive(gone) == null);
+    try g.refresh(Key.of(.answer, name, .a), name, q.now + 60 * std.time.ns_per_s);
+    const tenant = g.alive(gone).?;
+    try testing.expectEqual(.refresh, tenant.key.kind);
+    try g.drain();
+    try testing.expect(!tenant.settled());
 }
 
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
