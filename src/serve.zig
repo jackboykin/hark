@@ -278,8 +278,8 @@ const Server = struct {
             const c = try s.gpa.create(Conn);
             c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
-            try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
             s.conns += 1;
+            try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
         }
     }
 
