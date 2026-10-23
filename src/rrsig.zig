@@ -137,7 +137,7 @@ pub const VerifyMemo = struct {
                 return true;
             }
             if (mem.eql(u8, &s.ways[1], t)) {
-                s.ways = .{ t.*, s.ways[0] };
+                mem.swap(Tag, &s.ways[0], &s.ways[1]);
                 m.hits += 1;
                 return true;
             }
@@ -149,7 +149,8 @@ pub const VerifyMemo = struct {
     fn remember(m: *VerifyMemo, t: *const Tag) void {
         if (m.sets.len == 0) return;
         const s = m.set(t);
-        s.ways = .{ t.*, s.ways[0] };
+        s.ways[1] = s.ways[0];
+        s.ways[0] = t.*;
     }
 };
 
@@ -705,6 +706,18 @@ test "VerifyMemo: a remembered signature binds its key and still expires" {
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, &recs, now, &budget, &memo));
     try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, &recs, signed.rrsig.sig_expiration + 1, &budget, &memo));
     try testing.expectEqual(1, memo.hits);
+}
+
+test "VerifyMemo: a set holds its two newest tags" {
+    var memo: VerifyMemo = try .init(testing.allocator);
+    defer memo.deinit(testing.allocator);
+    const a: VerifyMemo.Tag = @splat(1);
+    var b = a;
+    b[31] = 2;
+    memo.remember(&a);
+    memo.remember(&b);
+    try testing.expect(memo.recall(&a));
+    try testing.expect(memo.recall(&b));
 }
 
 test "invalid key sizes are rejected" {
