@@ -1,7 +1,12 @@
 package harness
 
 import (
+	"bytes"
+	"fmt"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,3 +101,33 @@ func TestAResetTCPClientLeavesTheLoopFree(t *testing.T) {
 	wantRcode(t, h.addr, "after.invalid.", dns.RcodeNameError, time.Second)
 }
 
+func TestAHalfClosedClientIdlesTheLoop(t *testing.T) {
+	t.Parallel()
+	_, h := launchText(t, twoSilent, nil)
+	c := dial(t, h)
+	send(t, c, framed(t, "a.example.com.", 1))
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	before := cpuTicks(t, h)
+	time.Sleep(time.Second)
+	if spent := cpuTicks(t, h) - before; spent > 20 {
+		t.Errorf("hark spent %d ticks of a 100-tick second waiting", spent)
+	}
+	if _, err := readFrame(c); err != nil {
+		t.Errorf("want an answer, got %v", err)
+	}
+}
+
+func cpuTicks(t *testing.T, h *hark) int {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", h.cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := strings.Fields(string(b[bytes.LastIndexByte(b, ')')+1:]))
+	utime, _ := strconv.Atoi(f[11])
+	stime, _ := strconv.Atoi(f[12])
+	return utime + stime
+}

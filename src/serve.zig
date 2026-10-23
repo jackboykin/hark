@@ -300,7 +300,8 @@ const Server = struct {
         }
         if (rc == 0) {
             c.eof = true;
-            if (c.owed == 0) s.drop(c);
+            if (c.owed == 0) return s.drop(c);
+            s.e.rewatch(c.fd, c.token, 0) catch s.drop(c);
             return;
         }
         // Only a whole frame resets the idle clock.
@@ -811,7 +812,7 @@ const Server = struct {
         mem.copyForwards(u8, c.out.items, c.out.items[n..]);
         c.out.shrinkRetainingCapacity(c.out.items.len - n);
         if (c.out.items.len != 0) return;
-        s.e.rewatch(c.fd, c.token, linux.EPOLL.IN) catch return s.drop(c);
+        s.e.rewatch(c.fd, c.token, if (c.eof) 0 else linux.EPOLL.IN) catch return s.drop(c);
         if (c.eof and c.owed == 0) return s.drop(c);
         try s.frames(c);
     }
