@@ -36,6 +36,9 @@ pub const Report = struct {
     heard: sim.Sim.Heard = .empty,
     departed: u32 = 0,
     compared: u32 = 0,
+    /// Chaos limited an answer the reference did not, so hark never heard
+    /// what that answer would have held.
+    starved: bool = false,
     fired: Fired = .initFill(0),
     /// The chaos decisions that left hark's own, and under `tell`, named.
     left: chaos.Events = .empty,
@@ -271,7 +274,10 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
         return error.ScenarioFailed;
     };
     // A limit may only make its own answer fail.
-    if (limited or ref.limited) return;
+    if (limited or ref.limited) {
+        report.starved = report.starved or (limited and !ref.limited);
+        return;
+    }
     if (s.departed) {
         report.departed += 1;
         return;
@@ -282,6 +288,8 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
     const actual = sent.?.msg;
     // What chaos forgot may fail any later answer of its own.
     if (s.chaos.?.forgot and actual.header.flags.rcode == .server_failure) return;
+    // Nor is there anything stale of what a limit kept chaos from hearing.
+    if (report.starved and actual.header.flags.rcode == .server_failure and says(want, .stale_answer)) return;
     report.compared += 1;
     if (messageMismatch(actual, want)) |why| {
         std.debug.print("  chaos's answer, then the reference's:\n", .{});
@@ -292,10 +300,10 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
     }
 }
 
-fn synthesized(m: dns.Message) bool {
+fn says(m: dns.Message, code: dns.Ede.Code) bool {
     const opt = m.opt orelse return false;
     for (opt.options) |o| if (o.code == dns.edns_opt_ede and o.data.len >= 2 and
-        mem.readInt(u16, o.data[0..2], .big) == @backingInt(dns.Ede.Code.synthesized)) return true;
+        mem.readInt(u16, o.data[0..2], .big) == @backingInt(code)) return true;
     return false;
 }
 
@@ -315,7 +323,7 @@ fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
     if (af.rcode != wf.rcode) return "chaos moved the rcode";
     if (af.aa != wf.aa or af.tc != wf.tc or af.ad != wf.ad or af.ra != wf.ra) return "chaos moved the flags";
     if (!sectionEql(actual.answers, want.answers, false)) return "chaos moved the ANSWER";
-    const relayed = !synthesized(actual) and !synthesized(want);
+    const relayed = !says(actual, .synthesized) and !says(want, .synthesized);
     if (relayed and !sectionEql(actual.authorities, want.authorities, false)) return "chaos moved the AUTHORITY";
     if (!sectionEql(actual.additionals, want.additionals, false)) return "chaos moved the ADDITIONAL";
     if (af.rcode != .server_failure) return null;
