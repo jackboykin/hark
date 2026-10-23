@@ -929,7 +929,7 @@ pub const Graph = struct {
         errdefer g.work.allocator().destroy(b);
         b.* = budget;
         // Under chaos, spent in part before it starts.
-        b.queries += @intCast(try g.decide(.budget, key, g.cfg.max_queries + 1));
+        b.queries += @intCast(try g.decide(.budget, key, @as(u64, g.cfg.max_queries) + 1));
         const v = &b.validation;
         v.max_sig_verify -= @intCast(try g.decide(.budget, key, v.max_sig_verify + 1));
         v.max_nsec3_blocks -= @intCast(try g.decide(.budget, key, v.max_nsec3_blocks + 1));
