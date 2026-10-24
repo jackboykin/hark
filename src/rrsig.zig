@@ -261,15 +261,11 @@ pub fn verifyRrsig(
     // RFC 4035 §5.3.1; else an RRSIG naming a weaker algorithm hands the key to that verifier.
     if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
 
-    // RFC 4034 §3.1.3: signer name MUST be a (non-strict) ancestor of every
-    // RRset owner, and `labels` MUST NOT exceed the owner's label count nor
-    // fall below the signer's: fewer means the wildcard that signed sits above
-    // the zone. Owner-vs-signer is also checked at the resolver layer (bailiwick
-    // scrubbing); enforcing here defends future callers from missing it.
-    if (rrsig.labels < rrsig.signer_name.depth()) return error.InvalidSignature;
     for (rrset) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.depth()) return error.InvalidSignature;
+        // An expansion's wildcard must sit in the signer's zone: its key speaks for none above.
+        if (rrsig.labels < signedLabels(rr.name) and rrsig.labels < rrsig.signer_name.depth()) return error.InvalidSignature;
     }
 
     // An SOA or NS RRset *defines* the name it sits at: SOA marks an apex, and
@@ -915,20 +911,37 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
     try testing.expect(budget.stopped == .verify);
 }
 
-test "verifyRrsig rejects labels below the signer's label count" {
-    // `*.com` cannot sign inside example.com: the wildcard that generated the
-    // owner would sit above the zone. Unbound: "RRSIG label count too low for signer".
-    const owner = dns.Name.lit("foo.example.com");
-    const recs = [_]dns.ResourceRecord{
-        .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
+test "verifyRrsig takes an expansion only from a wildcard inside the signer's zone" {
+    const Case = struct { owner: []const u8, signer: []const u8, labels: u8, ok: bool };
+    const cases = [_]Case{
+        .{ .owner = "foo.example.com", .signer = "example.com", .labels = 2, .ok = true },
+        .{ .owner = "foo.example.com", .signer = "example.com", .labels = 1, .ok = false },
+        .{ .owner = "foo.example.com", .signer = "example.com", .labels = 0, .ok = false },
+        .{ .owner = "*.example", .signer = "*.example", .labels = 1, .ok = true },
+        .{ .owner = "x.*.example", .signer = "*.example", .labels = 1, .ok = false },
+        .{ .owner = "x.*.example", .signer = "*.example", .labels = 2, .ok = true },
     };
-    var sig_buf: [64]u8 = undefined;
-    var pub_buf: [32]u8 = undefined;
-    var signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_buf, &pub_buf);
-    var budget: ValidationBudget = .{};
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
-    signed.rrsig.labels = 1;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
+    const kp = Ed25519.KeyPair.generate(testing.io);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (cases) |c| {
+        const owner = try dns.parseDottedName(arena.allocator(), c.owner);
+        const signer = try dns.parseDottedName(arena.allocator(), c.signer);
+        const recs = [_]dns.ResourceRecord{
+            .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
+        };
+        var sig_buf: [64]u8 = undefined;
+        var pub_buf: [32]u8 = undefined;
+        var signed = try testSignRrsetBy(kp, &recs, .a, signer, .ed25519, &sig_buf, &pub_buf);
+        signed.rrsig.labels = c.labels;
+        const data = try buildSignedData(signed.rrsig, &recs);
+        var sig = try kp.signer(null, testing.io);
+        data.feed(&sig);
+        sig_buf = sig.finalize().toBytes();
+        var budget: ValidationBudget = .{};
+        const got = verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
+        if (c.ok) try got else try testing.expectError(error.InvalidSignature, got);
+    }
 }
 
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
