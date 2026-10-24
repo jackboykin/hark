@@ -637,7 +637,8 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
-                        const reply = try trust.referralDs(g, msg, zone, name);
+                        // No proof is no fact to keep.
+                        const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .aa = true, .target = name, .zone = zone, .stored_ns = g.now() };
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     s.ask.reset(ref.zone_cut);
@@ -816,8 +817,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     try g.publish(Key.of(.cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchors != null) {
-        const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-        if (ds.ttl > 0) try g.publish(Key.of(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
+        if (try trust.referralDs(g, msg, zone, ref.zone_cut)) |ds| try g.publish(Key.of(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
         // A signed delegation from a zone signed all the way down: whatever
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
