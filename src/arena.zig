@@ -1,14 +1,14 @@
 //! A bump arena for one thread, its chunks linked newest first.
+child: Allocator,
+at: usize = 0,
+foot: ?*Foot = null,
+
 const Arena = @This();
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Alignment = mem.Alignment;
 const testing = std.testing;
-
-child: Allocator,
-at: usize = 0,
-foot: ?*Foot = null,
 
 /// Each chunk ends in its foot, and the arena points at the newest, so an
 /// allocation that fits touches the arena alone.

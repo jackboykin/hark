@@ -1,5 +1,24 @@
 //! The live edge: one epoll, a socket per exchange, a timer heap.
 //! Listener fds ride the same epoll under a token.
+gpa: Allocator,
+/// TCP buffers are work in progress: the graph's `Work` counts them.
+work: Allocator,
+epfd: posix.fd_t,
+now_ns: i64 = 0,
+wall_sec: i64 = 0,
+timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
+seq: u32 = 0,
+flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
+/// Events that own nothing.
+queue: std.ArrayList(Event) = .empty,
+head: usize = 0,
+/// A reply is read only when its turn comes, so the consumer may stop at
+/// any event.
+batch: [64]linux.epoll_event = undefined,
+batch_len: usize = 0,
+batch_at: usize = 0,
+rx: [dns.max_message_len]u8 = undefined,
+
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -56,25 +75,6 @@ const Tcp = struct {
 
 /// Tells a token from a cell id.
 const client_tag: u64 = 1 << 32;
-
-gpa: Allocator,
-/// TCP buffers are work in progress: the graph's `Work` counts them.
-work: Allocator,
-epfd: posix.fd_t,
-now_ns: i64 = 0,
-wall_sec: i64 = 0,
-timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
-seq: u32 = 0,
-flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
-/// Events that own nothing.
-queue: std.ArrayList(Event) = .empty,
-head: usize = 0,
-/// A reply is read only when its turn comes, so the consumer may stop at
-/// any event.
-batch: [64]linux.epoll_event = undefined,
-batch_len: usize = 0,
-batch_at: usize = 0,
-rx: [dns.max_message_len]u8 = undefined,
 
 pub fn init(gpa: Allocator) !Edge {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);

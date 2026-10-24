@@ -1,5 +1,13 @@
 //! UDP by the batch: the datagrams already queued, received or sent in one
 //! syscall. Nothing waits to fill a batch.
+hdrs: [max]linux.mmsghdr,
+iovs: [max]posix.iovec,
+addrs: [max]na.PosixAddress,
+bytes: []u8,
+size: usize,
+n: usize = 0,
+fd: posix.fd_t = -1,
+
 const Batch = @This();
 const std = @import("std");
 const linux = std.os.linux;
@@ -11,14 +19,6 @@ const sys = @import("sys_union.zig");
 /// A syscall a datagram pays the kernel's entry and exit each time; eight
 /// to a call takes most of the saving.
 pub const max = 8;
-
-hdrs: [max]linux.mmsghdr,
-iovs: [max]posix.iovec,
-addrs: [max]na.PosixAddress,
-bytes: []u8,
-size: usize,
-n: usize = 0,
-fd: posix.fd_t = -1,
 
 /// Its headers point into it, so a batch lives on the heap and never moves.
 pub fn create(gpa: Allocator, size: usize) !*Batch {

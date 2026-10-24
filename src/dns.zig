@@ -1408,11 +1408,12 @@ fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
 /// A candidate entry spends its label count from `work`; once gone, names go
 /// out whole (Unbound CVE-2024-8508: labels² × entries per name).
 pub const NameTable = struct {
-    /// A name written at `offset`, `labels` long.
-    const Entry = struct { offset: u16, labels: u8 };
     entries: [64]Entry = undefined,
     len: usize = 0,
     work: u32 = 1 << 16,
+
+    /// A name written at `offset`, `labels` long.
+    const Entry = struct { offset: u16, labels: u8 };
 
     /// `suffix` is an uncompressed wire name `labels` long; `out` holds
     /// every entry's name.

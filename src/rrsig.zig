@@ -169,14 +169,14 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
 /// the RRset in canonical form sorted by RDATA. A record's rdata is kept
 /// canonical, so it is fed as it stands.
 pub const SignedData = struct {
-    pub const max_entries = 64;
-
     header: [18 + dns.max_name_wire_len]u8 = undefined,
     header_len: usize,
     labels: u8 = 0,
     original_ttl: u32 = 0,
     records: [max_entries]dns.ResourceRecord = undefined,
     len: usize = 0,
+
+    pub const max_entries = 64;
 
     fn raw(bytes: []const u8) SignedData {
         var d: SignedData = .{ .header_len = bytes.len };
