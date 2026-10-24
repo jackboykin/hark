@@ -698,7 +698,7 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     }
     var ttl: u32 = std.math.maxInt(u32);
     var proofs: std.ArrayList(RR) = .empty;
-    for (msg.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype) {
+    for (msg.authorities) |rr| switch (dnssec.covers(rr)) {
         .nsec, .nsec3 => {
             try proofs.append(g.scratch.allocator(), rr);
             if (rr.rtype != .rrsig) ttl = @min(ttl, rr.ttl);

@@ -985,7 +985,7 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
         life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);
     };
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
-    for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype) {
+    for (rrs) |rr| switch (dnssec.covers(rr)) {
         .soa => if (zone) |z| if (rr.name.eql(z)) {
             var levelled = rr;
             levelled.ttl = @min(rr.ttl, life);
