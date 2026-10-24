@@ -1011,7 +1011,7 @@ const Percent = struct {
 
 fn rssBytes() ?u64 {
     var buf: [128]u8 = undefined;
-    const rc = linux.open("/proc/self/statm", .{}, 0);
+    const rc = linux.open("/proc/self/statm", .{ .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: posix.fd_t = @intCast(rc);
     defer sys.close(fd);
@@ -1035,7 +1035,7 @@ fn crowdedQueue(fd: posix.fd_t) bool {
 
 fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
     const af = na.afU32(addr);
-    const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK, 0);
+    const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(sock);
     const one: c_int = 1;
     // V6ONLY keeps the families disjoint: the ACL is family-strict, and a
@@ -1060,7 +1060,7 @@ fn signalFd() !posix.fd_t {
     linux.sigaddset(&mask, linux.SIG.TERM);
     linux.sigaddset(&mask, linux.SIG.HUP);
     linux.sigaddset(&mask, linux.SIG.USR1);
-    const fd = try sys_linux.signalfd(-1, &mask, linux.SFD.NONBLOCK);
+    const fd = try sys_linux.signalfd(-1, &mask, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
     return fd;
 }
