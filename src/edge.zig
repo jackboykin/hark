@@ -124,13 +124,8 @@ fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
 }
 
 fn send(e: *Edge, ex: Exchange) !void {
-    var flight = e.open(ex) catch |err| {
-        const completion: Completion = switch (err) {
-            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources, error.OutOfMemory, error.WouldBlock, error.EpollCtlFailed => .unsent,
-            // Unreachable from here: the server's to answer for.
-            else => .timeout,
-        };
-        return e.push(.{ .exchange = .{ .id = ex.id, .completion = completion } });
+    var flight = e.open(ex) catch {
+        return e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
     };
     flight.seq = e.seq + 1;
     try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);

@@ -67,8 +67,8 @@ pub const Completion = union(enum) {
     /// Borrowed for the call: the cell parses its own copy.
     reply: []const u8,
     timeout,
-    /// Never left the host: out of sockets, buffers or memory. Says
-    /// nothing about the server.
+    /// Never left the host: out of sockets, buffers or memory, or no
+    /// route there. Says nothing about the server.
     unsent,
     /// Run again at this time; carries the cell's generation, since ids recycle.
     wake: u32,
