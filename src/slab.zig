@@ -148,6 +148,7 @@ pub const Reserve = struct {
         const head = start - @intFromPtr(raw.ptr);
         if (head > 0) posix.munmap(raw[0..head]);
         if (region_len - head > 0) posix.munmap(@alignCast(raw[head + region_len ..]));
+        posix.madvise(@ptrFromInt(start), region_len, std.os.linux.MADV.NOHUGEPAGE) catch {};
         const region: *Region = @ptrFromInt(start);
         region.* = .{ .slabs = @splat(.{}), .older = r.newest };
         r.newest = region;
