@@ -57,6 +57,9 @@ const Conn = struct {
 const Reply = union(enum) {
     udp: struct { fd: posix.fd_t, addr: na.Address },
     tcp: *Conn,
+    /// Its TCP connection closed; `drop` left it the UDP timeout to keep
+    /// its resolution wanted. Never answered.
+    left,
 };
 
 const Watched = union(enum) {
@@ -348,7 +351,7 @@ const Server = struct {
 
     fn drop(s: *Server, c: *Conn) void {
         if (c.owed > 0) for (s.pending.items) |*p| if (p.live and p.reply == .tcp and p.reply.tcp == c) {
-            p.reply = .{ .udp = .{ .fd = -1, .addr = c_addr_none } };
+            p.reply = .left;
         };
         sys.close(c.fd);
         s.watched.items[c.token & slot_mask].w = .free;
@@ -358,7 +361,6 @@ const Server = struct {
         s.gpa.destroy(c);
     }
 
-    const c_addr_none = na.initIp4(.{ 0, 0, 0, 0 }, 0);
     const client_sndbuf: c_int = 64 * 1024;
 
     fn sweep(s: *Server) void {
@@ -502,7 +504,7 @@ const Server = struct {
 
     fn ready(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
-        if (left(p.*)) {
+        if (p.reply == .left) {
             s.clients.unanswered.late += 1;
             return s.vacate(i);
         }
@@ -566,7 +568,7 @@ const Server = struct {
         const p = &s.pending.items[i];
         p.at_ns = if (!p.stale_tried and s.desk.retention.serve_stale_ttl != 0)
             patience(p.*)
-        else if (p.reply == .udp and s.e.now_ns < timeout(p.*))
+        else if (p.reply != .tcp and s.e.now_ns < timeout(p.*))
             timeout(p.*)
         else
             return;
@@ -578,7 +580,7 @@ const Server = struct {
     /// there is room for it (`reap`).
     fn gone(s: *Server, i: u32) !bool {
         const p = s.pending.items[i];
-        if (p.reply != .udp or s.e.now_ns < timeout(p)) return false;
+        if (p.reply == .tcp or s.e.now_ns < timeout(p)) return false;
         if (s.g.cell(p.a orelse p.root).holds == 1) {
             // Each is done within its resolution's deadline: the front goes stale first.
             while (s.late.front()) |l| if (s.parkedAs(l) == null) {
@@ -614,7 +616,7 @@ const Server = struct {
     fn impatient(s: *Server, p: *Pending) !bool {
         if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
         p.stale_tried = true;
-        if (left(p.*)) return false;
+        if (p.reply == .left) return false;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = p.query;
@@ -659,12 +661,6 @@ const Server = struct {
             .parked = parked,
             .work = Kib{ .bytes = g.work.bytes },
         });
-    }
-
-    /// Its TCP connection closed; `drop` left it the UDP timeout to keep
-    /// its resolution wanted.
-    fn left(p: Pending) bool {
-        return p.reply == .udp and p.reply.udp.fd == -1;
     }
 
     fn patience(p: Pending) i64 {
@@ -746,6 +742,7 @@ const Server = struct {
                 break :blk @min(@max(claimed, dns.max_udp_payload), s.cfg.max_udp_payload);
             },
             .tcp => dns.max_message_len,
+            .left => unreachable,
         };
         var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
@@ -759,6 +756,7 @@ const Server = struct {
             const peer = switch (reply) {
                 .udp => |u| u.addr,
                 .tcp => |c| c.addr,
+                .left => unreachable,
             };
             const rcode = served.rcode;
             var rb: [24]u8 = undefined;
@@ -778,14 +776,16 @@ const Server = struct {
 
     fn room(s: *Server, reply: Reply, frame: []u8) []u8 {
         return switch (reply) {
-            .udp => |u| if (u.fd < 0) frame[2..] else s.out.next(u.fd),
+            .udp => |u| s.out.next(u.fd),
             .tcp => frame[2..],
+            .left => unreachable,
         };
     }
 
     fn write(s: *Server, reply: Reply, frame: []u8, len: usize) void {
         switch (reply) {
-            .udp => |u| if (u.fd >= 0) s.out.push(len, &u.addr),
+            .udp => |u| s.out.push(len, &u.addr),
+            .left => unreachable,
             .tcp => |c| {
                 const framed = frame[0 .. 2 + len];
                 mem.writeInt(u16, framed[0..2], @intCast(len), .big);
