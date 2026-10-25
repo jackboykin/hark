@@ -39,6 +39,7 @@ type config struct {
 	cacheSize, tcpIdleMs int
 	allowFrom            []string
 	nofile               int
+	listenAny            bool
 }
 
 type stubZone struct {

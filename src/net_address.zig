@@ -130,6 +130,13 @@ pub fn fromSockaddr(sa: *const PosixAddress) Address {
     };
 }
 
+/// The wildcard: a socket bound to it takes every address of its family.
+pub fn isUnspecified(addr: Address) bool {
+    return switch (addr) {
+        inline else => |a| mem.allEqual(u8, &a.bytes, 0),
+    };
+}
+
 pub fn afU32(addr: Address) u32 {
     return switch (addr) {
         .ip4 => posix.AF.INET,

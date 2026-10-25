@@ -51,14 +51,18 @@ func startHark(ctx context.Context, t *testing.T, bin string, sc *scenario, port
 			return nil, err
 		}
 		h := &hark{addr: listen, logPath: filepath.Join(dir, "hark.log"), done: make(chan struct{})}
+		at := listen
+		if sc.config.listenAny {
+			at = netip.AddrPortFrom(netip.IPv4Unspecified(), listen.Port())
+		}
 		cfg := filepath.Join(dir, "hark.toml")
-		if err := os.WriteFile(cfg, []byte(sc.config.toml(listen, port, sc.rootHints, anchor)), 0o644); err != nil {
+		if err := os.WriteFile(cfg, []byte(sc.config.toml(at, port, sc.rootHints, anchor)), 0o644); err != nil {
 			return nil, err
 		}
 		if err := h.start(ctx, bin, cfg, sc.config.nofile); err != nil {
 			return nil, err
 		}
-		err = h.ready()
+		err = h.ready(at)
 		if err != nil && h.exited() && strings.Contains(h.log(), "AddressInUse") {
 			handed.Delete(listen)
 			continue
@@ -111,8 +115,8 @@ func (h *hark) start(ctx context.Context, bin, cfg string, nofile int) error {
 
 // A probe of the port could reach another test's freePort before hark
 // binds.
-func (h *hark) ready() error {
-	said := "listening on " + h.addr.String()
+func (h *hark) ready(at netip.AddrPort) error {
+	said := "listening on " + at.String()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
 		if h.exited() {
 			return fmt.Errorf("hark exited early (%v); log:\n%s", h.cmd.ProcessState, h.log())

@@ -56,6 +56,8 @@ const Conn = struct {
 
 const Reply = union(enum) {
     udp: struct { fd: posix.fd_t, addr: na.Address },
+    /// It leaves from the address its query was sent to.
+    wildcard: struct { fd: posix.fd_t, addr: na.Address, local: Batch.Local },
     tcp: *Conn,
     /// Its TCP connection closed; `drop` left it the UDP timeout to keep
     /// its resolution wanted. Never answered.
@@ -64,6 +66,8 @@ const Reply = union(enum) {
 
 const Watched = union(enum) {
     udp: posix.fd_t,
+    /// A UDP listener on every address of its family.
+    wildcard: posix.fd_t,
     listen: posix.fd_t,
     conn: *Conn,
     signal: posix.fd_t,
@@ -211,7 +215,7 @@ const Server = struct {
 
     fn listen(s: *Server, addr: na.Address) !void {
         const udp = try listenOn(addr, posix.SOCK.DGRAM);
-        try s.e.watch(udp, try s.token(.{ .udp = udp }), linux.EPOLL.IN);
+        try s.e.watch(udp, try s.token(if (na.isUnspecified(addr)) .{ .wildcard = udp } else .{ .udp = udp }), linux.EPOLL.IN);
         const tcp = try listenOn(addr, posix.SOCK.STREAM);
         // Edge-triggered, so a paused listener doesn't spin the loop; `reopen`
         // drains what queued meanwhile.
@@ -225,7 +229,8 @@ const Server = struct {
         const x = s.watched.items[tok & slot_mask];
         if (x.gen << slot_bits != tok & ~@as(u32, slot_mask)) return;
         switch (x.w) {
-            .udp => |fd| try s.readUdp(fd),
+            .udp => |fd| try s.readUdp(fd, false),
+            .wildcard => |fd| try s.readUdp(fd, true),
             .listen => |fd| if (!try s.accept(fd) and !s.paused) {
                 s.paused = true;
                 s.clients.detail.paused += 1;
@@ -238,7 +243,7 @@ const Server = struct {
 
     /// Drains the socket in one wake: an epoll call per query cost a third
     /// of the syscall time under load.
-    fn readUdp(s: *Server, fd: posix.fd_t) !void {
+    fn readUdp(s: *Server, fd: posix.fd_t, comptime wildcard: bool) !void {
         const crowded = crowdedQueue(fd);
         const parks = s.parks;
         var read: usize = 0;
@@ -249,7 +254,9 @@ const Server = struct {
             const got = s.in.recv(fd, want);
             for (0..got) |i| {
                 const from = s.in.from(i);
-                if (acl.allow(s.cfg.allow_from, from)) try s.ask(s.in.datagram(i), .{ .udp = .{ .fd = fd, .addr = from } }, crowded);
+                if (!acl.allow(s.cfg.allow_from, from)) continue;
+                const reply: Reply = if (wildcard) .{ .wildcard = .{ .fd = fd, .addr = from, .local = s.in.local(i) } } else .{ .udp = .{ .fd = fd, .addr = from } };
+                try s.ask(s.in.datagram(i), reply, crowded);
             }
             s.out.flush();
             if (got < want) return;
@@ -369,7 +376,7 @@ const Server = struct {
         while (i < s.watched.items.len) : (i += 1) {
             const c = switch (s.watched.items[i].w) {
                 .conn => |c| c,
-                .udp, .listen, .signal, .free => continue,
+                .udp, .wildcard, .listen, .signal, .free => continue,
             };
             // A client owed an answer gets the resolve deadline on top.
             const since = if (c.out.items.len != 0) c.blocked_ns else c.last_ns;
@@ -380,8 +387,8 @@ const Server = struct {
 
     fn ask(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
         // BCP 140: a UDP reply is dropped silently, no query; over TCP `validateQuery` answers it.
-        if (wire.len < 12 or (reply == .udp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
-        if (reply == .udp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
+        if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
+        if (reply != .tcp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = dns.readQuery(arena, wire) catch {
@@ -518,7 +525,7 @@ const Server = struct {
         // DNSBomb: a UDP client that joined a resolution is answered as long
         // after its ask as the first was, so replies leave spaced as their
         // questions came, never in one burst. TCP cannot be spoofed.
-        const echo = if (p.reply == .udp and !p.echoed) p.asked_ns - p.origin_ns else 0;
+        const echo = if (p.reply != .tcp and !p.echoed) p.asked_ns - p.origin_ns else 0;
         const leaves_ns = s.e.now_ns + echo;
         if (echo > 0 and leaves_ns < timeout(p.*)) {
             served.release(&s.g.store);
@@ -685,7 +692,7 @@ const Server = struct {
         };
         // Its waiter kept the resolution going; past a UDP client's
         // timeout the outcome is noted and the reply goes nowhere.
-        if (reply == .udp and leaves_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
+        if (reply != .tcp and leaves_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
             s.clients.unanswered.late += 1;
             return served.release(&s.g.store);
         }
@@ -737,7 +744,7 @@ const Server = struct {
         const arena = s.scratch.allocator();
         var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
-            .udp => blk: {
+            .udp, .wildcard => blk: {
                 const claimed = if (query.edns) |e| e.udp_payload_size else dns.max_udp_payload;
                 break :blk @min(@max(claimed, dns.max_udp_payload), s.cfg.max_udp_payload);
             },
@@ -754,7 +761,7 @@ const Server = struct {
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             const q = query.question.?;
             const peer = switch (reply) {
-                .udp => |u| u.addr,
+                inline .udp, .wildcard => |u| u.addr,
                 .tcp => |c| c.addr,
                 .left => unreachable,
             };
@@ -776,7 +783,7 @@ const Server = struct {
 
     fn room(s: *Server, reply: Reply, frame: []u8) []u8 {
         return switch (reply) {
-            .udp => |u| s.out.next(u.fd),
+            inline .udp, .wildcard => |u| s.out.next(u.fd),
             .tcp => frame[2..],
             .left => unreachable,
         };
@@ -785,6 +792,7 @@ const Server = struct {
     fn write(s: *Server, reply: Reply, frame: []u8, len: usize) void {
         switch (reply) {
             .udp => |u| s.out.push(len, &u.addr),
+            .wildcard => |u| s.out.pushFrom(len, &u.addr, u.local),
             .left => unreachable,
             .tcp => |c| {
                 const framed = frame[0 .. 2 + len];
@@ -1043,6 +1051,7 @@ fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
     if (af == posix.AF.INET6) try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(one));
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(one));
     if (sock_type == posix.SOCK.DGRAM) {
+        if (na.isUnspecified(addr)) try Batch.tellLocal(sock, af);
         const bufsize: c_int = 1024 * 1024;
         posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.RCVBUF, &mem.toBytes(bufsize)) catch {};
         posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(bufsize)) catch {};
