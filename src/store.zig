@@ -34,6 +34,11 @@ pub const Verdict = extern struct {
         return v.until_ns != 0;
     }
 
+    /// Where a version expiring at `expires_ns` stops serving under it.
+    pub fn end(v: Verdict, expires_ns: i64) i64 {
+        return if (v.judged()) @min(expires_ns, v.until_ns) else expires_ns;
+    }
+
     /// Stands at `instant_ns` (`Graph.instant`).
     pub fn serves(v: Verdict, instant_ns: i64) bool {
         return v.until_ns > instant_ns;
@@ -44,17 +49,24 @@ pub const Verdict = extern struct {
     }
 };
 
+/// One key's version: this header, the key's name, then the value as
+/// `build` writes it.
 pub const Blob = extern struct {
     refs: u32,
     len: u32,
-    /// Map keys holding it.
-    keys: u32 = 0,
+    name_hash: u32,
+    rtype: u16,
     kind: u8,
-    _pad: [3]u8 = @splat(0),
+    name_len: u8,
+    expires_ns: i64,
     verdict: Verdict = .{},
 
     pub fn bytes(b: *Blob) []align(8) u8 {
         return @as([*]align(8) u8, @ptrCast(b))[0..b.len];
+    }
+
+    pub fn key(b: *Blob) Key {
+        return .{ .kind = @fromBackingInt(b.kind), .rtype = @fromBackingInt(b.rtype), .name = b.payload()[0..b.name_len], .name_hash = b.name_hash };
     }
 
     fn payload(b: *Blob) []const u8 {
@@ -65,22 +77,20 @@ pub const Blob = extern struct {
         b.refs += 1;
         return b;
     }
+
+    pub fn shorten(b: *Blob, until_ns: i64) void {
+        b.expires_ns = @min(b.expires_ns, until_ns);
+    }
+
+    pub fn end(b: *Blob) i64 {
+        return b.verdict.end(b.expires_ns);
+    }
 };
 
 fn isReply(b: *Blob) bool {
     const kind: Kind = @fromBackingInt(b.kind);
-    return kind == .rrset or kind == .stub;
+    return kind == .rrset or kind == .stub or kind == .parental;
 }
-
-pub const Entry = struct {
-    blob: *Blob,
-    expires_ns: i64,
-    stored_ns: i64 = 0,
-
-    pub fn life(e: Entry) Life {
-        return .of(e.stored_ns, e.expires_ns, e.blob.verdict);
-    }
-};
 
 /// While a version serves: from its storing to its expiry, or from its
 /// verdict's judgment to the verdict's end when that comes first.
@@ -89,8 +99,8 @@ pub const Life = struct {
     end_ns: i64,
 
     pub fn of(stored_ns: i64, expires_ns: i64, v: Verdict) Life {
-        if (v.judged() and v.until_ns < expires_ns) return .{ .start_ns = @as(i64, v.judged_s) * std.time.ns_per_s, .end_ns = v.until_ns };
-        return .{ .start_ns = stored_ns, .end_ns = expires_ns };
+        const end_ns = v.end(expires_ns);
+        return .{ .start_ns = if (end_ns < expires_ns) @as(i64, v.judged_s) * std.time.ns_per_s else stored_ns, .end_ns = end_ns };
     }
 
     pub fn inLastTenth(l: Life, now_ns: i64) bool {
@@ -100,18 +110,15 @@ pub const Life = struct {
 
 /// Handed the store itself, so whatever embeds one finds itself by the
 /// field (`@fieldParentPtr`) and never pins its address.
-pub const OnEvict = *const fn (*Store, Key, *Blob) void;
+pub const OnEvict = *const fn (*Store, *Blob) void;
 
 pub const Store = struct {
     gpa: Allocator,
-    map: std.array_hash_map.Custom(Key, Entry, Key.Context, true) = .empty,
+    map: std.array_hash_map.Custom(Ref, void, ByRef, false) = .empty,
     /// Every live blob's bytes, whoever holds it.
     bytes: usize = 0,
-    /// A blob once per key holding it. The cap is on this, so names
-    /// sharing one blob still fill it.
+    /// The bytes of the blobs the map holds; the cap is on this.
     held: usize = 0,
-    /// Each blob the map holds, once.
-    kept: usize = 0,
     cap: usize,
     visited: std.bit_set.Dynamic = .{},
     hand: usize = 0,
@@ -128,15 +135,58 @@ pub const Store = struct {
 
     const door_bits = 1 << 16;
 
+    /// A blob and its key's fingerprint, in the 16 bits a user address
+    /// leaves free: a probe passes other keys' blobs without loading them.
+    /// Linux maps a process above 2^48 only when asked to by a hint.
+    const Ref = packed struct(u64) {
+        addr: u48,
+        tag: u16,
+
+        fn of(b: *Blob) Ref {
+            const addr = std.math.cast(u48, @intFromPtr(b)) orelse @panic("blob mapped above 2^48");
+            return .{ .addr = addr, .tag = tagOf(b.key().hash()) };
+        }
+
+        fn blob(r: Ref) *Blob {
+            return @ptrFromInt(r.addr);
+        }
+    };
+
+    /// The map draws slots from the hash's low 32 bits; the tag is its top 16.
+    fn tagOf(h: u64) u16 {
+        return @truncate(h >> 48);
+    }
+
+    const ByRef = struct {
+        pub fn hash(_: ByRef, r: Ref) u32 {
+            return @truncate(r.blob().key().hash());
+        }
+        pub fn eql(_: ByRef, a: Ref, b: Ref, _: usize) bool {
+            return a.tag == b.tag and a.blob().key().eql(b.blob().key());
+        }
+    };
+
+    const Probe = struct { key: Key, h: u64 };
+
+    const ByKey = struct {
+        pub fn hash(_: ByKey, p: Probe) u32 {
+            return @truncate(p.h);
+        }
+        pub fn eql(_: ByKey, p: Probe, r: Ref, _: usize) bool {
+            return tagOf(p.h) == r.tag and p.key.eql(r.blob().key());
+        }
+    };
+
+    fn find(s: *Store, key: Key) ?usize {
+        return s.map.getIndexAdapted(Probe{ .key = key, .h = key.hash() }, ByKey{});
+    }
+
     pub fn init(gpa: Allocator, cap: usize) !Store {
         return .{ .gpa = gpa, .cap = cap, .stage = try gpa.alloc(u8, 2 * @as(usize, dns.max_message_len)) };
     }
 
     pub fn deinit(s: *Store) void {
-        for (s.map.keys(), s.map.values()) |k, e| {
-            s.gpa.free(k.name);
-            s.letGo(e.blob);
-        }
+        for (s.map.keys()) |r| s.letGo(r.blob());
         s.map.deinit(s.gpa);
         s.visited.deinit(s.gpa);
         s.gpa.free(s.stage);
@@ -145,79 +195,65 @@ pub const Store = struct {
     pub fn unref(s: *Store, b: *Blob) void {
         b.refs -= 1;
         if (b.refs > 0) return;
-        std.debug.assert(b.keys == 0);
         s.bytes -= b.len;
         s.gpa.free(b.bytes());
     }
 
-    pub fn get(s: *Store, key: Key, now_ns: i64) ?Entry {
-        const i = s.map.getIndex(key) orelse return null;
-        const e = s.map.values()[i];
-        if (e.expires_ns <= now_ns) return null;
+    pub fn get(s: *Store, key: Key, now_ns: i64) ?*Blob {
+        const i = s.find(key) orelse return null;
+        const b = s.map.keys()[i].blob();
+        if (b.expires_ns <= now_ns) return null;
         if (i < s.visited.capacity()) s.visited.set(i);
-        return e;
+        return b;
     }
 
     /// Any age; not a SIEVE hit.
-    pub fn any(s: *Store, key: Key) ?Entry {
-        return s.map.get(key);
-    }
-
-    /// Only this version; a newer one is not its business.
-    pub fn shorten(s: *Store, key: Key, blob: *Blob, until_ns: i64) void {
-        const i = s.map.getIndex(key) orelse return;
-        const e = &s.map.values()[i];
-        if (e.blob == blob) e.expires_ns = @min(e.expires_ns, until_ns);
+    pub fn any(s: *Store, key: Key) ?*Blob {
+        return s.map.keys()[s.find(key) orelse return null].blob();
     }
 
     /// Forgets this version of a fact; a newer version is not its business.
-    pub fn drop(s: *Store, key: Key, blob: *Blob) void {
-        const i = s.map.getIndex(key) orelse return;
-        if (s.map.values()[i].blob == blob) s.removeAt(i);
+    pub fn drop(s: *Store, blob: *Blob) void {
+        const i = s.map.getIndex(Ref.of(blob)) orelse return;
+        if (s.map.keys()[i].blob() == blob) s.removeAt(i);
     }
 
     /// Takes the caller's reference on success; on any error it stays
     /// theirs. A new key over the cap must have knocked before.
-    pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
-        const gop = try s.map.getOrPut(s.gpa, key);
-        if (gop.found_existing) {
-            if (s.on_evict) |f| f(s, key, gop.value_ptr.blob);
-            s.letGo(gop.value_ptr.blob);
-        } else {
+    pub fn put(s: *Store, blob: *Blob) !void {
+        const ref = Ref.of(blob);
+        const gop = try s.map.getOrPut(s.gpa, ref);
+        const old: ?*Blob = if (gop.found_existing) gop.key_ptr.blob() else null;
+        if (old == null) {
             errdefer s.map.swapRemoveAt(gop.index);
-            if (s.held + blob.len > s.cap and !s.knock(key)) {
+            if (s.held + blob.len > s.cap and !s.knock(blob.key())) {
                 s.unadmitted += 1;
                 return error.Refused;
             }
-            gop.key_ptr.name = try s.gpa.dupe(u8, key.name);
-            // Runs before the swapRemoveAt above, while the key is still in place.
-            errdefer s.gpa.free(gop.key_ptr.name);
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
-        gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns, .stored_ns = now_ns };
-        if (blob.keys == 0) s.kept += blob.len;
-        blob.keys += 1;
+        gop.key_ptr.* = ref;
         s.held += blob.len;
         s.visited.set(gop.index);
+        if (old) |o| {
+            if (s.on_evict) |f| f(s, o);
+            s.letGo(o);
+        }
         while (s.held > s.cap and s.map.count() > 1) s.evict();
     }
 
     fn letGo(s: *Store, b: *Blob) void {
         s.held -= b.len;
-        b.keys -= 1;
-        if (b.keys == 0) s.kept -= b.len;
         s.unref(b);
     }
 
     fn removeAt(s: *Store, i: usize) void {
         const last = s.map.count() - 1;
         if (i != last) s.visited.setValue(i, s.visited.isSet(last));
-        const key = s.map.keys()[i];
-        const e = s.map.values()[i];
-        if (s.on_evict) |f| f(s, key, e.blob);
+        const b = s.map.keys()[i].blob();
+        if (s.on_evict) |f| f(s, b);
         s.map.swapRemoveAt(i);
-        s.gpa.free(key.name);
-        s.letGo(e.blob);
+        s.letGo(b);
         // Swap-remove moved only the last entry, into `i`.
         if (s.hand == last) s.hand = i;
     }
@@ -254,8 +290,10 @@ pub const Store = struct {
     }
 
     /// One reference, the caller's.
-    pub fn build(s: *Store, value: Value) !*Blob {
+    pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) !*Blob {
+        std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
         var w: Writer = .{ .buf = s.stage, .pos = @sizeOf(Blob) };
+        try w.slice(key.name);
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
@@ -295,13 +333,17 @@ pub const Store = struct {
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
         const b: *Blob = @ptrCast(out.ptr);
-        b.* = .{ .refs = 1, .len = @intCast(w.pos), .kind = @backingInt(std.meta.activeTag(value)) };
+        b.* = header(key, w.pos, expires_ns);
         s.bytes += w.pos;
         return b;
     }
 
+    fn header(key: Key, len: usize, expires_ns: i64) Blob {
+        return .{ .refs = 1, .len = @intCast(len), .name_hash = key.name_hash, .rtype = @backingInt(key.rtype), .kind = @backingInt(key.kind), .name_len = @intCast(key.name.len), .expires_ns = expires_ns };
+    }
+
     pub fn parse(arena: Allocator, b: *Blob) !Value {
-        var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()) };
+        var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()), .pos = b.name_len };
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name();
@@ -319,7 +361,7 @@ pub const Store = struct {
                 for (glue) |*gl| gl.* = try r.addr();
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
-            .rrset, .stub => |kind| blk: {
+            .rrset, .stub, .parental => |kind| blk: {
                 var reply: graph.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
                     .aa = undefined,
@@ -338,7 +380,7 @@ pub const Store = struct {
                 reply.answers = try r.records(arena, an);
                 reply.authorities = try r.records(arena, ns);
                 reply.additionals = try r.records(arena, ar);
-                break :blk if (kind == .rrset) .{ .rrset = reply } else .{ .stub = reply };
+                break :blk if (kind == .stub) .{ .stub = reply } else .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
                 var c: trust.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
@@ -346,7 +388,7 @@ pub const Store = struct {
                 c.records = try r.records(arena, try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
-            .addr, .answer, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
+            .addr, .answer, .secure, .exchange, .refresh, .ahead => unreachable,
         };
     }
 };
@@ -367,15 +409,15 @@ pub const Rrset = struct {
     /// `build`'s layout, which wrote it; so it cannot fail.
     pub fn of(b: *Blob) Rrset {
         std.debug.assert(isReply(b));
-        return read(.{ .buf = b.payload() }) catch unreachable;
+        return read(.{ .buf = b.payload(), .pos = b.name_len }) catch unreachable;
     }
 
     /// An `answer`'s answer section, without `of`'s walk over every record.
     pub fn answered(b: *Blob) ?Answered {
         std.debug.assert(isReply(b));
         const p = b.payload();
-        if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[0])))) != .answer) return null;
-        var at: usize = 1 + 1 + 2 + 4 + 8;
+        if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[b.name_len])))) != .answer) return null;
+        var at: usize = b.name_len + 1 + 1 + 2 + 4 + 8;
         at += dns.wireNameLen(p[at..]);
         at += dns.wireNameLen(p[at..]);
         return .{ .it = .{ .bytes = p[at + 6 ..] }, .left = mem.readInt(u16, p[at..][0..2], .little) };
@@ -569,9 +611,9 @@ test "a fact survives the blob byte for byte" {
     const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
     const key: Key = .of(.rrset, .lit("www.example.com"), .a);
 
-    const blob = try s.build(.{ .rrset = reply });
-    try s.put(key, blob, 1000, 0);
-    try testing.expectEqual(blob, s.get(key, 999).?.blob);
+    const blob = try s.build(key, .{ .rrset = reply }, 1000);
+    try s.put(blob);
+    try testing.expectEqual(blob, s.get(key, 999).?);
     try testing.expectEqual(null, s.get(key, 1000));
     try testing.expectEqual(blob.len, s.bytes);
 
@@ -611,15 +653,18 @@ test "a fact survives the blob byte for byte" {
     }
 
     _ = blob.ref();
-    const glue = [_]na.AddressKey{ .ip4(.{ 10, 0, 0, 1 }, 53), .ip6(@splat(1), 853) };
-    const newer = try s.build(.{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .of(.addr, .lit("ns.example.com"), .a), .glue = &glue }} } });
-    try s.put(key, newer, 2000, 0);
+    const newer = try s.build(key, .{ .rrset = reply }, 2000);
+    try s.put(newer);
     try testing.expectEqual(1, blob.refs);
-    const cut = (try Store.parse(arena, newer)).cut;
-    try testing.expect(cut.zone.eql(zone));
-    try testing.expect(cut.servers[0].glue.len == 2 and cut.servers[0].glue[1].eql(glue[1]));
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
+
+    const glue = [_]na.AddressKey{ .ip4(.{ 10, 0, 0, 1 }, 53), .ip6(@splat(1), 853) };
+    const cut_blob = try s.build(.of(.cut, zone, .a), .{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .of(.addr, .lit("ns.example.com"), .a), .glue = &glue }} } }, 10);
+    defer s.unref(cut_blob);
+    const cut = (try Store.parse(arena, cut_blob)).cut;
+    try testing.expect(cut.zone.eql(zone));
+    try testing.expect(cut.servers[0].glue.len == 2 and cut.servers[0].glue[1].eql(glue[1]));
 }
 
 test "the cap holds by eviction and admission" {
@@ -631,19 +676,19 @@ test "the cap holds by eviction and admission" {
     for (0..64) |i| {
         _ = try std.mem.print(&names[i], "k{d}", .{i});
         const key: Key = .init(.cut, std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3], .a);
-        const blob = try s.build(.{ .cut = .{ .zone = zone } });
-        s.put(key, blob, 10, 0) catch |err| {
+        const blob = try s.build(key, .{ .cut = .{ .zone = zone } }, 10);
+        s.put(blob) catch |err| {
             try testing.expectEqual(error.Refused, err);
-            try s.put(key, blob, 10, 0);
+            try s.put(blob);
         };
     }
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
     try testing.expect(s.unadmitted > 0);
     const key: Key = .init(.cut, "again", .a);
-    const again = try s.build(.{ .cut = .{ .zone = zone } });
-    try testing.expectError(error.Refused, s.put(key, again, 10, 0));
-    try s.put(key, again, 10, 0);
+    const again = try s.build(key, .{ .cut = .{ .zone = zone } }, 10);
+    try testing.expectError(error.Refused, s.put(again));
+    try s.put(again);
     try testing.expect(s.get(key, 0) != null);
     try testing.expectEqual(s.held, s.bytes);
 }
@@ -654,7 +699,7 @@ test "a replaced version leaves as one evicted" {
         store: Store,
         n: u32 = 0,
         last: ?*Blob = null,
-        fn evicted(s: *Store, _: Key, b: *Blob) void {
+        fn evicted(s: *Store, b: *Blob) void {
             const w: *@This() = @fieldParentPtr("store", s);
             w.n += 1;
             w.last = b;
@@ -665,10 +710,10 @@ test "a replaced version leaves as one evicted" {
     w.store.on_evict = Watched.evicted;
     const zone: dns.Name = .lit("x");
     const key: Key = .of(.cut, zone, .a);
-    const first = try w.store.build(.{ .cut = .{ .zone = zone } });
-    try w.store.put(key, first, 10, 0);
+    const first = try w.store.build(key, .{ .cut = .{ .zone = zone } }, 10);
+    try w.store.put(first);
     try testing.expectEqual(0, w.n);
-    try w.store.put(key, try w.store.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+    try w.store.put(try w.store.build(key, .{ .cut = .{ .zone = zone } }, 10));
     try testing.expectEqual(1, w.n);
     try testing.expectEqual(first, w.last.?);
 }

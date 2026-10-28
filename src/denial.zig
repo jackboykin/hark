@@ -120,7 +120,8 @@ pub const Index = struct {
 
 /// So the index cannot outgrow its facts: what goes is what was judged
 /// from `blob`.
-pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
+pub fn evicted(g: *Graph, blob: *store.Blob) void {
+    const key = blob.key();
     if (key.rtype != .nsec and key.rtype != .soa) return;
     const owner: dns.Name = .of(key.name);
     if (key.rtype == .soa) {

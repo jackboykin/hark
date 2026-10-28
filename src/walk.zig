@@ -355,11 +355,11 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     }
     var expires: i64 = std.math.maxInt(i64);
     for (s.hops[0..s.n]) |h| {
-        expires = @min(expires, g.cell(h.set).expires_ns);
+        expires = @min(expires, g.cell(h.set).expires());
         if (h.judge.unwrap()) |j| {
             if (!g.cell(j).settled()) return;
             // A verdict that failed is bogus, and lives no longer.
-            expires = @min(expires, g.cell(j).expires_ns);
+            expires = @min(expires, g.cell(j).expires());
         } else if (g.awaitsVerdict(g.cell(h.set).key.kind)) {
             // Nothing can judge RRSIGs, so nothing keeps them.
             expires = @min(expires, g.now());
@@ -387,7 +387,7 @@ fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
     var first: ?store.Life = null;
     for (hops) |h| {
         const c = g.cell(h.set);
-        const life: store.Life = .of(c.state.fact.reply().stored_ns, c.expires_ns, if (c.blob) |b| b.verdict else .{});
+        const life: store.Life = .of(c.state.fact.reply().stored_ns, c.expires(), if (c.blob) |b| b.verdict else .{});
         if (first == null or life.end_ns < first.?.end_ns) first = life;
     }
     const life = first orelse return null;
@@ -416,7 +416,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     // every name below a denial would store one. A fact from below the
     // parent's zone says nothing about it.
     if (deniedAbove(g, name, pc.zone) != null) return settleInside(g, id, parent, g.now());
-    if (g.held(Key.of(.rrset, name, .a))) |known| if (named(store.Rrset.of(known.blob).zone, pc.zone))
+    if (g.held(Key.of(.rrset, name, .a))) |known| if (named(store.Rrset.of(known).zone, pc.zone))
         return settleInside(g, id, parent, serving(g, known));
     if (!s.started) {
         s.ask.reset(pc.zone);
@@ -454,7 +454,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 /// Walks below the name ask the servers of the cut above, so it lives no
 /// longer than that cut, glue and all.
 fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64) !void {
-    try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone } }, @min(parent.expires_ns, until_ns));
+    try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone } }, @min(parent.expires(), until_ns));
 }
 
 /// An authoritative NXDOMAIN at a probe name, published.
@@ -506,21 +506,21 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
     }
 }
 
-fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name, held: store.Entry } {
+fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name, held: *store.Blob } {
     var up = name.parent();
     while (up) |n| : (up = n.parent()) {
         if (n.depth() <= zone.depth()) break;
         const h = g.held(Key.of(.rrset, n, .a)) orelse continue;
-        const r: store.Rrset = .of(h.blob);
+        const r: store.Rrset = .of(h);
         if (r.kind == .nxdomain and named(r.target, n)) return .{ .at = n, .held = h };
     }
     return null;
 }
 
 /// Bytes awaiting their verdict serve no time: it may yet find them bogus.
-fn serving(g: *const Graph, e: store.Entry) i64 {
-    if (g.awaitsVerdict(.rrset) and !e.blob.verdict.judged()) return g.now();
-    return e.life().end_ns;
+fn serving(g: *const Graph, e: *store.Blob) i64 {
+    if (g.awaitsVerdict(.rrset) and !e.verdict.judged()) return g.now();
+    return e.end();
 }
 
 fn named(wire: []const u8, n: dns.Name) bool {
@@ -541,7 +541,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     const rid = s.rrset.unwrap().?;
     if (!g.cell(rid).settled()) return;
     if (g.cell(rid).failure()) |why| return g.fail(id, why);
-    var expires = g.cell(rid).expires_ns;
+    var expires = g.cell(rid).expires();
     // A denial too: unjudged it is no fact, and nothing keeps it.
     if (g.cfg.trust_anchors != null) {
         if (s.judge == .none) s.judge = .wrap(try trust.demandSecure(g, id, rid) orelse
@@ -549,7 +549,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         const j = g.cell(s.judge.unwrap().?);
         if (!j.settled()) return;
         if (j.failure()) |why| return g.fail(id, why);
-        expires = @min(expires, j.expires_ns);
+        expires = @min(expires, j.expires());
     }
     var addrs: std.ArrayList(na.AddressKey) = .empty;
     var own = ownAddresses(g, g.cell(rid).blob.?, key.rtype);
@@ -734,8 +734,8 @@ fn aboveSays(g: *Graph, s: *const RrsetScratch) enum { waits, answers, silent } 
 fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
     if (!denial.denies(g, g.cell(id).key.rtype)) return false;
     const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
-    if (!provable(d.held.blob)) return false;
-    const v = d.held.blob.verdict;
+    if (!provable(d.held)) return false;
+    const v = d.held.verdict;
     if (v.serves(g.instant())) {
         if (v.chain().status != .secure) return false;
         try g.settleAs(id, d.held);
@@ -759,7 +759,7 @@ fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
     while (up) |owner| : (up = owner.parent()) {
         if (owner.isRoot()) break;
         const d = g.held(Key.of(.rrset, owner, .dname)) orelse continue;
-        const r: store.Rrset = .of(d.blob);
+        const r: store.Rrset = .of(d);
         if (r.kind != .answer) continue;
         var it = r.sections[0].iterator();
         while (it.next()) |rr| if (rr.rtype == .dname and rr.name.eql(owner)) return owner;

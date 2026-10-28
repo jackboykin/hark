@@ -108,9 +108,9 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (g.payer.validationStop()) |why| return g.fail(id, why);
     if (g.limit(g.payer) == null) {
-        const t = g.cell(rid);
-        t.expires_ns = @min(t.expires_ns, g.now());
-        if (t.blob) |b| g.store.drop(t.key, b);
+        const b = g.cell(rid).blob.?;
+        b.shorten(g.now());
+        g.store.drop(b);
     }
     try g.fail(id, bogus);
 }
@@ -161,7 +161,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         // The walk's parent proven no zone: the zone above it speaks for
         // the child, and the DS names it.
         .secure, .absent => {},
-        .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires_ns),
+        .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires()),
     }
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .ds), zone) orelse
         return g.fail(id, .unreachable_authority));
@@ -220,7 +220,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.keep(s.rrset.unwrap().?);
-            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires_ns, keys.expires_ns));
+            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires(), keys.expires()));
         },
         .nodata, .nxdomain => {
             // RFC 4034 §3.1.3.
@@ -229,7 +229,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             const cap = dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap, r.stored_ns));
-            const until = @min(rs.expires_ns, keys.expires_ns);
+            const until = @min(rs.expires(), keys.expires());
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => {
                     try g.keep(s.rrset.unwrap().?);
@@ -296,7 +296,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const ds = g.cell(s.ds.unwrap().?);
     if (!ds.settled()) return;
     if (ds.failure()) |why| return g.fail(id, why);
-    if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires_ns);
+    if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires());
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .dnskey), zone) orelse
         return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
@@ -315,7 +315,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
     try g.keep(s.rrset.unwrap().?);
-    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires_ns, ds.expires_ns));
+    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires(), ds.expires()));
 }
 
 /// The judgement of one rrset version; a fresh cell per version, since
@@ -359,11 +359,11 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         // Proven no zone, a folded child: its claims are judged as any
         // (RFC 6840 §4.1).
         .secure, .absent => {},
-        .insecure => return g.settle(id, .{ .secure = .{ .status = .insecure } }, zd.expires_ns),
+        .insecure => return g.settle(id, .{ .secure = .{ .status = .insecure } }, zd.expires()),
     }
     while (true) {
         if (s.fault == null) {
-            s.fault = try judge(g, id, s, t, @min(t.expires_ns, zd.expires_ns)) orelse return;
+            s.fault = try judge(g, id, s, t, @min(t.expires(), zd.expires())) orelse return;
             if (g.payer.validationStop()) |why| return g.fail(id, why);
         }
         const c = Claims.at(&t.state.fact.rrset, t.key.rtype, s.next);
@@ -431,7 +431,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     return null;
                 }
                 if (kc.failure() != null) break :f .{ .input = kid };
-                s.expires = @min(s.expires, kc.expires_ns);
+                s.expires = @min(s.expires, kc.expires());
                 const keys = kc.state.fact.dnskey;
                 switch (keys.status) {
                     .secure => {},
@@ -455,7 +455,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                         .secure => {
                             var only = r.*;
                             only.authorities = own.rrs;
-                            try denial.absorb(g, signer, only, own.until, kc.expires_ns);
+                            try denial.absorb(g, signer, only, own.until, kc.expires());
                         },
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
@@ -627,7 +627,7 @@ const Probe = struct {
                 if (!c.settled()) return .pending;
                 if (c.failure()) |why| {
                     if (why.cause == .asker) return .{ .stopped = why };
-                } else if (c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
+                } else if (c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires() };
                 p.cell = .none;
             }
             p.depth = @max(p.depth, above.depth()) + 1;

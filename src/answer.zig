@@ -364,7 +364,7 @@ fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, 
             .pending => unreachable,
         }
     }
-    return shape(d, arena, q, c, hops, secure, g.cell(root).expires_ns > g.now());
+    return shape(d, arena, q, c, hops, secure, g.cell(root).expires() > g.now());
 }
 
 pub fn failureOf(g: *graph.Graph, root: graph.CellId, cd: bool) ?graph.Failure {
@@ -389,7 +389,7 @@ fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_las
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
         hop.* = hopOf(d, h.blob, h.rrset);
-        const life: store.Life = .of(hop.rrset.stored_ns, h.expires_ns, h.blob.verdict);
+        const life: store.Life = .of(hop.rrset.stored_ns, h.blob.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
         if (!g.awaitsVerdict(h.kind)) {
             secure = false;

@@ -493,7 +493,9 @@ pub const Cell = struct {
     /// The cycle check that last walked through here.
     seen: u64 = 0,
     state: State = .pending,
-    expires_ns: i64 = 0,
+    /// The end of a state with no blob; one in a blob ends with it
+    /// (`expires`).
+    bare_expires_ns: i64 = 0,
     waiters: std.DoublyLinkedList = .{},
     /// Unpinned at settle; an answer's at free.
     inputs: std.SinglyLinkedList = .{},
@@ -511,6 +513,12 @@ pub const Cell = struct {
 
     /// What it settled on lives in its arena: pending, it carries none.
     pub const State = union(enum) { pending, fact: *Value, failure: *const Failure };
+
+    /// A version's end is its blob's, so every cell holding it sees the
+    /// same one, whichever shortened it.
+    pub fn expires(c: *const Cell) i64 {
+        return if (c.blob) |b| b.expires_ns else c.bare_expires_ns;
+    }
 
     pub fn settled(c: *const Cell) bool {
         return c.state != .pending;
@@ -649,8 +657,8 @@ pub const Graph = struct {
         return g;
     }
 
-    fn evicted(s: *store.Store, key: Key, blob: *store.Blob) void {
-        denial.evicted(@fieldParentPtr("store", s), key, blob);
+    fn evicted(s: *store.Store, blob: *store.Blob) void {
+        denial.evicted(@fieldParentPtr("store", s), blob);
     }
 
     pub fn deinit(g: *Graph) void {
@@ -1069,45 +1077,53 @@ pub const Graph = struct {
             },
             .cut, .addr, .rrset, .stub, .answer, .exchange, .refresh, .ahead, .parental => {},
         };
-        c.expires_ns = expires_ns;
         switch (value) {
             .cut, .rrset, .stub, .ds, .dnskey => {
                 const clock = Tally.clock(&g.tally.store_ns);
                 defer clock.stop();
-                const blob = try g.store.build(value);
+                const blob = try g.store.build(c.key, value, expires_ns);
+                const owned = owned: {
+                    errdefer g.store.unref(blob);
+                    break :owned try c.own(try store.Store.parse(c.arena.allocator(), blob));
+                };
                 c.blob = blob;
-                const owned = try c.own(try store.Store.parse(c.arena.allocator(), blob));
                 c.state = .{ .fact = owned };
                 if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
             },
             .addr, .answer, .exchange, .refresh, .ahead, .parental => {
                 const owned = try c.own(value);
+                c.bare_expires_ns = expires_ns;
                 c.state = .{ .fact = owned };
             },
             .secure => |v| {
                 const owned = try c.own(value);
+                c.bare_expires_ns = expires_ns;
                 c.state = .{ .fact = owned };
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
                 const t = c.scratch.secure.target;
-                if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
+                if (g.cell(t).blob) |b| b.verdict.stamp(v, expires_ns, g.now());
                 try g.keep(t);
             },
         }
         try g.woken(id, value == .answer);
     }
 
-    /// Settles on another key's judged version, its very bytes. Stores
-    /// nothing: the question's judge settles on the stamped verdict and
-    /// keeps it.
-    pub fn settleAs(g: *Graph, id: CellId, v: store.Entry) !void {
+    /// Settles on another key's judged version. Stores nothing: the
+    /// question's judge settles on the stamped verdict and keeps it.
+    pub fn settleAs(g: *Graph, id: CellId, v: *store.Blob) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
-        std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.blob.verdict.judged());
+        std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.verdict.judged());
         g.tally.settles += 1;
-        const owned = try c.own(try store.Store.parse(c.arena.allocator(), v.blob));
+        const value = try store.Store.parse(c.arena.allocator(), v);
+        const blob = try g.store.build(c.key, value, v.end());
+        blob.verdict = v.verdict;
+        const owned = owned: {
+            errdefer g.store.unref(blob);
+            break :owned try c.own(value);
+        };
+        c.blob = blob;
         c.state = .{ .fact = owned };
-        c.blob = v.blob.ref();
-        c.expires_ns = v.life().end_ns;
         try g.woken(id, false);
     }
 
@@ -1116,7 +1132,7 @@ pub const Graph = struct {
     /// on through the fact it holds.
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
         const c = g.cell(id);
-        const blob = try g.store.build(.{ .rrset = reply });
+        const blob = try g.store.build(c.key, .{ .rrset = reply }, c.expires());
         errdefer g.store.unref(blob);
         const parsed = try store.Store.parse(c.arena.allocator(), blob);
         if (c.blob) |b| g.store.unref(b);
@@ -1130,18 +1146,14 @@ pub const Graph = struct {
         return kind == .rrset and g.cfg.trust_anchors != null;
     }
 
-    /// The one way into the store, aged from when the bytes arrived.
     pub fn keep(g: *Graph, id: CellId) !void {
         const c = g.cell(id);
         const blob = c.blob orelse return;
-        if (c.expires_ns <= g.now()) return;
-        if (g.store.any(c.key)) |e| if (e.blob == blob) return;
+        if (blob.expires_ns <= g.now()) return;
+        if (g.store.any(c.key) == blob) return;
         if (try g.forgets(.keep, c.key)) return;
-        const at = switch (c.state.fact.*) {
-            .rrset, .stub => |r| r.stored_ns,
-            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .parental => g.now(),
-        };
-        g.store.put(c.key, blob.ref(), c.expires_ns, at) catch |err| {
+        std.debug.assert(blob.key().eql(c.key));
+        g.store.put(blob.ref()) catch |err| {
             g.store.unref(blob);
             if (err != error.Refused) return err;
         };
@@ -1160,7 +1172,7 @@ pub const Graph = struct {
         if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
         const owned = try c.own(why);
         c.state = .{ .failure = owned };
-        c.expires_ns = g.now();
+        c.bare_expires_ns = g.now();
         try g.woken(id, false);
     }
 
@@ -1218,14 +1230,12 @@ pub const Graph = struct {
     /// RFC 4035 §5.3.3: an rrset accepted as authentic ends with the
     /// signatures that authenticated it.
     pub fn authenticUntil(g: *Graph, id: CellId, until_ns: i64) void {
-        const c = g.cell(id);
-        c.expires_ns = @min(c.expires_ns, until_ns);
-        if (c.blob) |b| g.store.shorten(c.key, b, until_ns);
+        g.cell(id).blob.?.shorten(until_ns);
     }
 
     pub fn fresh(g: *Graph, id: CellId) bool {
         const c = g.cell(id);
-        return c.settled() and c.expires_ns > g.now();
+        return c.settled() and c.expires() > g.now();
     }
 
     /// What the running cell reads must hold past.
@@ -1274,7 +1284,7 @@ pub const Graph = struct {
 
     /// What `demand` hands the running rule without running it; the one
     /// predicate `lookup`, `holds` and `held` share.
-    const Served = union(enum) { stored: store.Entry, live: CellId };
+    const Served = union(enum) { stored: *store.Blob, live: CellId };
 
     fn served(g: *Graph, key: Key, live: ?CellId) ?Served {
         if (g.stored(key)) |e| return .{ .stored = e };
@@ -1288,13 +1298,13 @@ pub const Graph = struct {
         return if (g.fresh(id)) id else null;
     }
 
-    fn liveVersion(g: *Graph, live: ?CellId, e: store.Entry) ?CellId {
+    fn liveVersion(g: *Graph, live: ?CellId, b: *store.Blob) ?CellId {
         const id = live orelse return null;
-        return if (g.cell(id).blob == e.blob) id else null;
+        return if (g.cell(id).blob == b) id else null;
     }
 
     /// The stored fact `demand` would hand the running rule.
-    fn stored(g: *Graph, key: Key) ?store.Entry {
+    fn stored(g: *Graph, key: Key) ?*store.Blob {
         const e = g.store.get(key, g.now()) orelse return null;
         return if (e.expires_ns > g.instant()) e else null;
     }
@@ -1304,8 +1314,8 @@ pub const Graph = struct {
     pub fn proven(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         const e = g.stored(key) orelse return null;
-        if (g.cfg.trust_anchors != null and !e.blob.verdict.serves(g.instant())) return null;
-        return e.blob;
+        if (g.cfg.trust_anchors != null and !e.verdict.serves(g.instant())) return null;
+        return e;
     }
 
     /// Would `demand` hand the running rule a fact for `key` without
@@ -1319,7 +1329,7 @@ pub const Graph = struct {
 
     /// The version `demand` would hand the running rule, not merely a
     /// fresh one.
-    pub fn held(g: *Graph, key: Key) ?store.Entry {
+    pub fn held(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         return switch (g.served(key, g.indexed(key)) orelse return null) {
             .stored => |e| e,
@@ -1328,36 +1338,34 @@ pub const Graph = struct {
     }
 
     /// A settled rrset as the store keeps it.
-    pub fn version(g: *Graph, id: CellId) store.Entry {
-        const c = g.cell(id);
-        return .{ .blob = c.blob.?, .expires_ns = c.expires_ns, .stored_ns = c.state.fact.rrset.stored_ns };
+    pub fn version(g: *Graph, id: CellId) *store.Blob {
+        return g.cell(id).blob.?;
     }
 
     /// A stored fact, read from its live version when there is one.
-    fn factOf(g: *Graph, live: ?CellId, e: store.Entry) !Fact {
+    fn factOf(g: *Graph, live: ?CellId, e: *store.Blob) !Fact {
         if (g.liveVersion(live, e)) |id| if (g.liveFact(id)) |f| return .{ .value = f.value, .expires_ns = e.expires_ns };
-        return .{ .value = try store.Store.parse(g.scratch.allocator(), e.blob), .expires_ns = e.expires_ns };
+        return .{ .value = try store.Store.parse(g.scratch.allocator(), e), .expires_ns = e.expires_ns };
     }
 
     fn liveFact(g: *Graph, id: CellId) ?Fact {
         const c = g.cell(id);
-        return if (c.state == .fact) .{ .value = c.state.fact.*, .expires_ns = c.expires_ns } else null;
+        return if (c.state == .fact) .{ .value = c.state.fact.*, .expires_ns = c.expires() } else null;
     }
 
-    fn materialise(g: *Graph, key: Key, name: dns.Name, e: store.Entry) !CellId {
+    fn materialise(g: *Graph, key: Key, name: dns.Name, e: *store.Blob) !CellId {
         const id = try g.newCell(key, name, g.as_of);
         errdefer g.free(id);
         const c = g.cell(id);
-        const owned = try c.own(try store.Store.parse(c.arena.allocator(), e.blob));
+        const owned = try c.own(try store.Store.parse(c.arena.allocator(), e));
         c.state = .{ .fact = owned };
-        c.blob = e.blob.ref();
-        c.expires_ns = e.expires_ns;
+        c.blob = e.ref();
         return id;
     }
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    pub const Recalled = struct { kind: Kind, blob: *store.Blob, rrset: store.Rrset, expires_ns: i64 };
+    pub const Recalled = struct { kind: Kind, blob: *store.Blob, rrset: store.Rrset };
 
     /// The answer rule read against the store, building no cell: the
     /// question's chain as stored, into `arena`. `.fresh` is what the rule
@@ -1374,10 +1382,10 @@ pub const Graph = struct {
         while (true) {
             kind = g.hopKind(kind, next, qtype) orelse return null;
             const e = g.storedHop(kind.?, next, qtype, age) orelse return null;
-            const v = e.blob.verdict;
+            const v = e.verdict;
             if (g.awaitsVerdict(kind.?) and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
-            const r: store.Rrset = .of(e.blob);
-            try hops.append(arena, .{ .kind = kind.?, .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
+            const r: store.Rrset = .of(e);
+            try hops.append(arena, .{ .kind = kind.?, .blob = e, .rrset = r });
             const target: dns.Name = if (r.kind == .alias) .of(r.target) else .root;
             var it = r.sections[0].iterator();
             while (it.next()) |rr| if (rr.rtype == .cname) {
@@ -1394,12 +1402,12 @@ pub const Graph = struct {
     pub const Age = enum { fresh, any };
 
     /// `demandHop`, read from the store. Inline: it is a hit's lookup.
-    pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?store.Entry {
+    pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?*store.Blob {
         const own = @call(.always_inline, Key.of, .{ kind, name, qtype });
         if (g.entry(own, age)) |e| return e;
         if (!walk.cnameAnswers(qtype)) return null;
         const e = g.entry(own.at(kind, .cname), age) orelse return null;
-        return if (store.Rrset.of(e.blob).kind == .alias) e else null;
+        return if (store.Rrset.of(e).kind == .alias) e else null;
     }
 
     /// The kind of the hop at `name` after one of kind `from`. Null: a
@@ -1409,7 +1417,7 @@ pub const Graph = struct {
         return if (from == .rrset and kind == .stub) null else kind;
     }
 
-    inline fn entry(g: *Graph, key: Key, age: Age) ?store.Entry {
+    inline fn entry(g: *Graph, key: Key, age: Age) ?*store.Blob {
         return if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key);
     }
 
@@ -1441,7 +1449,7 @@ pub const Graph = struct {
             const alias = own.at(own.kind, .cname);
             const alias_live = g.indexed(alias);
             if (g.served(alias, alias_live)) |s| if (switch (s) {
-                .stored => |e| store.Rrset.of(e.blob).kind == .alias,
+                .stored => |e| store.Rrset.of(e).kind == .alias,
                 .live => |id| g.cell(id).state == .fact and g.cell(id).state.fact.reply().kind == .alias,
             }) return g.demandFound(by, alias, name, alias_live, s);
         }
@@ -1590,15 +1598,15 @@ pub const Graph = struct {
     /// kept, borrowed; null when it kept none.
     pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !?*store.Blob {
         if (expires_ns <= g.now()) return null;
-        const blob = try g.store.build(value);
-        g.store.put(key, blob, expires_ns, g.now()) catch |err| {
+        const blob = try g.store.build(key, value, expires_ns);
+        g.store.put(blob) catch |err| {
             g.store.unref(blob);
             if (err != error.Refused) return err;
             return null;
         };
         // A put may evict what it lands as it lands.
         const e = g.store.any(key) orelse return null;
-        return if (e.blob == blob) blob else null;
+        return if (e == blob) blob else null;
     }
 
     // ── Rules ──────────────────────────────────────────────────────────
@@ -1801,13 +1809,43 @@ test "an evicted root cut is re-derived, not walked" {
     var g = try q.graph(.{ .root_hints = &.{} });
     defer g.deinit();
     const root_cut: Key = .of(.cut, .root, .a);
-    g.store.drop(root_cut, g.store.any(root_cut).?.blob);
+    g.store.drop(g.store.any(root_cut).?);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const root = try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, .new);
     try g.drain();
     try testing.expect(g.store.get(root_cut, q.now) != null);
     g.unhold(root);
+}
+
+test "a version shortened through one instant's cell ends for every cell holding it" {
+    const testing = std.testing;
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
+    defer g.deinit();
+    const name: dns.Name = .lit("example");
+    const key = Key.of(.rrset, name, .a);
+    const rrs = [_]dns.ResourceRecord{.fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })};
+    const now = try g.newCell(key, name, 0);
+    g.cell(now).holds += 1;
+    defer g.unhold(now);
+    try g.settle(now, .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rrs, .target = name, .zone = .root, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
+    const version = g.cell(now).blob.?;
+    // A refresh's instant materialises the stored version, and its judge
+    // shortens it.
+    const lapse = q.now + 200 * std.time.ns_per_s;
+    const refresh = try g.newCell(Key.of(.refresh, name, .a), name, lapse);
+    g.cell(refresh).holds += 1;
+    defer g.unhold(refresh);
+    g.as_of = lapse;
+    const later = (try g.demand(refresh, key, name)).?;
+    try testing.expectEqual(version, g.cell(later).blob.?);
+    g.authenticUntil(later, q.now + 250 * std.time.ns_per_s);
+    g.as_of = 0;
+    // Out of the store, the version is read through the live cell.
+    g.store.drop(version);
+    try testing.expectEqual(version, g.held(key).?);
+    try testing.expectEqual(q.now + 250 * std.time.ns_per_s, g.cell(now).expires());
 }
 
 test "a shared cell is paid by a waiting question with room, not its first demander" {

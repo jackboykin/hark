@@ -312,10 +312,10 @@ test "fuzz: store round trip" {
             const owner = if (msg.question) |q| q.name else dns.Name.root;
             const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             const key: graph.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
-            const blob = st.build(.{ .rrset = reply }) catch return;
-            st.put(key, blob, 10, 0) catch st.unref(blob);
+            const blob = st.build(key, .{ .rrset = reply }, 10) catch return;
+            st.put(blob) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;
-            const back = (try store.Store.parse(alloc, got.blob)).rrset;
+            const back = (try store.Store.parse(alloc, got)).rrset;
             for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals }, [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals }) |want, have| {
                 try testing.expectEqual(want.len, have.len);
                 for (want, have) |a, b| {
