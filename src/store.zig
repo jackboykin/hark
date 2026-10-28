@@ -294,6 +294,7 @@ pub const Store = struct {
         std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
         var w: Writer = .{ .buf = s.stage, .pos = @sizeOf(Blob) };
         try w.slice(key.name);
+        w.anchors[0] = .{ .at = 0, .len = key.name.len };
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
@@ -418,9 +419,9 @@ pub const Rrset = struct {
         const p = b.payload();
         if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[b.name_len])))) != .answer) return null;
         var at: usize = b.name_len + 1 + 1 + 2 + 4 + 8;
-        at += dns.wireNameLen(p[at..]);
-        at += dns.wireNameLen(p[at..]);
-        return .{ .it = .{ .bytes = p[at + 6 ..] }, .left = mem.readInt(u16, p[at..][0..2], .little) };
+        at += stored(p, at).len;
+        at += stored(p, at).len;
+        return .{ .it = .{ .payload = p, .pos = at + 6, .end = p.len }, .left = mem.readInt(u16, p[at..][0..2], .little) };
     }
 
     pub const Answered = struct {
@@ -463,7 +464,7 @@ pub const Rrset = struct {
                 const fixed = try r.slice(10);
                 _ = try r.slice(mem.readInt(u16, fixed[8..10], .big));
             }
-            sec.* = .{ .bytes = r.buf[start..r.pos], .len = n };
+            sec.* = .{ .payload = r.buf, .start = start, .end = r.pos, .len = n };
         }
         return v;
     }
@@ -471,26 +472,28 @@ pub const Rrset = struct {
 
 /// A section's records, as stored; each read with the TTL it came with.
 pub const Records = struct {
-    bytes: []const u8,
+    payload: []const u8,
+    start: usize,
+    end: usize,
     len: u16,
 
     pub fn iterator(r: Records) Iterator {
-        return .{ .bytes = r.bytes };
+        return .{ .payload = r.payload, .pos = r.start, .end = r.end };
     }
 
     pub const Iterator = struct {
-        bytes: []const u8,
-        pos: usize = 0,
+        payload: []const u8,
+        pos: usize,
+        end: usize,
 
         pub fn next(it: *Iterator) ?dns.ResourceRecord {
-            if (it.pos == it.bytes.len) return null;
-            const owner_len = dns.wireNameLen(it.bytes[it.pos..]);
-            const owner = it.bytes[it.pos..][0..owner_len];
-            const fixed = it.bytes[it.pos + owner_len ..][0..10];
-            const rdata = it.bytes[it.pos + owner_len + 10 ..][0..mem.readInt(u16, fixed[8..10], .big)];
-            it.pos += owner_len + 10 + rdata.len;
+            if (it.pos == it.end) return null;
+            const owner = stored(it.payload, it.pos);
+            const fixed = it.payload[it.pos + owner.len ..][0..10];
+            const rdata = it.payload[it.pos + owner.len + 10 ..][0..mem.readInt(u16, fixed[8..10], .big)];
+            it.pos += owner.len + 10 + rdata.len;
             return .{
-                .name = .of(owner),
+                .name = .of(owner.name),
                 .rtype = @fromBackingInt(mem.readInt(u16, fixed[0..2], .big)),
                 .rclass = @fromBackingInt(mem.readInt(u16, fixed[2..4], .big)),
                 .ttl = mem.readInt(u32, fixed[4..8], .big),
@@ -500,9 +503,26 @@ pub const Records = struct {
     };
 };
 
+/// Whole, or two bytes in RFC 1035's pointer form at a suffix of a name
+/// stored whole, so it reads as one slice.
+fn stored(payload: []const u8, at: usize) struct { name: []const u8, len: usize } {
+    if (payload[at] < 0xc0) {
+        const n = dns.wireNameLen(payload[at..]);
+        return .{ .name = payload[at..][0..n], .len = n };
+    }
+    const to = @as(usize, payload[at] & 0x3f) << 8 | payload[at + 1];
+    return .{ .name = payload[to..][0..dns.wireNameLen(payload[to..])], .len = 2 };
+}
+
 const Writer = struct {
     buf: []u8,
     pos: usize,
+    /// Names stored whole that a later one may end with: the key's, the
+    /// value's first, and its latest.
+    anchors: [3]?Anchor = @splat(null),
+
+    const payload_at = @sizeOf(Blob);
+    const Anchor = struct { at: usize, len: usize };
 
     fn int(w: *Writer, comptime T: type, v: T) !void {
         if (w.pos + @sizeOf(T) > w.buf.len) return error.EndOfData;
@@ -517,7 +537,22 @@ const Writer = struct {
     }
 
     fn name(w: *Writer, n: dns.Name) !void {
+        if (n.wire.len > 2) for (w.anchors) |anchor| {
+            const a = anchor orelse continue;
+            const at = a.at + (suffixAt(w.buf[payload_at + a.at ..][0..a.len], n.wire) orelse continue);
+            if (at >= 1 << 14) continue;
+            return w.slice(&.{ 0xc0 | @as(u8, @intCast(at >> 8)), @truncate(at) });
+        };
+        const a: Anchor = .{ .at = w.pos - payload_at, .len = n.wire.len };
         try w.slice(n.wire);
+        if (w.anchors[1] == null) w.anchors[1] = a;
+        w.anchors[2] = a;
+    }
+
+    fn suffixAt(whole: []const u8, n: []const u8) ?usize {
+        var at: usize = 0;
+        while (whole.len - at > n.len) at += @as(usize, whole[at]) + 1;
+        return if (mem.eql(u8, whole[at..], n)) at else null;
     }
 
     fn addr(w: *Writer, k: na.AddressKey) !void {
@@ -529,7 +564,7 @@ const Writer = struct {
     /// As `Records.Iterator` reads them.
     fn records(w: *Writer, rrs: []const RR) !void {
         for (rrs) |rr| {
-            try w.slice(rr.name.wire);
+            try w.name(rr.name);
             try w.slice(&try rr.fixed());
             try w.slice(rr.rdata);
         }
@@ -557,7 +592,9 @@ const Reader = struct {
     }
 
     fn wireName(r: *Reader) ![]const u8 {
-        return r.slice(dns.wireNameLen(r.buf[r.pos..]));
+        const n = stored(r.buf, r.pos);
+        r.pos += n.len;
+        return n.name;
     }
 
     fn addr(r: *Reader) !na.AddressKey {
@@ -568,7 +605,7 @@ const Reader = struct {
 
     fn records(r: *Reader, arena: Allocator, n: u16) ![]RR {
         const out = try arena.alloc(RR, n);
-        var it: Records.Iterator = .{ .bytes = r.buf, .pos = r.pos };
+        var it: Records.Iterator = .{ .payload = r.buf, .pos = r.pos, .end = r.buf.len };
         for (out) |*rr| rr.* = it.next() orelse return error.EndOfData;
         r.pos = it.pos;
         return out;
@@ -614,6 +651,9 @@ test "a fact survives the blob byte for byte" {
     const blob = try s.build(key, .{ .rrset = reply }, 1000);
     try s.put(blob);
     try testing.expectEqual(blob, s.get(key, 999).?);
+    // Whole in the key and rdata alone: the target, zone and owners refer back.
+    try testing.expectEqual(2, mem.count(u8, blob.bytes(), "\x03www\x07example\x03com\x00"));
+    try testing.expectEqual(4, mem.count(u8, blob.bytes(), "\x07example\x03com\x00"));
     try testing.expectEqual(null, s.get(key, 1000));
     try testing.expectEqual(blob.len, s.bytes);
 
@@ -671,12 +711,10 @@ test "the cap holds by eviction and admission" {
     const testing = std.testing;
     var s = try Store.init(testing.allocator, 2048);
     defer s.deinit();
-    const zone: dns.Name = .lit("x");
-    var names: [64][8]u8 = undefined;
-    for (0..64) |i| {
-        _ = try std.mem.print(&names[i], "k{d}", .{i});
-        const key: Key = .init(.cut, std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3], .a);
-        const blob = try s.build(key, .{ .cut = .{ .zone = zone } }, 10);
+    var names: [64][5]u8 = undefined;
+    for (&names, 0..) |*buf, i| {
+        const zone: dns.Name = .of(try std.mem.print(buf, "{c}k{d}\x00", .{ @as(u8, if (i < 10) 2 else 3), i }));
+        const blob = try s.build(.of(.cut, zone, .a), .{ .cut = .{ .zone = zone } }, 10);
         s.put(blob) catch |err| {
             try testing.expectEqual(error.Refused, err);
             try s.put(blob);
@@ -685,7 +723,8 @@ test "the cap holds by eviction and admission" {
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
     try testing.expect(s.unadmitted > 0);
-    const key: Key = .init(.cut, "again", .a);
+    const zone: dns.Name = .lit("again");
+    const key: Key = .of(.cut, zone, .a);
     const again = try s.build(key, .{ .cut = .{ .zone = zone } }, 10);
     try testing.expectError(error.Refused, s.put(again));
     try s.put(again);

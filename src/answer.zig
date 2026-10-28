@@ -752,9 +752,11 @@ test "a proof two hops share goes out once" {
 
     // NSEC, IN, TTL 3600; rdata: next name the root, an A bitmap.
     const nsec = "\x00\x2f\x00\x01\x00\x00\x0e\x10\x00\x04\x00\x00\x01\x40";
+    const ab = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec;
+    const ac = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec;
     const hops = [_]store.Records{
-        .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec, .len = 2 },
-        .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec, .len = 2 },
+        .{ .payload = ab, .start = 0, .end = ab.len, .len = 2 },
+        .{ .payload = ac, .start = 0, .end = ac.len, .len = 2 },
     };
     var out: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = 4 };
