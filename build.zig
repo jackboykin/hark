@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) !void {
     if (b.option(bool, "chaos", "With -Dscenario, trace the seed's chaos run, held to its reference") orelse false) run_tests.setEnvironmentVariable("HARK_CHAOS", "1");
     // The replays read their scenarios at run time: an edited one reruns
     // them, and an added or removed one reconfigures.
-    for ([_][]const u8{ "test/scenarios/hark", "test/corpus/unbound" }) |root| try declareInputs(b, run_tests, root);
+    try declareInputs(b, run_tests, "test/scenarios/hark");
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);

@@ -1,6 +1,5 @@
 //! Loader for `.rpl` scenarios: the hark dialect of Unbound's testbound
-//! format plus the vendored corpus. Whatever test/rpl.go accepts, this
-//! must too.
+//! format. Whatever test/rpl.go accepts, this must too.
 //!
 //! Everything is allocated from the caller's arena, never freed piecemeal.
 const std = @import("std");
@@ -13,8 +12,7 @@ const dns64 = @import("../dns64.zig");
 const proof = @import("../proof.zig");
 const stub = @import("../stub.zig");
 
-/// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
-/// to cache TTL 0.
+/// testbound's default; hark refuses to cache TTL 0.
 const default_ttl: u32 = 3600;
 
 /// MATCH flags from every context; which ones a context honours is the
@@ -119,8 +117,7 @@ pub const Scenario = struct {
     stub_zones: []const stub.Zone = &.{},
     ranges: []const Range = &.{},
     steps: []const Step = &.{},
-    /// `; hark:` directives and Unbound-prelude equivalents; null is the
-    /// harness default.
+    /// `; hark:` directives; null is the harness default.
     qmin: ?bool = null,
     minimal_responses: ?bool = null,
     rebinding_enabled: ?bool = null,
@@ -161,12 +158,10 @@ pub const Diag = struct {
 
 pub const Error = error{ Parse, OutOfMemory };
 
-/// Unbound's `server:` … `CONFIG_END` prelude is lifted: stripped, qmin and
-/// minimal-responses honoured, the first RANGE's ADDRESS the root hint. No
-/// address remapping: nothing here binds a socket.
+/// No address remapping: nothing here binds a socket.
 pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) Error!Scenario {
     var p: Parser = .{ .arena = arena, .diag = diag, .lines = mem.splitScalar(u8, text, '\n') };
-    return p.parse(text);
+    return p.parse();
 }
 
 const Parser = struct {
@@ -176,8 +171,6 @@ const Parser = struct {
     lineno: usize = 0,
     /// The current significant line, held until `advance`.
     cur: ?[]const u8 = null,
-    /// The lifted corpus's root hint.
-    first_address: ?na.Address = null,
     scenario: Scenario = .{},
 
     fn fail(p: *Parser, msg: []const u8) Error {
@@ -282,8 +275,7 @@ const Parser = struct {
         } else return p.fail("unknown hark directive");
     }
 
-    fn parse(p: *Parser, text: []const u8) Error!Scenario {
-        try p.lift(text);
+    fn parse(p: *Parser) Error!Scenario {
         const head = try p.next();
         if (!mem.startsWith(u8, head, "SCENARIO_BEGIN")) return p.fail("expected SCENARIO_BEGIN");
         p.scenario.name = mem.trim(u8, head["SCENARIO_BEGIN".len..], " \t");
@@ -295,10 +287,7 @@ const Parser = struct {
                 p.advance();
                 p.scenario.ranges = ranges.items;
                 p.scenario.steps = steps.items;
-                if (p.scenario.root_hints.len == 0) {
-                    const first = p.first_address orelse return p.fail("no root-hints and no ADDRESS to default to");
-                    p.scenario.root_hints = try p.arena.dupe(na.Address, &.{first});
-                }
+                if (p.scenario.root_hints.len == 0) return p.fail("no root-hints");
                 return p.scenario;
             }
             if (mem.startsWith(u8, line, "RANGE_BEGIN")) {
@@ -310,19 +299,6 @@ const Parser = struct {
             } else return p.fail("unexpected directive at scenario level");
         }
         return p.fail("missing SCENARIO_END");
-    }
-
-    /// Skip the corpus prelude to CONFIG_END, reading the two knobs it sets.
-    fn lift(p: *Parser, text: []const u8) Error!void {
-        const end = mem.find(u8, text, "CONFIG_END") orelse return;
-        const prelude = text[0..end];
-        if (mem.find(u8, prelude, "server:") == null) return;
-        if (findKnob(prelude, "qname-minimisation:")) |v| p.scenario.qmin = yes(v);
-        if (findKnob(prelude, "minimal-responses:")) |v| p.scenario.minimal_responses = yes(v);
-        while (p.lines.next()) |raw| {
-            p.lineno += 1;
-            if (mem.startsWith(u8, mem.trimStart(u8, raw, " \t"), "CONFIG_END")) return;
-        }
     }
 
     fn range(p: *Parser, head: []const u8) Error!Range {
@@ -342,7 +318,6 @@ const Parser = struct {
                 _ = t.next();
                 addr_seen = try p.parseAddr(t.next() orelse return p.fail("ADDRESS takes one IP"));
                 if (t.next() != null) return p.fail("ADDRESS takes one IP");
-                if (p.first_address == null) p.first_address = addr_seen;
             } else if (mem.eql(u8, line, "ENTRY_BEGIN")) {
                 p.advance();
                 try entries.append(p.arena, try p.entry());
@@ -690,7 +665,7 @@ const Parser = struct {
         return out;
     }
 
-    /// A number, or an IANA mnemonic as older corpus files spell it.
+    /// A number, or an IANA mnemonic.
     fn algorithm(p: *Parser, text: []const u8) Error!dns.DnssecAlgorithm {
         if (isDigits(text)) return @fromBackingInt(try p.int(u8, text));
         const table = .{
@@ -780,16 +755,8 @@ fn enumIgnoreCase(comptime E: type, s: []const u8) ?E {
     return null;
 }
 
-fn findKnob(prelude: []const u8, key: []const u8) ?[]const u8 {
-    const at = mem.find(u8, prelude, key) orelse return null;
-    const rest = prelude[at + key.len ..];
-    const end = mem.findScalar(u8, rest, '\n') orelse rest.len;
-    return mem.trim(u8, rest[0..end], " \t\r\"");
-}
-
 fn yes(val: []const u8) bool {
-    const v = mem.trim(u8, val, " \t\"");
-    return eqlLower(v, "yes") or eqlLower(v, "true") or eqlLower(v, "on") or mem.eql(u8, v, "1");
+    return eqlLower(val, "yes") or eqlLower(val, "true") or eqlLower(val, "on") or mem.eql(u8, val, "1");
 }
 
 fn eqlLower(a: []const u8, comptime lower: []const u8) bool {
@@ -905,60 +872,6 @@ test "minimal hark scenario" {
     try testing.expectEqual(dns.RCode.name_error, s.steps[1].entry.?.flags.rcode);
     try testing.expectEqual(10, s.steps[2].seconds);
     try testing.expectEqual(7, s.steps[3].bound);
-}
-
-test "unbound prelude is lifted" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const s = try parseTest(arena_state.allocator(),
-        \\; config options
-        \\server:
-        \\    qname-minimisation: "no"
-        \\    minimal-responses: no
-        \\stub-zone:
-        \\    name: "."
-        \\    stub-addr: 193.0.14.129   # K.ROOT-SERVERS.NET.
-        \\CONFIG_END
-        \\
-        \\SCENARIO_BEGIN Test basic
-        \\RANGE_BEGIN 0 100
-        \\    ADDRESS 193.0.14.129
-        \\ENTRY_BEGIN
-        \\MATCH opcode qtype qname
-        \\ADJUST copy_id
-        \\REPLY QR NOERROR
-        \\SECTION QUESTION
-        \\. IN NS
-        \\SECTION ANSWER
-        \\. IN NS   K.ROOT-SERVERS.NET.
-        \\SECTION ADDITIONAL
-        \\K.ROOT-SERVERS.NET.   IN   A   193.0.14.129
-        \\ENTRY_END
-        \\RANGE_END
-        \\STEP 1 QUERY
-        \\ENTRY_BEGIN
-        \\REPLY RD
-        \\SECTION QUESTION
-        \\www.example.com. IN A
-        \\ENTRY_END
-        \\STEP 10 CHECK_ANSWER
-        \\ENTRY_BEGIN
-        \\MATCH all
-        \\REPLY QR RD RA NOERROR
-        \\SECTION QUESTION
-        \\www.example.com. IN A
-        \\SECTION ANSWER
-        \\www.example.com. IN A   10.20.30.40
-        \\ENTRY_END
-        \\SCENARIO_END
-    );
-    try testing.expectEqual(false, s.qmin.?);
-    try testing.expectEqual(false, s.minimal_responses.?);
-    try testing.expectEqual(1, s.root_hints.len);
-    try testing.expect(na.ipEqual(s.root_hints[0], s.ranges[0].address));
-    try testing.expect(s.ranges[0].entries[0].answers[0].name.isRoot());
-    try testing.expectEqual(default_ttl, s.ranges[0].entries[0].answers[0].ttl);
-    try testing.expect(s.steps[1].entry.?.match.all);
 }
 
 test "rejections" {

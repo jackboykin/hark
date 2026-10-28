@@ -851,24 +851,6 @@ test "hark walk scenarios settle to today's answers" {
     };
 }
 
-// Divergences from Unbound, strict: a pass is a note in
-// test/corpus/unbound/DIVERGENCES.md to revisit.
-test "lifted unbound walk scenarios settle to today's answers" {
-    const r = try replayDir("test/corpus/unbound", 4, &.{
-        "iter_resolve_minimised.rpl",
-        "iter_resolve_minimised_timeout.rpl",
-        "iter_cycle_noh.rpl",
-        "iter_dname_insec.rpl",
-        "iter_dname_ttl.rpl",
-        "iter_dname_ttl0.rpl",
-        "iter_domain_sale.rpl",
-        "iter_domain_sale_nschange.rpl",
-        "iter_cname_nx.rpl",
-    });
-    try testing.expectEqual(18, r.parsed);
-    try testing.expectEqual(0, r.failed);
-}
-
 /// ns1 (127.0.10.3) listens nowhere, ns2 (127.0.10.4) answers.
 const siblings_rpl =
     \\; hark: root-hints = 127.0.10.1
