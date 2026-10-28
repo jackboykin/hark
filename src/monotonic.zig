@@ -24,8 +24,10 @@ pub fn nowNs() i64 {
     return (ts.sec + testOffsetSec()) * std.time.ns_per_s + ts.nsec;
 }
 
+/// Whole seconds want no counter read: the coarse clock is the kernel's
+/// last tick, a few ms behind at most.
 pub fn wallclockSec() i64 {
     var ts: std.posix.timespec = undefined;
-    const base: i64 = if (linux.errno(linux.clock_gettime(.REALTIME, &ts)) == .SUCCESS) ts.sec else 0;
+    const base: i64 = if (linux.errno(linux.clock_gettime(.REALTIME_COARSE, &ts)) == .SUCCESS) ts.sec else 0;
     return base + testOffsetSec();
 }
