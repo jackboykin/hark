@@ -119,7 +119,6 @@ pub const Scenario = struct {
     steps: []const Step = &.{},
     /// `; hark:` directives; null is the harness default.
     qmin: ?bool = null,
-    minimal_responses: ?bool = null,
     rebinding_enabled: ?bool = null,
     rebinding_allow_zones: []const []const u8 = &.{},
     rebinding_extra_allow: []const []const u8 = &.{},
@@ -238,8 +237,6 @@ const Parser = struct {
             s.stub_zones = try mem.concat(p.arena, stub.Zone, &.{ s.stub_zones, &.{z} });
         } else if (mem.eql(u8, key, "qname-minimisation")) {
             s.qmin = yes(val);
-        } else if (mem.eql(u8, key, "minimal-responses")) {
-            s.minimal_responses = yes(val);
         } else if (mem.eql(u8, key, "rebinding-enabled")) {
             s.rebinding_enabled = yes(val);
         } else if (mem.eql(u8, key, "rebinding-allow-zone")) {

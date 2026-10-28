@@ -161,7 +161,6 @@ pub const Desk = struct {
     g: *graph.Graph,
     retention: Retention,
     dns64: ?dns64.Prefix,
-    minimal: bool,
     failures: Failures = .{},
 
     pub fn deinit(d: *Desk) void {
@@ -479,21 +478,19 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
     }
     const r = last.rrset;
-    // Unbound's positive_answer() carve-out: NS asked, the NS and glue are the answer (RFC 8109 priming).
-    const trim = d.minimal and q.qtype != .ns;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = proofs };
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     // AD vouches for authority (RFC 4035 §3.2.3): under a secure verdict,
-    // only the proofs it judged. Every hop's go out, minimal or not: the
-    // client needs each to validate the chain (RFC 6672 §5.3.3).
-    const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
+    // only the proofs it judged. Every hop's go out: the client needs each
+    // to validate the chain (RFC 6672 §5.3.3).
+    const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
         const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
-        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = true, .positive = true, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
+        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
     }
     try appendAged(arena, &authorities, &seen, r.sections[1], keep, age, life, last.floor, last.stale);
-    if (!(trim and (r.kind == .answer or r.kind == .alias))) {
+    if (!keep.trims()) {
         // Nothing judges additional, so AD vouches for none of it.
         var add = keep;
         add.section = .additional;
@@ -527,20 +524,21 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
 /// know there is none), the SOA to cache its absence (RFC 2308), and with
 /// DO the proofs to validate it (RFC 4035 §3.1.1, §3.1.3); DNSSEC records
 /// go only to DO or when asked for by type (RFC 3225), never for CD alone
-/// (§3.2.2 turns validation off). Everything else is decoration for
-/// clients that are not resolvers, and `minimal-responses` trims it:
-/// stubs do not follow referrals, and a delegation NS in authority
-/// invites section confusion (CVE-2025-11411). DS is never sent there.
+/// (§3.2.2 turns validation off). Nothing else goes but an NS question's
+/// NS and glue (`trims`): stubs do not follow referrals, and NS in
+/// authority invites section confusion (CVE-2025-11411). DS is never sent
+/// there.
 const Keep = struct {
     section: enum { answer, authority, additional },
     qtype: dns.RType,
     do_bit: bool,
-    /// `minimal-responses`, off for an NS question.
-    trim: bool = false,
-    /// NOERROR with an answer.
-    positive: bool = false,
     denial: bool = true,
     proofs_only: bool = false,
+
+    /// An NS question's NS and glue are its answer (RFC 8109 priming).
+    fn trims(k: Keep) bool {
+        return k.qtype != .ns;
+    }
 
     fn keeps(k: Keep, rr: dns.ResourceRecord) bool {
         const t = rr.rtype;
@@ -556,21 +554,16 @@ const Keep = struct {
                 // A denial's SOA is its lifetime; nothing else owes one.
                 .soa => k.denial,
                 .nsec, .nsec3 => k.do_bit,
-                .ns => !(k.trim and k.positive),
                 .ds => false,
                 // A signature goes with what it covers.
                 .rrsig => k.do_bit and switch (rr.covers().?) {
                     .soa => k.denial,
                     .nsec, .nsec3 => true,
-                    .ns => !(k.trim and k.positive),
-                    else => !k.trim,
+                    else => !k.trims(),
                 },
-                else => !k.trim,
+                else => !k.trims(),
             },
-            .additional => if (k.trim and k.positive) switch (t) {
-                .nsec, .nsec3 => k.do_bit,
-                else => false,
-            } else switch (t) {
+            .additional => !k.trims() and switch (t) {
                 .rrsig, .nsec, .nsec3 => k.do_bit,
                 else => true,
             },
@@ -732,8 +725,6 @@ test "a client is sent what Keep keeps" {
         rtype: dns.RType,
         covers: dns.RType = .a,
         do_bit: bool = false,
-        trim: bool = true,
-        positive: bool = true,
         qtype: dns.RType = .a,
         kept: bool,
     };
@@ -742,30 +733,29 @@ test "a client is sent what Keep keeps" {
         .{ .section = .answer, .rtype = .rrsig, .kept = false },
         .{ .section = .answer, .rtype = .rrsig, .do_bit = true, .kept = true },
         .{ .section = .answer, .rtype = .nsec, .qtype = .nsec, .kept = true },
-        .{ .section = .authority, .rtype = .soa, .positive = false, .kept = true },
-        .{ .section = .authority, .rtype = .nsec, .positive = false, .kept = false },
+        .{ .section = .authority, .rtype = .soa, .kept = true },
+        .{ .section = .authority, .rtype = .nsec, .kept = false },
         .{ .section = .authority, .rtype = .nsec, .do_bit = true, .kept = true },
         .{ .section = .authority, .rtype = .ns, .kept = false },
-        .{ .section = .authority, .rtype = .ns, .positive = false, .kept = true },
-        .{ .section = .authority, .rtype = .ns, .trim = false, .kept = true },
-        .{ .section = .authority, .rtype = .ds, .trim = false, .do_bit = true, .kept = false },
+        .{ .section = .authority, .rtype = .ns, .qtype = .ns, .kept = true },
+        .{ .section = .authority, .rtype = .ds, .qtype = .ns, .do_bit = true, .kept = false },
         .{ .section = .authority, .rtype = .rrsig, .covers = .nsec, .do_bit = true, .kept = true },
         .{ .section = .authority, .rtype = .rrsig, .covers = .ns, .do_bit = true, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .soa, .positive = false, .kept = false },
+        .{ .section = .authority, .rtype = .rrsig, .covers = .soa, .kept = false },
         .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .trim = false, .kept = true },
+        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .qtype = .ns, .kept = true },
         .{ .section = .authority, .rtype = .txt, .kept = false },
-        .{ .section = .authority, .rtype = .txt, .trim = false, .kept = true },
+        .{ .section = .authority, .rtype = .txt, .qtype = .ns, .kept = true },
         .{ .section = .additional, .rtype = .a, .kept = false },
-        .{ .section = .additional, .rtype = .nsec, .do_bit = true, .kept = true },
-        .{ .section = .additional, .rtype = .a, .positive = false, .kept = true },
-        .{ .section = .additional, .rtype = .rrsig, .trim = false, .kept = false },
+        .{ .section = .additional, .rtype = .nsec, .do_bit = true, .kept = false },
+        .{ .section = .additional, .rtype = .a, .qtype = .ns, .kept = true },
+        .{ .section = .additional, .rtype = .rrsig, .qtype = .ns, .kept = false },
     };
     for (rows) |row| {
         var rdata: [2]u8 = undefined;
         std.mem.writeInt(u16, &rdata, @backingInt(row.covers), .big);
         const rr: dns.ResourceRecord = .{ .name = .root, .rtype = row.rtype, .rclass = .in, .ttl = 0, .rdata = &rdata };
-        const keep: Keep = .{ .section = row.section, .qtype = row.qtype, .do_bit = row.do_bit, .trim = row.trim, .positive = row.positive };
+        const keep: Keep = .{ .section = row.section, .qtype = row.qtype, .do_bit = row.do_bit };
         try std.testing.expectEqual(row.kept, keep.keeps(rr));
     }
 }

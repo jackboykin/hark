@@ -13,10 +13,6 @@ SCENARIO_BEGIN leaf auth with minimal-responses style answer (no authority/addit
 ; records on positive answers (to refresh delegation state, or to bind
 ; the answer to a zone cut) would reject this response and SERVFAIL.
 ; Hark must accept the bare ANSWER section.
-;
-; Adjacent to EDNS: minimal-responses is the operator-facing knob that
-; trades AUTHORITY/ADDITIONAL fidelity for buffer headroom under the
-; RFC 6891 §6.2.3 sender's UDP-payload-size cap.
 
 ; ── Fake root server ───────────────────────────────────────────────
 RANGE_BEGIN 0 100

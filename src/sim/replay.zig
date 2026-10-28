@@ -133,7 +133,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         .g = &g,
         .retention = .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 },
         .dns64 = scenario.dns64_prefix,
-        .minimal = scenario.minimal_responses orelse true,
     };
     defer desk.deinit();
     var last: ?dns.Message = null;

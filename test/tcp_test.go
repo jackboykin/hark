@@ -22,7 +22,7 @@ const idle = 1500 * time.Millisecond
 // Port 9 is discard (RFC 863): nothing hark asks is answered.
 func launchBare(t *testing.T, c config) *hark {
 	t.Helper()
-	c.qnameMinimization, c.minimalResponses = true, true
+	c.qnameMinimization = true
 	sc := &scenario{rootHints: []netip.Addr{netip.MustParseAddr("127.0.0.1")}, config: c}
 	h, err := startHark(t.Context(), t, harkBin, sc, 9, "")
 	if err != nil {

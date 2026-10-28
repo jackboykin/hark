@@ -867,7 +867,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
     defer in.destroy(gpa);
     const out = try Batch.create(gpa, cfg.max_udp_payload);
     defer out.destroy(gpa);
-    var s: Server = .{ .in = in, .out = out, .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = @min(fdShare(4), max_conns), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
+    var s: Server = .{ .in = in, .out = out, .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = @min(fdShare(4), max_conns), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64 }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {

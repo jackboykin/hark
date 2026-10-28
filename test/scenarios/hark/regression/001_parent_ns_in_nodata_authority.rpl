@@ -85,10 +85,13 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question authority additional
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     missing.example.com. IN AAAA
+  SECTION AUTHORITY
+    example.com. 300 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
+  SECTION ADDITIONAL
 ENTRY_END
 
 ; The final AAAA must land on the example.com auth (127.0.10.3). A buggy

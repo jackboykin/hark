@@ -181,7 +181,6 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 	}
 	line("[server]")
 	line("listen = %s", list([]string{listen.String()}))
-	line("minimal-responses = %t", c.minimalResponses)
 	if c.tcpIdleMs > 0 {
 		line("tcp-idle-timeout-ms = %d", c.tcpIdleMs)
 	}

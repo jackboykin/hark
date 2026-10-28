@@ -28,13 +28,13 @@ type scenario struct {
 }
 
 type config struct {
-	qnameMinimization, minimalResponses, prefetch bool
-	staggerMs, maxQueries                         *int
-	minTTL, serveStaleTTL                         int
-	dns64Prefix                                   string
-	rebinding                                     bool
-	allowZones, extraAllow                        []string
-	stubZones                                     []stubZone
+	qnameMinimization, prefetch bool
+	staggerMs, maxQueries       *int
+	minTTL, serveStaleTTL       int
+	dns64Prefix                 string
+	rebinding                   bool
+	allowZones, extraAllow      []string
+	stubZones                   []stubZone
 	// Set by tests alone; zero is hark's default.
 	cacheSize, tcpIdleMs int
 	allowFrom            []string
@@ -114,7 +114,7 @@ func parse(name string, text []byte) (*scenario, error) {
 	p := parser{sc: &scenario{
 		sigValidity:   365 * 24 * time.Hour,
 		clientTimeout: 5 * time.Second,
-		config:        config{qnameMinimization: true, minimalResponses: true},
+		config:        config{qnameMinimization: true},
 	}}
 	for i, raw := range strings.Split(string(text), "\n") {
 		if err := p.line(raw); err != nil {
@@ -445,8 +445,6 @@ func (p *parser) directive(key, val string) error {
 		c.stubZones = append(c.stubZones, z)
 	case "qname-minimisation":
 		c.qnameMinimization = yes
-	case "minimal-responses":
-		c.minimalResponses = yes
 	case "prefetch":
 		c.prefetch = yes
 	case "rebinding-enabled":

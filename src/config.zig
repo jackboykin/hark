@@ -84,9 +84,6 @@ pub const ServerConfig = struct {
     drop_gid: ?u32 = null,
     /// BCP 140: empty allows every client, which off loopback is an open resolver.
     allow_from: []const acl.Cidr = &.{},
-    /// Only what answers the question: the answer, SOA on negatives, and
-    /// DNSSEC proofs under DO (`answer.zig:Keep`).
-    minimal_responses: bool = true,
     /// RFC 7766 §6.2.3.
     tcp_idle_timeout_ms: u32 = 5_000,
     tcp_queries_per_conn: u32 = 128,
@@ -148,7 +145,6 @@ const config_schema = [_]SectionSpec{
         .{ .name = "allow-from", .kind = .string_array },
         .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
         .{ .name = "tcp-queries-per-conn", .kind = .integer },
-        .{ .name = "minimal-responses", .kind = .boolean },
     } },
     .{ .name = "resolver", .keys = &.{
         .{ .name = "root-hints", .kind = .string_array },
@@ -265,7 +261,6 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
         // RFC 7828 §3.1: the keepalive TIMEOUT is a u16 of 100 ms units.
         if (try integer(u32, server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
         if (try integer(u32, server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
-        if (server.get("minimal-responses", .boolean)) |m| cfg.minimal_responses = m;
     }
 
     if (root.get("resolver", .table)) |resolver| {

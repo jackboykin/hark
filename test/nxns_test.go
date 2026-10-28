@@ -126,7 +126,7 @@ func TestGluelessNSFanoutIsBounded(t *testing.T) {
 	evil := serveEvilRoot(t)
 	sc := &scenario{
 		rootHints: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
-		config:    config{qnameMinimization: true, minimalResponses: true},
+		config:    config{qnameMinimization: true},
 	}
 	ctx, stop := context.WithCancel(t.Context())
 	h, err := startHark(ctx, t, harkBin, sc, evil.port(), "")
