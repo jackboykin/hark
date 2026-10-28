@@ -490,11 +490,11 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
     }
     try appendAged(arena, &authorities, &seen, r.sections[1], keep, age, life, last.floor, last.stale);
-    if (!keep.trims()) {
-        // Nothing judges additional, so AD vouches for none of it.
+    // Nothing judges additional, so AD vouches for none of it.
+    if (!secure) {
         var add = keep;
         add.section = .additional;
-        if (!secure) try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
+        try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
     }
     // Any hop counts: a stale alias still redirected.
     const ede: ?dns.Ede = if (stale_any)
@@ -524,21 +524,14 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
 /// know there is none), the SOA to cache its absence (RFC 2308), and with
 /// DO the proofs to validate it (RFC 4035 §3.1.1, §3.1.3); DNSSEC records
 /// go only to DO or when asked for by type (RFC 3225), never for CD alone
-/// (§3.2.2 turns validation off). Nothing else goes but an NS question's
-/// NS and glue (`trims`): stubs do not follow referrals, and NS in
-/// authority invites section confusion (CVE-2025-11411). DS is never sent
-/// there.
+/// (§3.2.2 turns validation off). Intake keeps nothing more but an NS
+/// answer's NS and glue (`walk.classify`), and DS is never sent there.
 const Keep = struct {
     section: enum { answer, authority, additional },
     qtype: dns.RType,
     do_bit: bool,
     denial: bool = true,
     proofs_only: bool = false,
-
-    /// An NS question's NS and glue are its answer (RFC 8109 priming).
-    fn trims(k: Keep) bool {
-        return k.qtype != .ns;
-    }
 
     fn keeps(k: Keep, rr: dns.ResourceRecord) bool {
         const t = rr.rtype;
@@ -558,12 +551,12 @@ const Keep = struct {
                 // A signature goes with what it covers.
                 .rrsig => k.do_bit and switch (rr.covers().?) {
                     .soa => k.denial,
-                    .nsec, .nsec3 => true,
-                    else => !k.trims(),
+                    .ds => false,
+                    else => true,
                 },
-                else => !k.trims(),
+                else => true,
             },
-            .additional => !k.trims() and switch (t) {
+            .additional => switch (t) {
                 .rrsig, .nsec, .nsec3 => k.do_bit,
                 else => true,
             },
@@ -736,20 +729,12 @@ test "a client is sent what Keep keeps" {
         .{ .section = .authority, .rtype = .soa, .kept = true },
         .{ .section = .authority, .rtype = .nsec, .kept = false },
         .{ .section = .authority, .rtype = .nsec, .do_bit = true, .kept = true },
-        .{ .section = .authority, .rtype = .ns, .kept = false },
-        .{ .section = .authority, .rtype = .ns, .qtype = .ns, .kept = true },
-        .{ .section = .authority, .rtype = .ds, .qtype = .ns, .do_bit = true, .kept = false },
+        .{ .section = .authority, .rtype = .ds, .do_bit = true, .kept = false },
         .{ .section = .authority, .rtype = .rrsig, .covers = .nsec, .do_bit = true, .kept = true },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .ns, .do_bit = true, .kept = false },
         .{ .section = .authority, .rtype = .rrsig, .covers = .soa, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .qtype = .ns, .kept = true },
-        .{ .section = .authority, .rtype = .txt, .kept = false },
-        .{ .section = .authority, .rtype = .txt, .qtype = .ns, .kept = true },
-        .{ .section = .additional, .rtype = .a, .kept = false },
-        .{ .section = .additional, .rtype = .nsec, .do_bit = true, .kept = false },
-        .{ .section = .additional, .rtype = .a, .qtype = .ns, .kept = true },
-        .{ .section = .additional, .rtype = .rrsig, .qtype = .ns, .kept = false },
+        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .kept = true },
+        .{ .section = .additional, .rtype = .a, .kept = true },
+        .{ .section = .additional, .rtype = .rrsig, .kept = false },
     };
     for (rows) |row| {
         var rdata: [2]u8 = undefined;

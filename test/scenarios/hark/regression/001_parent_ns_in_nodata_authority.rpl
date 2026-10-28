@@ -74,6 +74,26 @@ RANGE_BEGIN 0 100
       ns.example.com. 3600 IN A 127.0.10.3
       a.gtld.fake. 3600 IN A 127.0.10.2
   ENTRY_END
+  ; More NSEC than any proof needs, beside the zone's NS.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      flood.example.com. IN AAAA
+    SECTION AUTHORITY
+      example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
+      example.com. 3600 IN NS ns.example.com.
+      n0.example.com. 3600 IN NSEC n1.example.com. A
+      n1.example.com. 3600 IN NSEC n2.example.com. A
+      n2.example.com. 3600 IN NSEC n3.example.com. A
+      n3.example.com. 3600 IN NSEC n4.example.com. A
+      n4.example.com. 3600 IN NSEC n5.example.com. A
+      n5.example.com. 3600 IN NSEC n6.example.com. A
+      n6.example.com. 3600 IN NSEC n7.example.com. A
+      n7.example.com. 3600 IN NSEC n8.example.com. A
+      n8.example.com. 3600 IN NSEC n9.example.com. A
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -101,6 +121,25 @@ STEP 3 CHECK_QUERY_LOG
 ENTRY_BEGIN
   SECTION QUERY_LOG
     missing.example.com. AAAA 127.0.10.3
+ENTRY_END
+
+; A proof flood keeps no NS either.
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    flood.example.com. IN AAAA
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question authority additional
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    flood.example.com. IN AAAA
+  SECTION AUTHORITY
+    example.com. 300 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
+  SECTION ADDITIONAL
 ENTRY_END
 
 ; Trip conditions: a Hickory-class bug here would manifest as either

@@ -942,7 +942,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .aa = msg.header.flags.aa,
         .answers = keep.items,
-        .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,
         .target = cur,
         .zone = zone,
         .stored_ns = g.now(),
@@ -961,18 +960,24 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .nodata => if (!delegation.soaAbove(msg.authorities, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
         .answer, .alias, .yxdomain => {},
     }
+    // Past its proofs and a denial's SOA, only an answer to NS keeps
+    // authority and additional: its NS and glue are its answer (RFC 8109
+    // priming). No client is sent the rest: stubs do not follow referrals,
+    // and NS in authority invites section confusion (CVE-2025-11411).
+    const rest = reply.kind == .answer and qtype == .ns;
+    if (rest) reply.additionals = msg.additionals;
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
-    reply.authorities = try proofsNeeded(g, authorities, reply);
+    reply.authorities = try proofsNeeded(g, authorities, reply, rest);
     reply.ttl = replyTtl(reply);
     return .{ .reply = reply };
 }
 
 /// The proof a reply owes (RFC 4035 §3.1.3): a denial's from the zone it
-/// speaks for, a wildcard expansion's from the wildcard's zone. A flood is
-/// kept whole for the validator to refuse.
-fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]const dns.ResourceRecord {
+/// speaks for, a wildcard expansion's from the wildcard's zone. A flood's
+/// are kept unbound for the validator to refuse.
+fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: bool) ![]const dns.ResourceRecord {
     const a = g.scratch.allocator();
-    if (proof.proofFlood(rrs)) return rrs;
+    const flood = proof.proofFlood(rrs);
     const negative = reply.kind == .nodata or reply.kind == .nxdomain;
     const zone = if (negative) proof.denialZone(rrs, reply.target) else null;
     var signers: std.ArrayList(dns.Name) = .empty;
@@ -991,14 +996,14 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
             levelled.ttl = @min(rr.ttl, life);
             keep.appendAssumeCapacity(levelled);
         },
-        .nsec, .nsec3 => for (signers.items) |sn| {
+        .nsec, .nsec3 => if (flood) keep.appendAssumeCapacity(rr) else for (signers.items) |sn| {
             const signed = if (rr.rtype == .rrsig) rr.rrsig().signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
             if (signed) {
                 keep.appendAssumeCapacity(rr);
                 break;
             }
         },
-        else => keep.appendAssumeCapacity(rr),
+        else => if (rest) keep.appendAssumeCapacity(rr),
     };
     return keep.items;
 }
