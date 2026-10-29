@@ -215,7 +215,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     const now = g.wallNow();
     switch (r.kind) {
         .answer => {
-            const sig = (dnssec.validateRrset(r.answers, zone, .ds, false, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
+            const sig = (try dnssec.validateRrset(g.scratch.allocator(), r.answers, zone, .ds, false, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus).sig;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
@@ -226,7 +226,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             // RFC 4034 §3.1.3.
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
                 return .bogus;
-            const cap = dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
+            const cap = try dnssec.verifyAuthorityProofSigs(g.scratch.allocator(), r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap, r.stored_ns));
             const until = @min(rs.expires(), keys.expires());
@@ -310,7 +310,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
-    const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget, &g.verify_memo) catch
+    const sig = try dnssec.validateDnskeyRrset(g.scratch.allocator(), r.answers, ds_data.items, zone, now, budget, &g.verify_memo) orelse
         return failChain(g, id, s.rrset.unwrap().?);
     g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
@@ -463,7 +463,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     break :f null;
                 }
                 const records = if (c.is == .proof) r.authorities else r.answers;
-                const v = dnssec.validateRrset(records, c.owner, c.rtype, c.is == .proof, keys.records, now, budget, &g.verify_memo) orelse
+                const v = try dnssec.validateRrset(g.scratch.allocator(), records, c.owner, c.rtype, c.is == .proof, keys.records, now, budget, &g.verify_memo) orelse
                     break :f .bogus;
                 const verified = v.sig;
                 const cap = capExpiry(g, .of(verified, now), r.stored_ns);
