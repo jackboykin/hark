@@ -19,15 +19,19 @@ pub fn advanceTestClock(secs: i64) void {
 
 /// Boot time, immune to NTP jumps.
 pub fn nowNs() i64 {
-    var ts: std.posix.timespec = undefined;
-    if (linux.errno(linux.clock_gettime(.BOOTTIME, &ts)) != .SUCCESS) return 0;
+    const ts = read(.BOOTTIME);
     return (ts.sec + testOffsetSec()) * std.time.ns_per_s + ts.nsec;
 }
 
 /// Whole seconds want no counter read: the coarse clock is the kernel's
 /// last tick, a few ms behind at most.
 pub fn wallclockSec() i64 {
+    return read(.REALTIME_COARSE).sec + testOffsetSec();
+}
+
+/// Zero would stop time: nothing would lapse, and signatures be judged in 1970.
+fn read(clock: linux.clockid_t) std.posix.timespec {
     var ts: std.posix.timespec = undefined;
-    const base: i64 = if (linux.errno(linux.clock_gettime(.REALTIME_COARSE, &ts)) == .SUCCESS) ts.sec else 0;
-    return base + testOffsetSec();
+    if (linux.errno(linux.clock_gettime(clock, &ts)) != .SUCCESS) @panic("clock_gettime failed");
+    return ts;
 }
