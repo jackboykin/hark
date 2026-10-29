@@ -687,9 +687,9 @@ pub const Graph = struct {
         return g.edge.now_ns.*;
     }
 
-    /// Wall seconds, for signature windows.
+    /// Signature times are serials, wall seconds mod 2^32 (RFC 4034 §3.1.5).
     pub fn wallNow(g: *const Graph) u32 {
-        return @intCast(g.edge.wall_sec.*);
+        return @truncate(@as(u64, @bitCast(g.edge.wall_sec.*)));
     }
 
     pub fn cell(g: *Graph, id: CellId) *Cell {
