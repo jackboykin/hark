@@ -25,7 +25,6 @@ pub const VerifyError = error{
     InvalidSignature,
     UnsupportedAlgorithm,
     InvalidKey,
-    TooManyRecords,
     SignatureExpired,
     /// CVE-2023-50387 (KeyTrap) defense: per-resolution signature-verify budget
     /// exhausted. Callers map this to .bogus; the response SERVFAILs.
@@ -165,18 +164,33 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
 
+/// An RRset in canonical order (RFC 4034 §6.3), the order a signature
+/// covers it in.
+pub const Canonical = struct {
+    records: []const dns.ResourceRecord,
+
+    /// Sorts `records` in place, by RDATA alone: a set's records share
+    /// owner, type and class, and RDLENGTH must not order them, or records
+    /// of different sizes (mixed 1024/2048-bit DNSKEY) mis-sort.
+    pub fn sort(records: []dns.ResourceRecord) Canonical {
+        mem.sortUnstable(dns.ResourceRecord, records, {}, struct {
+            fn lessThan(_: void, a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
+                return mem.order(u8, a.rdata, b.rdata) == .lt;
+            }
+        }.lessThan);
+        return .{ .records = records };
+    }
+};
+
 /// RFC 4034 §3.1.8.1 signed data: RRSIG_RDATA (sans signature) followed by
-/// the RRset in canonical form sorted by RDATA. A record's rdata is kept
-/// canonical, so it is fed as it stands.
+/// the RRset in canonical form. A record's rdata is kept canonical, so it is
+/// fed as it stands.
 pub const SignedData = struct {
     header: [18 + dns.max_name_wire_len]u8 = undefined,
     header_len: usize,
     labels: u8 = 0,
     original_ttl: u32 = 0,
-    records: [max_entries]dns.ResourceRecord = undefined,
-    len: usize = 0,
-
-    pub const max_entries = 64;
+    set: Canonical = .{ .records = &.{} },
 
     fn raw(bytes: []const u8) SignedData {
         var d: SignedData = .{ .header_len = bytes.len };
@@ -186,7 +200,7 @@ pub const SignedData = struct {
 
     pub fn feed(self: *const SignedData, hasher: anytype) void {
         hasher.update(self.header[0..self.header_len]);
-        for (self.records[0..self.len]) |rr| {
+        for (self.set.records) |rr| {
             // RFC 4035 §5.3.2: fewer labels than the owner's sign the wildcard.
             var wc: dns.Name.Buf = undefined;
             const owner = if (self.labels < rr.name.depth()) dns.Name.child(&wc, "*", rr.name.ancestor(self.labels)).? else rr.name;
@@ -199,9 +213,8 @@ pub const SignedData = struct {
     }
 };
 
-pub fn buildSignedData(rrsig: dns.RrsigData, rrset: []const dns.ResourceRecord) error{TooManyRecords}!SignedData {
-    if (rrset.len > SignedData.max_entries) return error.TooManyRecords;
-    var out: SignedData = .{ .header_len = 18 + rrsig.signer_name.wire.len, .labels = rrsig.labels, .original_ttl = rrsig.original_ttl, .len = rrset.len };
+pub fn buildSignedData(rrsig: dns.RrsigData, set: Canonical) SignedData {
+    var out: SignedData = .{ .header_len = 18 + rrsig.signer_name.wire.len, .labels = rrsig.labels, .original_ttl = rrsig.original_ttl, .set = set };
     const h = &out.header;
     mem.writeInt(u16, h[0..2], @backingInt(rrsig.type_covered), .big);
     h[2] = @backingInt(rrsig.algorithm);
@@ -211,15 +224,6 @@ pub fn buildSignedData(rrsig: dns.RrsigData, rrset: []const dns.ResourceRecord) 
     mem.writeInt(u32, h[12..16], rrsig.sig_inception, .big);
     mem.writeInt(u16, h[16..18], rrsig.key_tag, .big);
     @memcpy(h[18..out.header_len], rrsig.signer_name.wire);
-    @memcpy(out.records[0..rrset.len], rrset);
-    // RFC 4034 §6.3: within an RRset, sort by RDATA (owner/type/class/TTL
-    // are identical). Must not include rdlength — it would mis-order records
-    // of different sizes (e.g. mixed 1024/2048-bit DNSKEY).
-    mem.sortUnstable(dns.ResourceRecord, out.records[0..rrset.len], {}, struct {
-        fn lessThan(_: void, a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
-            return mem.order(u8, a.rdata, b.rdata) == .lt;
-        }
-    }.lessThan);
     return out;
 }
 
@@ -234,12 +238,12 @@ const inception_skew_tolerance: u32 = 60;
 pub fn tryVerifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
-    rrset: []const dns.ResourceRecord,
+    set: Canonical,
     now_u32: u32,
     budget: *ValidationBudget,
     memo: *VerifyMemo,
 ) error{ValidationBudgetExhausted}!bool {
-    verifyRrsig(rrsig, dnskey, rrset, now_u32, budget, memo) catch |e| switch (e) {
+    verifyRrsig(rrsig, dnskey, set, now_u32, budget, memo) catch |e| switch (e) {
         error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
         else => return false,
     };
@@ -249,7 +253,7 @@ pub fn tryVerifyRrsig(
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
-    rrset: []const dns.ResourceRecord,
+    set: Canonical,
     now_u32: u32,
     budget: *ValidationBudget,
     memo: *VerifyMemo,
@@ -261,7 +265,7 @@ pub fn verifyRrsig(
     // RFC 4035 §5.3.1; else an RRSIG naming a weaker algorithm hands the key to that verifier.
     if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
 
-    for (rrset) |rr| {
+    for (set.records) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.depth()) return error.InvalidSignature;
         // An expansion's wildcard must sit in the signer's zone: its key speaks for none above.
@@ -280,14 +284,14 @@ pub fn verifyRrsig(
     // (lib/dns/validator.c:1473-1483); it is the only such check in Unbound or
     // BIND.
     if (rrsig.type_covered == .soa or rrsig.type_covered == .ns) {
-        for (rrset) |rr| {
+        for (set.records) |rr| {
             if (!rr.name.eql(rrsig.signer_name)) return error.InvalidSignature;
         }
     }
 
     if (!inWindow(rrsig, now_u32)) return error.SignatureExpired;
 
-    const data = try buildSignedData(rrsig, rrset);
+    const data = buildSignedData(rrsig, set);
 
     switch (rrsig.algorithm) {
         inline .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => |alg| {
@@ -564,7 +568,7 @@ test "buildSignedData produces correct header" {
 
     const owner_name = dns.Name.lit("www.example.com");
 
-    const rrset = [_]dns.ResourceRecord{.fixture(.{
+    var rrset = [_]dns.ResourceRecord{.fixture(.{
         .name = owner_name,
         .rtype = .a,
         .rclass = .in,
@@ -573,7 +577,7 @@ test "buildSignedData produces correct header" {
     })};
 
     var flat = TestFlatten{};
-    (try buildSignedData(rrsig, &rrset)).feed(&flat);
+    buildSignedData(rrsig, .sort(&rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
@@ -617,7 +621,7 @@ test "buildSignedData reconstructs wildcard owner name" {
     // Owner has 3 labels but RRSIG says 2 — wildcard expansion
     const owner_name = dns.Name.lit("foo.example.com");
 
-    const rrset = [_]dns.ResourceRecord{.fixture(.{
+    var rrset = [_]dns.ResourceRecord{.fixture(.{
         .name = owner_name,
         .rtype = .a,
         .rclass = .in,
@@ -626,7 +630,7 @@ test "buildSignedData reconstructs wildcard owner name" {
     })};
 
     var flat = TestFlatten{};
-    (try buildSignedData(rrsig, &rrset)).feed(&flat);
+    buildSignedData(rrsig, .sort(&rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
     // After the RRSIG header (18 bytes) + signer name (13 bytes) = offset 31
@@ -646,6 +650,7 @@ test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
         "\xc0\x0c\x00\x21\x00\x01\x00\x00\x01\x2c\x00\x0c" ++
         "\x00\x0a\x00\x14\x13\xc4\x03SIP\xc0\x16";
     const msg = try dns.parseMessage(a, wire);
+    const answers = try a.dupe(dns.ResourceRecord, msg.answers);
     const b64 = std.base64.standard.Decoder;
     var key: [32]u8 = undefined;
     try b64.decode(&key, "pN1ZplRgxmic0CryiKUUNeppeKGaijf6hL5+N3QVvM4=");
@@ -665,7 +670,7 @@ test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
     const dnskey: dns.DnskeyData = .{ .flags = 257, .protocol = 3, .algorithm = .ed25519, .public_key = &key };
     var budget: ValidationBudget = .{};
     var memo: VerifyMemo = .{};
-    try verifyRrsig(rrsig, dnskey, msg.answers, 1_800_000_000, &budget, &memo);
+    try verifyRrsig(rrsig, dnskey, .sort(answers), 1_800_000_000, &budget, &memo);
 }
 
 test "ECDSA P-384 signature verification" {
@@ -680,7 +685,7 @@ test "ECDSA P-384 signature verification" {
 }
 
 test "VerifyMemo: a remembered signature binds its key and still expires" {
-    const recs = [_]dns.ResourceRecord{
+    var recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var sig_bytes: [64]u8 = undefined;
@@ -695,12 +700,12 @@ test "VerifyMemo: a remembered signature binds its key and still expires" {
     var budget: ValidationBudget = .{};
     const now: u32 = 1_700_000_000;
 
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, now, &budget, &memo);
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, now, &budget, &memo);
+    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
+    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
     try testing.expectEqual(1, memo.hits);
     // Same signature and data under another key of the same algorithm.
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, &recs, now, &budget, &memo));
-    try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, &recs, signed.rrsig.sig_expiration + 1, &budget, &memo));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, .sort(&recs), now, &budget, &memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), signed.rrsig.sig_expiration + 1, &budget, &memo));
     try testing.expectEqual(1, memo.hits);
 }
 
@@ -835,17 +840,17 @@ const test_window_dnskey = dns.DnskeyData{
     .algorithm = .ecdsap256sha256,
     .public_key = &.{},
 };
-const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
+const test_window_empty_set: Canonical = .{ .records = &.{} };
 
 test "verifyRrsig rejects expired signature" {
     var budget: ValidationBudget = .{};
     // Expiration tolerance is 0 — any time strictly past expiration rejects.
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + 1, &budget, &test_memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, 1700000000 + 1, &budget, &test_memo));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
     var budget: ValidationBudget = .{};
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, &budget, &test_memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, 1699000000 - inception_skew_tolerance - 1, &budget, &test_memo));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
@@ -855,7 +860,7 @@ test "verifyRrsig tolerates clock skew within window" {
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
-        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, &budget, &test_memo));
+        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, now, &budget, &test_memo));
     }
 }
 
@@ -874,13 +879,13 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
         .signer_name = cross_signer,
         .signature = &.{},
     };
-    const rrset = [_]dns.ResourceRecord{
+    var rrset = [_]dns.ResourceRecord{
         .fixture(.{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
     };
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, &budget, &test_memo),
+        verifyRrsig(rrsig, test_window_dnskey, .sort(&rrset), 1699500000, &budget, &test_memo),
     );
 }
 
@@ -892,7 +897,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
         try testing.expectError(error.InvalidKey, verifyRrsig(
             test_window_rrsig,
             test_window_dnskey,
-            test_window_empty_rrset,
+            test_window_empty_set,
             1699500000,
             &budget,
             &test_memo,
@@ -903,7 +908,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
     try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
         test_window_rrsig,
         test_window_dnskey,
-        test_window_empty_rrset,
+        test_window_empty_set,
         1699500000,
         &budget,
         &test_memo,
@@ -927,19 +932,19 @@ test "verifyRrsig takes an expansion only from a wildcard inside the signer's zo
     for (cases) |c| {
         const owner = try dns.parseDottedName(arena.allocator(), c.owner);
         const signer = try dns.parseDottedName(arena.allocator(), c.signer);
-        const recs = [_]dns.ResourceRecord{
+        var recs = [_]dns.ResourceRecord{
             .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
         };
         var sig_buf: [64]u8 = undefined;
         var pub_buf: [32]u8 = undefined;
         var signed = try testSignRrsetBy(kp, &recs, .a, signer, .ed25519, &sig_buf, &pub_buf);
         signed.rrsig.labels = c.labels;
-        const data = try buildSignedData(signed.rrsig, &recs);
+        const data = buildSignedData(signed.rrsig, .sort(&recs));
         var sig = try kp.signer(null, testing.io);
         data.feed(&sig);
         sig_buf = sig.finalize().toBytes();
         var budget: ValidationBudget = .{};
-        const got = verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
+        const got = verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), 1_700_000_000, &budget, &test_memo);
         if (c.ok) try got else try testing.expectError(error.InvalidSignature, got);
     }
 }
@@ -973,24 +978,24 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         // Owner strictly below the signer: rejected however good the signature.
         var sig_buf: [64]u8 = undefined;
         var pub_buf: [32]u8 = undefined;
-        const below = [_]dns.ResourceRecord{
+        var below = [_]dns.ResourceRecord{
             .fixture(.{ .name = child, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata }),
         };
         const signed = try testSignRrset(&below, rtype, parent, .ed25519, &sig_buf, &pub_buf);
         try testing.expectError(
             error.InvalidSignature,
-            verifyRrsig(signed.rrsig, signed.dnskey, &below, 1_700_000_000, &budget, &test_memo),
+            verifyRrsig(signed.rrsig, signed.dnskey, .sort(&below), 1_700_000_000, &budget, &test_memo),
         );
 
         // Owner == signer is the apex shape and must still verify, or the rule
         // would reject every legitimate apex NS/SOA in existence.
         var apex_sig_buf: [64]u8 = undefined;
         var apex_pub_buf: [32]u8 = undefined;
-        const at_apex = [_]dns.ResourceRecord{
+        var at_apex = [_]dns.ResourceRecord{
             .fixture(.{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata }),
         };
         const apex = try testSignRrset(&at_apex, rtype, parent, .ed25519, &apex_sig_buf, &apex_pub_buf);
-        try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget, &test_memo);
+        try verifyRrsig(apex.rrsig, apex.dnskey, .sort(&at_apex), 1_700_000_000, &budget, &test_memo);
     }
 }
 
@@ -1046,7 +1051,9 @@ pub fn testSignRrsetBy(
         .signer_name = signer,
         .signature = &.{},
     };
-    const data = try buildSignedData(rrsig, rrset);
+    const set = try testing.allocator.dupe(dns.ResourceRecord, rrset);
+    defer testing.allocator.free(set);
+    const data = buildSignedData(rrsig, .sort(set));
     var sig = try kp.signer(null, testing.io);
     data.feed(&sig);
     sig_buf.* = sig.finalize().toBytes();

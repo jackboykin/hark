@@ -93,10 +93,10 @@ pub fn validateDnskeyRrset(
         dnskey_only[dnskey_count] = rr;
         dnskey_count += 1;
     }
-    const filtered = dnskey_only[0..dnskey_count];
+    const filtered: rrsig.Canonical = .sort(dnskey_only[0..dnskey_count]);
 
     var anchored: Keyset = undefined;
-    const fits = anchored.init(filtered);
+    const fits = anchored.init(filtered.records);
     std.debug.assert(fits);
     var n: usize = 0;
     for (anchored.keys[0..anchored.len], anchored.tags[0..anchored.len]) |dk, tag| {
@@ -228,14 +228,14 @@ const Keyset = struct {
 fn rrsetVerifiesWithAnyKey(
     sig: dns.RrsigData,
     keyset: *const Keyset,
-    rrset: []const dns.ResourceRecord,
+    set: rrsig.Canonical,
     now_u32: u32,
     budget: *rrsig.ValidationBudget,
     memo: *rrsig.VerifyMemo,
 ) error{ValidationBudgetExhausted}!bool {
     for (keyset.keys[0..keyset.len], keyset.tags[0..keyset.len]) |dk, tag| {
         if (tag != sig.key_tag) continue;
-        if (try rrsig.tryVerifyRrsig(sig, dk, rrset, now_u32, budget, memo)) return true;
+        if (try rrsig.tryVerifyRrsig(sig, dk, set, now_u32, budget, memo)) return true;
     }
     return false;
 }
@@ -412,7 +412,7 @@ pub fn validateRrset(
     // Refuse rather than truncate: the caller sets AD on the *unpruned*
     // response, so verifying a signature over records[0..64] while
     // shipping 70 records launders the 6 attacker-appended RRs into an
-    // authenticated answer. buildSignedData refuses >64 anyway.
+    // authenticated answer.
     var filtered: [64]dns.ResourceRecord = undefined;
     var count: usize = 0;
     for (records) |rr| {
@@ -422,13 +422,14 @@ pub fn validateRrset(
         count += 1;
     }
     if (count == 0) return null;
+    const set: rrsig.Canonical = .sort(filtered[0..count]);
     var keyset: Keyset = undefined;
     if (!keyset.init(dnskey_records)) return null;
 
     var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32, .unexpanded = unexpanded };
     while (it.next()) |i| {
         const sig = records[i].rrsig();
-        if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) {
+        if (rrsetVerifiesWithAnyKey(sig, &keyset, set, now_u32, budget, memo) catch return null) {
             while (it.next()) |_| {}
             return .{ .sig = sig, .unweighed = it.passed };
         }
@@ -479,10 +480,11 @@ pub fn verifyAuthorityProofSigs(
             rrset_count += 1;
         }
 
+        const set: rrsig.Canonical = .sort(rrset[0..rrset_count]);
         var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32, .unexpanded = true };
         const sig = while (it.next()) |j| {
             const sig = authorities[j].rrsig();
-            if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return null) break sig;
+            if (rrsetVerifiesWithAnyKey(sig, &keyset, set, now_u32, budget, memo) catch return null) break sig;
         } else return null;
         cap = cap.meet(.of(sig, now_u32));
     }
@@ -761,7 +763,7 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
     _ = try std.fmt.hexToBytes(&digest, "812cb1a22af04380e2f72d91c06c14eb1a918cf30037a8a9c67497e9264b4bfa");
     try verifyDs(.{ .key_tag = 59829, .algorithm = .mldsa44, .digest_type = .sha256, .digest = &digest }, dnskey, rrsig.test_owner);
 
-    const mx = [_]dns.ResourceRecord{.fixture(.{
+    var mx = [_]dns.ResourceRecord{.fixture(.{
         .name = rrsig.test_owner,
         .rtype = .mx,
         .rclass = .in,
@@ -780,13 +782,13 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .signature = &signature,
     };
     var budget: rrsig.ValidationBudget = .{};
-    try rrsig.verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo);
+    try rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo);
 
     signature[100] ^= 1;
-    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo));
+    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo));
     signature[100] ^= 1;
     sig.signer_name = proof.test_com;
-    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo));
+    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo));
 }
 
 test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
@@ -945,7 +947,9 @@ fn testSignMlDsa(
         .signer_name = signer,
         .signature = &.{},
     };
-    const data = try rrsig.buildSignedData(sig, rrset);
+    const set = try testing.allocator.dupe(dns.ResourceRecord, rrset);
+    defer testing.allocator.free(set);
+    const data = rrsig.buildSignedData(sig, .sort(set));
     var s = try kp.signer(null);
     data.feed(&s);
     sig_buf.* = s.finalize().toBytes();

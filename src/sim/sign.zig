@@ -139,13 +139,9 @@ pub const Signer = struct {
             var covered = false;
             for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rrsig().type_covered == head.rtype and o.rrsig().signer_name.eql(key.zone) and !reservedAlgorithm(@backingInt(o.rrsig().algorithm)));
             if (covered) continue;
-            var set: [rrsig.SignedData.max_entries]RR = undefined;
-            var n: usize = 0;
-            for (originals) |rr| if (rr.rclass == .in and rr.rtype == head.rtype and rr.name.eql(head.name)) {
-                set[n] = rr;
-                n += 1;
-            };
-            try out.append(self.arena, try self.sign(key, set[0..n], if (self.expands(wildcard, head.name, key, forced)) wildcard else null));
+            var set: std.ArrayList(RR) = .empty;
+            for (originals) |rr| if (rr.rclass == .in and rr.rtype == head.rtype and rr.name.eql(head.name)) try set.append(self.arena, rr);
+            try out.append(self.arena, try self.sign(key, .sort(set.items), if (self.expands(wildcard, head.name, key, forced)) wildcard else null));
         }
         return out.items;
     }
@@ -193,8 +189,8 @@ pub const Signer = struct {
 
     /// One RRSIG over `set` (one owner and type); with `wildcard`, as
     /// an expansion of that owner.
-    pub fn sign(self: *Signer, key: *const Key, set: []const RR, wildcard: ?dns.Name) !RR {
-        const head = set[0];
+    pub fn sign(self: *Signer, key: *const Key, set: rrsig.Canonical, wildcard: ?dns.Name) !RR {
+        const head = set.records[0];
         var sig: dns.RrsigData = .{
             .type_covered = head.rtype,
             .algorithm = .ecdsap256sha256,
@@ -206,7 +202,7 @@ pub const Signer = struct {
             .signer_name = key.zone,
             .signature = &.{},
         };
-        const data = try rrsig.buildSignedData(sig, set);
+        const data = rrsig.buildSignedData(sig, set);
         var h = Sha256.init(.{});
         data.feed(&h);
         const minted = try self.mint.signatures.getOrPut(self.mint.arena, h.finalResult());
@@ -227,7 +223,7 @@ pub const Signer = struct {
             if (!na.ipEqual(s.address, address) or !s.key.zone.eql(q.name)) continue;
             const rrs = try self.arena.alloc(RR, 2);
             rrs[0] = try .init(self.arena, .{ .name = s.key.zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = s.key.dnskey } });
-            rrs[1] = try self.sign(s.key, rrs[0..1], null);
+            rrs[1] = try self.sign(s.key, .sort(rrs[0..1]), null);
             return rrs;
         }
         return null;
