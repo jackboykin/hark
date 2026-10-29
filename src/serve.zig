@@ -894,7 +894,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
         }
         // No reply waits out a wait.
         s.out.flush();
-        const ev = try e.next(@min(e.now_ns + std.time.ns_per_s, s.nextTimer())) orelse {
+        const ev = try e.next(@min(sweep_at, stats_at, s.nextTimer())) orelse {
             try s.settle();
             continue;
         };
