@@ -190,7 +190,6 @@ pub const Ask = struct {
     /// Once more, skipping the dead unless all are.
     fn retry(a: *Ask, g: *Graph) void {
         a.retried = true;
-        g.stats.resolver.detail.retry += 1;
         a.tried = 0;
         for (a.servers[0..a.nservers], 0..) |s, i| if (g.isDead(s)) {
             a.tried |= bit(i);
@@ -1058,6 +1057,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         a.local = true;
         return .exhausted;
     }
+    var refused = false;
     while (true) {
         var i: u8 = 0;
         while (i < a.nattempts) {
@@ -1078,13 +1078,13 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 // normalizes case answers; a garbled datagram gets the
                 // same second chance.
                 .mismatch, .malformed => if (at.case == .random) {
-                    _ = try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .plain, qname, qtype);
+                    if (try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .plain, qname, qtype) == null) refused = true;
                 },
                 .reply => |r| {
                     if (r.msg.header.flags.tc) {
                         // TC over TCP: a broken server, as good as a timeout.
                         if (at.transport == .udp) {
-                            _ = try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .random, qname, qtype);
+                            if (try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .random, qname, qtype) == null) refused = true;
                         }
                     } else {
                         const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
@@ -1097,6 +1097,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 },
             }
         }
+        // A later run may have a payer with room, so the pass carries on.
+        if (refused) return if (a.nattempts > 0) .pending else a.giveUp(g);
         if (a.nattempts > 0 and (g.cfg.stagger_ms == 0 or a.nattempts == max_hedge)) return .pending;
         // The stagger is the time a server is given before it is late. One
         // that has only ever been silent is given none: a server with
@@ -1122,7 +1124,11 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         // The dead are hedged to only once nothing live is in flight.
         if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
         const last = p.last and !a.more;
-        const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
+        const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse {
+            refused = true;
+            continue;
+        };
+        if (a.retried) g.stats.resolver.detail.retry += 1;
         const stagger = try g.stretch(.stagger, g.cell(id).key, state.hedgeStagger() orelse g.cfg.stagger_ms);
         a.hedge_at = g.now() + @as(i64, stagger) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
@@ -1161,13 +1167,11 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 
 /// Null: refused, so launch nothing more; what is in flight may still answer.
 fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
-    a.tried |= Ask.bit(server);
     const ex = try g.exchange(id, a.servers[server], transport, case, qname, qtype, a.nattempts == 0 and last) orelse {
         a.cut_short = a.cut_short or !a.retried;
-        a.tried = Ask.bit(a.nservers) - 1;
-        a.fetched_unglued = true;
         return null;
     };
+    a.tried |= Ask.bit(server);
     a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
     return ex.est;
