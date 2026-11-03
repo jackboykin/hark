@@ -223,12 +223,15 @@ pub const Kept = struct { msg: dns.Message, verdict: Verdict };
 /// `none`: an rcode that answers nothing.
 pub const Verdict = union(enum) { reply: Reply, loop, none };
 
+/// A held fact above a name that speaks for every name below it, and its judge.
+const Above = struct { fact: OptionalCellId = .none, judge: OptionalCellId = .none };
+
 pub const RrsetScratch = struct {
     cut: OptionalCellId = .none,
-    /// A held fact above the name that speaks for every name below it, and
-    /// its judge: a DNAME (RFC 6672 §3.4.1) or a denial (RFC 8020 §2).
-    above: OptionalCellId = .none,
-    above_judge: OptionalCellId = .none,
+    /// Watched before the cut is sought (RFC 6672 §3.4.1).
+    dname: Above = .{},
+    /// Watched once the cut is known (RFC 8020 §2).
+    denial: Above = .{},
     started: bool = false,
     ask: Ask = .{},
 };
@@ -589,18 +592,14 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
         if (s.cut == .none) {
-            if (s.above == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, s, Key.of(.rrset, owner, .dname), owner);
-            switch (aboveSays(g, s)) {
+            if (s.dname.fact == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, &s.dname, Key.of(.rrset, owner, .dname), owner);
+            switch (aboveSays(g, &s.dname)) {
                 .waits => return,
                 .answers => {
-                    const reply = try dnameRedirect(g, name, s.above.unwrap().?);
+                    const reply = try dnameRedirect(g, name, s.dname.fact.unwrap().?);
                     return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                 },
-                // Let go, so past here only a denial is watched.
-                .silent => {
-                    s.above = .none;
-                    s.above_judge = .none;
-                },
+                .silent => {},
             }
             // Indexed proofs deny the name without a packet.
             if (try denial.deny(g, id)) return;
@@ -612,10 +611,10 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .failed => |why| return g.fail(id, why),
             .cut => |cid| g.cell(cid),
         };
-        if (s.above == .none and try belowDenial(g, id, s, cut.state.fact.cut.zone)) return;
-        switch (aboveSays(g, s)) {
+        if (s.denial.fact == .none and try belowDenial(g, id, s, cut.state.fact.cut.zone)) return;
+        switch (aboveSays(g, &s.denial)) {
             .waits => return,
-            .answers => return g.settleAs(id, g.version(s.above.unwrap().?)),
+            .answers => return g.settleAs(id, g.version(s.denial.fact.unwrap().?)),
             .silent => {},
         }
         s.ask.reset(cut.state.fact.cut.zone);
@@ -716,13 +715,13 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
     }
 }
 
-fn watchAbove(g: *Graph, id: CellId, s: *RrsetScratch, key: Key, at: dns.Name) !void {
-    s.above = .wrap(try g.demand(id, key, at));
-    if (s.above.unwrap()) |aid| s.above_judge = .wrap(try trust.demandSecure(g, id, aid));
+fn watchAbove(g: *Graph, id: CellId, above: *Above, key: Key, at: dns.Name) !void {
+    above.fact = .wrap(try g.demand(id, key, at));
+    if (above.fact.unwrap()) |aid| above.judge = .wrap(try trust.demandSecure(g, id, aid));
 }
 
-fn aboveSays(g: *Graph, s: *const RrsetScratch) enum { waits, answers, silent } {
-    const j = g.cell(s.above_judge.unwrap() orelse return .silent);
+fn aboveSays(g: *Graph, above: *const Above) enum { waits, answers, silent } {
+    const j = g.cell(above.judge.unwrap() orelse return .silent);
     if (!j.settled()) return .waits;
     return if (j.failure() == null and j.state.fact.secure.status == .secure) .answers else .silent;
 }
@@ -740,7 +739,7 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
         try g.settleAs(id, d.held);
         return true;
     }
-    try watchAbove(g, id, s, Key.of(.rrset, d.at, .a), d.at);
+    try watchAbove(g, id, &s.denial, Key.of(.rrset, d.at, .a), d.at);
     return false;
 }
 
