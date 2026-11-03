@@ -391,12 +391,11 @@ fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_las
         hop.* = hopOf(d, h.blob, h.rrset);
         const life: store.Life = .of(hop.rrset.stored_ns, h.blob.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
-        if (!g.awaitsVerdict(h.kind)) {
+        const v = h.standing orelse {
             secure = false;
             continue;
-        }
-        const v = h.blob.verdict;
-        secure = secure and v.chain().status == .secure;
+        };
+        secure = secure and v.status == .secure;
         hop.life = lifeOf(g, v.proven_until_ns);
     }
     if (yield_last_tenth and g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;

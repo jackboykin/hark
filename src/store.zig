@@ -16,6 +16,7 @@ const RR = dns.ResourceRecord;
 
 /// `secure(rrset)` over exactly these bytes.
 pub const Verdict = extern struct {
+    /// Read through `standing`: 0 decodes to secure, and zeroed is unjudged.
     status: u8 = 0,
     _pad: [3]u8 = @splat(0),
     judged_s: u32 = 0,
@@ -39,12 +40,8 @@ pub const Verdict = extern struct {
         return if (v.judged()) @min(expires_ns, v.until_ns) else expires_ns;
     }
 
-    /// Stands at `instant_ns` (`Graph.instant`).
-    pub fn serves(v: Verdict, instant_ns: i64) bool {
-        return v.until_ns > instant_ns;
-    }
-
-    pub fn chain(v: Verdict) trust.Chain {
+    pub fn standing(v: Verdict, instant_ns: i64) ?trust.Chain {
+        if (!v.judged() or v.until_ns <= instant_ns) return null;
         return .{ .status = @fromBackingInt(v.status), .proven_until_ns = v.proven_until_ns };
     }
 };

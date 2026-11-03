@@ -1314,7 +1314,7 @@ pub const Graph = struct {
     pub fn proven(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         const e = g.stored(key) orelse return null;
-        if (g.cfg.trust_anchors != null and !e.verdict.serves(g.instant())) return null;
+        if (g.cfg.trust_anchors != null and e.verdict.standing(g.instant()) == null) return null;
         return e;
     }
 
@@ -1365,7 +1365,7 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    pub const Recalled = struct { kind: Kind, blob: *store.Blob, rrset: store.Rrset };
+    pub const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?trust.Chain };
 
     /// The answer rule read against the store, building no cell: the
     /// question's chain as stored, into `arena`. `.fresh` is what the rule
@@ -1382,10 +1382,13 @@ pub const Graph = struct {
         while (true) {
             kind = g.hopKind(kind, next, qtype) orelse return null;
             const e = g.storedHop(kind.?, next, qtype, age) orelse return null;
-            const v = e.verdict;
-            if (g.awaitsVerdict(kind.?) and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
+            var standing: ?trust.Chain = null;
+            if (g.awaitsVerdict(kind.?)) {
+                standing = e.verdict.standing(g.now());
+                if (if (age == .fresh) standing == null else !e.verdict.judged()) return null;
+            }
             const r: store.Rrset = .of(e);
-            try hops.append(arena, .{ .kind = kind.?, .blob = e, .rrset = r });
+            try hops.append(arena, .{ .blob = e, .rrset = r, .standing = standing });
             const target: dns.Name = if (r.kind == .alias) .of(r.target) else .root;
             var it = r.sections[0].iterator();
             while (it.next()) |rr| if (rr.rtype == .cname) {

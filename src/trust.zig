@@ -333,8 +333,8 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     const sid = try g.newCell(key, t.name, g.as_of);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = g.gen(rid) };
     try g.pin(sid, by);
-    if (t.blob) |b| if (b.verdict.serves(g.instant())) {
-        try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
+    if (t.blob) |b| if (b.verdict.standing(g.instant())) |v| {
+        try g.settle(sid, .{ .secure = v }, b.verdict.until_ns);
         return sid;
     };
     try g.pin(rid, sid);

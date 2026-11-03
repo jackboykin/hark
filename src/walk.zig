@@ -735,9 +735,8 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
     if (!denial.denies(g, g.cell(id).key.rtype)) return false;
     const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
     if (!provable(d.held)) return false;
-    const v = d.held.verdict;
-    if (v.serves(g.instant())) {
-        if (v.chain().status != .secure) return false;
+    if (d.held.verdict.standing(g.instant())) |v| {
+        if (v.status != .secure) return false;
         try g.settleAs(id, d.held);
         return true;
     }
