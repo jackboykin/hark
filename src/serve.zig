@@ -372,8 +372,12 @@ const Server = struct {
     }
 
     fn drop(s: *Server, c: *Conn) void {
-        if (c.owed > 0) for (s.pending.items) |*p| if (p.phase != .vacant and p.tcpOn(c)) {
+        if (c.owed > 0) for (s.pending.items, 0..) |*p, i| if (p.phase != .vacant and p.tcpOn(c)) {
             p.owes = .left;
+            if (p.at_ns != Pending.never) continue;
+            p.at_ns = @max(timeout(p.*), s.e.now_ns);
+            // Without room for a timer, it stays until its root settles.
+            s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
         };
         sys.close(c.fd);
         s.watched.items[c.token & slot_mask].w = .free;

@@ -153,6 +153,28 @@ func TestLateWaitersMakeRoomForNewQuestions(t *testing.T) {
 	}
 }
 
+func TestALeftTCPClientMakesRoomLikeALateOne(t *testing.T) {
+	t.Parallel()
+	_, h := launchText(t, admission, tinyCache)
+	var conns []net.Conn
+	for i, name := range silentNames() {
+		c := dial(t, h)
+		send(t, c, framed(t, name, uint16(i+1)))
+		conns = append(conns, c)
+	}
+	wantRcode(t, h.addr, "localhost.", dns.RcodeSuccess, 5*time.Second)
+	for _, c := range conns {
+		if err := c.(*net.TCPConn).SetLinger(0); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+	}
+	advance(t, h, 3)
+	fire(t, h, "b.live.")
+	advance(t, h, 2)
+	wantRcode(t, h.addr, "c.live.", dns.RcodeSuccess, 2*time.Second)
+}
+
 func TestACrowdedQueueShedsNovelNamesOnly(t *testing.T) {
 	t.Parallel()
 	_, h := launchText(t, admission, nil)
