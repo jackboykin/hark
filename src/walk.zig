@@ -866,18 +866,15 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
     var hops: usize = 0;
-    var answered = false;
-    var overflow = false;
-    var clipped = false;
     var seen: [max_links + 1]dns.Name = undefined;
     // A CNAME question's answer: the target of the CNAME it matched.
     var asked_alias: ?dns.Name = null;
     // What the links before `cur` kept: `keep[0..passed]`.
     var passed: usize = 0;
     // NXDOMAIN denies the end of the chain; records there are noise.
-    const collect = msg.header.flags.rcode != .name_error;
-    while (true) : (hops += 1) {
-        if (hops > 0 and !speaksFor(g, zone, cur)) break;
+    const denied = msg.header.flags.rcode == .name_error;
+    const end: enum { answered, asked_alias, overflow, clipped, left, dead_end } = chain: while (true) : (hops += 1) {
+        if (hops > 0 and !speaksFor(g, zone, cur)) break :chain .left;
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         passed = keep.items.len;
@@ -890,8 +887,9 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         const looped = for (keep.items[0..passed]) |k| {
             if (k.rtype == .dname and k.name.eql(cur)) break true;
         } else false;
+        var answered = false;
         for (here) |rr| {
-            if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and rr.rtype == qtype) {
+            if (!denied and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and rr.rtype == qtype) {
                 answered = true;
                 if (looped and dnssec.covers(rr) == .dname) continue;
                 try keep.append(g.scratch.allocator(), rr);
@@ -901,7 +899,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         if (answered) {
             // Asked for RRSIG, collecting already took every signature.
             if (qtype != .rrsig and keep.items.len > passed) try keepSigs(g, &keep, here, cur, qtype);
-            break;
+            break :chain if (asked_alias != null) .asked_alias else .answered;
         }
         var cname: ?dns.ResourceRecord = null;
         for (here) |rr| if (rr.rtype == .cname and rr.name.eql(cur) and rr.name.isSubdomainOf(zone)) {
@@ -910,48 +908,36 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         };
         // Past the question's limit the rest is left unread: an alias to
         // where it stopped, so the answer finds the chain too long.
-        if ((cname != null or dname != null) and hops == max_links) {
-            clipped = true;
-            break;
-        }
+        if ((cname != null or dname != null) and hops == max_links) break :chain .clipped;
         if (dname) |d| {
             try keepDname(g, &keep, msg.answers, d);
-            const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.dname()) orelse {
-                overflow = true;
-                break;
-            };
+            const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.dname()) orelse break :chain .overflow;
             cname = try .init(g.scratch.allocator(), .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } });
         }
-        const c = cname orelse break;
+        const c = cname orelse break :chain .dead_end;
         try keep.append(g.scratch.allocator(), c);
         try keepSigs(g, &keep, here, cur, .cname);
         if (qtype == .cname) {
-            answered = true;
             asked_alias = c.cname();
-            break;
+            break :chain .asked_alias;
         }
         cur = c.cname();
-    }
+    };
     const yx = msg.header.flags.rcode == .yx_domain;
-    const left = !overflow and !answered and hops > 0 and !speaksFor(g, zone, cur);
-    // The rcode is the unread end's.
-    const unread = left or clipped or asked_alias != null;
-    if (overflow != yx and !(yx and unread)) return null;
+    const kind: Reply.Of = switch (end) {
+        .left, .clipped, .asked_alias => .alias,
+        .overflow => if (yx) .yxdomain else return null,
+        .answered => if (yx) return null else .answer,
+        .dead_end => if (yx) return null else if (denied) .nxdomain else if (hops > 0) .alias else .nodata,
+    };
     var reply: Reply = .{
-        .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
+        .kind = kind,
         .aa = msg.header.flags.aa,
         .answers = keep.items,
-        .target = cur,
+        .target = asked_alias orelse cur,
         .zone = zone,
         .stored_ns = g.now(),
     };
-    // A CNAME question is answered by the alias itself, the fact
-    // `publishAlias` records for every other type.
-    if (qtype == .cname) if (asked_alias) |t| {
-        reply.kind = .alias;
-        reply.target = t;
-    };
-    if (msg.header.flags.rcode == .name_error and !unread) reply.kind = .nxdomain;
     // A denial names its zone by its SOA (RFC 2308 §3); an answerless
     // NOERROR may refer instead.
     switch (reply.kind) {
@@ -965,7 +951,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     // and NS in authority invites section confusion (CVE-2025-11411).
     const rest = reply.kind == .answer and qtype == .ns;
     if (rest) reply.additionals = msg.additionals;
-    const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
+    const authorities = if (end == .left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, authorities, reply, rest);
     reply.ttl = replyTtl(reply);
     return .{ .reply = reply };
