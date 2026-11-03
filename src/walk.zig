@@ -36,7 +36,7 @@ pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport,
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
-    zone: dns.Name = .root,
+    zone: dns.Name,
     /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
     cut: OptionalCellId = .none,
     /// Every address gathered so far; a later gather appends what is new.
@@ -115,10 +115,6 @@ pub const Ask = struct {
         mem.copyForwards(Attempt, a.attempts[i .. a.nattempts - 1], a.attempts[i + 1 .. a.nattempts]);
         a.nattempts -= 1;
         return at;
-    }
-
-    pub fn reset(a: *Ask, zone: dns.Name) void {
-        a.* = .{ .zone = zone };
     }
 
     fn untried(a: *const Ask) u32 {
@@ -232,14 +228,12 @@ pub const RrsetScratch = struct {
     dname: Above = .{},
     /// Watched once the cut is known (RFC 8020 §2).
     denial: Above = .{},
-    started: bool = false,
-    ask: Ask = .{},
+    ask: ?Ask = null,
 };
 
 pub const CutScratch = struct {
     parent: OptionalCellId = .none,
-    started: bool = false,
-    ask: Ask = .{},
+    ask: ?Ask = null,
 };
 
 /// Inputs are held by id: a version that expires the moment it settles (a
@@ -421,19 +415,19 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (deniedAbove(g, name, pc.zone) != null) return settleInside(g, id, parent, g.now());
     if (g.held(Key.of(.rrset, name, .a))) |known| if (named(store.Rrset.of(known).zone, pc.zone))
         return settleInside(g, id, parent, serving(g, known));
-    if (!s.started) {
-        s.ask.reset(pc.zone);
-        s.ask.seed(g, pc);
-        s.started = true;
+    if (s.ask == null) {
+        s.ask = .{ .zone = pc.zone };
+        s.ask.?.seed(g, pc);
     }
-    switch (try ask(g, id, &s.ask, name, .a)) {
+    const a = &s.ask.?;
+    switch (try ask(g, id, a, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, ended(g, &s.ask)),
+        .exhausted => try g.fail(id, ended(g, a)),
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone)) {
                 .referral => |ref| {
-                    const cut = try absorbReferral(g, id, ref, msg, pc.zone, s.ask.placed_until_ns);
+                    const cut = try absorbReferral(g, id, ref, msg, pc.zone, a.placed_until_ns);
                     try g.settle(id, cut.value, cut.expires_ns);
                 },
                 // Each puts the name inside the parent's zone. Only an
@@ -590,7 +584,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
-    if (!s.started) {
+    if (s.ask == null) {
         if (s.cut == .none) {
             if (s.dname.fact == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, &s.dname, Key.of(.rrset, owner, .dname), owner);
             switch (aboveSays(g, &s.dname)) {
@@ -617,22 +611,22 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .answers => return g.settleAs(id, g.version(s.denial.fact.unwrap().?)),
             .silent => {},
         }
-        s.ask.reset(cut.state.fact.cut.zone);
-        s.ask.seed(g, cut.state.fact.cut);
-        s.started = true;
+        s.ask = .{ .zone = cut.state.fact.cut.zone };
+        s.ask.?.seed(g, cut.state.fact.cut);
     }
+    const a = &s.ask.?;
     while (true) {
-        switch (try ask(g, id, &s.ask, name, qtype)) {
+        switch (try ask(g, id, a, name, qtype)) {
             .pending => return,
-            .exhausted => return g.failRemembered(id, ended(g, &s.ask)),
+            .exhausted => return g.failRemembered(id, ended(g, a)),
             .reply => |kept| {
                 const msg = kept.msg;
-                const zone = s.ask.zone;
+                const zone = a.zone;
                 if (delegation.extractReferral(msg, name, zone)) |ref| {
                     // Each referral descends toward the name, so its depth
                     // bounds the walk.
                     std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.depth() > zone.depth());
-                    const cut = try absorbReferral(g, id, ref, msg, zone, s.ask.placed_until_ns);
+                    const cut = try absorbReferral(g, id, ref, msg, zone, a.placed_until_ns);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
@@ -640,15 +634,15 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .aa = true, .target = name, .zone = zone, .stored_ns = g.now() };
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
-                    s.ask.reset(ref.zone_cut);
-                    s.ask.seed(g, cut.value.cut);
+                    a.* = .{ .zone = ref.zone_cut };
+                    a.seed(g, cut.value.cut);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
                     .reply => |r| r,
                     .loop => return g.failRemembered(id, Links.loop),
                     // No useful response (RFC 9520 §2).
-                    .none => return g.failRemembered(id, ended(g, &s.ask)),
+                    .none => return g.failRemembered(id, ended(g, a)),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);

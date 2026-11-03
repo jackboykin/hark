@@ -35,8 +35,7 @@ pub fn of(zones: []const Zone, name: dns.Name, qtype: dns.RType) ?*const Zone {
 }
 
 pub const Scratch = struct {
-    ask: walk.Ask = .{},
-    started: bool = false,
+    ask: ?walk.Ask = null,
 };
 
 /// A told server's referral: the zone is what its servers answer.
@@ -48,20 +47,18 @@ pub fn run(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.stub;
-    if (!s.started) {
-        s.ask.reset(of(g.cfg.stub_zones, name, qtype).?.apex);
-        s.started = true;
-    }
-    switch (try walk.ask(g, id, &s.ask, name, qtype)) {
+    if (s.ask == null) s.ask = .{ .zone = of(g.cfg.stub_zones, name, qtype).?.apex };
+    const a = &s.ask.?;
+    switch (try walk.ask(g, id, a, name, qtype)) {
         .pending => return,
-        .exhausted => return g.failRemembered(id, walk.ended(g, &s.ask)),
+        .exhausted => return g.failRemembered(id, walk.ended(g, a)),
         .reply => |kept| {
-            if (delegation.extractReferral(kept.msg, name, s.ask.zone) != null) return g.failRemembered(id, referred);
+            if (delegation.extractReferral(kept.msg, name, a.zone) != null) return g.failRemembered(id, referred);
             return switch (kept.verdict) {
                 .reply => |r| g.settle(id, .{ .stub = r }, walk.replyExpiry(r)),
                 .loop => g.failRemembered(id, walk.Links.loop),
                 // No useful response (RFC 9520 §2).
-                .none => g.failRemembered(id, walk.ended(g, &s.ask)),
+                .none => g.failRemembered(id, walk.ended(g, a)),
             };
         },
     }
