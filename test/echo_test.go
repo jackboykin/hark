@@ -107,3 +107,19 @@ func TestAJoinerWaitsAsLongAsTheFirst(t *testing.T) {
 		t.Errorf("the settled name took %v", d)
 	}
 }
+
+func TestAJoinerOwesNothingToAFirstPastItsTimeout(t *testing.T) {
+	t.Parallel()
+	resp, h := launchText(t, gated, nil)
+	open := serveGate(t, resp.port)
+	t0 := time.Now()
+	fire(t, h, "a.example.com.")
+	time.Sleep(time.Until(t0.Add(2100 * time.Millisecond)))
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(open)
+	}()
+	if _, err := ask(t.Context(), "udp", h.addr, "a.example.com.", time.Second); err != nil {
+		t.Errorf("no reply: %v", err)
+	}
+}

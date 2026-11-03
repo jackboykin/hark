@@ -99,8 +99,6 @@ const Pending = struct {
     question_bytes: []u8 = &.{},
     owes: Owes,
     asked_ns: i64,
-    /// When the first client parked on the same cell asked.
-    origin_ns: i64,
     phase: enum {
         vacant,
         waiting,
@@ -452,14 +450,14 @@ const Server = struct {
             return;
         };
         try s.g.drain();
-        var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns };
         {
             errdefer s.release(p);
             // Recall declined what the graph holds: inside the refresh window, a
             // verdict it could not stamp, a put the store refused, DNS64's A.
             if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
                 c.cache.hit += 1;
-                try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
+                try s.answered(reply, query, served, p.asked_ns);
                 return s.release(p);
             };
             const canonical = q.name.wire;
@@ -487,7 +485,7 @@ const Server = struct {
         try s.timers.ensureUnusedCapacity(s.gpa, 1);
         try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
         const i: u32 = s.vacant.pop() orelse blk: {
-            try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .owes = undefined, .asked_ns = 0, .origin_ns = 0, .phase = .vacant, .gen = std.math.maxInt(u32) });
+            try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .owes = undefined, .asked_ns = 0, .phase = .vacant, .gen = std.math.maxInt(u32) });
             break :blk @intCast(s.pending.items.len - 1);
         };
         const gen = s.pending.items[i].gen +% 1;
@@ -506,9 +504,10 @@ const Server = struct {
             if (!c.settled()) continue;
             var i = s.heads.items[id];
             s.heads.items[id] = Pending.none;
+            const first = s.firstOwed(i);
             while (i != Pending.none) {
                 const next = s.pending.items[i].next;
-                try s.ready(i);
+                try s.ready(i, first);
                 i = next;
             }
         }
@@ -518,7 +517,7 @@ const Server = struct {
             const p = &s.pending.items[t.slot];
             if (p.phase == .vacant or p.gen != t.gen or p.at_ns != t.at_ns) continue;
             if (p.phase == .echoing) {
-                try s.ready(t.slot);
+                try s.ready(t.slot, p.asked_ns);
                 continue;
             }
             if (t.at_ns == patience(p.*) and try s.impatient(p) or try s.gone(t.slot)) {
@@ -528,7 +527,17 @@ const Server = struct {
         }
     }
 
-    fn ready(s: *Server, i: u32) !void {
+    fn firstOwed(s: *Server, head: u32) i64 {
+        var first: i64 = std.math.maxInt(i64);
+        var i = head;
+        while (i != Pending.none) : (i = s.pending.items[i].next) {
+            const p = s.pending.items[i];
+            if (p.owes == .reply and p.owes.reply != .tcp and s.e.now_ns < timeout(p)) first = @min(first, p.asked_ns);
+        }
+        return first;
+    }
+
+    fn ready(s: *Server, i: u32, first_ns: i64) !void {
         const p = &s.pending.items[i];
         const reply = switch (p.owes) {
             .reply => |r| r,
@@ -546,22 +555,23 @@ const Server = struct {
             return s.link(i);
         };
         // DNSBomb: a UDP client that joined a resolution is answered as long
-        // after its ask as the first was, so replies leave spaced as their
-        // questions came, never in one burst. TCP cannot be spoofed.
-        const echo = if (reply != .tcp and p.phase != .echoing) p.asked_ns - p.origin_ns else 0;
-        const leaves_ns = s.e.now_ns + echo;
-        if (echo > 0 and leaves_ns < timeout(p.*)) {
+        // after its ask as the first still waiting was, so replies leave
+        // spaced as their questions came, never in one burst. TCP cannot be
+        // spoofed.
+        const echo = if (reply != .tcp) p.asked_ns - first_ns else 0;
+        if (echo > 0) {
             served.release(&s.g.store);
             // Shaped again when it leaves, so its TTLs age to then.
-            try s.timers.push(s.gpa, .{ .at_ns = leaves_ns, .slot = i, .gen = p.gen });
-            p.at_ns = leaves_ns;
+            p.at_ns = s.e.now_ns + echo;
+            std.debug.assert(p.at_ns < timeout(p.*));
+            try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
             p.phase = .echoing;
             s.clients.detail.echoed += 1;
             s.clients.detail.delay_ms += @intCast(@divTrunc(echo, std.time.ns_per_ms));
             return;
         }
         s.clients.cache.miss += 1;
-        try s.answered(reply, query, served, p.asked_ns, leaves_ns);
+        try s.answered(reply, query, served, p.asked_ns);
         s.vacate(i);
     }
 
@@ -574,10 +584,7 @@ const Server = struct {
         const on = p.a orelse p.root;
         p.prev = Pending.none;
         p.next = s.heads.items[on];
-        if (p.next != Pending.none) {
-            s.pending.items[p.next].prev = i;
-            p.origin_ns = @min(p.origin_ns, s.pending.items[p.next].origin_ns);
-        }
+        if (p.next != Pending.none) s.pending.items[p.next].prev = i;
         s.heads.items[on] = i;
     }
 
@@ -658,7 +665,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
         s.clients.cache.miss += 1;
-        try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
+        try s.answered(reply, query, served, p.asked_ns);
         return true;
     }
 
@@ -711,7 +718,7 @@ const Server = struct {
         return t.at_ns;
     }
 
-    fn answered(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64, leaves_ns: i64) !void {
+    fn answered(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) !void {
         const q = query.question.?;
         _ = s.desk.derived(q, answer.Client.fromQuery(query), served) catch |err| {
             served.release(&s.g.store);
@@ -719,7 +726,7 @@ const Server = struct {
         };
         // Its waiter kept the resolution going; past a UDP client's
         // timeout the outcome is noted and the reply goes nowhere.
-        if (reply != .tcp and leaves_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
+        if (reply != .tcp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
             s.clients.unanswered.late += 1;
             return served.release(&s.g.store);
         }
