@@ -59,6 +59,10 @@ const Reply = union(enum) {
     /// It leaves from the address its query was sent to.
     wildcard: struct { fd: posix.fd_t, addr: na.Address, local: Batch.Local },
     tcp: *Conn,
+};
+
+const Owes = union(enum) {
+    reply: Reply,
     /// Its TCP connection closed; `drop` left it the UDP timeout to keep
     /// its resolution wanted. Never answered.
     left,
@@ -93,24 +97,35 @@ const Pending = struct {
     query: dns.Query,
     /// The question's name and spelling, once parked; until then the read's.
     question_bytes: []u8 = &.{},
-    reply: Reply,
+    owes: Owes,
     asked_ns: i64,
     /// When the first client parked on the same cell asked.
     origin_ns: i64,
-    /// Past the client's patience, stale was looked for once.
-    stale_tried: bool = false,
-    /// Settled, and held to leave at `at_ns`.
-    echoed: bool = false,
+    phase: enum {
+        vacant,
+        waiting,
+        /// Past mattering, it stays only for its resolution, until `reap`.
+        late,
+        echoing,
+    } = .waiting,
     /// The slot is reused; a timer names the tenant it was set for.
     gen: u32 = 0,
-    live: bool = true,
     /// When the loop looks at it next; a timer for any other time is spent.
-    at_ns: i64 = std.math.maxInt(i64),
+    at_ns: i64 = never,
     /// The other clients parked on the same cell.
     prev: u32 = none,
     next: u32 = none,
 
     const none = std.math.maxInt(u32);
+    const never = std.math.maxInt(i64);
+
+    fn patient(p: Pending) bool {
+        return p.owes == .reply and p.owes.reply == .tcp;
+    }
+
+    fn tcpOn(p: Pending, c: *const Conn) bool {
+        return p.patient() and p.owes.reply.tcp == c;
+    }
 };
 
 const Timer = struct {
@@ -343,7 +358,7 @@ const Server = struct {
     /// Clients still waiting get nothing; the graph frees their roots.
     fn deinit(s: *Server) void {
         for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
-        for (s.pending.items) |p| if (p.live) s.release(p);
+        for (s.pending.items) |p| if (p.phase != .vacant) s.release(p);
         s.pending.deinit(s.gpa);
         s.vacant.deinit(s.gpa);
         s.heads.deinit(s.gpa);
@@ -357,8 +372,8 @@ const Server = struct {
     }
 
     fn drop(s: *Server, c: *Conn) void {
-        if (c.owed > 0) for (s.pending.items) |*p| if (p.live and p.reply == .tcp and p.reply.tcp == c) {
-            p.reply = .left;
+        if (c.owed > 0) for (s.pending.items) |*p| if (p.phase != .vacant and p.tcpOn(c)) {
+            p.owes = .left;
         };
         sys.close(c.fd);
         s.watched.items[c.token & slot_mask].w = .free;
@@ -433,7 +448,7 @@ const Server = struct {
             return;
         };
         try s.g.drain();
-        var p: Pending = .{ .root = root, .query = query, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
         {
             errdefer s.release(p);
             // Recall declined what the graph holds: inside the refresh window, a
@@ -468,7 +483,7 @@ const Server = struct {
         try s.timers.ensureUnusedCapacity(s.gpa, 1);
         try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
         const i: u32 = s.vacant.pop() orelse blk: {
-            try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .reply = undefined, .asked_ns = 0, .origin_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
+            try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .owes = undefined, .asked_ns = 0, .origin_ns = 0, .phase = .vacant, .gen = std.math.maxInt(u32) });
             break :blk @intCast(s.pending.items.len - 1);
         };
         const gen = s.pending.items[i].gen +% 1;
@@ -497,12 +512,12 @@ const Server = struct {
             if (t.at_ns > s.e.now_ns) break;
             _ = s.timers.pop();
             const p = &s.pending.items[t.slot];
-            if (!p.live or p.gen != t.gen or p.at_ns != t.at_ns) continue;
-            if (p.echoed) {
+            if (p.phase == .vacant or p.gen != t.gen or p.at_ns != t.at_ns) continue;
+            if (p.phase == .echoing) {
                 try s.ready(t.slot);
                 continue;
             }
-            if (try s.impatient(p) or try s.gone(t.slot)) {
+            if (t.at_ns == patience(p.*) and try s.impatient(p) or try s.gone(t.slot)) {
                 s.unpark(t.slot);
                 s.vacate(t.slot);
             } else try s.schedule(t.slot);
@@ -511,34 +526,38 @@ const Server = struct {
 
     fn ready(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
-        if (p.reply == .left) {
-            s.clients.unanswered.late += 1;
-            return s.vacate(i);
-        }
+        const reply = switch (p.owes) {
+            .reply => |r| r,
+            .left => {
+                s.clients.unanswered.late += 1;
+                return s.vacate(i);
+            },
+        };
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = p.query;
         const served = try s.shape(arena, p, query.question.?, answer.Client.fromQuery(query)) orelse {
             try s.reach(p.a.?);
+            if (p.phase == .echoing) p.phase = .waiting;
             return s.link(i);
         };
         // DNSBomb: a UDP client that joined a resolution is answered as long
         // after its ask as the first was, so replies leave spaced as their
         // questions came, never in one burst. TCP cannot be spoofed.
-        const echo = if (p.reply != .tcp and !p.echoed) p.asked_ns - p.origin_ns else 0;
+        const echo = if (reply != .tcp and p.phase != .echoing) p.asked_ns - p.origin_ns else 0;
         const leaves_ns = s.e.now_ns + echo;
         if (echo > 0 and leaves_ns < timeout(p.*)) {
             served.release(&s.g.store);
             // Shaped again when it leaves, so its TTLs age to then.
             try s.timers.push(s.gpa, .{ .at_ns = leaves_ns, .slot = i, .gen = p.gen });
             p.at_ns = leaves_ns;
-            p.echoed = true;
+            p.phase = .echoing;
             s.clients.detail.echoed += 1;
             s.clients.detail.delay_ms += @intCast(@divTrunc(echo, std.time.ns_per_ms));
             return;
         }
         s.clients.cache.miss += 1;
-        try s.answered(p.reply, query, served, p.asked_ns, leaves_ns);
+        try s.answered(reply, query, served, p.asked_ns, leaves_ns);
         s.vacate(i);
     }
 
@@ -567,18 +586,20 @@ const Server = struct {
     fn vacate(s: *Server, i: u32) void {
         const p = &s.pending.items[i];
         s.release(p.*);
-        p.live = false;
+        p.phase = .vacant;
         s.vacant.appendAssumeCapacity(i);
     }
 
     fn schedule(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
-        p.at_ns = if (!p.stale_tried and s.desk.retention.serve_stale_ttl != 0)
+        const now = s.e.now_ns;
+        p.at_ns = if (s.desk.retention.serve_stale_ttl != 0 and now < patience(p.*))
             patience(p.*)
-        else if (p.reply != .tcp and s.e.now_ns < timeout(p.*))
+        else if (!p.patient() and now < timeout(p.*))
             timeout(p.*)
         else
-            return;
+            Pending.never;
+        if (p.at_ns == Pending.never) return;
         try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
     }
 
@@ -587,13 +608,14 @@ const Server = struct {
     /// there is room for it (`reap`).
     fn gone(s: *Server, i: u32) !bool {
         const p = s.pending.items[i];
-        if (p.reply == .tcp or s.e.now_ns < timeout(p)) return false;
+        if (p.patient() or s.e.now_ns < timeout(p)) return false;
         if (s.g.cell(p.a orelse p.root).holds == 1) {
             // Each is done within its resolution's deadline: the front goes stale first.
             while (s.late.front()) |l| if (s.parkedAs(l) == null) {
                 _ = s.late.popFront();
             } else break;
             try s.late.pushBack(s.gpa, .{ .slot = i, .gen = p.gen });
+            s.pending.items[i].phase = .late;
             return false;
         }
         s.clients.unanswered.late += 1;
@@ -615,15 +637,16 @@ const Server = struct {
 
     fn parkedAs(s: *Server, l: Tenant) ?u32 {
         const p = s.pending.items[l.slot];
-        return if (p.live and p.gen == l.gen and !p.echoed) l.slot else null;
+        return if (p.phase == .late and p.gen == l.gen) l.slot else null;
     }
 
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
     /// the resolution goes on without it.
     fn impatient(s: *Server, p: *Pending) !bool {
-        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
-        p.stale_tried = true;
-        if (p.reply == .left) return false;
+        const reply = switch (p.owes) {
+            .reply => |r| r,
+            .left => return false,
+        };
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = p.query;
@@ -631,7 +654,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
         s.clients.cache.miss += 1;
-        try s.answered(p.reply, query, served, p.asked_ns, s.e.now_ns);
+        try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
         return true;
     }
 
@@ -749,7 +772,6 @@ const Server = struct {
                 break :blk @min(@max(claimed, dns.max_udp_payload), s.cfg.max_udp_payload);
             },
             .tcp => dns.max_message_len,
-            .left => unreachable,
         };
         var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
@@ -763,7 +785,6 @@ const Server = struct {
             const peer = switch (reply) {
                 inline .udp, .wildcard => |u| u.addr,
                 .tcp => |c| c.addr,
-                .left => unreachable,
             };
             const rcode = served.rcode;
             var rb: [24]u8 = undefined;
@@ -785,7 +806,6 @@ const Server = struct {
         return switch (reply) {
             inline .udp, .wildcard => |u| s.out.next(u.fd),
             .tcp => frame[2..],
-            .left => unreachable,
         };
     }
 
@@ -793,7 +813,6 @@ const Server = struct {
         switch (reply) {
             .udp => |u| s.out.push(len, &u.addr),
             .wildcard => |u| s.out.pushFrom(len, &u.addr, u.local),
-            .left => unreachable,
             .tcp => |c| {
                 const framed = frame[0 .. 2 + len];
                 mem.writeInt(u16, framed[0..2], @intCast(len), .big);
