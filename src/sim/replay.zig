@@ -127,8 +127,9 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
     // CHECK_ANSWER reads the held roots' hops.
-    var held: Held = .{ null, null };
-    defer unholdAll(&g, &held);
+    var held: Held = .{};
+    defer held.kept.deinit(g.gpa);
+    defer letGoAll(&g, &held);
     var desk: answer.Desk = .{
         .g = &g,
         .retention = .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 },
@@ -203,7 +204,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     report.phase = .warm;
     try requery(gpa, arena, &g, &s, scenario, opts, report, &held, &desk, &rb);
     // Quiescence: nothing outlives its demand.
-    unholdAll(&g, &held);
+    letGoAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
         report.msg = "cells, budgets, flights or work bytes outlived the scenario";
@@ -248,13 +249,31 @@ fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scena
     }
 }
 
-const Held = [2]?graph.CellId;
+const Held = struct {
+    roots: [2]?graph.CellId = .{ null, null },
+    kept: std.ArrayList(graph.CellId) = .empty,
+};
 
 fn unholdAll(g: *graph.Graph, held: *Held) void {
-    for (held) |*h| if (h.*) |id| {
+    for (&held.roots) |*h| if (h.*) |id| {
         g.unhold(id);
         h.* = null;
     };
+    var i: usize = 0;
+    while (i < held.kept.items.len) {
+        const id = held.kept.items[i];
+        if (!g.cell(id).settled()) {
+            i += 1;
+            continue;
+        }
+        g.unhold(id);
+        _ = held.kept.swapRemove(i);
+    }
+}
+
+fn letGoAll(g: *graph.Graph, held: *Held) void {
+    unholdAll(g, held);
+    while (held.kept.pop()) |id| g.unhold(id);
 }
 
 /// What the client was sent, read back off the wire serve builds.
@@ -352,7 +371,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         },
         .graph => blk: {
             const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null;
-            for (held) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
+            for (held.roots) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
                 limited = limited or why.cause == .asker or why.remembered;
             };
             break :blk try desk.derived(q, client, built);
@@ -398,13 +417,15 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const asked = try desk.asked(arena, q, client);
     const root = try g.demandRoot(asked.name, asked.qtype, .new);
-    held[0] = root;
+    held.roots[0] = root;
     try g.drain();
     // RFC 8767 §5: stale at the client's patience, as serve does.
     const patience = s.now_ns + answer.stale_client_ms * std.time.ns_per_ms;
     if (desk.retention.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
         if (try desk.memory(arena, q, client, .stale)) |served| {
-            unholdAll(g, held);
+            errdefer served.release(&g.store);
+            held.roots[0] = null;
+            if (g.cell(root).holds == 1) try held.kept.append(g.gpa, root) else g.unhold(root);
             return served;
         }
     }
@@ -415,7 +436,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     const served = try desk.built(arena, root, q, client);
     const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
     const a = try g.demandRoot(aq.name, aq.qtype, .new);
-    held[1] = a;
+    held.roots[1] = a;
     try g.drain();
     if (!try settleBy(g, s, a, deadline)) {
         served.release(&g.store);

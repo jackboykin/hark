@@ -66,6 +66,8 @@ const Owes = union(enum) {
     /// Its TCP connection closed; `drop` left it the UDP timeout to keep
     /// its resolution wanted. Never answered.
     left,
+    /// Answered stale, it stays only to keep its resolution wanted (RFC 8767 §5).
+    nothing,
 };
 
 const Watched = union(enum) {
@@ -117,12 +119,24 @@ const Pending = struct {
     const none = std.math.maxInt(u32);
     const never = std.math.maxInt(i64);
 
-    fn patient(p: Pending) bool {
-        return p.owes == .reply and p.owes.reply == .tcp;
+    fn patience(p: Pending) i64 {
+        return p.asked_ns + answer.stale_client_ms * std.time.ns_per_ms;
+    }
+
+    fn timeout(p: Pending) i64 {
+        return p.asked_ns + answer.client_timeout_ms * std.time.ns_per_ms;
+    }
+
+    fn lapses(p: Pending) i64 {
+        return switch (p.owes) {
+            .nothing => p.asked_ns,
+            .reply => |r| if (r == .tcp) never else p.timeout(),
+            .left => p.timeout(),
+        };
     }
 
     fn tcpOn(p: Pending, c: *const Conn) bool {
-        return p.patient() and p.owes.reply.tcp == c;
+        return p.owes == .reply and p.owes.reply == .tcp and p.owes.reply.tcp == c;
     }
 };
 
@@ -177,6 +191,7 @@ const Server = struct {
     /// Clients parked on unsettled cells, in stable slots.
     pending: std.ArrayList(Pending) = .empty,
     vacant: std.ArrayList(u32) = .empty,
+    holding: u32 = 0,
     /// Ever parked: a wake counts its misses by it, since `reap` may unpark mid-wake.
     parks: u64 = 0,
     /// By cell id, the first slot parked on it.
@@ -373,7 +388,7 @@ const Server = struct {
         if (c.owed > 0) for (s.pending.items, 0..) |*p, i| if (p.phase != .vacant and p.tcpOn(c)) {
             p.owes = .left;
             if (p.at_ns != Pending.never) continue;
-            p.at_ns = @max(timeout(p.*), s.e.now_ns);
+            p.at_ns = @max(p.timeout(), s.e.now_ns);
             // Without room for a timer, it stays until its root settles.
             s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
         };
@@ -520,7 +535,8 @@ const Server = struct {
                 try s.ready(t.slot, p.asked_ns);
                 continue;
             }
-            if (t.at_ns == patience(p.*) and try s.impatient(p) or try s.gone(t.slot)) {
+            if (t.at_ns == p.patience()) try s.impatient(p);
+            if (try s.gone(t.slot)) {
                 s.unpark(t.slot);
                 s.vacate(t.slot);
             } else try s.schedule(t.slot);
@@ -532,7 +548,7 @@ const Server = struct {
         var i = head;
         while (i != Pending.none) : (i = s.pending.items[i].next) {
             const p = s.pending.items[i];
-            if (p.owes == .reply and p.owes.reply != .tcp and s.e.now_ns < timeout(p)) first = @min(first, p.asked_ns);
+            if (p.owes == .reply and p.owes.reply != .tcp and s.e.now_ns < p.timeout()) first = @min(first, p.asked_ns);
         }
         return first;
     }
@@ -545,6 +561,7 @@ const Server = struct {
                 s.clients.unanswered.late += 1;
                 return s.vacate(i);
             },
+            .nothing => return s.vacate(i),
         };
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
@@ -563,7 +580,7 @@ const Server = struct {
             served.release(&s.g.store);
             // Shaped again when it leaves, so its TTLs age to then.
             p.at_ns = s.e.now_ns + echo;
-            std.debug.assert(p.at_ns < timeout(p.*));
+            std.debug.assert(p.at_ns < p.timeout());
             try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
             p.phase = .echoing;
             s.clients.detail.echoed += 1;
@@ -597,6 +614,7 @@ const Server = struct {
     fn vacate(s: *Server, i: u32) void {
         const p = &s.pending.items[i];
         s.release(p.*);
+        if (p.owes == .nothing) s.holding -= 1;
         p.phase = .vacant;
         s.vacant.appendAssumeCapacity(i);
     }
@@ -604,22 +622,22 @@ const Server = struct {
     fn schedule(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
         const now = s.e.now_ns;
-        p.at_ns = if (s.desk.retention.serve_stale_ttl != 0 and now < patience(p.*))
-            patience(p.*)
-        else if (!p.patient() and now < timeout(p.*))
-            timeout(p.*)
+        p.at_ns = if (s.desk.retention.serve_stale_ttl != 0 and now < p.patience())
+            p.patience()
+        else if (now < p.lapses())
+            p.lapses()
         else
             Pending.never;
         if (p.at_ns == Pending.never) return;
         try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
     }
 
-    /// Past its timeout a UDP client lets go, unless it alone holds the
+    /// Past `lapses` a client lets go, unless it alone holds the
     /// resolution: the outcome is still wanted for the next ask, while
     /// there is room for it (`reap`).
     fn gone(s: *Server, i: u32) !bool {
         const p = s.pending.items[i];
-        if (p.patient() or s.e.now_ns < timeout(p)) return false;
+        if (s.e.now_ns < p.lapses()) return false;
         if (s.g.cell(p.a orelse p.root).holds == 1) {
             // Each is done within its resolution's deadline: the front goes stale first.
             while (s.late.front()) |l| if (s.parkedAs(l) == null) {
@@ -629,7 +647,7 @@ const Server = struct {
             s.pending.items[i].phase = .late;
             return false;
         }
-        s.clients.unanswered.late += 1;
+        if (p.owes != .nothing) s.clients.unanswered.late += 1;
         return true;
     }
 
@@ -640,7 +658,7 @@ const Server = struct {
         while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
             const l = s.late.popFront() orelse return;
             const i = s.parkedAs(l) orelse continue;
-            s.clients.unanswered.reaped += 1;
+            if (s.pending.items[i].owes != .nothing) s.clients.unanswered.reaped += 1;
             s.unpark(i);
             s.vacate(i);
         }
@@ -653,20 +671,21 @@ const Server = struct {
 
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
     /// the resolution goes on without it.
-    fn impatient(s: *Server, p: *Pending) !bool {
+    fn impatient(s: *Server, p: *Pending) !void {
         const reply = switch (p.owes) {
             .reply => |r| r,
-            .left => return false,
+            .left, .nothing => return,
         };
         s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = p.query;
         const q = query.question.?;
         const client = answer.Client.fromQuery(query);
-        const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
+        const served = try s.desk.memory(arena, q, client, .stale) orelse return;
         s.clients.cache.miss += 1;
         try s.answered(reply, query, served, p.asked_ns);
-        return true;
+        p.owes = .nothing;
+        s.holding += 1;
     }
 
     fn logSummary(s: *Server) void {
@@ -681,7 +700,7 @@ const Server = struct {
     fn logCounters(s: *Server) void {
         const g = s.g;
         const c = s.clients;
-        const parked = s.pending.items.len - s.vacant.items.len;
+        const parked = s.pending.items.len - s.vacant.items.len - s.holding;
         if (build_options.testing_enabled) std.debug.assert(sum(c.queries) == sum(c.replies) + sum(c.unanswered) + parked);
         logCounts("clients", c);
         logCounts("resolver", g.stats.resolver);
@@ -702,14 +721,6 @@ const Server = struct {
             .parked = parked,
             .work = Kib{ .bytes = g.work.bytes },
         });
-    }
-
-    fn patience(p: Pending) i64 {
-        return p.asked_ns + answer.stale_client_ms * std.time.ns_per_ms;
-    }
-
-    fn timeout(p: Pending) i64 {
-        return p.asked_ns + answer.client_timeout_ms * std.time.ns_per_ms;
     }
 
     /// When the loop must look at a parked client next.

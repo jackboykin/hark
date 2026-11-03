@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,6 +102,118 @@ func TestAResetTCPClientLeavesTheLoopFree(t *testing.T) {
 	c.Close()
 	time.Sleep(2200 * time.Millisecond)
 	wantRcode(t, h.addr, "after.invalid.", dns.RcodeNameError, time.Second)
+}
+
+// Each hop takes most of an untimed server's 400 ms, so the walk outlasts a
+// stub's 1.8 s patience.
+const (
+	staleName = "a.b.c.d.e.f.g.example.com."
+	staleHops = 8
+)
+
+const staleWalk = `; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a refresh longer than a stub's patience
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.20
+  ENTRY_END
+RANGE_END
+SCENARIO_END
+`
+
+func serveStaleWalk(t *testing.T, port uint16) {
+	t.Helper()
+	labels := strings.Split(strings.TrimSuffix(staleName, "."), ".")
+	var answered atomic.Bool
+	for hop := range staleHops {
+		at := netip.AddrFrom4([4]byte{127, 0, 10, byte(20 + hop)})
+		c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(at, port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, from, err := c.ReadFromUDPAddrPort(buf)
+				if err != nil {
+					return
+				}
+				q := &dns.Msg{Data: slices.Clone(buf[:n])}
+				if q.Unpack() != nil || len(q.Question) == 0 {
+					continue
+				}
+				m := replyTo(q)
+				rr := func(text string) dns.RR {
+					r, err := dns.New(text)
+					if err != nil {
+						panic(err)
+					}
+					return r
+				}
+				delay := 350 * time.Millisecond
+				switch {
+				case hop == 0 && !answered.Swap(true):
+					delay = 0
+					m.Authoritative = true
+					m.Answer = []dns.RR{rr(staleName + " 1 IN A 192.0.2.1")}
+				case hop == staleHops-1:
+					m.Authoritative = true
+					m.Answer = []dns.RR{rr(staleName + " 300 IN A 192.0.2.2")}
+				default:
+					if hop == 0 {
+						delay = 0
+					}
+					cut := strings.Join(labels[len(labels)-hop-3:], ".") + "."
+					m.Ns = []dns.RR{rr(cut + " 86400 IN NS ns." + cut)}
+					m.Extra = []dns.RR{rr(fmt.Sprintf("ns.%s 86400 IN A 127.0.10.%d", cut, 21+hop))}
+				}
+				time.AfterFunc(delay, func() {
+					if m.Pack() == nil {
+						c.WriteToUDPAddrPort(m.Data, from)
+					}
+				})
+			}
+		}()
+	}
+}
+
+func TestAnsweringStaleLeavesTheRefreshRunning(t *testing.T) {
+	t.Parallel()
+	resp, h := launchText(t, staleWalk, func(c *config) { c.serveStaleTTL = 60 })
+	serveStaleWalk(t, resp.port)
+	address := func(r *dns.Msg) string {
+		if len(r.Answer) == 0 {
+			return ""
+		}
+		return r.Answer[len(r.Answer)-1].(*dns.A).A.String()
+	}
+
+	r, err := ask(t.Context(), "udp", h.addr, staleName, time.Second)
+	if err != nil || address(r) != "192.0.2.1" {
+		t.Fatalf("first answer: %v, %v", r, err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	r, err = ask(t.Context(), "udp", h.addr, staleName, 2*time.Second)
+	if err != nil || address(r) != "192.0.2.1" {
+		t.Fatalf("want it served stale: %v, %v", r, err)
+	}
+	time.Sleep(time.Second)
+	r, err = ask(t.Context(), "udp", h.addr, staleName, time.Second)
+	if err != nil || address(r) != "192.0.2.2" {
+		t.Errorf("want the refreshed answer: %v, %v", r, err)
+	}
 }
 
 func TestAHalfClosedClientIdlesTheLoop(t *testing.T) {
