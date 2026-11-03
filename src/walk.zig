@@ -117,6 +117,10 @@ pub const Ask = struct {
         return at;
     }
 
+    fn untouched(a: *const Ask) bool {
+        return !a.retried and a.tried == 0;
+    }
+
     fn untried(a: *const Ask) u32 {
         return (bit(a.nservers) - 1) & ~a.tried;
     }
@@ -151,7 +155,7 @@ pub const Ask = struct {
         // Nothing says a server never timed is slower than the best that
         // answer, or faster: an ask's first attempt goes to it as readily.
         // Every later one goes to a server that answers while any is left.
-        if (a.tried == 0) ties |= untimed;
+        if (a.untouched()) ties |= untimed;
         // Every dead server ties in the dead band.
         const last = if (best == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
         var k = try g.uniform(.pick, by, @popCount(ties));
@@ -1050,7 +1054,7 @@ test "an age rounds up to the whole second" {
 
 pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
     // The question never changes, so it is checked until a server is touched.
-    if (a.tried == 0 and !mayHear(g, a.zone, qname, qtype)) {
+    if (a.untouched() and !mayHear(g, a.zone, qname, qtype)) {
         a.local = true;
         return .exhausted;
     }
