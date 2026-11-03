@@ -46,12 +46,16 @@ const Conn = struct {
     len: usize = 0,
     served: u32 = 0,
     last_ns: i64,
-    /// Answers owed; a half-closed client waits for them.
     owed: u32 = 0,
-    eof: bool = false,
+    draining: bool = false,
     /// Reply bytes the socket has not taken; while any wait, nothing more is asked.
     out: std.ArrayList(u8) = .empty,
     blocked_ns: i64 = 0,
+
+    fn interest(c: *const Conn) u32 {
+        if (c.out.items.len != 0) return linux.EPOLL.OUT;
+        return if (c.draining) 0 else linux.EPOLL.IN;
+    }
 };
 
 const Reply = union(enum) {
@@ -337,12 +341,7 @@ const Server = struct {
             .AGAIN, .INTR => return,
             else => return s.drop(c),
         }
-        if (rc == 0) {
-            c.eof = true;
-            if (c.owed == 0) return s.drop(c);
-            s.e.rewatch(c.fd, c.token, 0) catch s.drop(c);
-            return;
-        }
+        if (rc == 0) return s.drain(c);
         // Only a whole frame resets the idle clock.
         c.len += rc;
         try s.frames(c);
@@ -351,9 +350,9 @@ const Server = struct {
     fn frames(s: *Server, c: *Conn) !void {
         const tok = c.token;
         var start: usize = 0;
-        while (c.len - start >= 2 and c.out.items.len == 0) {
+        while (c.len - start >= 2 and c.out.items.len == 0 and !c.draining) {
             const flen: usize = mem.readInt(u16, c.buf[start..][0..2], .big);
-            if (flen == 0 or flen > max_frame or c.served >= s.cfg.tcp_queries_per_conn) return s.drop(c);
+            if (flen == 0 or flen > max_frame) return s.drop(c);
             if (c.len - start < 2 + flen) break;
             c.served += 1;
             c.owed += 1;
@@ -363,6 +362,7 @@ const Server = struct {
             // Turned away, or a failed write: the connection is gone.
             if (s.watched.items[tok & slot_mask].w != .conn) return;
             start += 2 + flen;
+            if (c.served >= s.cfg.tcp_queries_per_conn) return s.drain(c);
         }
         mem.copyForwards(u8, c.buf[0 .. c.len - start], c.buf[start..c.len]);
         c.len -= start;
@@ -382,6 +382,25 @@ const Server = struct {
         s.freed.deinit(s.gpa);
         s.listeners.deinit(s.gpa);
         s.scratch.deinit();
+    }
+
+    fn drain(s: *Server, c: *Conn) void {
+        c.draining = true;
+        if (s.closeIfDone(c)) return;
+        s.e.rewatch(c.fd, c.token, c.interest()) catch s.drop(c);
+    }
+
+    /// Unread bytes would turn the close into a reset, which can lose the
+    /// answers just sent. Bounded, so a client can't hold the loop by sending.
+    fn closeIfDone(s: *Server, c: *Conn) bool {
+        if (!c.draining or c.owed > 0 or c.out.items.len > 0) return false;
+        var unread: [max_frame]u8 = undefined;
+        for (0..64) |_| {
+            const rc = linux.read(c.fd, &unread, unread.len);
+            if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+        }
+        s.drop(c);
+        return true;
     }
 
     fn drop(s: *Server, c: *Conn) void {
@@ -845,11 +864,14 @@ const Server = struct {
                     const n = s.take(c, rest) orelse return;
                     rest = rest[n..];
                 }
-                if (rest.len == 0) return s.closeIfDone(c);
+                if (rest.len == 0) {
+                    _ = s.closeIfDone(c);
+                    return;
+                }
                 c.out.appendSlice(s.gpa, rest) catch return s.drop(c);
                 if (c.out.items.len == rest.len) {
                     c.blocked_ns = s.e.now_ns;
-                    s.e.rewatch(c.fd, c.token, linux.EPOLL.OUT) catch s.drop(c);
+                    s.e.rewatch(c.fd, c.token, c.interest()) catch s.drop(c);
                 }
             },
         }
@@ -862,8 +884,8 @@ const Server = struct {
         mem.copyForwards(u8, c.out.items, c.out.items[n..]);
         c.out.shrinkRetainingCapacity(c.out.items.len - n);
         if (c.out.items.len != 0) return;
-        s.e.rewatch(c.fd, c.token, if (c.eof) 0 else linux.EPOLL.IN) catch return s.drop(c);
-        if (c.eof and c.owed == 0) return s.drop(c);
+        if (s.closeIfDone(c)) return;
+        s.e.rewatch(c.fd, c.token, c.interest()) catch return s.drop(c);
         try s.frames(c);
     }
 
@@ -876,10 +898,6 @@ const Server = struct {
                 return null;
             },
         };
-    }
-
-    fn closeIfDone(s: *Server, c: *Conn) void {
-        if (c.eof and c.owed == 0) s.drop(c);
     }
 };
 

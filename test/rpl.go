@@ -36,10 +36,10 @@ type config struct {
 	allowZones, extraAllow      []string
 	stubZones                   []stubZone
 	// Set by tests alone; zero is hark's default.
-	cacheSize, tcpIdleMs int
-	allowFrom            []string
-	nofile               int
-	listenAny            bool
+	cacheSize, tcpIdleMs, tcpQueries int
+	allowFrom                        []string
+	nofile                           int
+	listenAny                        bool
 }
 
 type stubZone struct {

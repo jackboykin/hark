@@ -90,6 +90,18 @@ func TestLateUDPIsSilentAndTCPIsAnswered(t *testing.T) {
 	}
 }
 
+func TestTheQueryLimitKeepsTheAnswersOwed(t *testing.T) {
+	t.Parallel()
+	_, h := launchText(t, twoSilent, func(c *config) { c.tcpQueries = 2 })
+	c := dial(t, h)
+	send(t, c, append(framed(t, "a.example.com.", 1), framed(t, "b.example.com.", 2)...))
+	time.Sleep(100 * time.Millisecond)
+	send(t, c, framed(t, "c.example.com.", 3))
+	if got := ids(replies(t, c, 3)); !slices.Equal(got, []uint16{1, 2}) {
+		t.Fatalf("replies to %v, want 1 and 2", got)
+	}
+}
+
 func TestAResetTCPClientLeavesTheLoopFree(t *testing.T) {
 	t.Parallel()
 	_, h := launchText(t, twoSilent, func(c *config) { c.serveStaleTTL = 60 })
