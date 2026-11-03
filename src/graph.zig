@@ -767,7 +767,7 @@ pub const Graph = struct {
         }
         const jitter = @min(refresh_jitter_ns, @divTrunc(lapses_ns - g.now(), 2));
         const at = g.now() + if (jitter > 0) @as(i64, @intCast(try g.uniform(.prefetch, rkey, @intCast(jitter)))) else 0;
-        const id = try g.newRoot(rkey, name, lapses_ns, .{ .deadline_ns = 0 });
+        const id = try g.newRoot(rkey, name, lapses_ns, .{ .deadline_ns = at + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.wake(id, at);
@@ -862,12 +862,7 @@ pub const Graph = struct {
 
     pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
         if (completion == .wake) {
-            if (g.gen(id) == completion.wake) {
-                // A refresh's budget runs from its first wake.
-                const c = g.cell(id);
-                if (c.key.kind == .refresh and c.scratch.answer.budget.deadline_ns == 0) c.scratch.answer.budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
-                try g.enqueue(id);
-            }
+            if (g.gen(id) == completion.wake) try g.enqueue(id);
             return g.drain();
         }
         const c = g.cell(id);
