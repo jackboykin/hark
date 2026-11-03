@@ -192,23 +192,23 @@ pub const Desk = struct {
         if (q.qtype == .rrsig and d.g.cfg.trust_anchors != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
-        if (try d.hold(q, c)) |ede| {
+        if (try d.hold(q, c)) |held| {
             // Held, the graph is closed: memory serves the last tenth too.
             if (try d.memory(arena, q, c, .live)) |s| return .{ .recalled = try d.derived(q, c, s) };
-            switch (ede.code) {
+            switch (held) {
                 // A hold with nothing left to serve asks afresh.
-                .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
-                .other, .dnssec_bogus, .cached_error, .blocked, .not_supported, .no_reachable_authority, .unsupported_nsec3_iterations, .synthesized, .over_quota => return .{ .held = servfail(q, ede) },
+                .stale => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
+                .failed => |ede| return .{ .held = servfail(q, ede) },
             }
         }
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };
         return .graph;
     }
 
-    fn hold(d: *Desk, q: dns.Question, c: Client) !?dns.Ede {
-        const ede = d.failures.get(q, c.cd, d.g.now()) orelse return null;
-        if (!builtin.is_test) return ede;
-        return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else ede;
+    fn hold(d: *Desk, q: dns.Question, c: Client) !?Failures.Held {
+        const held = d.failures.get(q, c.cd, d.g.now()) orelse return null;
+        if (!builtin.is_test) return held;
+        return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else held;
     }
 
     /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.
@@ -624,7 +624,13 @@ pub const Failures = struct {
     /// would probe ever longer.
     map: std.array_hash_map.Custom([]const u8, Entry, Seeded, true) = .empty,
 
-    const Entry = struct { until_ns: i64, window_s: u32, ede: dns.Ede };
+    const Entry = struct {
+        until_ns: i64,
+        is: union(enum) { stale, failure: struct { window_s: u32, ede: dns.Ede } },
+    };
+
+    pub const Held = union(enum) { stale, failed: dns.Ede };
+
     const Seeded = struct {
         pub fn hash(_: Seeded, k: []const u8) u32 {
             return @truncate(std.hash.Wyhash.hash(rand.hash_seed, k));
@@ -649,18 +655,21 @@ pub const Failures = struct {
         return buf[0 .. name.len + 3];
     }
 
-    /// The EDE to answer with while the window lasts. A validation failure
-    /// keeps its reason, a stale hold says to serve stale again; anything
-    /// else is RFC 8914's cached error.
-    pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?dns.Ede {
+    /// What holds the question while the window lasts. A validation failure
+    /// keeps its reason; any other is RFC 8914's cached error.
+    pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?Held {
         if (f.map.count() == 0) return null;
         var buf: [dns.max_name_wire_len + 3]u8 = undefined;
         const e = f.map.get(key(&buf, q, cd)) orelse return null;
         if (e.until_ns <= now_ns) return null;
-        return switch (e.ede.code) {
-            .dnssec_bogus, .unsupported_nsec3_iterations, .stale_answer, .stale_nxdomain_answer => e.ede,
-            .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota => .{ .code = .cached_error },
+        const failure = switch (e.is) {
+            .stale => return .stale,
+            .failure => |x| x,
         };
+        return .{ .failed = switch (failure.ede.code) {
+            .dnssec_bogus, .unsupported_nsec3_iterations => failure.ede,
+            .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota, .stale_answer, .stale_nxdomain_answer => .{ .code = .cached_error },
+        } };
     }
 
     /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
@@ -676,20 +685,24 @@ pub const Failures = struct {
             if (f.map.fetchSwapRemove(k)) |kv| gpa.free(kv.key);
             return;
         }
-        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .window_s = first_s, .ede = served.ede.? });
+        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .is = .stale });
         const ede = served.ede orelse dns.Ede{ .code = .other };
         if (f.map.getPtr(k)) |e| {
             // Every client waiting on one failure notes it: once is enough.
             if (now_ns < e.until_ns) return;
-            // Failing again within a window of the last lapsing: back off.
-            const again = now_ns < e.until_ns + @as(i64, e.window_s) * std.time.ns_per_s;
-            e.window_s = if (again) @min(e.window_s * 2, max_window_s) else first_s;
-            e.until_ns = now_ns + @as(i64, e.window_s) * std.time.ns_per_s;
-            e.ede = ede;
-            return;
+            switch (e.is) {
+                .stale => {},
+                .failure => |x| {
+                    // Failing again within a window of the last lapsing: back off.
+                    const again = now_ns < e.until_ns + @as(i64, x.window_s) * std.time.ns_per_s;
+                    const window_s = if (again) @min(x.window_s * 2, max_window_s) else first_s;
+                    e.* = .{ .until_ns = now_ns + @as(i64, window_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = window_s, .ede = ede } } };
+                    return;
+                },
+            }
         }
         if (first_s == 0) return;
-        try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .window_s = first_s, .ede = ede });
+        try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = first_s, .ede = ede } } });
     }
 
     /// Past `max_entries` another question is forgotten, one the seeded
@@ -773,7 +786,7 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     const s = std.time.ns_per_s;
     const failed = servfail(q, .{ .code = .no_reachable_authority });
     try f.note(testing.allocator, q, false, failed, 5, 0);
-    try testing.expectEqual(dns.Ede.Code.cached_error, f.get(q, false, 4 * s).?.code);
+    try testing.expectEqual(dns.Ede.Code.cached_error, f.get(q, false, 4 * s).?.failed.code);
     try testing.expectEqual(null, f.get(q, true, 4 * s));
     try testing.expectEqual(null, f.get(q, false, 5 * s));
     try f.note(testing.allocator, q, false, failed, 5, 6 * s);
@@ -785,6 +798,16 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     ok.rcode = .no_error;
     try f.note(testing.allocator, q, false, ok, 5, 17 * s);
     try testing.expectEqual(0, f.map.count());
+    // A hold that lapsed is no failure to back off from.
+    var held = ok;
+    held.hold_until_ns = 30 * s;
+    held.ede = .{ .code = .stale_answer };
+    try f.note(testing.allocator, q, false, held, 5, 20 * s);
+    try testing.expectEqual(Failures.Held.stale, f.get(q, false, 29 * s).?);
+    try f.note(testing.allocator, q, false, failed, 5, 31 * s);
+    try testing.expect(f.get(q, false, 35 * s) != null);
+    try testing.expectEqual(null, f.get(q, false, 36 * s));
+    try f.note(testing.allocator, q, false, ok, 5, 37 * s);
     // Past the bound, each question remembered forgets another.
     for (0..Failures.max_entries + 2) |t| {
         var other = q;
