@@ -1085,10 +1085,9 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns3_ms = ns3_ms, .ns1 = if (g.rtt.get(ns1)) |e| e.* else null, .ns2 = if (g.rtt.get(ns2)) |e| e.* else null };
 }
 
-/// srtt 1.5 s: a 3 s estimate, past the 2 s cap.
-const dead: ns_rtt.RttState = .{ .srtt_us = 1500 * std.time.us_per_ms, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
+const dead: ns_rtt.RttState = .{ .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
 
-const silent: ns_rtt.RttState = .{ .srtt_us = 400 * std.time.us_per_ms, .consecutive_timeouts = 1 };
+const silent: ns_rtt.RttState = .{ .consecutive_timeouts = 1 };
 
 const far: ns_rtt.RttState = .{ .srtt_us = 160 * std.time.us_per_ms, .min_rtt_us = 160 * std.time.us_per_ms };
 
@@ -1126,7 +1125,7 @@ test "the last live server waits its whole estimate, unhedged" {
     defer arena_state.deinit();
     // srtt 1.5 s: a 3 s estimate.
     for (1..9) |seed| {
-        const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = .{ .srtt_us = 1500 * std.time.us_per_ms }, .ns2 = dead });
+        const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = .{ .srtt_us = 1500 * std.time.us_per_ms, .min_rtt_us = 1500 * std.time.us_per_ms }, .ns2 = dead });
         try testing.expect(w.ns2_ms.? - w.ns1_ms.? >= 3000);
     }
 }
@@ -1259,11 +1258,12 @@ test "an exchange that never left the host writes no estimate" {
     s.pending_unsent = 1;
     const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
+    const unsent = s.next(s.now_ns + 10 * std.time.ns_per_s).?;
+    try g.complete(unsent.id, unsent.completion);
+    try testing.expectEqual(1, g.stats.resolver.faults.unsent);
+    const server = na.AddressKey.fromAddress(scenario.root_hints[0]);
+    try testing.expectEqual(null, g.rtt.get(server));
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expect(g.cell(root).failure() == null);
-    try testing.expectEqual(1, g.stats.resolver.faults.unsent);
-    // Only replies wrote it: a timeout would have started it at 400 ms.
-    const server = na.AddressKey.fromAddress(scenario.root_hints[0]);
-    try testing.expect(g.rtt.get(server).?.srtt_us < 50 * std.time.us_per_ms);
     g.unhold(root);
 }

@@ -8,6 +8,9 @@ const AddressKey = @import("net_address.zig").AddressKey;
 
 const initial_timeout_ms: u32 = 400;
 
+/// RFC 6298's first RTO, R + 4 * R/2, with the initial timeout as R.
+const silent_base_ms: u32 = 3 * initial_timeout_ms;
+
 /// At 50 a two-round-trip exchange to a 20 ms server timed out once in ~400.
 const min_timeout_ms: u32 = 100;
 const min_stagger_ms: u32 = 50;
@@ -72,7 +75,7 @@ pub const RttState = struct {
     /// Any reply, whatever its rcode.
     pub fn observe(s: *RttState, rtt_us: i64, now_ms: i64) void {
         const rtt: u32 = @intCast(std.math.clamp(rtt_us, 1, std.math.maxInt(u32)));
-        if (s.srtt_us == 0) {
+        if (s.min_rtt_us == 0) {
             s.srtt_us = rtt;
             s.rttvar_us = rtt / 2;
         } else {
@@ -91,10 +94,6 @@ pub const RttState = struct {
     }
 
     pub fn observeTimeout(s: *RttState, now_ms: i64) void {
-        if (s.srtt_us == 0) {
-            s.srtt_us = initial_timeout_ms * 1000;
-            s.rttvar_us = initial_timeout_ms * 500;
-        }
         if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
         if (s.consecutive_timeouts < dead_threshold) return;
         s.dead_until_ms = @max(s.dead_until_ms, now_ms + s.deadWindowMs());
@@ -108,12 +107,9 @@ pub const RttState = struct {
         return s.consecutive_timeouts >= dead_threshold and s.dead_until_ms > now_ms;
     }
 
-    /// Lower is asked first. A reply alone places a server by round trip:
-    /// the estimate a timeout leaves one that has never answered is how
-    /// long to wait for it, not how far it is.
     pub fn band(s: RttState, now_ms: i64) i64 {
         if (s.isDead(now_ms)) return dead_band;
-        if (s.min_rtt_us == 0) return if (s.srtt_us == 0) untimed_band else silent_band;
+        if (s.min_rtt_us == 0) return if (s.consecutive_timeouts == 0) untimed_band else silent_band;
         return @divTrunc(@as(i64, s.srtt_us), band_us);
     }
 
@@ -130,18 +126,22 @@ pub const RttState = struct {
     }
 
     fn rto(s: RttState) u32 {
-        if (s.srtt_us == 0) return initial_timeout_ms;
-        // RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0
-        // and then any jitter times out.
-        const srtt: i64 = s.srtt_us;
-        const base_us = @max(srtt + 4 * @as(i64, s.rttvar_us), 2 * srtt);
-        const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
+        if (s.min_rtt_us == 0 and s.consecutive_timeouts == 0) return initial_timeout_ms;
+        const base_ms = if (s.min_rtt_us == 0) silent_base_ms else s.estimateMs();
 
         const shift: u5 = @intCast(@min(s.consecutive_timeouts, max_backoff_shifts));
         const backed_off = @as(u64, base_ms) << shift;
 
         const cap = if (s.consecutive_timeouts >= dead_threshold) dead_probe_timeout_ms else max_timeout_ms;
         return @intCast(@max(min_timeout_ms, @min(backed_off, cap)));
+    }
+
+    /// RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0 and
+    /// then any jitter times out.
+    fn estimateMs(s: RttState) u32 {
+        const srtt: i64 = s.srtt_us;
+        const base_us = @max(srtt + 4 * @as(i64, s.rttvar_us), 2 * srtt);
+        return @intCast(@max(1, @divTrunc(base_us, 1000)));
     }
 
     fn deadWindowMs(s: RttState) i64 {
@@ -247,6 +247,17 @@ test "a reply ranks above no history, and no history above silence" {
     var lossy = slow;
     lossy.observeTimeout(1000);
     try testing.expectEqual(slow.band(1000), lossy.band(1000));
+}
+
+test "a server's first reply sets its estimate, whatever timeouts came before" {
+    var clean: RttState = .unknown;
+    clean.observe(20_000, 1000);
+    for (1..dead_threshold + 1) |timeouts| {
+        var lost: RttState = .unknown;
+        for (0..timeouts) |_| lost.observeTimeout(1000);
+        lost.observe(20_000, 1000);
+        try testing.expectEqual(clean, lost);
+    }
 }
 
 test "hedge stagger is 3x min_rtt clamped to [50, 300]" {
