@@ -150,67 +150,73 @@ pub const RttState = struct {
     }
 };
 
-/// Every server's estimate, in a table sized once: `ways` slots a set, the
+pub const Table = ServerTable(RttState);
+
+/// What hark holds per server, in a table sized once: `ways` slots a set, the
 /// set the address's seeded hash picks. A newcomer takes an empty slot in
 /// its set, else the one written longest ago, so a flood of glue addresses
 /// displaces its own estimates before those in use, and nothing allocates
 /// or leaves a tombstone after init.
-pub const Table = struct {
-    /// A slot's hash, high bit set; zero is empty.
-    tags: [slots]u32,
-    keys: [slots]AddressKey,
-    written_ms: [slots]i64,
-    states: [slots]RttState,
+pub fn ServerTable(comptime State: type) type {
+    return struct {
+        /// A slot's hash, high bit set; zero is empty.
+        tags: [slots]u32,
+        keys: [slots]AddressKey,
+        written_ms: [slots]i64,
+        states: [slots]State,
 
-    const ways = 8;
-    const slots = max_entries;
-    const sets = slots / ways;
+        const Self = @This();
 
-    /// Only the tags are written, so a slot's page stays untouched until
-    /// a server lands in it.
-    pub fn create(gpa: Allocator) !*Table {
-        const t = try gpa.create(Table);
-        t.tags = @splat(0);
-        return t;
-    }
+        const ways = 8;
+        const slots = max_entries;
+        const sets = slots / ways;
 
-    fn slot(key: AddressKey) struct { set: usize, tag: u32 } {
-        const h = AddressKey.HashCtx.hash(.{}, key);
-        return .{ .set = @as(usize, @intCast(h % sets)) * ways, .tag = @as(u32, @truncate(h >> 32)) | 1 << 31 };
-    }
+        /// Only the tags are written, so a slot's page stays untouched until
+        /// a server lands in it.
+        pub fn create(gpa: Allocator) !*Self {
+            const t = try gpa.create(Self);
+            t.tags = @splat(0);
+            return t;
+        }
 
-    fn find(t: *const Table, set: usize, tag: u32, key: AddressKey) ?usize {
-        for (set..set + ways) |i| if (t.tags[i] == tag and t.keys[i].eql(key)) return i;
-        return null;
-    }
+        fn slot(key: AddressKey) struct { set: usize, tag: u32 } {
+            const h = AddressKey.HashCtx.hash(.{}, key);
+            return .{ .set = @as(usize, @intCast(h % sets)) * ways, .tag = @as(u32, @truncate(h >> 32)) | 1 << 31 };
+        }
 
-    pub fn get(t: *Table, key: AddressKey) ?*RttState {
-        const at = slot(key);
-        return &t.states[t.find(at.set, at.tag, key) orelse return null];
-    }
+        fn find(t: *const Self, set: usize, tag: u32, key: AddressKey) ?usize {
+            for (set..set + ways) |i| if (t.tags[i] == tag and t.keys[i].eql(key)) return i;
+            return null;
+        }
 
-    /// The estimate to write for `key`, made unknown if it had none.
-    pub fn write(t: *Table, key: AddressKey, now_ms: i64) *RttState {
-        const at = slot(key);
-        const i = t.find(at.set, at.tag, key) orelse claim: {
-            var oldest = at.set;
-            for (at.set..at.set + ways) |i| {
-                if (t.tags[i] == 0) break :claim t.claim(i, at.tag, key);
-                if (t.written_ms[i] < t.written_ms[oldest]) oldest = i;
-            }
-            break :claim t.claim(oldest, at.tag, key);
-        };
-        t.written_ms[i] = now_ms;
-        return &t.states[i];
-    }
+        pub fn get(t: *Self, key: AddressKey) ?*State {
+            const at = slot(key);
+            return &t.states[t.find(at.set, at.tag, key) orelse return null];
+        }
 
-    fn claim(t: *Table, i: usize, tag: u32, key: AddressKey) usize {
-        t.tags[i] = tag;
-        t.keys[i] = key;
-        t.states[i] = .unknown;
-        return i;
-    }
-};
+        /// The state to write for `key`, made unknown if it had none.
+        pub fn write(t: *Self, key: AddressKey, now_ms: i64) *State {
+            const at = slot(key);
+            const i = t.find(at.set, at.tag, key) orelse claim: {
+                var oldest = at.set;
+                for (at.set..at.set + ways) |i| {
+                    if (t.tags[i] == 0) break :claim t.claim(i, at.tag, key);
+                    if (t.written_ms[i] < t.written_ms[oldest]) oldest = i;
+                }
+                break :claim t.claim(oldest, at.tag, key);
+            };
+            t.written_ms[i] = now_ms;
+            return &t.states[i];
+        }
+
+        fn claim(t: *Self, i: usize, tag: u32, key: AddressKey) usize {
+            t.tags[i] = tag;
+            t.keys[i] = key;
+            t.states[i] = .unknown;
+            return i;
+        }
+    };
+}
 
 test "a newcomer to a full set takes the slot written longest ago" {
     const na = @import("net_address.zig");
