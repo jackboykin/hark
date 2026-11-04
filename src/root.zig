@@ -8,6 +8,7 @@ pub const config = @import("config.zig");
 pub const delegation = @import("delegation.zig");
 pub const denial = @import("denial.zig");
 pub const dns = @import("dns.zig");
+pub const dot = @import("dot.zig");
 pub const dns64 = @import("dns64.zig");
 pub const dnssec = @import("dnssec.zig");
 pub const edge = @import("edge.zig");
@@ -50,6 +51,7 @@ test {
     _ = @import("delegation.zig");
     _ = @import("denial.zig");
     _ = @import("dns.zig");
+    _ = @import("dot.zig");
     _ = @import("dns64.zig");
     _ = @import("dnssec.zig");
     _ = @import("edge.zig");
