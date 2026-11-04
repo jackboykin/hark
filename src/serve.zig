@@ -723,6 +723,7 @@ const Server = struct {
         if (build_options.testing_enabled) std.debug.assert(sum(c.queries) == sum(c.replies) + sum(c.unanswered) + parked);
         logCounts("clients", c);
         logCounts("resolver", g.stats.resolver);
+        if (s.e.sessions) |d| logCounts("dot", d.stats);
         logCounts("trust", g.stats.trust);
         logCounts("verify_memo", .{ .hits = g.verify_memo.hits, .misses = g.verify_memo.misses });
         logCounts("store", .{
@@ -905,6 +906,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
     rand.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
+    if (cfg.encrypted_transport == .opportunistic) try e.enableSessions(cfg.upstream_port, cfg.dot_port);
     var g = try graph.Graph.init(gpa, work, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),

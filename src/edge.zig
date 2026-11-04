@@ -1,5 +1,5 @@
 //! The live edge: one epoll, a socket per exchange, a timer heap.
-//! Listener fds ride the same epoll under a token.
+//! Listener fds and sessions ride the same epoll under a token.
 gpa: Allocator,
 /// TCP buffers are work in progress: the graph's `Work` counts them.
 work: Allocator,
@@ -9,7 +9,8 @@ wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
 flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
-/// Events that own nothing.
+/// Events that own nothing. A session's replies borrow its read buffer, which
+/// no read touches until they have left.
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
 /// A reply is read only when its turn comes, so the consumer may stop at
@@ -18,6 +19,7 @@ batch: [64]linux.epoll_event = undefined,
 batch_len: usize = 0,
 batch_at: usize = 0,
 rx: [dns.max_message_len]u8 = undefined,
+sessions: ?*Sessions = null,
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -30,6 +32,7 @@ const sys = @import("sys_union.zig");
 const monotonic = @import("monotonic.zig");
 const rand = @import("rand.zig");
 const graph = @import("graph.zig");
+const Sessions = @import("sessions.zig");
 
 const CellId = graph.CellId;
 const Completion = graph.Completion;
@@ -47,9 +50,12 @@ const Timer = struct {
     at_ns: i64,
     seq: u32,
     id: CellId,
-    /// The cell's generation for a wake, the flight's sequence for a timeout.
+    /// The cell's generation for a wake, the flight's sequence for a timeout,
+    /// a session's token for its own.
     gen: u32,
-    kind: enum { timeout, wake },
+    kind: Kind,
+
+    const Kind = enum { timeout, wake, carried, conn };
 
     fn before(_: void, a: Timer, b: Timer) std.math.Order {
         return switch (std.math.order(a.at_ns, b.at_ns)) {
@@ -75,6 +81,7 @@ const Tcp = struct {
 
 /// Tells a token from a cell id.
 const client_tag: u64 = 1 << 32;
+pub const session_tag: u64 = 1 << 33;
 
 pub fn init(gpa: Allocator) !Edge {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -84,16 +91,25 @@ pub fn init(gpa: Allocator) !Edge {
     return e;
 }
 
+pub fn enableSessions(e: *Edge, plain_port: u16, dot_port: u16) !void {
+    e.sessions = try .create(e, plain_port, dot_port);
+}
+
 pub fn deinit(e: *Edge) void {
     for (e.flights.values()) |f| e.close(f);
     e.flights.deinit(e.gpa);
+    if (e.sessions) |s| s.destroy();
     e.timers.deinit(e.gpa);
     e.queue.deinit(e.gpa);
     sys.close(e.epfd);
 }
 
 pub fn edge(e: *Edge) graph.Edge {
-    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased };
+    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased, .roundsFn = if (e.sessions != null) roundsErased else null };
+}
+
+fn roundsErased(ctx: *anyopaque, server: na.Address, transport: graph.Transport) u32 {
+    return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.rounds(server, transport);
 }
 
 fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
@@ -117,12 +133,13 @@ pub fn rewatch(e: *Edge, fd: posix.fd_t, token: u32, events: u32) !void {
     try e.ctl(linux.EPOLL.CTL_MOD, fd, events, client_tag | token);
 }
 
-fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
+pub fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
     var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = data } };
     if (linux.errno(linux.epoll_ctl(e.epfd, op, fd, &ev)) != .SUCCESS) return error.EpollCtlFailed;
 }
 
 fn send(e: *Edge, ex: Exchange) !void {
+    if (e.sessions) |s| if (try s.carry(ex)) return;
     var flight = e.open(ex) catch {
         return e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
     };
@@ -171,12 +188,12 @@ fn finish(e: *Edge, id: CellId, completion: Completion) Event {
     return .{ .exchange = .{ .id = id, .completion = completion } };
 }
 
-fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: @FieldType(Timer, "kind")) !void {
+pub fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: Timer.Kind) !void {
     e.seq += 1;
     try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
 }
 
-fn push(e: *Edge, ev: Event) !void {
+pub fn push(e: *Edge, ev: Event) !void {
     try e.queue.append(e.gpa, ev);
 }
 
@@ -195,10 +212,11 @@ fn pop(e: *Edge) ?Event {
 pub fn next(e: *Edge, until_ns: i64) !?Event {
     while (true) {
         if (e.pop()) |ev| return ev;
-        while (e.batch_at < e.batch_len) {
+        if (e.batch_at < e.batch_len) {
             const polled = e.batch[e.batch_at];
             e.batch_at += 1;
             if (try e.ready(polled)) |ev| return ev;
+            continue;
         }
         e.tick();
         try e.fire();
@@ -224,12 +242,15 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
-        // Reserved before the timer leaves the heap, so its event can't be lost.
+        // Reserved before the timer leaves the heap, so its events can't be
+        // lost; a session's rearm takes the slot the timer leaves.
         try e.queue.ensureUnusedCapacity(e.gpa, 1);
         _ = e.timers.pop();
         switch (t.kind) {
             .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
             .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) e.queue.appendAssumeCapacity(e.finish(t.id, .timeout)),
+            .carried => try e.sessions.?.flightDue(t.id, t.gen),
+            .conn => try e.sessions.?.connDue(t.gen),
         }
     }
 }
@@ -237,6 +258,10 @@ fn fire(e: *Edge) !void {
 fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     const d = ev.data.u64;
     if (d & client_tag != 0) return .{ .client = .{ .token = @truncate(d), .events = ev.events } };
+    if (d & session_tag != 0) {
+        try e.sessions.?.ready(@truncate(d), ev.events);
+        return null;
+    }
     const id: CellId = @truncate(d);
     const f = e.flights.getPtr(id) orelse return null;
     if (f.tcp) |t| return e.readyTcp(id, f.fd, t);

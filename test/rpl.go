@@ -39,6 +39,7 @@ type config struct {
 	cacheSize, tcpIdleMs, tcpQueries int
 	allowFrom                        []string
 	nofile                           int
+	dotPort                          uint16
 	listenAny                        bool
 }
 

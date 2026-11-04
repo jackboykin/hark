@@ -56,17 +56,21 @@ const root_hints_default: [2 * root_servers.len]Address = hints: {
 };
 
 /// Each default is the value `hark.toml.example` shows.
+pub const EncryptedTransport = enum { off, opportunistic };
+
 pub const ServerConfig = struct {
     listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0) },
     /// Empty: the IANA roots.
     root_hints: []const Address = &.{},
     /// Where glue points. Test-only: production always asks port 53.
     upstream_port: u16 = 53,
+    dot_port: u16 = 853,
     /// Lets upstreams sit on 127/8. Test-only.
     allow_loopback_upstreams: bool = false,
     stub_zones: []const stub.Zone = &.{},
     cache_size: usize = 12 * 1024 * 1024,
     prefetch: bool = false,
+    encrypted_transport: EncryptedTransport = .off,
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     /// The first window a failed question is answered from memory (RFC 9520 §3.2).
@@ -150,12 +154,14 @@ const config_schema = [_]SectionSpec{
         .{ .name = "root-hints", .kind = .string_array },
         .{ .name = "stub-zones", .kind = .string_array },
         .{ .name = "upstream-port", .kind = .integer },
+        .{ .name = "dot-port", .kind = .integer },
         .{ .name = "allow-loopback-upstreams", .kind = .boolean },
         .{ .name = "trust-anchors", .kind = .string_array },
         .{ .name = "dnssec", .kind = .boolean },
         .{ .name = "qname-minimization", .kind = .boolean },
         .{ .name = "dns64-prefix", .kind = .string },
         .{ .name = "stagger-ms", .kind = .integer },
+        .{ .name = "encrypted-transport", .kind = .string },
         .{ .name = "max-queries", .kind = .integer },
     } },
     .{ .name = "cache", .keys = &.{
@@ -279,6 +285,11 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
             if (p < 1 or p > 65535) return error.InvalidValue;
             cfg.upstream_port = @intCast(p);
         }
+        if (resolver.get("dot-port", .integer)) |p| {
+            if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
+            if (p < 1 or p > 65535) return error.InvalidValue;
+            cfg.dot_port = @intCast(p);
+        }
         if (resolver.get("allow-loopback-upstreams", .boolean)) |b| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.allow_loopback_upstreams = b;
@@ -298,6 +309,12 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
         // Past a second, most stubs have given up.
         if (try integer(u32, resolver, "stagger-ms", 0, 1000)) |v| cfg.stagger_ms = v;
         if (try integer(u32, resolver, "max-queries", 1, maxInt(u32))) |v| cfg.max_queries = v;
+        if (resolver.get("encrypted-transport", .string)) |s| {
+            cfg.encrypted_transport = std.meta.stringToEnum(EncryptedTransport, s) orelse {
+                errLog("config: encrypted-transport must be \"off\" or \"opportunistic\", got '{s}'", .{s});
+                return error.InvalidValue;
+            };
+        }
     }
 
     if (root.get("cache", .table)) |cache| {

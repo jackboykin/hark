@@ -19,6 +19,9 @@ stagger-ms = 150              # nameserver racing delay; 0 disables
 max-queries = 100             # upstream exchanges one resolution may spend
 root-hints = []               # override IANA roots ("ip" or "ip:port");
                               # empty = compiled-in defaults
+encrypted-transport = "off"   # or "opportunistic": authoritative servers that
+                              # take it (RFC 9539), unauthenticated; needs
+                              # outbound port 853, new connections add latency
 stub-zones = []               # "<zone> <addr> [<addr> ...]": a zone asked of
                               # these servers alone, which must be its
                               # authorities; its answers are never validated,

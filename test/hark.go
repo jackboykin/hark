@@ -194,6 +194,10 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 	line("qname-minimization = %t", c.qnameMinimization)
 	line("dnssec = %t", anchor != "")
 	line("upstream-port = %d", port)
+	if c.dotPort != 0 {
+		line("encrypted-transport = %q", "opportunistic")
+		line("dot-port = %d", c.dotPort)
+	}
 	line("allow-loopback-upstreams = true")
 	if c.staggerMs != nil {
 		line("stagger-ms = %d", *c.staggerMs)
