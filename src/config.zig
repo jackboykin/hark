@@ -55,6 +55,11 @@ const root_hints_default: [2 * root_servers.len]Address = hints: {
     break :hints hints;
 };
 
+const loopback_cidrs = [_]acl.Cidr{
+    .{ .address = net_addr.initIp4(.{ 127, 0, 0, 0 }, 0), .prefix = 8 },
+    .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0, 0, 0), .prefix = 128 },
+};
+
 /// Each default is the value `hark.toml.example` shows.
 pub const EncryptedTransport = enum { off, opportunistic };
 
@@ -86,8 +91,7 @@ pub const ServerConfig = struct {
     /// Numeric: names would need NSS.
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
-    /// BCP 140: empty allows every client, which off loopback is an open resolver.
-    allow_from: []const acl.Cidr = &.{},
+    clients: []const acl.Cidr = &loopback_cidrs,
     /// RFC 7766 §6.2.3.
     tcp_idle_timeout_ms: u32 = 5_000,
     tcp_queries_per_conn: u32 = 128,
@@ -146,7 +150,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "max-udp-payload", .kind = .integer },
         .{ .name = "user", .kind = .integer },
         .{ .name = "group", .kind = .integer },
-        .{ .name = "allow-from", .kind = .string_array },
+        .{ .name = "clients", .kind = .string_array },
         .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
         .{ .name = "tcp-queries-per-conn", .kind = .integer },
     } },
@@ -263,7 +267,7 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
         if (try integer(u16, server, "max-udp-payload", dns.max_udp_payload, dns.max_message_len)) |v| cfg.max_udp_payload = v;
         if (try credential(server, "user")) |u| cfg.drop_uid = u;
         if (try credential(server, "group")) |g| cfg.drop_gid = g;
-        if (server.get("allow-from", .string_array)) |entries| cfg.allow_from = try parseCidrList(arena, entries);
+        if (server.get("clients", .string_array)) |entries| cfg.clients = try parseCidrList(arena, entries);
         // RFC 7828 §3.1: the keepalive TIMEOUT is a u16 of 100 ms units.
         if (try integer(u32, server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
         if (try integer(u32, server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
@@ -519,7 +523,7 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
         return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
     }
 
-    // Same strict dotted-quad grammar as acl.zig's allow-from parsing —
+    // Same strict dotted-quad grammar as acl.zig's CIDR parsing —
     // one config file, one IPv4 grammar.
     const ip4 = std.Io.net.Ip4Address.parse(s, default_port) catch return null;
     return .{ .ip4 = ip4 };
@@ -776,12 +780,13 @@ test "stub-zones names a zone's servers, and refuses what no operator may name" 
     ));
     for ([_][]const u8{ "127.0.0.1:53", "127.0.0.1:5335", "[::1]:5335", "[::]:5335" }) |server| {
         var buf: [256]u8 = undefined;
-        const text = try std.mem.print(&buf, "[server]\nlisten = [\"127.0.0.1:53\", \"0.0.0.0:5335\", \"[::]:5335\"]\n[resolver]\nstub-zones = [\"internal {s}\"]\n", .{server});
+        const text = try std.mem.print(&buf, "[server]\nlisten = [\"127.0.0.1:53\", \"0.0.0.0:5335\", \"[::]:5335\"]\nclients = [\"192.0.2.0/24\"]\n[resolver]\nstub-zones = [\"internal {s}\"]\n", .{server});
         try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, text));
     }
     var other = try parseConfig(testing.allocator,
         \\[server]
         \\listen = ["0.0.0.0:5335", "[::]:5335"]
+        \\clients = ["192.0.2.0/24"]
         \\[resolver]
         \\stub-zones = ["internal 192.168.1.1:5335 127.0.0.1:53 [::1]:53"]
     );
@@ -799,7 +804,7 @@ test "parseConfig handles OOM without leaking" {
     const contents =
         \\[server]
         \\listen = ["127.0.0.1:8053", "[::1]:8053"]
-        \\allow-from = ["127.0.0.0/8", "10.0.0.0/8"]
+        \\clients = ["127.0.0.0/8", "10.0.0.0/8"]
         \\
         \\[resolver]
         \\root-hints = ["198.41.0.4:53", "199.9.14.201:53"]

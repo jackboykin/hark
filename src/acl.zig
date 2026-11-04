@@ -1,4 +1,4 @@
-//! CIDR prefixes: `[server].allow-from`, which the server's UDP and TCP
+//! CIDR prefixes: `[server].clients`, which the server's UDP and TCP
 //! front-ends enforce, and the rebinding scrub's extra sets.
 const std = @import("std");
 const mem = std.mem;
@@ -48,10 +48,7 @@ pub fn parse(s: []const u8) ?Cidr {
     return .{ .address = address, .prefix = prefix };
 }
 
-/// Empty allows every client: fine on loopback, the default, and an open
-/// resolver and reflection amplifier anywhere else (BCP 140).
 pub fn allow(entries: []const Cidr, addr: na.Address) bool {
-    if (entries.len == 0) return true;
     for (entries) |e| if (e.matches(addr)) return true;
     return false;
 }
@@ -154,14 +151,10 @@ test "matchesBytes accepts bare rdata bytes" {
     try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
 }
 
-test "allow with empty entries permits all" {
-    try testing.expect(allow(&.{}, na.initIp4(.{ 8, 8, 8, 8 }, 0)));
-    try testing.expect(allow(&.{}, na.initIp6(@splat(0), 0, 0, 0)));
-}
-
 test "allow returns false when no entry matches" {
     const c = parse("127.0.0.0/8") orelse return error.ParseFailed;
     const list = [_]Cidr{c};
     try testing.expect(!allow(&list, na.initIp4(.{ 8, 8, 8, 8 }, 0)));
     try testing.expect(allow(&list, na.initIp4(.{ 127, 1, 2, 3 }, 0)));
+    try testing.expect(!allow(&.{}, na.initIp4(.{ 127, 1, 2, 3 }, 0)));
 }

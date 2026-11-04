@@ -195,9 +195,9 @@ func TestTCPClients(t *testing.T) {
 	})
 }
 
-func TestAllowFromRefusesTCP(t *testing.T) {
+func TestClientsRefusesTCP(t *testing.T) {
 	t.Parallel()
-	h := launchBare(t, config{allowFrom: []string{"192.0.2.0/24"}})
+	h := launchBare(t, config{clients: []string{"192.0.2.0/24"}})
 	c := dial(t, h)
 	send(t, c, framed(t, "acl.invalid.", 1))
 	if n, err := c.Read(make([]byte, 16)); err != io.EOF && !errors.Is(err, syscall.ECONNRESET) {

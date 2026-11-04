@@ -286,7 +286,7 @@ const Server = struct {
             const got = s.in.recv(fd, want);
             for (0..got) |i| {
                 const from = s.in.from(i);
-                if (!acl.allow(s.cfg.allow_from, from)) continue;
+                if (!acl.allow(s.cfg.clients, from)) continue;
                 const reply: Reply = if (wildcard) .{ .wildcard = .{ .fd = fd, .addr = from, .local = s.in.local(i) } } else .{ .udp = .{ .fd = fd, .addr = from } };
                 try s.ask(s.in.datagram(i), reply, crowded);
             }
@@ -312,7 +312,7 @@ const Server = struct {
             }
             const cfd: posix.fd_t = @intCast(rc);
             const addr = na.fromSockaddr(&pa);
-            if (!acl.allow(s.cfg.allow_from, addr)) {
+            if (!acl.allow(s.cfg.clients, addr)) {
                 sys.close(cfd);
                 continue;
             }

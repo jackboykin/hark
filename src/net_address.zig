@@ -40,6 +40,11 @@ pub const AddressKey = struct {
         return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
     }
 
+    pub fn isLoopback(a: AddressKey) bool {
+        if (a.family == std.posix.AF.INET) return a.addr[0] == 127;
+        return mem.eql(u8, &a.addr, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
+    }
+
     pub fn ip4(bytes: [4]u8, port: u16) AddressKey {
         var addr: [16]u8 = @splat(0);
         addr[0..4].* = bytes;

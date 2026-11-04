@@ -57,12 +57,7 @@ pub const AddrPolicy = struct {
     }
 
     pub fn allows(policy: AddrPolicy, addr: na.AddressKey) bool {
-        return (policy.allow_loopback and loopback(addr)) or !na.isNonRoutableNs(addr);
-    }
-
-    fn loopback(addr: na.AddressKey) bool {
-        if (addr.family == std.posix.AF.INET) return addr.addr[0] == 127;
-        return std.mem.eql(u8, &addr.addr, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
+        return (policy.allow_loopback and addr.isLoopback()) or !na.isNonRoutableNs(addr);
     }
 };
 

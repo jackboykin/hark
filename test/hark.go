@@ -187,8 +187,8 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 	if c.tcpQueries > 0 {
 		line("tcp-queries-per-conn = %d", c.tcpQueries)
 	}
-	if len(c.allowFrom) > 0 {
-		line("allow-from = %s", list(c.allowFrom))
+	if len(c.clients) > 0 {
+		line("clients = %s", list(c.clients))
 	}
 	line("\n[resolver]")
 	line("qname-minimization = %t", c.qnameMinimization)

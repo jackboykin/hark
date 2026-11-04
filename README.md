@@ -26,4 +26,4 @@ sudo hark serve                            # built-in defaults
 hark serve --config /etc/hark/hark.toml    # custom config
 ```
 
-hark primarily runs as a server. By default it listens on `127.0.0.1:53` and `[::1]:53`. Binding a non-loopback address requires an explicit `allow-from` allowlist in the config. See the example config [`hark.toml.example`](hark.toml.example) to tune any value yourself.
+hark primarily runs as a server. By default it listens on `127.0.0.1:53` and `[::1]:53`. Only `clients` are answered, loopback by default. See the example config [`hark.toml.example`](hark.toml.example) to tune any value yourself.
