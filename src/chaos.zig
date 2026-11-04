@@ -5,7 +5,7 @@ const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const na = @import("net_address.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier };
 
 pub const Events = std.array_hash_map.Auto(u64, void);
 

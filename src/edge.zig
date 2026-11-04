@@ -242,7 +242,7 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     if (f.tcp) |t| return e.readyTcp(id, f.fd, t);
     const rc = linux.recvfrom(f.fd, &e.rx, e.rx.len, linux.MSG.DONTWAIT, null, null);
     return switch (linux.errno(rc)) {
-        .SUCCESS => e.finish(id, .{ .reply = e.rx[0..rc] }),
+        .SUCCESS => e.finish(id, .{ .reply = .{ .bytes = e.rx[0..rc] } }),
         .AGAIN, .INTR => null,
         // ICMP unreachable and kin: nobody there.
         else => e.finish(id, .timeout),
@@ -274,7 +274,7 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
     if (t.got < 2 + @as(usize, len)) return null;
     // Copied out before `finish` frees the buffer.
     @memcpy(e.rx[0..len], t.reply[2..][0..len]);
-    return e.finish(id, .{ .reply = e.rx[0..len] });
+    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..len] } });
 }
 
 test "a consumer that stops between events leaves nothing behind" {

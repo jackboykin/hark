@@ -20,7 +20,7 @@ pub const Transport = enum {
     tcp,
 
     /// Handshake included.
-    fn coldRtts(t: Transport) u32 {
+    pub fn coldRtts(t: Transport) u32 {
         return switch (t) {
             .udp => 1,
             .tcp => 2,
@@ -113,10 +113,10 @@ pub const RttState = struct {
         return @divTrunc(@as(i64, s.srtt_us), band_us);
     }
 
-    pub fn timeout(s: RttState, is_last: bool, transport: Transport) u32 {
+    pub fn timeout(s: RttState, is_last: bool, rounds: u32) u32 {
         const base = s.rto();
         const want = if (is_last) base else @min(base, failover_timeout_cap_ms);
-        return want * transport.coldRtts();
+        return want * rounds;
     }
 
     pub fn hedgeStagger(s: RttState) ?u32 {
@@ -291,10 +291,10 @@ test "min_rtt re-anchors after hedge_decay_ms" {
 test "timeouts inflate the RTO but leave the hedge stagger" {
     var s: RttState = .unknown;
     s.observe(20_000, 1000);
-    const rto_clean = s.timeout(true, .udp);
+    const rto_clean = s.timeout(true, 1);
     const hedge = s.hedgeStagger();
     for (0..dead_threshold) |_| s.observeTimeout(1000);
-    try testing.expect(s.timeout(true, .udp) > rto_clean);
+    try testing.expect(s.timeout(true, 1) > rto_clean);
     try testing.expectEqual(hedge, s.hedgeStagger());
 }
 
@@ -305,7 +305,7 @@ test "the threshold timeout marks dead; the window lapses to one probe and escal
     try testing.expect(!s.isDead(1000));
     s.observeTimeout(1000);
     try testing.expect(s.isDead(1000));
-    try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, .udp));
+    try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, 1));
     try testing.expect(!s.isDead(1000 + dead_duration_ms));
     s.sent(9001);
     try testing.expect(s.isDead(9000));
@@ -316,14 +316,10 @@ test "the threshold timeout marks dead; the window lapses to one probe and escal
     try testing.expect(!s.isDead(1000));
 }
 
-test "a cold exchange costs the transport's round trips of the estimate" {
+test "only the last server's wait runs past the failover cap" {
     var s: RttState = .unknown;
-    try testing.expectEqual(initial_timeout_ms * 2, s.timeout(true, .tcp));
     for (0..8) |_| s.observe(150_000, 1000);
-    const udp = s.timeout(true, .udp);
-    try testing.expect(udp > min_timeout_ms);
-    try testing.expectEqual(udp * 2, s.timeout(true, .tcp));
     for (0..3) |_| s.observeTimeout(1000);
-    try testing.expect(s.timeout(true, .udp) > failover_timeout_cap_ms);
-    try testing.expectEqual(failover_timeout_cap_ms * 2, s.timeout(false, .tcp));
+    try testing.expect(s.timeout(true, 1) > failover_timeout_cap_ms);
+    try testing.expectEqual(failover_timeout_cap_ms, s.timeout(false, 1));
 }

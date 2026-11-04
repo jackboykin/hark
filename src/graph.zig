@@ -59,17 +59,28 @@ pub const Exchange = struct {
     id: CellId,
     server: na.Address,
     transport: Transport,
+    /// Held by the cell until the exchange completes.
     wire: []const u8,
     deadline_ns: i64,
 };
 
-pub const Completion = union(enum) {
+pub const Heard = struct {
     /// Borrowed for the call: the cell parses its own copy.
-    reply: []const u8,
+    bytes: []const u8,
+    /// Came over a stream, whatever was asked: no datagram's limit applies.
+    stream: bool = false,
+    queued_ns: i64 = 0,
+};
+
+pub const Completion = union(enum) {
+    reply: Heard,
     timeout,
     /// Never left the host: out of sockets, buffers or memory, or no
     /// route there. Says nothing about the server.
     unsent,
+    /// Its carrier gave up before the server could answer. Asked again, it
+    /// goes another way. Says nothing about the server.
+    moved,
     /// Run again at this time; carries the cell's generation, since ids recycle.
     wake: u32,
 };
@@ -83,6 +94,7 @@ pub const Edge = struct {
     rng: std.Random,
     sendFn: *const fn (*anyopaque, Exchange) anyerror!void,
     wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
+    roundsFn: ?*const fn (*anyopaque, na.Address, Transport) u32 = null,
     chaos: ?*chaos.Chaos = null,
 
     pub fn send(e: Edge, ex: Exchange) !void {
@@ -91,6 +103,11 @@ pub const Edge = struct {
 
     pub fn wake(e: Edge, id: CellId, gen: u32, at_ns: i64) !void {
         return e.wakeFn(e.ctx, id, gen, at_ns);
+    }
+
+    pub fn rounds(e: Edge, server: na.Address, transport: Transport) u32 {
+        const f = e.roundsFn orelse return transport.coldRtts();
+        return f(e.ctx, server, transport);
     }
 };
 
@@ -266,6 +283,7 @@ pub const Outcome = union(enum) {
     reply: struct { msg: dns.Message, rtt_ns: i64 },
     timeout,
     unsent,
+    moved,
     /// Parses, but a wrong id, question or 0x20 case: not the reply sent for.
     mismatch,
     /// Does not parse.
@@ -385,6 +403,7 @@ pub const Stats = struct {
             timeout: u64 = 0,
             /// Never left the host.
             unsent: u64 = 0,
+            moved: u64 = 0,
         } = .{},
         early: struct { refresh: u64 = 0 } = .{},
         detail: struct {
@@ -873,16 +892,17 @@ pub const Graph = struct {
             .wake => unreachable,
             .timeout => .timeout,
             .unsent => .unsent,
-            .reply => |borrowed| blk: {
+            .moved => .moved,
+            .reply => |heard| blk: {
                 const clock = Tally.clock(&g.tally.parse_ns);
                 defer clock.stop();
                 g.tally.parses += 1;
-                const bytes = try arena.dupe(u8, borrowed);
+                const bytes = try arena.dupe(u8, heard.bytes);
                 var p = dns.parse(arena, bytes) catch break :blk .malformed;
                 if (p.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // After the match, so a forger gains nothing over a mismatch.
-                if (sc.transport == .udp and bytes.len > dns.edns_udp_payload) break :blk .oversized;
+                if (sc.transport == .udp and !heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
                 // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
                     var n: usize = 0;
@@ -896,13 +916,14 @@ pub const Graph = struct {
                 p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
                 p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
                 p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
-                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns } };
+                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns } };
             },
         };
         if (g.cfg.trace) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            std.debug.print("  {s} {s} {f} {t} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, std.meta.activeTag(outcome) });
+            const over: []const u8 = if (completion == .reply and completion.reply.stream) " over a session" else "";
+            std.debug.print("  {s} {s} {f} {t}{s} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, over, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
                 const m = outcome.reply.msg;
                 std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
@@ -916,6 +937,7 @@ pub const Graph = struct {
                 if (!sc.cut_short) g.observeTimeout(sc.server);
             },
             .unsent => g.stats.resolver.faults.unsent += 1,
+            .moved => g.stats.resolver.faults.moved += 1,
             .mismatch, .malformed, .oversized => {},
         }
         c.holds -= 1;
@@ -1678,7 +1700,7 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
-    pub const Sent = struct { id: CellId, est: ns_rtt.RttState };
+    pub const Sent = struct { id: CellId, est: ns_rtt.RttState, rounds: u32 };
 
     /// Null, like `demand`, when the payer's budget or deadline, or the
     /// asker's orphaning, refuses the work.
@@ -1713,11 +1735,12 @@ pub const Graph = struct {
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
         // Silent past the capped wait is silent, however long this send waits.
-        const owed_at = g.now() + patience * state.timeout(false, transport) * std.time.ns_per_ms;
-        const timeout_at = g.now() + patience * state.timeout(uncapped, transport) * std.time.ns_per_ms;
+        const addr = server.toAddress();
+        const rounds = g.edge.rounds(addr, transport);
+        const owed_at = g.now() + patience * state.timeout(false, rounds) * std.time.ns_per_ms;
+        const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
-        const addr = server.toAddress();
         sc.* = .{ .id = qid, .sent = msg.question.?.spelled.?, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
@@ -1729,7 +1752,7 @@ pub const Graph = struct {
         });
         g.flights += 1;
         if (transport == .udp) g.stats.resolver.exchanges.udp += 1 else g.stats.resolver.exchanges.tcp += 1;
-        return .{ .id = id, .est = state };
+        return .{ .id = id, .est = state, .rounds = rounds };
     }
 };
 

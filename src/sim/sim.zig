@@ -122,6 +122,12 @@ pub const Sim = struct {
             try s.hear(q, silence);
             return s.schedule(ex.id, s.now_ns, 0, .unsent);
         }
+        if (s.chaos) |ch| if (ch.live(.carrier)) {
+            const key = graph.Key.of(.rrset, q.name, q.qtype);
+            const event = ch.peek(.carrier, key);
+            try ch.spend(.carrier, key);
+            if (try ch.choose(.carrier, event, 4, .{ .key = key }) != 0) return s.schedule(ex.id, s.now_ns, 0, .moved);
+        };
         // RFC 8109 root priming is not logged.
         if (!(q.name.isRoot() and q.qtype == .ns))
             try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .transport = ex.transport });
@@ -198,7 +204,7 @@ pub const Sim = struct {
         }
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
-        return s.schedule(ex.id, at, tie, .{ .reply = try s.arena.dupe(u8, wire) });
+        return s.schedule(ex.id, at, tie, .{ .reply = .{ .bytes = try s.arena.dupe(u8, wire) } });
     }
 
     const silence: u64 = 0;

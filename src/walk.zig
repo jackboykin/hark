@@ -1072,6 +1072,9 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 // nothing of it.
                 .timeout => a.cut_short = a.cut_short or (!a.retried and ex.scratch.exchange.cut_short),
                 .unsent => a.local = true,
+                .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.transport, at.case, qname, qtype) == null) {
+                    refused = true;
+                },
                 // The server's breach: no TCP retry, only a sibling.
                 .oversized => {},
                 // Over TCP a forger cannot follow, and a server that
@@ -1124,12 +1127,12 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         // The dead are hedged to only once nothing live is in flight.
         if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
         const last = p.last and !a.more;
-        const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse {
+        const sent = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse {
             refused = true;
             continue;
         };
         if (a.retried) g.stats.resolver.detail.retry += 1;
-        const stagger = try g.stretch(.stagger, g.cell(id).key, state.hedgeStagger() orelse g.cfg.stagger_ms);
+        const stagger = try g.stretch(.stagger, g.cell(id).key, (sent.est.hedgeStagger() orelse g.cfg.stagger_ms) * sent.rounds);
         a.hedge_at = g.now() + @as(i64, stagger) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
         // Sent to one that may answer, the ask waits. Behind one that never
@@ -1166,7 +1169,7 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 }
 
 /// Null: refused, so launch nothing more; what is in flight may still answer.
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
     const ex = try g.exchange(id, a.servers[server], transport, case, qname, qtype, a.nattempts == 0 and last) orelse {
         a.cut_short = a.cut_short or !a.retried;
         return null;
@@ -1174,7 +1177,7 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
     a.tried |= Ask.bit(server);
     a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
-    return ex.est;
+    return ex;
 }
 
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
