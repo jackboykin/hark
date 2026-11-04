@@ -26,6 +26,7 @@ pub const special_use = @import("special_use.zig");
 pub const store = @import("store.zig");
 pub const stub = @import("stub.zig");
 pub const sys = @import("sys_union.zig");
+pub const tls13 = @import("tls13.zig");
 pub const toml = @import("toml.zig");
 pub const trust = @import("trust.zig");
 pub const walk = @import("walk.zig");
@@ -74,6 +75,7 @@ test {
     _ = @import("stub.zig");
     _ = @import("sys_linux.zig");
     _ = @import("sys_union.zig");
+    _ = @import("tls13.zig");
     _ = @import("toml.zig");
     _ = @import("trust.zig");
     _ = @import("walk.zig");
