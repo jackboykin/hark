@@ -1,47 +1,36 @@
-# hark configuration — install as /etc/hark/hark.toml
+# hark configuration. Install as /etc/hark/hark.toml.
 
 [server]
 listen = ["127.0.0.1:53", "[::1]:53"]
 clients = ["127.0.0.0/8", "::1/128"]
-max-udp-payload = 1232        # max EDNS0 buffer size honored from clients;
-                              # raise only where the path MTU fits it
-tcp-idle-timeout-ms = 5000    # close idle TCP clients (RFC 7766 §6.2.3)
-tcp-queries-per-conn = 128    # queries per TCP connection before close
-# user = 65534                # numeric uid to drop to after binding :53
-# group = 65534               # numeric gid; names need NSS — pass resolved ids
+max-udp-payload = 1232        # largest EDNS0 buffer honored from clients
+tcp-idle-timeout-ms = 5000    # idle TCP clients are closed after this
+tcp-queries-per-conn = 128    # TCP connections are closed after this many queries
+# user = 65534                # uid to drop to after binding :53. Numeric only
+# group = 65534               # gid to drop to. Numeric only
 
 [resolver]
 dnssec = true
-qname-minimization = true     # RFC 9156
-dns64-prefix = ""             # NAT64 Pref64::/n, e.g. "64:ff9b::/96" (RFC 6147); "" = off
-stagger-ms = 150              # nameserver racing delay; 0 disables
-max-queries = 100             # upstream exchanges one resolution may spend
-root-hints = []               # override IANA roots ("ip" or "ip:port");
-                              # empty = compiled-in defaults
-encrypted-transport = "off"   # or "opportunistic": authoritative servers that
-                              # take it (RFC 9539), unauthenticated; needs
-                              # outbound port 853, new connections add latency
-stub-zones = []               # "<zone> <addr> [<addr> ...]": a zone asked of
-                              # these servers alone, which must be its
-                              # authorities; its answers are never validated,
-                              # e.g. "internal 192.168.1.1"
+qname-minimization = true
+dns64-prefix = ""             # NAT64 prefix such as "64:ff9b::/96", otherwise off
+stagger-ms = 150              # wait before trying the next nameserver. 0 disables
+max-queries = 100             # upstream queries one resolution may spend
+root-hints = []               # "ip" or "ip:port" entries, otherwise the IANA roots
+encrypted-transport = "off"   # "opportunistic" uses DoT where authorities offer it. Needs outbound port 853
+stub-zones = []               # "<zone> <addr>..." entries such as "internal 192.168.1.1". Never validated
 
 [cache]
-size = 12582912               # answer cache, bytes; resolutions in flight may hold
-                              # as much again, past which only what is known is
-                              # served
-prefetch = false              # an answer asked for in the last tenth of its
-                              # life is fetched again in the background
-serve-stale-ttl = 0           # serve expired answers for N seconds
-min-ttl = 0                   # floor for very short TTLs
-servfail-ttl = 5              # a failed question answers from memory this long,
-                              # doubling while it keeps failing, to 5 min
+size = 12582912               # bytes. Memory peaks near twice this
+prefetch = false              # refetch answers asked for in the last tenth of their TTL
+serve-stale-ttl = 0           # serve expired answers for this many seconds
+min-ttl = 0                   # TTL floor
+servfail-ttl = 5              # seconds a failed question answers from memory. Doubles while it keeps failing, up to 300
 
 [rebinding]
 enabled = true                # scrub private addresses from public-zone answers
-allow-zones = []              # owner names exempt from scrubbing (split-horizon)
-extra-block = []              # additional CIDRs to scrub
-extra-allow = []              # CIDRs to exempt (e.g. ["127.0.0.0/8"] for DNSBLs)
+allow-zones = []              # zones exempt from scrubbing, for split-horizon
+extra-block = []              # more CIDRs to scrub
+extra-allow = []              # CIDRs to exempt, such as ["127.0.0.0/8"] for DNSBLs
 
 [logging]
 queries = false               # log every query
