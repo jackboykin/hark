@@ -13,6 +13,7 @@ shared: Socket.Shared = .{},
 
 const std = @import("std");
 const linux = std.os.linux;
+const log = std.log;
 const mem = std.mem;
 const na = @import("net_address.zig");
 const sys = @import("sys_union.zig");
@@ -232,6 +233,8 @@ fn drop(s: *Sessions, c: *Conn, how: Socket.End) !void {
     if (how == .failed or !c.socket.established() or (c.pending.count() > 0 and c.last_reply_ns == null)) {
         s.setStanding(c.key, damping_ns, false);
         s.stats.failed += 1;
+        var ab: [64]u8 = undefined;
+        log.debug("dot server={s} damped: {t}, {d} pending, {s}", .{ na.format(c.key.toAddress(), &ab), c.socket.state, c.pending.count(), c.socket.fault });
     } else {
         s.stats.closed += 1;
         // §4.6.7: what a close leaves pending goes plain. A dial for it would

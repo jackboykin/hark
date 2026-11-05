@@ -7,6 +7,7 @@ state: enum { connecting, handshaking, established } = .connecting,
 session: dot.Session = undefined,
 held: []u8 = &.{},
 unsent: std.ArrayList(u8) = .empty,
+fault: []const u8 = "silence",
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -94,9 +95,15 @@ pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
     const held = sock.held.len;
     const rc = linux.read(sock.fd, sh.rx[held..].ptr, sh.rx.len - held);
     switch (linux.errno(rc)) {
-        .SUCCESS => if (rc == 0) return .{ .ended = .closed },
+        .SUCCESS => if (rc == 0) {
+            sock.fault = "eof";
+            return .{ .ended = .closed };
+        },
         .AGAIN, .INTR => return .nothing,
-        else => return .{ .ended = .closed },
+        else => |err| {
+            sock.sawErrno(err);
+            return .{ .ended = .closed };
+        },
     }
     @memcpy(sh.rx[0..held], sock.held);
     sh.read = sock.session.reader(&sh.rx, held);
@@ -106,10 +113,15 @@ pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
     return .read;
 }
 
+fn sawErrno(sock: *Socket, err: linux.E) void {
+    sock.fault = std.enums.tagName(linux.E, err) orelse "unnamed errno";
+}
+
 fn connected(sock: *Socket) !News {
     var err: i32 = 0;
     var len: posix.socklen_t = @sizeOf(i32);
     if (linux.errno(linux.getsockopt(sock.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS or err != 0) {
+        sock.sawErrno(@fromBackingInt(@intCast(err)));
         return .{ .ended = .failed };
     }
     // Keys only now: nearly every first dial meets a closed port, and the
@@ -130,6 +142,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
     std.debug.assert(sh.out_len == 0);
     while (true) {
         const ev = sock.session.next(&sh.read, &sh.out) catch |err| {
+            sock.fault = @errorName(err);
             if (err != error.AlertHeard) _ = sock.put(sock.session.alert(&sh.out, tls13.alert(@errorCast(err)))) catch {};
             return .{ .ended = .failed };
         } orelse {
@@ -149,7 +162,10 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
                 return .established;
             },
             .send => |bytes| if (!try sock.put(bytes)) return .{ .ended = .closed },
-            .closed => return .{ .ended = .closed },
+            .closed => {
+                sock.fault = "close_notify";
+                return .{ .ended = .closed };
+            },
             .reply => |m| return .{ .reply = .{ .id = mem.readInt(u16, m[0..2], .big), .bytes = m } },
         }
     }
@@ -183,7 +199,10 @@ fn put(sock: *Socket, bytes: []const u8) !bool {
         switch (linux.errno(rc)) {
             .SUCCESS => rest = rest[rc..],
             .AGAIN, .INTR => {},
-            else => return false,
+            else => |err| {
+                sock.sawErrno(err);
+                return false;
+            },
         }
         if (rest.len == 0) return true;
         try sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, linux.EPOLL.IN | linux.EPOLL.OUT, Edge.session_tag | sock.token);
@@ -197,7 +216,10 @@ fn flushUnsent(sock: *Socket) !bool {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .AGAIN, .INTR => return true,
-        else => return false,
+        else => |err| {
+            sock.sawErrno(err);
+            return false;
+        },
     }
     sock.unsent.replaceRangeAssumeCapacity(0, rc, &.{});
     if (sock.unsent.items.len == 0) try sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, linux.EPOLL.IN, Edge.session_tag | sock.token);
