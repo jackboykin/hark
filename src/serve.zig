@@ -936,6 +936,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
         log.info("dropped to uid={?d} gid={?d}", .{ cfg.drop_uid, cfg.drop_gid });
     }
     if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
+    posix.sigaction(.PIPE, &.{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 }, null);
     const sig = try signalFd();
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
