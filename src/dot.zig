@@ -83,8 +83,9 @@ pub const Session = struct {
         mem.writeInt(u16, frame[0..2], @intCast(n), .big);
         @memcpy(frame[2..][0..wire.len], wire);
         mem.writeInt(u16, frame[2..4], id, .big);
-        const options = mem.readInt(u16, wire[wire.len - 2 ..][0..2], .big);
-        mem.writeInt(u16, frame[2 + wire.len - 2 ..][0..2], options + @as(u16, @intCast(4 + pad)), .big);
+        // The wire ends in an OPT with no options: these two bytes are its RDLEN.
+        std.debug.assert(mem.readInt(u16, wire[wire.len - 2 ..][0..2], .big) == 0);
+        mem.writeInt(u16, frame[2 + wire.len - 2 ..][0..2], @intCast(4 + pad), .big);
         mem.writeInt(u16, frame[2 + wire.len ..][0..2], padding_option, .big);
         mem.writeInt(u16, frame[2 + wire.len + 2 ..][0..2], @intCast(pad), .big);
         @memset(frame[2 + wire.len + 4 ..][0..pad], 0);
