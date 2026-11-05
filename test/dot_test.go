@@ -220,9 +220,10 @@ func TestDotOnceAServerTakesIt(t *testing.T) {
 	h := launchDot(t, s, "a.example.com.", "b.example.com.", "c.example.com.")
 	wantAnswer(t, h, "a.example.com.", plainAnswer)
 	s.waitShook(t, 1)
+	waitFor(t, "the probe letting go", func() bool { return s.ended.Load() == 1 })
 	wantAnswer(t, h, "b.example.com.", dotAnswer)
-	if s.conns.Load() != 1 {
-		t.Errorf("%d dials, want the one", s.conns.Load())
+	if s.conns.Load() != 2 {
+		t.Errorf("%d dials, want the probe's and the question's", s.conns.Load())
 	}
 	// §4.3: three days from its last reply, a server is unknown again.
 	if err := advanceClock(t.Context(), h.addr, 3*24*3600); err != nil {
@@ -255,8 +256,8 @@ func TestDotHangingUpOnAQueryGoesPlainAndDamps(t *testing.T) {
 	}
 	wantAnswer(t, h, "c.example.com.", plainAnswer)
 	time.Sleep(50 * time.Millisecond)
-	if s.conns.Load() != 1 {
-		t.Errorf("%d dials: damping should have stopped a second", s.conns.Load())
+	if s.conns.Load() != 2 {
+		t.Errorf("%d dials: damping should have stopped a third", s.conns.Load())
 	}
 }
 
@@ -332,11 +333,11 @@ func TestDotAnIdleCloseJustDialsAgain(t *testing.T) {
 	wantAnswer(t, h, "a.example.com.", plainAnswer)
 	s.waitShook(t, 1)
 	wantAnswer(t, h, "b.example.com.", dotAnswer)
-	waitFor(t, "the close", func() bool { return s.ended.Load() == 1 })
-	wantAnswer(t, h, "c.example.com.", dotAnswer)
 	waitFor(t, "the close", func() bool { return s.ended.Load() == 2 })
+	wantAnswer(t, h, "c.example.com.", dotAnswer)
+	waitFor(t, "the close", func() bool { return s.ended.Load() == 3 })
 	wantAnswer(t, h, "d.example.com.", dotAnswer)
-	if s.conns.Load() != 3 {
+	if s.conns.Load() != 4 {
 		t.Errorf("%d dials, want one per session", s.conns.Load())
 	}
 	if s.notified.Load() < 2 {
@@ -348,11 +349,11 @@ func TestDotAStalledDialDoesNotHoldQuestions(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	// The first session answers once and closes; the port then takes
-	// connections and says nothing.
+	// The probe and one session answer; the port then takes connections and
+	// says nothing.
 	s := startDot(t, func(s *dotServer, _ *tls.Config) {
 		s.stall = func() bool {
-			if s.conns.Load() == 1 {
+			if s.conns.Load() <= 2 {
 				return false
 			}
 			<-release
@@ -367,7 +368,7 @@ func TestDotAStalledDialDoesNotHoldQuestions(t *testing.T) {
 	wantAnswer(t, h, "a.example.com.", plainAnswer)
 	s.waitShook(t, 1)
 	wantAnswer(t, h, "b.example.com.", dotAnswer)
-	waitFor(t, "the close", func() bool { return s.ended.Load() == 1 })
+	waitFor(t, "the close", func() bool { return s.ended.Load() == 2 })
 	t0 := time.Now()
 	wantAnswer(t, h, "c.example.com.", plainAnswer)
 	if d := time.Since(t0); d > 1500*time.Millisecond {
@@ -404,7 +405,7 @@ func TestDotALostQueryLeavesALiveSession(t *testing.T) {
 	for i := 0; ; i++ {
 		select {
 		case <-lost:
-			if s.conns.Load() != 1 {
+			if s.conns.Load() != 2 {
 				t.Errorf("%d dials: the session went on answering, so it should have stayed", s.conns.Load())
 			}
 			// A timeout, so the walk's one retry; not asked again without end.
@@ -450,7 +451,7 @@ func TestDotAClosePendingQueriesGoPlain(t *testing.T) {
 	if answered.Load() != 8 {
 		t.Errorf("%d of 8 answered", answered.Load())
 	}
-	if s.conns.Load() != 1 {
+	if s.conns.Load() != 2 {
 		t.Errorf("%d dials: a close with queries pending should not dial again at once", s.conns.Load())
 	}
 }
@@ -484,8 +485,8 @@ func TestDotAReplyOutlivesAPartialOneBehindIt(t *testing.T) {
 	}
 	wg.Wait()
 	// A reply spoiled in the buffer reads as a mismatch and earns a retry.
-	if s.conns.Load() != 1 || s.queries.Load() != 2 {
-		t.Errorf("%d dials, %d queries: want one session carrying both once", s.conns.Load(), s.queries.Load())
+	if s.conns.Load() != 2 || s.queries.Load() != 2 {
+		t.Errorf("%d dials, %d queries: want the probe and one session carrying both once", s.conns.Load(), s.queries.Load())
 	}
 }
 

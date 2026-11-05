@@ -290,8 +290,11 @@ fn onEstablished(s: *Sessions, c: *Conn) !bool {
     c.last_ns = s.edge.now_ns;
     s.stats.established += 1;
     s.setStanding(c.key, persistence_ns, true);
+    // Left idle, a probe would meet the server's idle timer, and a first query
+    // crossing that close would damp the server for a day.
+    const asked = c.queued.items.len != 0;
     while (c.queued.pop()) |at| if (!try s.send(c, at)) return false;
-    return c.socket.flush(&s.shared);
+    return try c.socket.flush(&s.shared) and asked;
 }
 
 pub fn flightDue(s: *Sessions, id: CellId, seq: u32) !void {
