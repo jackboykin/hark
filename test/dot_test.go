@@ -36,19 +36,22 @@ func dotScenario(names ...string) string {
 	return b.String()
 }
 
+const closeNotifyLen = 5 + 2 + 1 + 16
+
 type dotServer struct {
 	l     net.Listener
 	conns atomic.Int64
 	// Past a handshake, hark has heard the server's Finished and said its own.
 	shook atomic.Int64
 	// Past a close, hark has heard it and let go.
-	ended   atomic.Int64
-	queries atomic.Int64
-	mu      sync.Mutex
-	sni     []string
-	alpn    []string
-	sizes   []int
-	stall   func() bool
+	ended    atomic.Int64
+	notified atomic.Int64
+	queries  atomic.Int64
+	mu       sync.Mutex
+	sni      []string
+	alpn     []string
+	sizes    []int
+	stall    func() bool
 }
 
 func self(t *testing.T) tls.Certificate {
@@ -107,7 +110,9 @@ func startDot(t *testing.T, tweak func(*dotServer, *tls.Config), serve func(s *d
 				s.shook.Add(1)
 				serve(s, tc)
 				tc.CloseWrite()
-				io.Copy(io.Discard, tc)
+				if n, _ := io.Copy(io.Discard, c); n == closeNotifyLen {
+					s.notified.Add(1)
+				}
 				s.ended.Add(1)
 			}()
 		}
@@ -333,6 +338,9 @@ func TestDotAnIdleCloseJustDialsAgain(t *testing.T) {
 	wantAnswer(t, h, "d.example.com.", dotAnswer)
 	if s.conns.Load() != 3 {
 		t.Errorf("%d dials, want one per session", s.conns.Load())
+	}
+	if s.notified.Load() < 2 {
+		t.Errorf("%d close_notify in 2 closes", s.notified.Load())
 	}
 }
 

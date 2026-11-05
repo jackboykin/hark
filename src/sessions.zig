@@ -321,7 +321,6 @@ pub fn connDue(s: *Sessions, token: u32) !void {
     if (s.edge.now_ns < due or c.pending.count() > 0) {
         return s.edge.schedule(@max(due, s.edge.now_ns + std.time.ns_per_s), 0, token, .conn);
     }
-    c.socket.closeNotify(&s.shared);
     return s.drop(c, .closed);
 }
 

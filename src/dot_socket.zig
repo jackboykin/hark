@@ -3,7 +3,7 @@
 edge: *Edge,
 token: u32,
 fd: posix.fd_t,
-state: enum { connecting, handshaking, established } = .connecting,
+state: enum { connecting, handshaking, established, alerted } = .connecting,
 session: dot.Session = undefined,
 held: []u8 = &.{},
 unsent: std.ArrayList(u8) = .empty,
@@ -63,6 +63,11 @@ pub fn open(edge: *Edge, server: na.Address, port: u16, token: u32) !Socket {
 
 pub fn close(sock: *Socket) void {
     const e = sock.edge;
+    if (sock.state == .established and sock.unsent.items.len == 0) {
+        var out: [tls13.overhead + 2]u8 = undefined;
+        const alert = sock.session.alert(&out, .close_notify);
+        _ = linux.write(sock.fd, alert.ptr, alert.len);
+    }
     sys.close(sock.fd);
     if (sock.state != .connecting) sock.session.deinit();
     sock.unsent.deinit(e.gpa);
@@ -143,6 +148,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
     while (true) {
         const ev = sock.session.next(&sh.read, &sh.out) catch |err| {
             sock.fault = @errorName(err);
+            sock.state = .alerted;
             if (err != error.AlertHeard) _ = sock.put(sock.session.alert(&sh.out, tls13.alert(@errorCast(err)))) catch {};
             return .{ .ended = .failed };
         } orelse {
@@ -184,11 +190,6 @@ pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !?QueryId {
 pub fn flush(sock: *Socket, sh: *Shared) !bool {
     defer sh.out_len = 0;
     return sock.put(sh.out[0..sh.out_len]);
-}
-
-pub fn closeNotify(sock: *Socket, sh: *Shared) void {
-    std.debug.assert(sh.out_len == 0);
-    _ = sock.put(sock.session.alert(&sh.out, .close_notify)) catch {};
 }
 
 /// Written whole, or kept to write when the socket takes it. False: gone.
