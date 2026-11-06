@@ -78,6 +78,14 @@ pub fn established(sock: *const Socket) bool {
     return sock.state == .established;
 }
 
+pub fn rounds(sock: *const Socket) u32 {
+    return switch (sock.state) {
+        .connecting, .alerted => dial_rounds,
+        .handshaking => dial_rounds - 1,
+        .established => 1,
+    };
+}
+
 /// AES-128-GCM's safe limit for one key (RFC 8446 §5.5 points at 2^24.5):
 /// rather than turn the key, a session this old is left for a new one.
 pub fn spent(sock: *const Socket) bool {

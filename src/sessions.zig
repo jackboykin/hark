@@ -128,7 +128,7 @@ pub fn rounds(s: *const Sessions, server: na.Address, transport: graph.Transport
     return switch (s.route(server, .fromAddress(server))) {
         .plain, .probe => transport.coldRtts(),
         .dial => Socket.dial_rounds,
-        .session => |c| if (c.socket.established()) 1 else Socket.dial_rounds,
+        .session => |c| c.socket.rounds(),
     };
 }
 
