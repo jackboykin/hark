@@ -105,14 +105,14 @@ pub fn deinit(e: *Edge) void {
 }
 
 pub fn edge(e: *Edge) graph.Edge {
-    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased, .roundsFn = if (e.sessions != null) roundsErased else null };
+    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased, .quoteFn = if (e.sessions != null) quoteErased else null };
 }
 
-fn roundsErased(ctx: *anyopaque, server: na.Address, transport: graph.Transport) u32 {
-    return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.rounds(server, transport);
+fn quoteErased(ctx: *anyopaque, server: na.AddressKey, transport: graph.Transport) graph.Quote {
+    return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.quote(server, transport);
 }
 
-fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
+fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!graph.Exposure {
     return @as(*Edge, @ptrCast(@alignCast(ctx))).send(ex);
 }
 
@@ -138,14 +138,16 @@ pub fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
     if (linux.errno(linux.epoll_ctl(e.epfd, op, fd, &ev)) != .SUCCESS) return error.EpollCtlFailed;
 }
 
-fn send(e: *Edge, ex: Exchange) !void {
-    if (e.sessions) |s| if (try s.carry(ex)) return;
+fn send(e: *Edge, ex: Exchange) !graph.Exposure {
+    if (e.sessions) |s| if (try s.carry(ex)) return .encrypted;
     var flight = e.open(ex) catch {
-        return e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
+        try e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
+        return .none;
     };
     flight.seq = e.seq + 1;
     try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);
+    return .cleartext;
 }
 
 fn open(e: *Edge, ex: Exchange) !Flight {
@@ -312,7 +314,7 @@ test "a consumer that stops between events leaves nothing behind" {
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
     try sys.getsockname(server, &sa.any, &sa_len);
-    try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
 
     var stop: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&stop, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
@@ -342,7 +344,7 @@ test "a timer whose event can't be queued stays due" {
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
     try sys.getsockname(server, &sa.any, &sa_len);
-    try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = 0 });
+    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = 0 });
 
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, e.next(0));

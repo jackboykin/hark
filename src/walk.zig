@@ -63,6 +63,8 @@ pub const Ask = struct {
     local: bool = false,
     /// The asker's limit kept a server from being asked.
     cut_short: bool = false,
+    /// The most any send has shown of the question.
+    shown: graph.Exposure = .none,
     /// The placement of the cut whose servers this ask took: a delegation
     /// they give lives no longer.
     placed_until_ns: i64 = std.math.maxInt(i64),
@@ -133,34 +135,50 @@ pub const Ask = struct {
         last: bool,
     };
 
-    /// Uniform within the best band. Chosen per send, so a timeout earlier
-    /// in this ask already counts.
-    fn pick(a: *const Ask, g: *Graph, by: Key) !?Pick {
-        var best: i64 = ns_rtt.dead_band;
+    /// Uniform among the best. Chosen per send, so a timeout earlier in
+    /// this ask already counts.
+    fn pick(a: *const Ask, g: *Graph, by: Key, transport: Transport) !?Pick {
+        var best: u64 = std.math.maxInt(u64);
+        var best_band: i64 = ns_rtt.dead_band;
+        var best_shows: graph.Exposure = .none;
         var ties: u32 = 0;
-        var untimed: u32 = 0;
+        var untimed: [@typeInfo(graph.Exposure).@"enum".field_names.len]u32 = @splat(0);
         var live: u8 = 0;
         var m = a.untried();
         while (m != 0) : (m &= m - 1) {
             const i = @ctz(m);
             const b = g.band(a.servers[i]);
+            const shows = a.shown.max(g.edge.quote(a.servers[i], transport).exposure);
             live += @intFromBool(b != ns_rtt.dead_band);
-            if (b == ns_rtt.untimed_band) untimed |= bit(i);
-            if (b < best) {
-                best = b;
+            if (b == ns_rtt.untimed_band) untimed[@backingInt(shows)] |= bit(i);
+            const r = rank(b, shows);
+            if (r < best) {
+                best = r;
+                best_band = b;
+                best_shows = shows;
                 ties = bit(i);
-            } else if (b == best) ties |= bit(i);
+            } else if (r == best) ties |= bit(i);
         }
         if (ties == 0) return null;
         // Nothing says a server never timed is slower than the best that
         // answer, or faster: an ask's first attempt goes to it as readily.
         // Every later one goes to a server that answers while any is left.
-        if (a.untouched()) ties |= untimed;
+        if (a.untouched()) ties |= untimed[@backingInt(best_shows)];
         // Every dead server ties in the dead band.
-        const last = if (best == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
+        const last = if (best_band == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
         var k = try g.uniform(.pick, by, @popCount(ties));
         while (k > 0) : (k -= 1) ties &= ties - 1;
-        return .{ .server = @ctz(ties), .band = best, .last = last };
+        return .{ .server = @ctz(ties), .band = best_band, .last = last };
+    }
+
+    /// Lower goes first. A server that may answer beats a silent one, and a
+    /// silent one the dead, so privacy never stalls an answer. Then the less
+    /// a send shows wins, however much faster a server that shows more.
+    /// Then the sooner band.
+    fn rank(b: i64, shows: graph.Exposure) u64 {
+        const class: u64 = if (b < ns_rtt.silent_band) 0 else if (b == ns_rtt.silent_band) 1 else 2;
+        const soon: u64 = if (b < ns_rtt.untimed_band) @intCast(b) else (1 << 60) - 1;
+        return class << 62 | @as(u64, @backingInt(shows)) << 60 | soon;
     }
 
     fn flying(a: *const Ask, g: *Graph) i64 {
@@ -1049,6 +1067,40 @@ test "an age rounds up to the whole second" {
     try std.testing.expectEqual(2, ageOf(0, std.time.ns_per_s + 1));
 }
 
+test "a send that shows less goes first, however slower, until the ask has shown more" {
+    const testing = std.testing;
+    const World = struct {
+        now: i64 = std.time.ns_per_s,
+        wall: i64 = 0,
+        sealed: na.AddressKey,
+
+        fn send(_: *anyopaque, _: graph.Exchange) anyerror!graph.Exposure {
+            return .none;
+        }
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+        fn quote(ctx: *anyopaque, server: na.AddressKey, transport: Transport) graph.Quote {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            if (!w.sealed.eql(server)) return .{ .rounds = transport.coldRtts(), .exposure = .cleartext };
+            return .{ .rounds = 3, .exposure = .encrypted };
+        }
+    };
+    const near: na.AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 53));
+    const far: na.AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 2 }, 53));
+    var w: World = .{ .sealed = far };
+    var g = try Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &w, .now_ns = &w.now, .wall_sec = &w.wall, .rng = @import("rand.zig").thread, .sendFn = World.send, .wakeFn = World.wake, .quoteFn = World.quote });
+    defer g.deinit();
+    g.rtt.write(near, 1000).observe(10 * std.time.us_per_ms, 1000);
+    g.rtt.write(far, 1000).observe(300 * std.time.us_per_ms, 1000);
+    var a: Ask = .{ .zone = .root };
+    a.servers[0] = near;
+    a.servers[1] = far;
+    a.nservers = 2;
+    const by: Key = .of(.rrset, .root, .ns);
+    try testing.expectEqual(1, (try a.pick(&g, by, .udp)).?.server);
+    a.shown = .cleartext;
+    try testing.expectEqual(0, (try a.pick(&g, by, .udp)).?.server);
+}
+
 // ── The sibling loop ───────────────────────────────────────────────
 
 pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
@@ -1109,7 +1161,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
         if (!due and waited < ns_rtt.silent_band) return .pending;
-        const p = try a.pick(g, g.cell(id).key) orelse {
+        const transport: Transport = if (a.tcp_first) .tcp else .udp;
+        const p = try a.pick(g, g.cell(id).key, transport) orelse {
             // No server left to try or to hedge to: before a timeout is
             // sat out, gather what settled since and ask for what is unknown.
             switch (try gatherServers(g, id, a)) {
@@ -1127,7 +1180,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         // The dead are hedged to only once nothing live is in flight.
         if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
         const last = p.last and !a.more;
-        const sent = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse {
+        const sent = try sendTo(g, id, a, p.server, last, transport, .random, qname, qtype) orelse {
             refused = true;
             continue;
         };
@@ -1175,6 +1228,7 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
         return null;
     };
     a.tried |= Ask.bit(server);
+    a.shown = a.shown.max(ex.exposure);
     a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
     return ex;

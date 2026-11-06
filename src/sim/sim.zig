@@ -103,8 +103,11 @@ pub const Sim = struct {
         return .{ .ctx = s, .now_ns = &s.now_ns, .wall_sec = &s.wall_sec, .rng = s.prng.random(), .sendFn = sendErased, .wakeFn = wakeErased };
     }
 
-    fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
-        return @as(*Sim, @ptrCast(@alignCast(ctx))).send(ex);
+    fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!graph.Exposure {
+        const s: *Sim = @ptrCast(@alignCast(ctx));
+        const unsent = s.pending_unsent > 0;
+        try s.send(ex);
+        return if (unsent) .none else .cleartext;
     }
 
     fn wakeErased(ctx: *anyopaque, id: u32, gen: u32, at_ns: i64) anyerror!void {

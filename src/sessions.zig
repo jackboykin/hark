@@ -109,9 +109,9 @@ const Route = union(enum) {
     session: *Conn,
 };
 
-fn route(s: *const Sessions, server: na.Address, key: na.AddressKey) Route {
+fn route(s: *const Sessions, key: na.AddressKey) Route {
     // A server told at another port: nothing says what its 853 is.
-    if (server.getPort() != s.plain_port) return .plain;
+    if (key.port != s.plain_port) return .plain;
     const standing = s.standing.get(key) orelse return .probe;
     return switch (standing.status(s.edge.now_ns)) {
         .damped => .plain,
@@ -124,17 +124,17 @@ fn route(s: *const Sessions, server: na.Address, key: na.AddressKey) Route {
     };
 }
 
-pub fn rounds(s: *const Sessions, server: na.Address, transport: graph.Transport) u32 {
-    return switch (s.route(server, .fromAddress(server))) {
-        .plain, .probe => transport.coldRtts(),
-        .dial => Socket.dial_rounds,
-        .session => |c| c.socket.rounds(),
+pub fn quote(s: *const Sessions, server: na.AddressKey, transport: graph.Transport) graph.Quote {
+    return switch (s.route(server)) {
+        .plain, .probe => .{ .rounds = transport.coldRtts(), .exposure = .cleartext },
+        .dial => .{ .rounds = Socket.dial_rounds, .exposure = .encrypted },
+        .session => |c| .{ .rounds = c.socket.rounds(), .exposure = .encrypted },
     };
 }
 
 pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const key: na.AddressKey = .fromAddress(ex.server);
-    const c = switch (s.route(ex.server, key)) {
+    const c = switch (s.route(key)) {
         .plain => return false,
         .probe => {
             // Nobody else's dial starts while this one is out, or for as long

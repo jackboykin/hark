@@ -64,6 +64,22 @@ pub const Exchange = struct {
     deadline_ns: i64,
 };
 
+/// What an on-path observer sees of a question, least first.
+pub const Exposure = enum(u2) {
+    none,
+    encrypted,
+    cleartext,
+
+    pub fn max(a: Exposure, b: Exposure) Exposure {
+        return if (@backingInt(a) >= @backingInt(b)) a else b;
+    }
+};
+
+pub const Quote = struct {
+    rounds: u32,
+    exposure: Exposure,
+};
+
 pub const Heard = struct {
     /// Borrowed for the call: the cell parses its own copy.
     bytes: []const u8,
@@ -92,12 +108,12 @@ pub const Edge = struct {
     now_ns: *const i64,
     wall_sec: *const i64,
     rng: std.Random,
-    sendFn: *const fn (*anyopaque, Exchange) anyerror!void,
+    sendFn: *const fn (*anyopaque, Exchange) anyerror!Exposure,
     wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
-    roundsFn: ?*const fn (*anyopaque, na.Address, Transport) u32 = null,
+    quoteFn: ?*const fn (*anyopaque, na.AddressKey, Transport) Quote = null,
     chaos: ?*chaos.Chaos = null,
 
-    pub fn send(e: Edge, ex: Exchange) !void {
+    pub fn send(e: Edge, ex: Exchange) !Exposure {
         return e.sendFn(e.ctx, ex);
     }
 
@@ -105,8 +121,8 @@ pub const Edge = struct {
         return e.wakeFn(e.ctx, id, gen, at_ns);
     }
 
-    pub fn rounds(e: Edge, server: na.Address, transport: Transport) u32 {
-        const f = e.roundsFn orelse return transport.coldRtts();
+    pub fn quote(e: Edge, server: na.AddressKey, transport: Transport) Quote {
+        const f = e.quoteFn orelse return .{ .rounds = transport.coldRtts(), .exposure = .cleartext };
         return f(e.ctx, server, transport);
     }
 };
@@ -1700,7 +1716,7 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
-    pub const Sent = struct { id: CellId, est: ns_rtt.RttState, rounds: u32 };
+    pub const Sent = struct { id: CellId, est: ns_rtt.RttState, rounds: u32, exposure: Exposure };
 
     /// Null, like `demand`, when the payer's budget or deadline, or the
     /// asker's orphaning, refuses the work.
@@ -1736,14 +1752,14 @@ pub const Graph = struct {
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
         // Silent past the capped wait is silent, however long this send waits.
         const addr = server.toAddress();
-        const rounds = g.edge.rounds(addr, transport);
+        const rounds = g.edge.quote(server, transport).rounds;
         const owed_at = g.now() + patience * state.timeout(false, rounds) * std.time.ns_per_ms;
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         sc.* = .{ .id = qid, .sent = msg.question.?.spelled.?, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
-        try g.edge.send(.{
+        const exposure = try g.edge.send(.{
             .id = id,
             .server = addr,
             .transport = transport,
@@ -1752,7 +1768,7 @@ pub const Graph = struct {
         });
         g.flights += 1;
         if (transport == .udp) g.stats.resolver.exchanges.udp += 1 else g.stats.resolver.exchanges.tcp += 1;
-        return .{ .id = id, .est = state, .rounds = rounds };
+        return .{ .id = id, .est = state, .rounds = rounds, .exposure = exposure };
     }
 };
 
@@ -1765,7 +1781,9 @@ const Quiet = struct {
         return .init(std.testing.allocator, std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
     }
 
-    fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+    fn send(_: *anyopaque, _: Exchange) anyerror!Exposure {
+        return .none;
+    }
     fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
 };
 
