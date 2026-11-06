@@ -129,32 +129,36 @@ pub const Ask = struct {
 
     const Pick = struct {
         server: u8,
-        /// The best untried band: a never-timed first pick ties with it.
-        band: i64,
+        /// The best untried: a never-timed first pick ties with it.
+        track: ns_rtt.Track,
         /// Last untried of its kind, live or dead: waits uncapped.
         last: bool,
     };
 
-    /// Uniform among the best. Chosen per send, so a timeout earlier in
-    /// this ask already counts.
+    /// Chosen per send, so a timeout earlier in this ask already counts.
     fn pick(a: *const Ask, g: *Graph, by: Key, transport: Transport) !?Pick {
         var best: u64 = std.math.maxInt(u64);
-        var best_band: i64 = ns_rtt.dead_band;
+        var best_track: ns_rtt.Track = .dead;
         var best_shows: graph.Exposure = .none;
         var ties: u32 = 0;
         var untimed: [@typeInfo(graph.Exposure).@"enum".field_names.len]u32 = @splat(0);
         var live: u8 = 0;
+        var bits: [max_servers]u64 = undefined;
+        g.noise(bits[0..a.nservers]);
         var m = a.untried();
         while (m != 0) : (m &= m - 1) {
             const i = @ctz(m);
-            const b = g.band(a.servers[i]);
-            const shows = a.shown.max(g.edge.quote(a.servers[i], transport).exposure);
-            live += @intFromBool(b != ns_rtt.dead_band);
-            if (b == ns_rtt.untimed_band) untimed[@backingInt(shows)] |= bit(i);
-            const r = rank(b, shows);
+            const e = g.estimate(a.servers[i]);
+            const t = e.track;
+            const quote = g.edge.quote(a.servers[i], transport);
+            const shows = a.shown.max(quote.exposure);
+            live += @intFromBool(t != .dead);
+            if (t == .untimed) untimed[@backingInt(shows)] |= bit(i);
+            const soon = if (t == .timed) g.wait(e.est.?, quote.rounds, bits[i]) else unheard;
+            const r = rank(t, shows, soon);
             if (r < best) {
                 best = r;
-                best_band = b;
+                best_track = t;
                 best_shows = shows;
                 ties = bit(i);
             } else if (r == best) ties |= bit(i);
@@ -164,26 +168,34 @@ pub const Ask = struct {
         // answer, or faster: an ask's first attempt goes to it as readily.
         // Every later one goes to a server that answers while any is left.
         if (a.untouched()) ties |= untimed[@backingInt(best_shows)];
-        // Every dead server ties in the dead band.
-        const last = if (best_band == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
+        // Every dead server ties.
+        const last = if (best_track == .dead) @popCount(ties) == 1 else live == 1;
         var k = try g.uniform(.pick, by, @popCount(ties));
         while (k > 0) : (k -= 1) ties &= ties - 1;
-        return .{ .server = @ctz(ties), .band = best_band, .last = last };
+        return .{ .server = @ctz(ties), .track = best_track, .last = last };
     }
+
+    const unheard: u64 = (1 << 60) - 1;
 
     /// Lower goes first. A server that may answer beats a silent one, and a
     /// silent one the dead, so privacy never stalls an answer. Then the less
     /// a send shows wins, however much faster a server that shows more.
-    /// Then the sooner band.
-    fn rank(b: i64, shows: graph.Exposure) u64 {
-        const class: u64 = if (b < ns_rtt.silent_band) 0 else if (b == ns_rtt.silent_band) 1 else 2;
-        const soon: u64 = if (b < ns_rtt.untimed_band) @intCast(b) else (1 << 60) - 1;
-        return class << 62 | @as(u64, @backingInt(shows)) << 60 | soon;
+    /// Then the sooner wait.
+    fn rank(t: ns_rtt.Track, shows: graph.Exposure, soon: u64) u64 {
+        const class: u64 = switch (t) {
+            .timed, .untimed => 0,
+            .silent => 1,
+            .dead => 2,
+        };
+        return class << 62 | @as(u64, @backingInt(shows)) << 60 | @min(soon, unheard);
     }
 
-    fn flying(a: *const Ask, g: *Graph) i64 {
-        var best: i64 = ns_rtt.dead_band;
-        for (a.attempts[0..a.nattempts]) |at| best = @min(best, g.band(a.servers[at.server]));
+    fn flying(a: *const Ask, g: *Graph) ns_rtt.Track {
+        var best: ns_rtt.Track = .dead;
+        for (a.attempts[0..a.nattempts]) |at| {
+            const t = g.track(a.servers[at.server]);
+            if (@backingInt(t) < @backingInt(best)) best = t;
+        }
         return best;
     }
 
@@ -1160,7 +1172,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         // nothing against it goes at once.
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
-        if (!due and waited < ns_rtt.silent_band) return .pending;
+        if (!due and waited.mayAnswer()) return .pending;
         const transport: Transport = if (a.tcp_first) .tcp else .udp;
         const p = try a.pick(g, g.cell(id).key, transport) orelse {
             // No server left to try or to hedge to: before a timeout is
@@ -1176,21 +1188,21 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 },
             }
         };
-        if (!due and p.band >= ns_rtt.silent_band) return .pending;
+        if (!due and !p.track.mayAnswer()) return .pending;
         // The dead are hedged to only once nothing live is in flight.
-        if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
+        if (p.track == .dead and waited != .dead) return .pending;
         const last = p.last and !a.more;
         const sent = try sendTo(g, id, a, p.server, last, transport, .random, qname, qtype) orelse {
             refused = true;
             continue;
         };
         if (a.retried) g.stats.resolver.detail.retry += 1;
-        const stagger = try g.stretch(.stagger, g.cell(id).key, (sent.est.hedgeStagger() orelse g.cfg.stagger_ms) * sent.rounds);
+        const stagger = try g.stretch(.stagger, g.cell(id).key, g.holdMs(sent.est, sent.rounds));
         a.hedge_at = g.now() + @as(i64, stagger) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
         // Sent to one that may answer, the ask waits. Behind one that never
         // has, it goes round to gather, and to ask for what is unknown.
-        if (p.band < ns_rtt.silent_band) return .pending;
+        if (p.track.mayAnswer()) return .pending;
     }
 }
 

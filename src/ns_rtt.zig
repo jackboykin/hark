@@ -1,5 +1,6 @@
 //! Each server's round-trip estimate, and what it decides: the timeout and
-//! hedge stagger an exchange gets, and when a silent server counts as dead.
+//! hedge stagger an exchange gets, the wait a send to it draws, and when a
+//! silent server counts as dead.
 
 const std = @import("std");
 const testing = std.testing;
@@ -49,14 +50,36 @@ const hedge_decay_ms: i64 = 30_000;
 
 const max_hedge_stagger_ms: u32 = 300;
 
-/// Estimates closer than this are noise.
-const band_us: i64 = 50 * std.time.us_per_ms;
+/// srtt averages about 15 samples at its gain of 1/8, so it is unsure by
+/// their spread over √15, about 4.
+const sure_divisor = 4;
 
-/// Past every band a reply reaches: never timed, then timed out and never
-/// answered, then dead.
-pub const untimed_band = dead_band - 2;
-pub const silent_band = dead_band - 1;
-pub const dead_band = std.math.maxInt(i64);
+const forget_ms: i64 = 10 * std.time.ms_per_min;
+
+const loss_one: u16 = 1 << 15;
+
+/// Near standard normal from 64 random bits: four 16-bit uniforms summed,
+/// centred and scaled to unit variance.
+pub fn normal(bits: u64) f64 {
+    var sum: u64 = 0;
+    inline for (0..4) |k| sum += bits >> (16 * k) & 0xffff;
+    return (@as(f64, @floatFromInt(sum)) - 2 * 65535.0) * (@sqrt(3.0) / 65536.0);
+}
+
+/// In the order servers are asked.
+pub const Track = enum {
+    timed,
+    untimed,
+    silent,
+    dead,
+
+    pub fn mayAnswer(t: Track) bool {
+        return switch (t) {
+            .timed, .untimed => true,
+            .silent, .dead => false,
+        };
+    }
+};
 
 /// RFC 1035 §4.2.1 ≥2 s.
 const failover_timeout_cap_ms: u32 = 2000;
@@ -69,6 +92,8 @@ pub const RttState = struct {
     dead_until_ms: i64 = 0,
     min_rtt_us: u32 = 0,
     min_rtt_stamp_ms: i64 = 0,
+    heard_ms: i64 = 0,
+    loss: u16 = 0,
 
     pub const unknown: RttState = .{};
 
@@ -78,12 +103,15 @@ pub const RttState = struct {
         if (s.min_rtt_us == 0) {
             s.srtt_us = rtt;
             s.rttvar_us = rtt / 2;
+            s.loss = 0;
         } else {
             // RFC 6298
             const delta = @max(s.srtt_us, rtt) - @min(s.srtt_us, rtt);
             s.rttvar_us = 3 * (s.rttvar_us / 4) + delta / 4;
             s.srtt_us = 7 * (s.srtt_us / 8) + rtt / 8;
+            s.loss -= s.loss / 8;
         }
+        s.heard_ms = now_ms;
         // Re-anchoring lets the floor follow a route change upward.
         if (s.min_rtt_us == 0 or rtt < s.min_rtt_us or now_ms - s.min_rtt_stamp_ms > hedge_decay_ms) {
             s.min_rtt_us = rtt;
@@ -95,6 +123,7 @@ pub const RttState = struct {
 
     pub fn observeTimeout(s: *RttState, now_ms: i64) void {
         if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
+        s.loss += (loss_one - s.loss) / 8;
         if (s.consecutive_timeouts < dead_threshold) return;
         s.dead_until_ms = @max(s.dead_until_ms, now_ms + s.deadWindowMs());
     }
@@ -107,10 +136,21 @@ pub const RttState = struct {
         return s.consecutive_timeouts >= dead_threshold and s.dead_until_ms > now_ms;
     }
 
-    pub fn band(s: RttState, now_ms: i64) i64 {
-        if (s.isDead(now_ms)) return dead_band;
-        if (s.min_rtt_us == 0) return if (s.consecutive_timeouts == 0) untimed_band else silent_band;
-        return @divTrunc(@as(i64, s.srtt_us), band_us);
+    pub fn track(s: RttState, now_ms: i64) Track {
+        if (s.isDead(now_ms)) return .dead;
+        if (s.min_rtt_us == 0) return if (s.consecutive_timeouts == 0) .untimed else .silent;
+        return .timed;
+    }
+
+    /// One draw, in µs, from a standard normal `z`.
+    pub fn wait(s: RttState, now_ms: i64, rounds: u32, hold_ms: u32, z: f64) u64 {
+        const srtt: f64 = @floatFromInt(s.srtt_us);
+        const sure = @as(f64, @floatFromInt(s.rttvar_us)) / sure_divisor;
+        const unheard: f64 = @floatFromInt(@max(0, now_ms - s.heard_ms));
+        const width = @sqrt(sure * sure + srtt * srtt * unheard * (1.0 / @as(f64, forget_ms)));
+        const rtt = @max(1, srtt + z * width);
+        const lost = @as(f64, @floatFromInt(s.loss)) / loss_one * @as(f64, @floatFromInt(hold_ms)) * std.time.us_per_ms;
+        return @intFromFloat(@as(f64, @floatFromInt(rounds)) * rtt + lost);
     }
 
     pub fn timeout(s: RttState, is_last: bool, rounds: u32) u32 {
@@ -247,12 +287,23 @@ test "a reply ranks above no history, and no history above silence" {
     var dead = slow;
     for (0..dead_threshold) |_| dead.observeTimeout(1000);
     const untimed: RttState = .unknown;
-    try testing.expect(slow.band(1000) < untimed.band(1000));
-    try testing.expect(untimed.band(1000) < silent.band(1000));
-    try testing.expect(silent.band(1000) < dead.band(1000));
+    try testing.expectEqual(.timed, slow.track(1000));
+    try testing.expectEqual(.untimed, untimed.track(1000));
+    try testing.expectEqual(.silent, silent.track(1000));
+    try testing.expectEqual(.dead, dead.track(1000));
     var lossy = slow;
     lossy.observeTimeout(1000);
-    try testing.expectEqual(slow.band(1000), lossy.band(1000));
+    try testing.expectEqual(.timed, lossy.track(1000));
+}
+
+test "a drawn wait counts its round trips and losses, and widens unheard" {
+    var s: RttState = .unknown;
+    for (0..20) |_| s.observe(20_000, 1000);
+    try testing.expectEqual(60_000, s.wait(1000, 3, 100, 0));
+    var lossy = s;
+    lossy.observeTimeout(1000);
+    try testing.expect(lossy.wait(1000, 1, 100, 0) > s.wait(1000, 1, 100, 0));
+    try testing.expect(s.wait(1000 + forget_ms, 1, 100, -1) < s.wait(1000, 1, 100, -1));
 }
 
 test "a server's first reply sets its estimate, whatever timeouts came before" {

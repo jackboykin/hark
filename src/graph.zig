@@ -1701,17 +1701,40 @@ pub const Graph = struct {
         return @divTrunc(g.now(), std.time.ns_per_ms);
     }
 
-    pub fn band(g: *Graph, server: na.AddressKey) i64 {
+    pub fn track(g: *Graph, server: na.AddressKey) ns_rtt.Track {
+        return g.estimate(server).track;
+    }
+
+    pub const Estimate = struct { track: ns_rtt.Track, est: ?*const ns_rtt.RttState };
+
+    pub fn estimate(g: *Graph, server: na.AddressKey) Estimate {
         if (g.chaosAt(.dead)) |ch| {
             const event = ch.named(.dead, std.hash.Wyhash.hash(0, &server.addr) ^ server.port);
-            if ((ch.choose(.dead, event, 4, .{ .server = server }) catch 0) == 1) return ns_rtt.dead_band;
+            if ((ch.choose(.dead, event, 4, .{ .server = server }) catch 0) == 1) return .{ .track = .dead, .est = null };
         }
-        const s = g.rtt.get(server) orelse return ns_rtt.RttState.unknown.band(g.nowMs());
-        return s.band(g.nowMs());
+        const s = g.rtt.get(server) orelse return .{ .track = ns_rtt.RttState.unknown.track(g.nowMs()), .est = null };
+        return .{ .track = s.track(g.nowMs()), .est = s };
     }
 
     pub fn isDead(g: *Graph, server: na.AddressKey) bool {
-        return g.band(server) == ns_rtt.dead_band;
+        return g.track(server) == .dead;
+    }
+
+    /// Under chaos every timed server ties, so chaos picks among them.
+    pub fn wait(g: *Graph, est: *const ns_rtt.RttState, rounds: u32, bits: u64) u64 {
+        if (g.chaosAt(.pick) != null) return 0;
+        const hold_ms = if (est.loss == 0) 0 else g.holdMs(est.*, rounds);
+        return est.wait(g.nowMs(), rounds, hold_ms, ns_rtt.normal(bits));
+    }
+
+    pub fn noise(g: *Graph, out: []u64) void {
+        if (g.chaosAt(.pick) != null) return @memset(out, 0);
+        g.edge.rng.bytes(mem.sliceAsBytes(out));
+    }
+
+    pub fn holdMs(g: *const Graph, est: ns_rtt.RttState, rounds: u32) u32 {
+        if (g.cfg.stagger_ms == 0) return est.timeout(false, rounds);
+        return (est.hedgeStagger() orelse g.cfg.stagger_ms) * rounds;
     }
 
     // ── Exchanges ──────────────────────────────────────────────────────
