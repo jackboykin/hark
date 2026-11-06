@@ -220,6 +220,7 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
             if (try e.ready(polled)) |ev| return ev;
             continue;
         }
+        if (e.sessions) |s| try s.flush();
         e.tick();
         try e.fire();
         if (e.pop()) |ev| return ev;

@@ -10,6 +10,8 @@ flights: std.array_hash_map.Auto(CellId, *Carried) = .empty,
 next_token: u32 = 0,
 stats: Stats = .{},
 shared: Socket.Shared = .{},
+/// Whose queries wait in `shared.out`, to leave in one write.
+unflushed: ?*Conn = null,
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -164,8 +166,17 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
         c.queued.appendAssumeCapacity(at);
         return true;
     }
-    if (!try s.send(c, at) or !try c.socket.flush(&s.shared)) try s.drop(c, .closed);
+    if (s.unflushed != c) try s.flush();
+    if (try s.send(c, at)) s.unflushed = c else try s.drop(c, .closed);
     return true;
+}
+
+/// What a turn sealed for a session leaves now, so its queries share
+/// segments: one segment each would spend a busy session's window.
+pub fn flush(s: *Sessions) !void {
+    const c = s.unflushed orelse return;
+    s.unflushed = null;
+    if (!try c.socket.flush(&s.shared)) try s.drop(c, .closed);
 }
 
 /// Room in `pending` and `queued` is the caller's to have made. A query is in
@@ -227,6 +238,10 @@ fn drop(s: *Sessions, c: *Conn, how: Socket.End) !void {
     const e = s.edge;
     try e.queue.ensureUnusedCapacity(e.gpa, c.pending.count() + c.queued.items.len);
     _ = s.conns.swapRemove(mem.findScalar(*Conn, s.conns.items, c).?);
+    if (s.unflushed == c) {
+        s.unflushed = null;
+        s.shared.out_len = 0;
+    }
     // A handshake that ended failed, however it ended, and so did a session
     // that took queries and answered none: only that keeps asking again from
     // going round forever on a server that hangs up.
@@ -263,6 +278,7 @@ fn closeConn(s: *Sessions, c: *Conn) void {
 }
 
 pub fn ready(s: *Sessions, token: u32, events: u32) !void {
+    try s.flush();
     const c = s.byToken(token) orelse return;
     switch (try c.socket.ready(&s.shared, events)) {
         .nothing => {},
