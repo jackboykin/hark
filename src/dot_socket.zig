@@ -20,11 +20,9 @@ const rand = @import("rand.zig");
 const dot = @import("dot.zig");
 const tls13 = @import("tls13.zig");
 const Edge = @import("edge.zig");
+const carrier = @import("carrier.zig");
 
 const Socket = @This();
-
-/// How a query is told from its neighbours on a socket.
-pub const QueryId = u16;
 
 /// TCP and TLS, then the question: hark's Finished and the query leave
 /// together, so a dial costs a reply three round trips.
@@ -37,14 +35,9 @@ pub const Shared = struct {
     out_len: usize = 0,
 };
 
-pub const End = enum { failed, closed };
-
-pub const Event = union(enum) {
-    /// Queries may go; those before the next flush leave with its Finished.
-    established,
-    reply: struct { id: QueryId, bytes: []u8 },
-    ended: End,
-};
+const End = carrier.End;
+const News = carrier.News;
+const Event = carrier.Event;
 
 pub fn open(edge: *Edge, server: na.Address, port: u16, token: u32) !Socket {
     const fd = try sys.socket(na.afU32(server), posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
@@ -91,13 +84,6 @@ pub fn rounds(sock: *const Socket) u32 {
 pub fn spent(sock: *const Socket) bool {
     return sock.established() and sock.session.write.seq >= 1 << 24;
 }
-
-pub const News = union(enum) {
-    nothing,
-    /// `next` has events to take.
-    read,
-    ended: End,
-};
 
 pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
     if (sock.state == .connecting) return sock.connected();
@@ -187,7 +173,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
 
 /// `wire` readied to leave at the next flush, or sooner if there's no room.
 /// Null: gone.
-pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !?QueryId {
+pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !?u16 {
     if (sh.out_len + dot.max_sealed > sh.out.len and !try sock.flush(sh)) return null;
     const q = sock.session.query(sh.out[sh.out_len..], wire);
     sh.out_len += q.sealed.len;

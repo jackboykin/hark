@@ -9,6 +9,7 @@ pub const delegation = @import("delegation.zig");
 pub const denial = @import("denial.zig");
 pub const dns = @import("dns.zig");
 pub const dot = @import("dot.zig");
+pub const carrier = @import("carrier.zig");
 pub const dot_socket = @import("dot_socket.zig");
 pub const dns64 = @import("dns64.zig");
 pub const dnssec = @import("dnssec.zig");
@@ -54,6 +55,7 @@ test {
     _ = @import("denial.zig");
     _ = @import("dns.zig");
     _ = @import("dot.zig");
+    _ = @import("carrier.zig");
     _ = @import("dot_socket.zig");
     _ = @import("dns64.zig");
     _ = @import("dnssec.zig");
