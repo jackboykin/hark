@@ -99,6 +99,12 @@ pub const Carrier = union(Kind) {
         };
     }
 
+    pub fn heard(c: *const Carrier) bool {
+        return switch (c.*) {
+            inline else => |*x| x.heard(),
+        };
+    }
+
     pub fn stage(c: *const Carrier) []const u8 {
         return switch (c.*) {
             inline else => |*x| x.stage(),

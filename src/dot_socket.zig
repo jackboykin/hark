@@ -67,6 +67,10 @@ pub fn close(sock: *Socket) void {
     if (sock.held.len != 0) e.work.free(sock.held);
 }
 
+pub fn heard(sock: *const Socket) bool {
+    return sock.state != .connecting;
+}
+
 pub fn stage(sock: *const Socket) []const u8 {
     return @tagName(sock.state);
 }

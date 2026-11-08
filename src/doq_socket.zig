@@ -82,6 +82,10 @@ pub fn spent(sock: *const Socket) bool {
     return sock.conn.spent(sock.edge.now_ns);
 }
 
+pub fn heard(sock: *const Socket) bool {
+    return sock.conn.heard;
+}
+
 pub fn stage(sock: *const Socket) []const u8 {
     return @tagName(sock.conn.phase);
 }
