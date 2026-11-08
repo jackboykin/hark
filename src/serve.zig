@@ -723,7 +723,7 @@ const Server = struct {
         if (build_options.testing_enabled) std.debug.assert(sum(c.queries) == sum(c.replies) + sum(c.unanswered) + parked);
         logCounts("clients", c);
         logCounts("resolver", g.stats.resolver);
-        if (s.e.sessions) |d| logCounts("dot", d.stats);
+        if (s.e.sessions) |d| inline for (comptime std.enums.values(@import("carrier.zig").Kind)) |kind| logCounts(@tagName(kind), d.stats.get(kind));
         logCounts("trust", g.stats.trust);
         logCounts("verify_memo", .{ .hits = g.verify_memo.hits, .misses = g.verify_memo.misses });
         logCounts("store", .{

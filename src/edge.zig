@@ -51,7 +51,7 @@ const Timer = struct {
     seq: u32,
     id: CellId,
     /// The cell's generation for a wake, the flight's sequence for a timeout,
-    /// a session's token for its own.
+    /// a session's token for its own, whose wake sequence is then `id`.
     gen: u32,
     kind: Kind,
 
@@ -253,7 +253,7 @@ fn fire(e: *Edge) !void {
             .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
             .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) e.queue.appendAssumeCapacity(e.finish(t.id, .timeout)),
             .carried => try e.sessions.?.flightDue(t.id, t.gen),
-            .conn => try e.sessions.?.connDue(t.gen),
+            .conn => try e.sessions.?.connDue(t.gen, t.id),
         }
     }
 }

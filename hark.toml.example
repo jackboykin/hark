@@ -16,7 +16,7 @@ dns64-prefix = ""             # NAT64 prefix such as "64:ff9b::/96", otherwise o
 stagger-ms = 150              # wait before trying the next nameserver. 0 disables
 max-queries = 100             # upstream queries one resolution may spend
 root-hints = []               # "ip" or "ip:port" entries, otherwise the IANA roots
-encrypted-transport = "off"   # "opportunistic" uses DoT where authorities offer it. Needs outbound port 853
+encrypted-transport = "off"   # "opportunistic" uses DoQ or DoT where authorities offer it. Needs outbound port 853, UDP and TCP
 stub-zones = []               # "<zone> <addr>..." entries such as "internal 192.168.1.1". Never validated
 
 [cache]

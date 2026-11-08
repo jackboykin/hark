@@ -1,18 +1,21 @@
 //! What carries a server's exchanges over an encrypted session: the one
 //! interface `Sessions` drives, whichever transport is underneath.
+
 const std = @import("std");
 const na = @import("net_address.zig");
 const Edge = @import("edge.zig");
 const DotSocket = @import("dot_socket.zig");
+const DoqSocket = @import("doq_socket.zig");
 
-pub const Kind = enum { dot };
+pub const Kind = enum { dot, doq };
 
 pub const Carrier = union(Kind) {
     dot: DotSocket,
+    doq: DoqSocket,
 
-    pub fn open(kind: Kind, edge: *Edge, server: na.Address, port: u16, tag: u32) !Carrier {
+    pub fn open(kind: Kind, edge: *Edge, sh: *Shared, server: na.Address, port: u16, tag: u32) !Carrier {
         return switch (kind) {
-            .dot => .{ .dot = try .open(edge, server, port, tag) },
+            inline else => |k| @unionInit(Carrier, @tagName(k), try .open(edge, &@field(sh, @tagName(k)), server, port, tag)),
         };
     }
 
@@ -46,10 +49,17 @@ pub const Carrier = union(Kind) {
         };
     }
 
-    pub fn query(c: *Carrier, sh: *Shared, wire: []const u8) !?QueryId {
+    /// `wire` must outlive its query.
+    pub fn query(c: *Carrier, sh: *Shared, wire: []const u8) !Taken {
         return switch (c.*) {
-            inline else => |*x, kind| if (try x.query(&@field(sh, @tagName(kind)), wire)) |id| id else null,
+            inline else => |*x, kind| try x.query(&@field(sh, @tagName(kind)), wire),
         };
+    }
+
+    pub fn cancel(c: *Carrier, id: QueryId) void {
+        switch (c.*) {
+            inline else => |*x| x.cancel(id),
+        }
     }
 
     /// False: gone.
@@ -61,7 +71,7 @@ pub const Carrier = union(Kind) {
 
     pub fn unflush(c: *const Carrier, sh: *Shared) void {
         switch (c.*) {
-            inline else => |_, kind| @field(sh, @tagName(kind)).out_len = 0,
+            inline else => |*x, kind| x.unflush(&@field(sh, @tagName(kind))),
         }
     }
 
@@ -77,15 +87,27 @@ pub const Carrier = union(Kind) {
         };
     }
 
+    pub fn due(c: *const Carrier) ?i64 {
+        return switch (c.*) {
+            inline else => |*x| x.due(),
+        };
+    }
+
+    pub fn fire(c: *Carrier, sh: *Shared) !News {
+        return switch (c.*) {
+            inline else => |*x, kind| try x.fire(&@field(sh, @tagName(kind))),
+        };
+    }
+
     pub fn stage(c: *const Carrier) []const u8 {
         return switch (c.*) {
-            inline else => |*x| @tagName(x.state),
+            inline else => |*x| x.stage(),
         };
     }
 
     pub fn fault(c: *const Carrier) []const u8 {
         return switch (c.*) {
-            inline else => |*x| x.fault,
+            inline else => |*x| x.fault(),
         };
     }
 };
@@ -93,15 +115,24 @@ pub const Carrier = union(Kind) {
 pub fn dialRounds(kind: Kind) u32 {
     return switch (kind) {
         .dot => DotSocket.dial_rounds,
+        .doq => DoqSocket.dial_rounds,
     };
 }
 
 pub const Shared = struct {
     dot: DotSocket.Shared = .{},
+    doq: DoqSocket.Shared = .{},
 };
 
 /// How a query is told from its neighbours on a session.
 pub const QueryId = u64;
+
+pub const Taken = union(enum) {
+    sent: QueryId,
+    /// It waits for `room`.
+    later,
+    gone,
+};
 
 pub const End = enum { failed, closed };
 
@@ -116,5 +147,7 @@ pub const Event = union(enum) {
     /// Queries may go; those before the next flush leave with the handshake's last flight.
     established,
     reply: struct { id: QueryId, bytes: []u8 },
+    refused: QueryId,
+    room,
     ended: End,
 };

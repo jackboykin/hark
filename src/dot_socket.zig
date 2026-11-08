@@ -7,7 +7,7 @@ state: enum { connecting, handshaking, established, alerted } = .connecting,
 session: dot.Session = undefined,
 held: []u8 = &.{},
 unsent: std.ArrayList(u8) = .empty,
-fault: []const u8 = "silence",
+why: []const u8 = "silence",
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -39,7 +39,7 @@ const End = carrier.End;
 const News = carrier.News;
 const Event = carrier.Event;
 
-pub fn open(edge: *Edge, server: na.Address, port: u16, token: u32) !Socket {
+pub fn open(edge: *Edge, _: *Shared, server: na.Address, port: u16, token: u32) !Socket {
     const fd = try sys.socket(na.afU32(server), posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
     const on: i32 = 1;
@@ -65,6 +65,28 @@ pub fn close(sock: *Socket) void {
     if (sock.state != .connecting) sock.session.deinit();
     sock.unsent.deinit(e.gpa);
     if (sock.held.len != 0) e.work.free(sock.held);
+}
+
+pub fn stage(sock: *const Socket) []const u8 {
+    return @tagName(sock.state);
+}
+
+pub fn fault(sock: *const Socket) []const u8 {
+    return sock.why;
+}
+
+pub fn due(_: *const Socket) ?i64 {
+    return null;
+}
+
+pub fn fire(_: *Socket, _: *Shared) !carrier.News {
+    return .nothing;
+}
+
+pub fn cancel(_: *Socket, _: carrier.QueryId) void {}
+
+pub fn unflush(_: *const Socket, sh: *Shared) void {
+    sh.out_len = 0;
 }
 
 pub fn established(sock: *const Socket) bool {
@@ -95,7 +117,7 @@ pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
     const rc = linux.read(sock.fd, sh.rx[held..].ptr, sh.rx.len - held);
     switch (linux.errno(rc)) {
         .SUCCESS => if (rc == 0) {
-            sock.fault = "eof";
+            sock.why = "eof";
             return .{ .ended = .closed };
         },
         .AGAIN, .INTR => return .nothing,
@@ -113,7 +135,7 @@ pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
 }
 
 fn sawErrno(sock: *Socket, err: linux.E) void {
-    sock.fault = std.enums.tagName(linux.E, err) orelse "unnamed errno";
+    sock.why = std.enums.tagName(linux.E, err) orelse "unnamed errno";
 }
 
 fn connected(sock: *Socket) !News {
@@ -141,7 +163,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
     std.debug.assert(sh.out_len == 0);
     while (true) {
         const ev = sock.session.next(&sh.read, &sh.out) catch |err| {
-            sock.fault = @errorName(err);
+            sock.why = @errorName(err);
             sock.state = .alerted;
             if (err != error.AlertHeard) _ = sock.put(sock.session.alert(&sh.out, tls13.alert(@errorCast(err)))) catch {};
             return .{ .ended = .failed };
@@ -163,7 +185,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
             },
             .send => |bytes| if (!try sock.put(bytes)) return .{ .ended = .closed },
             .closed => {
-                sock.fault = "close_notify";
+                sock.why = "close_notify";
                 return .{ .ended = .closed };
             },
             .reply => |m| return .{ .reply = .{ .id = mem.readInt(u16, m[0..2], .big), .bytes = m } },
@@ -172,12 +194,11 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
 }
 
 /// `wire` readied to leave at the next flush, or sooner if there's no room.
-/// Null: gone.
-pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !?u16 {
-    if (sh.out_len + dot.max_sealed > sh.out.len and !try sock.flush(sh)) return null;
+pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !carrier.Taken {
+    if (sh.out_len + dot.max_sealed > sh.out.len and !try sock.flush(sh)) return .gone;
     const q = sock.session.query(sh.out[sh.out_len..], wire);
     sh.out_len += q.sealed.len;
-    return q.id;
+    return .{ .sent = q.id };
 }
 
 /// False: gone.

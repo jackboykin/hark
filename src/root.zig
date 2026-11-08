@@ -11,6 +11,8 @@ pub const dns = @import("dns.zig");
 pub const dot = @import("dot.zig");
 pub const carrier = @import("carrier.zig");
 pub const dot_socket = @import("dot_socket.zig");
+pub const doq_socket = @import("doq_socket.zig");
+pub const quic = @import("quic.zig");
 pub const dns64 = @import("dns64.zig");
 pub const dnssec = @import("dnssec.zig");
 pub const edge = @import("edge.zig");
@@ -57,6 +59,8 @@ test {
     _ = @import("dot.zig");
     _ = @import("carrier.zig");
     _ = @import("dot_socket.zig");
+    _ = @import("doq_socket.zig");
+    _ = @import("quic.zig");
     _ = @import("dns64.zig");
     _ = @import("dnssec.zig");
     _ = @import("edge.zig");
