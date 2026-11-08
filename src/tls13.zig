@@ -28,6 +28,7 @@ pub const Error = error{
     HandshakeFailure,
     IllegalParameter,
     MissingExtension,
+    NoApplicationProtocol,
     ProtocolVersion,
     RecordOverflow,
     UnexpectedMessage,
@@ -42,6 +43,7 @@ pub fn alert(err: Error) tls.Alert.Description {
         error.HandshakeFailure => .handshake_failure,
         error.IllegalParameter => .illegal_parameter,
         error.MissingExtension => .missing_extension,
+        error.NoApplicationProtocol => .no_application_protocol,
         error.ProtocolVersion => .protocol_version,
         error.RecordOverflow => .record_overflow,
         error.UnexpectedMessage => .unexpected_message,
@@ -52,11 +54,15 @@ pub fn alert(err: Error) tls.Alert.Description {
 pub const Offer = struct {
     alpn: ?[]const u8,
     answerable: []const tls.ExtensionType = &.{},
+    /// Transport parameters, which make this QUIC's handshake (RFC 9001 §8).
+    quic: ?[]const u8 = null,
 };
 
 pub const entropy_len = 32 + X25519.secret_length + P256.SecretKey.encoded_length + MlKem.seed_length;
 pub const max_hello = 1536;
 const max_alpn = 16;
+pub const max_quic_params = 64;
+const max_peer_params = 512;
 const finished_len = 4 + Hmac.mac_length;
 const empty_certificate = [_]u8{@backingInt(tls.HandshakeType.certificate)} ++ tls.int(u24, 4) ++ [_]u8{ 0, 0, 0, 0 };
 
@@ -161,6 +167,8 @@ pub const Handshake = struct {
     framer: Framer = .{},
     held: [max_held]u8 = undefined,
     held_len: u16 = 0,
+    peer_params: [max_peer_params]u8 = undefined,
+    peer_params_len: u16 = 0,
 
     pub fn begin(h: *Handshake, out: *[max_hello]u8, entropy: *const [entropy_len]u8, offer: Offer) error{WeakEntropy}![]const u8 {
         const random = entropy[0..32];
@@ -193,7 +201,7 @@ pub const Handshake = struct {
             tls.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++ random.* ++ [1]u8{0} ++
             tls.int(u16, 2) ++ tls.int(u16, suite) ++ [2]u8{ 1, 0 };
 
-        comptime std.debug.assert(before.len + 2 + fixed.len + 7 + max_alpn <= max_hello);
+        comptime std.debug.assert(before.len + 2 + fixed.len + 7 + max_alpn + 4 + max_quic_params <= max_hello);
         var n: usize = before.len + 2;
         @memcpy(out[0..before.len], &before);
         @memcpy(out[n..][0..fixed.len], &fixed);
@@ -206,6 +214,13 @@ pub const Handshake = struct {
             out[n + 6] = @intCast(proto.len);
             @memcpy(out[n + 7 ..][0..proto.len], proto);
             n += 7 + proto.len;
+        }
+        if (offer.quic) |params| {
+            std.debug.assert(params.len <= max_quic_params);
+            mem.writeInt(u16, out[n..][0..2], @backingInt(tls.ExtensionType.quic_transport_parameters), .big);
+            mem.writeInt(u16, out[n + 2 ..][0..2], @intCast(params.len), .big);
+            @memcpy(out[n + 4 ..][0..params.len], params);
+            n += 4 + params.len;
         }
         mem.writeInt(u16, out[before.len..][0..2], @intCast(n - before.len - 2), .big);
         mem.writeInt(u24, out[1..4], @intCast(n - 4), .big);
@@ -396,13 +411,27 @@ pub const Handshake = struct {
         return out;
     }
 
-    fn extensions(h: *const Handshake, body: []const u8) Error!void {
+    pub fn peerParams(h: *const Handshake) []const u8 {
+        return h.peer_params[0..h.peer_params_len];
+    }
+
+    fn extensions(h: *Handshake, body: []const u8) Error!void {
         var r: Reader = .{ .rest = body };
         const list = try r.bytes(try r.int(u16));
         try r.end();
         var exts: Extensions = .{ .list = list };
+        var chosen_alpn = false;
+        var params = false;
         while (try exts.next()) |e| switch (e.kind) {
+            .quic_transport_parameters => {
+                if (h.offer.quic == null) return error.UnsupportedExtension;
+                if (e.data.len > max_peer_params) return error.DecodeError;
+                @memcpy(h.peer_params[0..e.data.len], e.data);
+                h.peer_params_len = @intCast(e.data.len);
+                params = true;
+            },
             .application_layer_protocol_negotiation => {
+                chosen_alpn = true;
                 const offered = h.offer.alpn orelse return error.UnsupportedExtension;
                 var names: Reader = .{ .rest = e.data };
                 const name = try names.bytes(try names.int(u16));
@@ -416,6 +445,9 @@ pub const Handshake = struct {
             .supported_groups => {},
             else => if (mem.findScalar(tls.ExtensionType, h.offer.answerable, e.kind) == null) return error.UnsupportedExtension,
         };
+        if (h.offer.quic == null) return;
+        if (!params) return error.MissingExtension;
+        if (!chosen_alpn) return error.NoApplicationProtocol;
     }
 };
 
@@ -637,6 +669,13 @@ test "an extension nobody offered fails" {
     h.offer.answerable = &.{.server_name};
     _ = try h.read(&trace.server_hello);
     try testing.expectError(error.UnsupportedExtension, h.read(&trace.server_flight));
+}
+
+test "a QUIC handshake whose server sends no transport parameters fails" {
+    var h = traced();
+    h.offer.quic = &.{};
+    _ = try h.read(&trace.server_hello);
+    try testing.expectError(error.MissingExtension, h.read(&trace.server_flight));
 }
 
 test "RFC 8448: records seal and open as in the trace" {
