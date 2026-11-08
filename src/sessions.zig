@@ -6,6 +6,8 @@ plain_port: u16,
 dot_port: u16,
 standing: *ns_rtt.ServerTable(Standings),
 conns: std.ArrayList(*Conn) = .empty,
+/// Each server's sessions, by carrier.
+by_server: std.HashMapUnmanaged(na.AddressKey, std.EnumArray(Kind, ?*Conn), na.AddressKey.HashCtx, 80) = .empty,
 flights: std.array_hash_map.Auto(CellId, *Carried) = .empty,
 next_token: u32 = 0,
 stats: std.EnumArray(Kind, Stats) = .initFill(.{}),
@@ -115,6 +117,7 @@ pub fn destroy(s: *Sessions) void {
     s.flights.deinit(e.gpa);
     for (s.conns.items) |c| s.closeConn(c);
     s.conns.deinit(e.gpa);
+    s.by_server.deinit(e.gpa);
     e.gpa.destroy(s.standing);
     e.gpa.destroy(s);
 }
@@ -259,6 +262,7 @@ fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn
     const e = s.edge;
     if (s.conns.items.len >= max_conns and !try s.evictIdle()) return error.TooManySessions;
     try s.conns.ensureUnusedCapacity(e.gpa, 1);
+    try s.by_server.ensureUnusedCapacity(e.gpa, 1);
     try e.timers.ensureUnusedCapacity(e.gpa, 1);
     const c = try e.gpa.create(Conn);
     errdefer e.gpa.destroy(c);
@@ -270,6 +274,9 @@ fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn
         .dial_by_ns = e.now_ns + dial_timeout_ns,
     };
     s.conns.appendAssumeCapacity(c);
+    const of = s.by_server.getOrPutAssumeCapacity(key);
+    if (!of.found_existing) of.value_ptr.* = .initFill(null);
+    of.value_ptr.set(kind, c);
     try s.rearm(c);
     s.stats.getPtr(kind).dials += 1;
     return c;
@@ -281,8 +288,7 @@ fn setStanding(s: *Sessions, key: na.AddressKey, kind: Kind, for_ns: i64, capabl
 }
 
 fn find(s: *const Sessions, key: na.AddressKey, kind: Kind) ?*Conn {
-    for (s.conns.items) |c| if (c.carrier == kind and c.key.eql(key)) return c;
-    return null;
+    return (s.by_server.get(key) orelse return null).get(kind);
 }
 
 fn byToken(s: *const Sessions, token: u32) ?*Conn {
@@ -305,6 +311,12 @@ fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
     const e = s.edge;
     try e.queue.ensureUnusedCapacity(e.gpa, c.pending.count() + c.queued.items.len);
     _ = s.conns.swapRemove(mem.findScalar(*Conn, s.conns.items, c).?);
+    if (s.by_server.getPtr(c.key)) |of| if (of.get(c.carrier) == c) {
+        of.set(c.carrier, null);
+        for (of.values) |o| {
+            if (o != null) break;
+        } else _ = s.by_server.remove(c.key);
+    };
     if (s.unflushed == c) {
         s.unflushed = null;
         c.carrier.unflush(&s.shared);
