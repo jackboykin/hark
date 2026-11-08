@@ -704,6 +704,9 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
 /// RFC 7828.
 pub const edns_opt_tcp_keepalive: u16 = 11;
 
+/// RFC 7830.
+pub const edns_opt_padding: u16 = 12;
+
 /// RFC 8914.
 pub const edns_opt_ede: u16 = 15;
 
@@ -1400,6 +1403,37 @@ fn frameEdnsOptions(rdata: []const u8) Error!void {
     if (pos != rdata.len) return error.FormatError;
 }
 
+/// The Padding option goes last in the OPT, as RFC 8467 §4 has it.
+pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
+    if (msg.len < header_len) return error.EndOfData;
+    const hdr = Header.parse(msg[0..header_len]);
+    var p: Parser = .{ .msg = msg, .pos = header_len };
+    for (0..hdr.qd_count) |_| {
+        try p.skipName();
+        _ = try p.readSlice(4);
+    }
+    for (0..@as(usize, hdr.an_count) + hdr.ns_count + hdr.ar_count) |_| {
+        try p.skipName();
+        const rtype: RType = @fromBackingInt(try p.readU16());
+        _ = try p.readSlice(6);
+        const rdlength_at = p.pos;
+        const rdata = try p.readSlice(try p.readU16());
+        if (rtype != .opt) continue;
+        const end = p.pos;
+        const grown = mem.alignForward(usize, msg.len + 4, block);
+        const n = grown - msg.len - 4;
+        if (grown > out.len or rdata.len + 4 + n > std.math.maxInt(u16)) return error.InvalidRDataLength;
+        @memcpy(out[0..end], msg[0..end]);
+        mem.writeInt(u16, out[rdlength_at..][0..2], @intCast(rdata.len + 4 + n), .big);
+        mem.writeInt(u16, out[end..][0..2], edns_opt_padding, .big);
+        mem.writeInt(u16, out[end + 2 ..][0..2], @intCast(n), .big);
+        @memset(out[end + 4 ..][0..n], 0);
+        @memcpy(out[end + 4 + n .. grown], msg[end..]);
+        return out[0..grown];
+    }
+    return error.FormatError;
+}
+
 fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
     return std.math.cast(T, val) orelse error.InvalidRDataLength;
 }
@@ -1873,6 +1907,26 @@ test "RFC 6891 §6.1.1: a query's OPT is the only one in the message, whatever s
     const header = "\x12\x34\x01\x00\x00\x01\x00\x01\x00\x00\x00\x01";
     const wire = header ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ opt ++ opt;
     try testing.expectError(error.MultipleOptRecords, readQuery(arena.allocator(), wire));
+}
+
+test "padding ends the OPT's options, whatever it holds and whatever follows it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const header = "\x12\x34\x00\x00\x00\x01\x00\x00\x00\x00\x00\x02";
+    const cookie = "\x00\x0a\x00\x08" ++ "\x01\x02\x03\x04\x05\x06\x07\x08";
+    const opt = "\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x0c" ++ cookie;
+    const after = "\x01x\x00\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x01";
+    const wire = header ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ opt ++ after;
+    var out: [256]u8 = undefined;
+    const padded = try pad(&out, wire, 128);
+    try testing.expectEqual(128, padded.len);
+    const m = try parseMessage(arena.allocator(), padded);
+    const options = m.opt.?.options;
+    try testing.expectEqual(2, options.len);
+    try testing.expectEqualSlices(u8, cookie[4..], options[0].data);
+    try testing.expectEqual(edns_opt_padding, options[1].code);
+    try testing.expectEqual(1, m.additionals.len);
+    try testing.expectEqualSlices(u8, "\xc0\x00\x02\x01", m.additionals[0].rdata);
 }
 
 test "names are read lowercase, and the question as it was spelled" {

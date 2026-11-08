@@ -5,6 +5,7 @@ const std = @import("std");
 const mem = std.mem;
 const crypto = std.crypto;
 const tls = crypto.tls;
+const dns = @import("dns.zig");
 const tls13 = @import("tls13.zig");
 const Keys = tls13.Keys;
 
@@ -34,7 +35,6 @@ pub const Event = union(enum) {
 
 pub const max_sealed = 2048;
 
-const padding_option: u16 = 12;
 const pad_block = 128;
 const max_frame = 2 + 512 + 4 + pad_block;
 
@@ -77,19 +77,11 @@ pub const Session = struct {
         std.debug.assert(wire.len >= 12 + 11 and wire.len <= 512);
         const id = s.next_id;
         s.next_id +%= 1;
-        // RFC 9539 §4.6.8.1, RFC 8467 §4.1.
-        const pad = mem.alignForward(usize, wire.len + 4, pad_block) - wire.len - 4;
-        const n = wire.len + 4 + pad;
-        mem.writeInt(u16, frame[0..2], @intCast(n), .big);
-        @memcpy(frame[2..][0..wire.len], wire);
+        // Every exchange's wire carries an OPT.
+        const padded = dns.pad(frame[2..], wire, pad_block) catch unreachable;
+        mem.writeInt(u16, frame[0..2], @intCast(padded.len), .big);
         mem.writeInt(u16, frame[2..4], id, .big);
-        // The wire ends in an OPT with no options: these two bytes are its RDLEN.
-        std.debug.assert(mem.readInt(u16, wire[wire.len - 2 ..][0..2], .big) == 0);
-        mem.writeInt(u16, frame[2 + wire.len - 2 ..][0..2], @intCast(4 + pad), .big);
-        mem.writeInt(u16, frame[2 + wire.len ..][0..2], padding_option, .big);
-        mem.writeInt(u16, frame[2 + wire.len + 2 ..][0..2], @intCast(pad), .big);
-        @memset(frame[2 + wire.len + 4 ..][0..pad], 0);
-        return .{ .id = id, .sealed = s.write.seal(out, .application_data, frame[0 .. 2 + n]) };
+        return .{ .id = id, .sealed = s.write.seal(out, .application_data, frame[0 .. 2 + padded.len]) };
     }
 
     pub fn alert(s: *Session, out: []u8, what: tls.Alert.Description) []const u8 {
