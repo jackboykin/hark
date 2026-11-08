@@ -1403,8 +1403,7 @@ fn frameEdnsOptions(rdata: []const u8) Error!void {
     if (pos != rdata.len) return error.FormatError;
 }
 
-/// The Padding option goes last in the OPT, as RFC 8467 §4 has it.
-pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
+fn findOpt(msg: []const u8) Error!?struct { rdlength_at: usize, end: usize } {
     if (msg.len < header_len) return error.EndOfData;
     const hdr = Header.parse(msg[0..header_len]);
     var p: Parser = .{ .msg = msg, .pos = header_len };
@@ -1417,21 +1416,38 @@ pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
         const rtype: RType = @fromBackingInt(try p.readU16());
         _ = try p.readSlice(6);
         const rdlength_at = p.pos;
-        const rdata = try p.readSlice(try p.readU16());
-        if (rtype != .opt) continue;
-        const end = p.pos;
-        const grown = mem.alignForward(usize, msg.len + 4, block);
-        const n = grown - msg.len - 4;
-        if (grown > out.len or rdata.len + 4 + n > std.math.maxInt(u16)) return error.InvalidRDataLength;
-        @memcpy(out[0..end], msg[0..end]);
-        mem.writeInt(u16, out[rdlength_at..][0..2], @intCast(rdata.len + 4 + n), .big);
-        mem.writeInt(u16, out[end..][0..2], edns_opt_padding, .big);
-        mem.writeInt(u16, out[end + 2 ..][0..2], @intCast(n), .big);
-        @memset(out[end + 4 ..][0..n], 0);
-        @memcpy(out[end + 4 + n .. grown], msg[end..]);
-        return out[0..grown];
+        _ = try p.readSlice(try p.readU16());
+        if (rtype == .opt) return .{ .rdlength_at = rdlength_at, .end = p.pos };
     }
-    return error.FormatError;
+    return null;
+}
+
+/// The Padding option goes last in the OPT, as RFC 8467 §4 has it.
+pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
+    const opt = try findOpt(msg) orelse return error.FormatError;
+    const end = opt.end;
+    const rdlength = end - opt.rdlength_at - 2;
+    const grown = mem.alignForward(usize, msg.len + 4, block);
+    const n = grown - msg.len - 4;
+    if (grown > out.len or rdlength + 4 + n > std.math.maxInt(u16)) return error.InvalidRDataLength;
+    @memcpy(out[0..end], msg[0..end]);
+    mem.writeInt(u16, out[opt.rdlength_at..][0..2], @intCast(rdlength + 4 + n), .big);
+    mem.writeInt(u16, out[end..][0..2], edns_opt_padding, .big);
+    mem.writeInt(u16, out[end + 2 ..][0..2], @intCast(n), .big);
+    @memset(out[end + 4 ..][0..n], 0);
+    @memcpy(out[end + 4 + n .. grown], msg[end..]);
+    return out[0..grown];
+}
+
+pub fn hasOption(msg: []const u8, code: u16) Error!bool {
+    const opt = try findOpt(msg) orelse return false;
+    const rdata = msg[opt.rdlength_at + 2 .. opt.end];
+    try frameEdnsOptions(rdata);
+    var pos: usize = 0;
+    while (pos < rdata.len) : (pos += 4 + @as(usize, mem.readInt(u16, rdata[pos + 2 ..][0..2], .big))) {
+        if (mem.readInt(u16, rdata[pos..][0..2], .big) == code) return true;
+    }
+    return false;
 }
 
 fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
