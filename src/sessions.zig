@@ -125,44 +125,37 @@ const Way = union(enum) {
     session: *Conn,
 };
 
-const Route = struct { way: Way, probe: std.EnumSet(Kind) };
+const Best = struct { way: Way, known: u32 };
 
-/// The fewest round trips over a carrier known to work, and which unknown carriers to probe: those whose dial would beat it.
-fn route(s: *const Sessions, key: na.AddressKey) Route {
-    var r: Route = .{ .way = .plain, .probe = .empty };
+/// The fewest round trips over a carrier known to work, and the fewest a
+/// dial over one would take.
+fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Best {
+    var b: Best = .{ .way = .plain, .known = std.math.maxInt(u32) };
     // A server told at another port: nothing says what its 853 is.
-    if (key.port != s.plain_port) return r;
-    const standings = s.standing.get(key);
-    var best: u32 = std.math.maxInt(u32);
-    var known: u32 = std.math.maxInt(u32);
+    if (key.port != s.plain_port) return b;
+    var fewest: u32 = std.math.maxInt(u32);
     for (std.enums.values(Kind)) |kind| {
         const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
-        switch (standing.status(s.edge.now_ns)) {
-            .damped => {},
-            .unknown => r.probe.insert(kind),
-            .capable => {
-                const dial_rounds = carrier.dialRounds(kind);
-                known = @min(known, dial_rounds);
-                var way: Way = .{ .dial = kind };
-                var rounds = dial_rounds;
-                if (s.find(key, kind)) |c| if (!c.carrier.spent()) {
-                    if (c.overdue) continue;
-                    way = .{ .session = c };
-                    rounds = c.carrier.rounds();
-                };
-                if (rounds < best) {
-                    best = rounds;
-                    r.way = way;
-                }
-            },
+        if (standing.status(s.edge.now_ns) != .capable) continue;
+        const dial_rounds = carrier.dialRounds(kind);
+        b.known = @min(b.known, dial_rounds);
+        var way: Way = .{ .dial = kind };
+        var rounds = dial_rounds;
+        if (s.find(key, kind)) |c| if (!c.carrier.spent()) {
+            if (c.overdue) continue;
+            way = .{ .session = c };
+            rounds = c.carrier.rounds();
+        };
+        if (rounds < fewest) {
+            fewest = rounds;
+            b.way = way;
         }
     }
-    for (std.enums.values(Kind)) |kind| if (carrier.dialRounds(kind) >= known) r.probe.remove(kind);
-    return r;
+    return b;
 }
 
 pub fn quote(s: *const Sessions, server: na.AddressKey, need: graph.Need) graph.Quote {
-    return switch (s.route(server).way) {
+    return switch (s.best(server, s.standing.get(server)).way) {
         .plain => .{ .rounds = need.plainRounds(), .exposure = .cleartext },
         .dial => |kind| .{ .rounds = carrier.dialRounds(kind), .exposure = .encrypted },
         .session => |c| .{ .rounds = c.carrier.rounds(), .exposure = .encrypted },
@@ -171,9 +164,14 @@ pub fn quote(s: *const Sessions, server: na.AddressKey, need: graph.Need) graph.
 
 pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const key: na.AddressKey = .fromAddress(ex.server);
-    const r = s.route(key);
-    var probes = r.probe.iterator();
-    while (probes.next()) |kind| {
+    if (key.port != s.plain_port) return false;
+    const standings = s.standing.get(key);
+    const r = s.best(key, standings);
+    // An unknown carrier is probed only while its dial would beat every
+    // carrier known to work.
+    for (std.enums.values(Kind)) |kind| {
+        const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
+        if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= r.known) continue;
         // Nobody else's dial starts while this one is out, or for as long
         // if it could not start.
         s.setStanding(key, kind, dial_timeout_ns, false);
