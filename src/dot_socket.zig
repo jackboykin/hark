@@ -203,6 +203,7 @@ pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !carrier.Taken {
 
 /// False: gone.
 pub fn flush(sock: *Socket, sh: *Shared) !bool {
+    if (sh.out_len == 0) return true;
     defer sh.out_len = 0;
     return sock.put(sh.out[0..sh.out_len]);
 }

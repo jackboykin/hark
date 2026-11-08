@@ -394,6 +394,9 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
             },
         },
     }
+    // What it owes back, ACKs included, leaves with the turn's other sends.
+    if (s.unflushed != c) try s.flush();
+    s.unflushed = c;
     try s.rearm(c);
 }
 

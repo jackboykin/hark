@@ -23,8 +23,11 @@ const Socket = @This();
 /// The handshake, then the question: it leaves with hark's Finished.
 pub const dial_rounds = 2;
 
+/// Datagrams a read takes at most.
+const batch = 16;
+
 pub const Shared = struct {
-    rx: [quic.max_received]u8 = undefined,
+    rx: [batch][quic.max_received]u8 = undefined,
     tx: [quic.burst][quic.max_datagram]u8 = undefined,
     /// Replies put together from several packets; the edge has taken them by the next read.
     delivered: std.ArrayList([]u8) = .empty,
@@ -109,30 +112,46 @@ pub fn fire(sock: *Socket, sh: *Shared) !carrier.News {
     return sock.news(sh);
 }
 
+/// After its timers: what the connection owes leaves, and whatever it said
+/// waits for `next`.
 fn news(sock: *Socket, sh: *Shared) !carrier.News {
     if (sock.conn.ended == null and !try sock.flush(sh)) return .{ .ended = .closed };
+    return sock.said();
+}
+
+fn said(sock: *const Socket) carrier.News {
     return if (sock.conn.event_at < sock.conn.events.items.len) .read else .nothing;
 }
 
-/// A datagram at a time: a reply may point into the shared buffer until
-/// the edge has taken it.
+/// What has come, a batch of datagrams in one call, each in a buffer of
+/// its own: a reply may point into one until the edge has taken it. What
+/// the connection owes leaves with the turn's other sends.
 pub fn ready(sock: *Socket, sh: *Shared, _: u32) !carrier.News {
     for (sh.delivered.items) |b| sock.edge.work.free(b);
     sh.delivered.clearRetainingCapacity();
-    while (sock.conn.event_at == sock.conn.events.items.len) {
-        const rc = linux.recvfrom(sock.fd, &sh.rx, sh.rx.len, linux.MSG.DONTWAIT, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => try sock.conn.input(sh.rx[0..rc], sock.edge.now_ns, &sh.delivered),
-            .AGAIN, .INTR => break,
-            // ICMP unreachable and kin: nobody speaks QUIC there.
-            else => |err| {
-                sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";
-                return .{ .ended = .failed };
-            },
-        }
+    var msgs: [batch]linux.mmsghdr = undefined;
+    var iov: [batch]posix.iovec = undefined;
+    for (&msgs, &iov, &sh.rx) |*m, *v, *b| {
+        v.* = .{ .base = b, .len = b.len };
+        m.* = .{ .hdr = .{ .name = null, .namelen = 0, .iov = v[0..1].ptr, .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
+    }
+    const rc = linux.recvmmsg(sock.fd, &msgs, batch, linux.MSG.DONTWAIT, null);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .AGAIN, .INTR => return sock.said(),
+        // ICMP unreachable and kin: nobody speaks QUIC there.
+        else => |err| {
+            sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";
+            return .{ .ended = .failed };
+        },
+    }
+    for (msgs[0..rc], sh.rx[0..rc]) |m, *b| {
+        // Past what the server was told it may send: lost, as on the wire.
+        if (m.hdr.flags & linux.MSG.TRUNC != 0) continue;
+        try sock.conn.input(b[0..m.len], sock.edge.now_ns, &sh.delivered);
         if (sock.conn.ended != null) break;
     }
-    return sock.news(sh);
+    return sock.said();
 }
 
 pub fn next(sock: *Socket, _: *Shared) !?carrier.Event {

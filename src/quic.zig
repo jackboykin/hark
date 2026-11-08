@@ -23,7 +23,9 @@ const retry_nonce = hex("461599d35d632bf2239825bb");
 
 /// The floor every path carries (RFC 9000 §14), so no path MTU is discovered.
 pub const max_datagram = 1200;
-pub const max_received = 65527;
+/// Hark's max_udp_payload_size: what IPv4 over Ethernet carries in one
+/// datagram. A server may send no larger (RFC 9000 §18.2).
+pub const max_received = 1472;
 pub const alpn = "doq";
 
 // RFC 9001 §6.6: AES-GCM's limits.
@@ -289,6 +291,7 @@ pub fn ourParams(out: *[tls13.max_quic_params]u8) []const u8 {
         .{ Param.max_idle_timeout, idle_ms },
         .{ Param.initial_max_data, connection_window },
         .{ Param.initial_max_stream_data_bidi_local, stream_window },
+        .{ Param.max_udp_payload_size, max_received },
     }) |p| {
         w.varint(@backingInt(p[0]));
         w.varint(varintLen(p[1]));
