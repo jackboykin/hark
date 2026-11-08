@@ -53,12 +53,24 @@ pub const OptionalCellId = enum(CellId) {
     }
 };
 
-pub const Transport = ns_rtt.Transport;
+/// What an exchange needs of its carrier. Encrypted sessions are streams.
+pub const Need = enum {
+    datagram,
+    stream,
+
+    /// Handshake included.
+    pub fn plainRounds(n: Need) u32 {
+        return switch (n) {
+            .datagram => 1,
+            .stream => 2,
+        };
+    }
+};
 
 pub const Exchange = struct {
     id: CellId,
     server: na.Address,
-    transport: Transport,
+    need: Need,
     /// Held by the cell until the exchange completes.
     wire: []const u8,
     deadline_ns: i64,
@@ -110,7 +122,7 @@ pub const Edge = struct {
     rng: std.Random,
     sendFn: *const fn (*anyopaque, Exchange) anyerror!Exposure,
     wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
-    quoteFn: ?*const fn (*anyopaque, na.AddressKey, Transport) Quote = null,
+    quoteFn: ?*const fn (*anyopaque, na.AddressKey, Need) Quote = null,
     chaos: ?*chaos.Chaos = null,
 
     pub fn send(e: Edge, ex: Exchange) !Exposure {
@@ -121,9 +133,9 @@ pub const Edge = struct {
         return e.wakeFn(e.ctx, id, gen, at_ns);
     }
 
-    pub fn quote(e: Edge, server: na.AddressKey, transport: Transport) Quote {
-        const f = e.quoteFn orelse return .{ .rounds = transport.coldRtts(), .exposure = .cleartext };
-        return f(e.ctx, server, transport);
+    pub fn quote(e: Edge, server: na.AddressKey, need: Need) Quote {
+        const f = e.quoteFn orelse return .{ .rounds = need.plainRounds(), .exposure = .cleartext };
+        return f(e.ctx, server, need);
     }
 };
 
@@ -296,7 +308,7 @@ pub const Answer = struct {
 };
 
 pub const Outcome = union(enum) {
-    reply: struct { msg: dns.Message, rtt_ns: i64 },
+    reply: struct { msg: dns.Message, rtt_ns: i64, stream: bool },
     timeout,
     unsent,
     moved,
@@ -307,7 +319,7 @@ pub const Outcome = union(enum) {
     oversized,
 };
 
-/// Plain goes only over TCP, where a forger cannot follow.
+/// Plain goes only by stream, where a forger cannot follow.
 pub const Case = enum { random, plain };
 
 /// Why a cell settled on no fact: nothing about the DNS, so it is never
@@ -414,7 +426,7 @@ pub const Budget = struct {
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
     resolver: struct {
-        exchanges: struct { udp: u64 = 0, tcp: u64 = 0 } = .{},
+        exchanges: struct { datagram: u64 = 0, stream: u64 = 0 } = .{},
         faults: struct {
             timeout: u64 = 0,
             /// Never left the host.
@@ -478,7 +490,7 @@ const ExchangeScratch = struct {
     sent: []const u8,
     qtype: dns.RType,
     server: na.Address,
-    transport: Transport,
+    need: Need,
     case: Case,
     sent_ns: i64,
     /// The payer's deadline came before the wait the server is owed, so a
@@ -918,7 +930,7 @@ pub const Graph = struct {
                 if (p.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // After the match, so a forger gains nothing over a mismatch.
-                if (sc.transport == .udp and !heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
+                if (!heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
                 // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
                     var n: usize = 0;
@@ -932,14 +944,14 @@ pub const Graph = struct {
                 p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
                 p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
                 p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
-                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns } };
+                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns, .stream = heard.stream } };
             },
         };
         if (g.cfg.trace) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             const over: []const u8 = if (completion == .reply and completion.reply.stream) " over a session" else "";
-            std.debug.print("  {s} {s} {f} {t}{s} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, over, std.meta.activeTag(outcome) });
+            std.debug.print("  {s} {s} {f} {t}{s} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.need, over, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
                 const m = outcome.reply.msg;
                 std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
@@ -1743,8 +1755,8 @@ pub const Graph = struct {
 
     /// Null, like `demand`, when the payer's budget or deadline, or the
     /// asker's orphaning, refuses the work.
-    pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, uncapped: bool) !?Sent {
-        std.debug.assert(case == .random or transport == .tcp);
+    pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, need: Need, case: Case, qname: dns.Name, qtype: dns.RType, uncapped: bool) !?Sent {
+        std.debug.assert(case == .random or need == .stream);
         // The run's payer may spend itself mid-run while another waiter
         // still has room: the shared work goes on at that one's cost.
         if (g.limit(g.payer) != null) g.payer = g.payerOf(by) orelse g.payer;
@@ -1775,22 +1787,22 @@ pub const Graph = struct {
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
         // Silent past the capped wait is silent, however long this send waits.
         const addr = server.toAddress();
-        const rounds = g.edge.quote(server, transport).rounds;
+        const rounds = g.edge.quote(server, need).rounds;
         const owed_at = g.now() + patience * state.timeout(false, rounds) * std.time.ns_per_ms;
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
-        sc.* = .{ .id = qid, .sent = msg.question.?.spelled.?, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
+        sc.* = .{ .id = qid, .sent = msg.question.?.spelled.?, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         const exposure = try g.edge.send(.{
             .id = id,
             .server = addr,
-            .transport = transport,
+            .need = need,
             .wire = wire,
             .deadline_ns = deadline_ns,
         });
         g.flights += 1;
-        if (transport == .udp) g.stats.resolver.exchanges.udp += 1 else g.stats.resolver.exchanges.tcp += 1;
+        if (need == .datagram) g.stats.resolver.exchanges.datagram += 1 else g.stats.resolver.exchanges.stream += 1;
         return .{ .id = id, .est = state, .rounds = rounds, .exposure = exposure };
     }
 };
@@ -1929,10 +1941,10 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .udp, .random, host, .a, true));
+    try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .datagram, .random, host, .a, true));
     g.cell(second).scratch.answer.budget.queries = 0;
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expect(try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .udp, .random, host, .a, true) != null);
+    try testing.expect(try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .datagram, .random, host, .a, true) != null);
     try testing.expectEqual(1, g.cell(second).scratch.answer.budget.queries);
     g.payer = &g.unpaid;
     g.unhold(first);

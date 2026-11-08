@@ -11,7 +11,7 @@ const sign = @import("sign.zig");
 const graph = @import("../graph.zig");
 const chaos = @import("../chaos.zig");
 
-const Transport = graph.Transport;
+const Need = graph.Need;
 const Exchange = graph.Exchange;
 const Completion = graph.Completion;
 
@@ -19,7 +19,7 @@ pub const LogRow = struct {
     server: na.Address,
     qname: dns.Name,
     qtype: dns.RType,
-    transport: Transport,
+    need: Need,
 };
 
 const Event = struct {
@@ -133,16 +133,16 @@ pub const Sim = struct {
         };
         // RFC 8109 root priming is not logged.
         if (!(q.name.isRoot() and q.qtype == .ns))
-            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .transport = ex.transport });
+            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .need = ex.need });
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;
             try s.hear(q, silence);
             return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         }
-        var asked = try s.ask(ex.server, q, ex.transport);
+        var asked = try s.ask(ex.server, q, ex.need);
         const tie = try s.tieOf(asked.final());
         const delay = s.latency(ex.server, asked);
-        const entry = s.findEntry(ex.server, q, ex.transport) orelse {
+        const entry = s.findEntry(ex.server, q, ex.need) orelse {
             // No RANGE for this address: nothing listens there.
             if (!s.serves(ex.server)) {
                 try s.hear(q, silence);
@@ -200,14 +200,14 @@ pub const Sim = struct {
         var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         // A UDP reply past the advertised payload arrives truncated.
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
-        if (ex.transport == .udp and wire.len > payload) {
+        if (ex.need == .datagram and wire.len > payload) {
             var hdr = msg.header;
             hdr.flags.tc = true;
             wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .question = msg.question }) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
-        return s.schedule(ex.id, at, tie, .{ .reply = .{ .bytes = try s.arena.dupe(u8, wire) } });
+        return s.schedule(ex.id, at, tie, .{ .reply = .{ .bytes = try s.arena.dupe(u8, wire), .stream = ex.need == .stream } });
     }
 
     const silence: u64 = 0;
@@ -235,13 +235,13 @@ pub const Sim = struct {
     }
 
     /// Names a query by what it asks and how many times it was asked.
-    fn ask(s: *Sim, server: na.Address, q: dns.Question, transport: Transport) !std.hash.Wyhash {
+    fn ask(s: *Sim, server: na.Address, q: dns.Question, need: Need) !std.hash.Wyhash {
         var h = std.hash.Wyhash.init(0);
         hashServer(&h, server);
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         h.update(q.name.formatInto(&nb));
         h.update(mem.asBytes(&q.qtype));
-        h.update(mem.asBytes(&transport));
+        h.update(mem.asBytes(&need));
         const nth = try s.sent.getOrPut(s.gpa, h.final());
         if (!nth.found_existing) nth.value_ptr.* = 0;
         nth.value_ptr.* += 1;
@@ -295,17 +295,17 @@ pub const Sim = struct {
         return false;
     }
 
-    fn findEntry(s: *const Sim, server: na.Address, q: dns.Question, transport: Transport) ?*const rpl.Entry {
+    fn findEntry(s: *const Sim, server: na.Address, q: dns.Question, need: Need) ?*const rpl.Entry {
         for (s.ranges) |*r| {
             if (!na.ipEqual(r.address, server)) continue;
             if (s.step < r.start or s.step > r.end) continue;
-            for (r.entries) |*e| if (entryMatches(e, q, transport)) return e;
+            for (r.entries) |*e| if (entryMatches(e, q, need)) return e;
         }
         return null;
     }
 
     /// An empty MATCH means `question` (qname, qtype, qclass).
-    fn entryMatches(e: *const rpl.Entry, q: dns.Question, transport: Transport) bool {
+    fn entryMatches(e: *const rpl.Entry, q: dns.Question, need: Need) bool {
         const eq = e.question orelse return false;
         var m = e.match;
         if (m.isEmpty()) m.question = true;
@@ -314,8 +314,8 @@ pub const Sim = struct {
             m.qtype = true;
             m.qclass = true;
         }
-        if (m.tcp and transport != .tcp) return false;
-        if (m.udp and transport != .udp) return false;
+        if (m.tcp and need != .stream) return false;
+        if (m.udp and need != .datagram) return false;
         if (m.qtype and eq.qtype != q.qtype) return false;
         if (m.qname and !eq.name.eql(q.name)) return false;
         if (m.subdomain and !q.name.isSubdomainOf(eq.name)) return false;

@@ -16,19 +16,6 @@ const silent_base_ms: u32 = 3 * initial_timeout_ms;
 const min_timeout_ms: u32 = 100;
 const min_stagger_ms: u32 = 50;
 
-pub const Transport = enum {
-    udp,
-    tcp,
-
-    /// Handshake included.
-    pub fn coldRtts(t: Transport) u32 {
-        return switch (t) {
-            .udp => 1,
-            .tcp => 2,
-        };
-    }
-};
-
 const max_timeout_ms: u32 = 10_000;
 
 const dead_threshold: u8 = 4;

@@ -21,7 +21,7 @@ const Graph = graph.Graph;
 const CellId = graph.CellId;
 const OptionalCellId = graph.OptionalCellId;
 const Key = graph.Key;
-const Transport = graph.Transport;
+const Need = graph.Need;
 const Reply = graph.Reply;
 const Failure = graph.Failure;
 
@@ -31,7 +31,7 @@ const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
 
-pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport, case: graph.Case };
+pub const Attempt = struct { exchange: CellId, server: u8, need: Need, case: graph.Case };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
@@ -57,8 +57,8 @@ pub const Ask = struct {
     hedge_at: i64 = 0,
     /// The first failing reply: an rcode from someone, as opposed to silence.
     held: OptionalCellId = .none,
-    /// The zone's DS names ML-DSA-44, whose DO answers truncate: TCP from the start.
-    tcp_first: bool = false,
+    /// The zone's DS names ML-DSA-44, whose DO answers truncate: a stream from the start.
+    stream_first: bool = false,
     /// An attempt, or a server set's sub-resolution, never left the host.
     local: bool = false,
     /// The asker's limit kept a server from being asked.
@@ -94,7 +94,7 @@ pub const Ask = struct {
     fn gather(a: *Ask, g: *Graph) Found {
         // Told servers are learned from no delegation: no DS hark holds
         // describes them.
-        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
+        if (a.nservers == 0) a.stream_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
         return .{ .held = a.nservers };
     }
 
@@ -136,7 +136,7 @@ pub const Ask = struct {
     };
 
     /// Chosen per send, so a timeout earlier in this ask already counts.
-    fn pick(a: *const Ask, g: *Graph, by: Key, transport: Transport) !?Pick {
+    fn pick(a: *const Ask, g: *Graph, by: Key, need: Need) !?Pick {
         var best: u64 = std.math.maxInt(u64);
         var best_track: ns_rtt.Track = .dead;
         var best_shows: graph.Exposure = .none;
@@ -150,7 +150,7 @@ pub const Ask = struct {
             const i = @ctz(m);
             const e = g.estimate(a.servers[i]);
             const t = e.track;
-            const quote = g.edge.quote(a.servers[i], transport);
+            const quote = g.edge.quote(a.servers[i], need);
             const shows = a.shown.max(quote.exposure);
             live += @intFromBool(t != .dead);
             if (t == .untimed) untimed[@backingInt(shows)] |= bit(i);
@@ -1090,9 +1090,9 @@ test "a send that shows less goes first, however slower, until the ask has shown
             return .none;
         }
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
-        fn quote(ctx: *anyopaque, server: na.AddressKey, transport: Transport) graph.Quote {
+        fn quote(ctx: *anyopaque, server: na.AddressKey, need: Need) graph.Quote {
             const w: *@This() = @ptrCast(@alignCast(ctx));
-            if (!w.sealed.eql(server)) return .{ .rounds = transport.coldRtts(), .exposure = .cleartext };
+            if (!w.sealed.eql(server)) return .{ .rounds = need.plainRounds(), .exposure = .cleartext };
             return .{ .rounds = 3, .exposure = .encrypted };
         }
     };
@@ -1108,9 +1108,9 @@ test "a send that shows less goes first, however slower, until the ask has shown
     a.servers[1] = far;
     a.nservers = 2;
     const by: Key = .of(.rrset, .root, .ns);
-    try testing.expectEqual(1, (try a.pick(&g, by, .udp)).?.server);
+    try testing.expectEqual(1, (try a.pick(&g, by, .datagram)).?.server);
     a.shown = .cleartext;
-    try testing.expectEqual(0, (try a.pick(&g, by, .udp)).?.server);
+    try testing.expectEqual(0, (try a.pick(&g, by, .datagram)).?.server);
 }
 
 // ── The sibling loop ───────────────────────────────────────────────
@@ -1136,22 +1136,22 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 // nothing of it.
                 .timeout => a.cut_short = a.cut_short or (!a.retried and ex.scratch.exchange.cut_short),
                 .unsent => a.local = true,
-                .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.transport, at.case, qname, qtype) == null) {
+                .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.need, at.case, qname, qtype) == null) {
                     refused = true;
                 },
                 // The server's breach: no TCP retry, only a sibling.
                 .oversized => {},
-                // Over TCP a forger cannot follow, and a server that
+                // Over a stream a forger cannot follow, and a server that
                 // normalizes case answers; a garbled datagram gets the
                 // same second chance.
                 .mismatch, .malformed => if (at.case == .random) {
-                    if (try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .plain, qname, qtype) == null) refused = true;
+                    if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .plain, qname, qtype) == null) refused = true;
                 },
                 .reply => |r| {
                     if (r.msg.header.flags.tc) {
-                        // TC over TCP: a broken server, as good as a timeout.
-                        if (at.transport == .udp) {
-                            if (try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .random, qname, qtype) == null) refused = true;
+                        // TC over a stream: a broken server, as good as a timeout.
+                        if (!r.stream) {
+                            if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .random, qname, qtype) == null) refused = true;
                         }
                     } else {
                         const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
@@ -1173,8 +1173,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
         if (!due and waited.mayAnswer()) return .pending;
-        const transport: Transport = if (a.tcp_first) .tcp else .udp;
-        const p = try a.pick(g, g.cell(id).key, transport) orelse {
+        const need: Need = if (a.stream_first) .stream else .datagram;
+        const p = try a.pick(g, g.cell(id).key, need) orelse {
             // No server left to try or to hedge to: before a timeout is
             // sat out, gather what settled since and ask for what is unknown.
             switch (try gatherServers(g, id, a)) {
@@ -1192,7 +1192,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         // The dead are hedged to only once nothing live is in flight.
         if (p.track == .dead and waited != .dead) return .pending;
         const last = p.last and !a.more;
-        const sent = try sendTo(g, id, a, p.server, last, transport, .random, qname, qtype) orelse {
+        const sent = try sendTo(g, id, a, p.server, last, need, .random, qname, qtype) orelse {
             refused = true;
             continue;
         };
@@ -1234,14 +1234,14 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 }
 
 /// Null: refused, so launch nothing more; what is in flight may still answer.
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
-    const ex = try g.exchange(id, a.servers[server], transport, case, qname, qtype, a.nattempts == 0 and last) orelse {
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, need: Need, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
+    const ex = try g.exchange(id, a.servers[server], need, case, qname, qtype, a.nattempts == 0 and last) orelse {
         a.cut_short = a.cut_short or !a.retried;
         return null;
     };
     a.tried |= Ask.bit(server);
     a.shown = a.shown.max(ex.exposure);
-    a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .transport = transport, .case = case };
+    a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .need = need, .case = case };
     a.nattempts += 1;
     return ex;
 }

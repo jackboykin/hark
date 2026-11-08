@@ -108,8 +108,8 @@ pub fn edge(e: *Edge) graph.Edge {
     return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased, .quoteFn = if (e.sessions != null) quoteErased else null };
 }
 
-fn quoteErased(ctx: *anyopaque, server: na.AddressKey, transport: graph.Transport) graph.Quote {
-    return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.quote(server, transport);
+fn quoteErased(ctx: *anyopaque, server: na.AddressKey, need: graph.Need) graph.Quote {
+    return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.quote(server, need);
 }
 
 fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!graph.Exposure {
@@ -154,10 +154,10 @@ fn open(e: *Edge, ex: Exchange) !Flight {
     // Reserved before the fd exists, so nothing after registering it can fail.
     try e.timers.ensureUnusedCapacity(e.gpa, 1);
     try e.flights.ensureUnusedCapacity(e.gpa, 1);
-    const kind: u32 = if (ex.transport == .udp) posix.SOCK.DGRAM else posix.SOCK.STREAM;
+    const kind: u32 = if (ex.need == .datagram) posix.SOCK.DGRAM else posix.SOCK.STREAM;
     const fd = try sys.socket(na.afU32(ex.server), kind | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
-    if (ex.transport == .udp) {
+    if (ex.need == .datagram) {
         try na.connectTo(fd, &ex.server);
         _ = try sys.sendto(fd, ex.wire, 0, null, 0);
         try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.IN, ex.id);
@@ -302,7 +302,7 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
     if (t.got < 2 + @as(usize, len)) return null;
     // Copied out before `finish` frees the buffer.
     @memcpy(e.rx[0..len], t.reply[2..][0..len]);
-    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..len] } });
+    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..len], .stream = true } });
 }
 
 test "a consumer that stops between events leaves nothing behind" {
@@ -315,7 +315,7 @@ test "a consumer that stops between events leaves nothing behind" {
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
     try sys.getsockname(server, &sa.any, &sa_len);
-    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
 
     var stop: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&stop, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
@@ -345,7 +345,7 @@ test "a timer whose event can't be queued stays due" {
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
     try sys.getsockname(server, &sa.any, &sa_len);
-    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = 0 });
+    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = 0 });
 
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, e.next(0));

@@ -126,9 +126,9 @@ fn route(s: *const Sessions, key: na.AddressKey) Route {
     };
 }
 
-pub fn quote(s: *const Sessions, server: na.AddressKey, transport: graph.Transport) graph.Quote {
+pub fn quote(s: *const Sessions, server: na.AddressKey, need: graph.Need) graph.Quote {
     return switch (s.route(server)) {
-        .plain, .probe => .{ .rounds = transport.coldRtts(), .exposure = .cleartext },
+        .plain, .probe => .{ .rounds = need.plainRounds(), .exposure = .cleartext },
         .dial => .{ .rounds = Socket.dial_rounds, .exposure = .encrypted },
         .session => |c| .{ .rounds = c.socket.rounds(), .exposure = .encrypted },
     };
