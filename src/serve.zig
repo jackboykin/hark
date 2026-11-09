@@ -53,8 +53,8 @@ const Conn = struct {
     blocked_ns: i64 = 0,
 
     fn interest(c: *const Conn) u32 {
-        if (c.out.items.len != 0) return linux.EPOLL.OUT;
-        return if (c.draining) 0 else linux.EPOLL.IN;
+        const io: u32 = if (c.out.items.len != 0) linux.EPOLL.OUT else if (c.draining) 0 else linux.EPOLL.IN;
+        return io | linux.EPOLL.RDHUP;
     }
 };
 
@@ -267,7 +267,8 @@ const Server = struct {
                 s.paused = true;
                 s.clients.detail.paused += 1;
             },
-            .conn => |c| if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c, events),
+            // RFC 7766 §6.2.4: a client that closed its session is sent nothing more.
+            .conn => |c| if (events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) s.close(c) else if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c),
             .signal => |fd| s.onSignal(fd),
             .free => {},
         }
@@ -322,7 +323,7 @@ const Server = struct {
             c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
             s.conns += 1;
-            try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
+            try s.e.watch(c.fd, c.token, c.interest());
         }
     }
 
@@ -333,15 +334,14 @@ const Server = struct {
         s.paused = !drained;
     }
 
-    fn readTcp(s: *Server, c: *Conn, events: u32) !void {
-        if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0 and events & linux.EPOLL.IN == 0) return s.drop(c);
+    fn readTcp(s: *Server, c: *Conn) !void {
         const rc = linux.read(c.fd, c.buf[c.len..].ptr, c.buf.len - c.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .AGAIN, .INTR => return,
             else => return s.drop(c),
         }
-        if (rc == 0) return s.drain(c);
+        if (rc == 0) return s.close(c);
         // Only a whole frame resets the idle clock.
         c.len += rc;
         try s.frames(c);
@@ -390,17 +390,21 @@ const Server = struct {
         s.e.rewatch(c.fd, c.token, c.interest()) catch s.drop(c);
     }
 
-    /// Unread bytes would turn the close into a reset, which can lose the
-    /// answers just sent. Bounded, so a client can't hold the loop by sending.
     fn closeIfDone(s: *Server, c: *Conn) bool {
         if (!c.draining or c.owed > 0 or c.out.items.len > 0) return false;
+        s.close(c);
+        return true;
+    }
+
+    /// Unread bytes would turn the close into a reset, which can lose the
+    /// answers just sent. Bounded, so a client can't hold the loop by sending.
+    fn close(s: *Server, c: *Conn) void {
         var unread: [max_frame]u8 = undefined;
         for (0..64) |_| {
             const rc = linux.read(c.fd, &unread, unread.len);
             if (linux.errno(rc) != .SUCCESS or rc == 0) break;
         }
         s.drop(c);
-        return true;
     }
 
     fn drop(s: *Server, c: *Conn) void {

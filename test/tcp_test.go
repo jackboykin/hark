@@ -113,18 +113,6 @@ func TestTCPClients(t *testing.T) {
 		}
 	})
 
-	t.Run("half close still answered", func(t *testing.T) {
-		t.Parallel()
-		c := dial(t, h)
-		send(t, c, framed(t, "half.invalid.", 9))
-		if err := c.(*net.TCPConn).CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if got := ids(replies(t, c, 1)); !slices.Equal(got, []uint16{9}) {
-			t.Fatalf("replies to %v, want 9", got)
-		}
-	})
-
 	t.Run("oversized frame closes", func(t *testing.T) {
 		t.Parallel()
 		c := dial(t, h)
