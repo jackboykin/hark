@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -64,10 +63,9 @@ func startHark(ctx context.Context, t *testing.T, bin string, sc *scenario, port
 		}
 		err = h.ready(at)
 		if err != nil && h.exited() && strings.Contains(h.log(), "AddressInUse") {
-			handed.Delete(listen)
 			continue
 		}
-		t.Cleanup(func() { h.stopped(t); handed.Delete(listen) })
+		t.Cleanup(func() { h.stopped(t) })
 		return h, err
 	}
 }
@@ -143,10 +141,6 @@ func (h *hark) log() string {
 	return string(b)
 }
 
-// hark binds UDP with SO_REUSEADDR: a second hark on a port the kernel
-// offered again would take the first's queries.
-var handed sync.Map
-
 func freePort() (netip.AddrPort, error) {
 	for {
 		u, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -158,10 +152,7 @@ func freePort() (netip.AddrPort, error) {
 		u.Close()
 		if err == nil {
 			l.Close()
-			if _, dup := handed.LoadOrStore(ap, nil); !dup {
-				return ap, nil
-			}
-			continue
+			return ap, nil
 		}
 		if !errors.Is(err, syscall.EADDRINUSE) {
 			return netip.AddrPort{}, err
