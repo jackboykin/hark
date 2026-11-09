@@ -16,6 +16,7 @@ const rebinding = @import("../rebinding.zig");
 const config = @import("../config.zig");
 const ns_rtt = @import("../ns_rtt.zig");
 const chaos = @import("../chaos.zig");
+const slab = @import("../slab.zig");
 
 pub const Phase = enum { steps, warm };
 
@@ -702,10 +703,14 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
 }
 
 /// Take jobs until none are left. Leaks are counted, not traced, so the
-/// replays run on the production allocator; a leak's site shows under
-/// -Dscenario, on testing.allocator.
+/// replays run on the production allocator, a tenant on this thread's
+/// reserve, which in debug checks every free and quarantines freed slots;
+/// a leak's site shows under -Dscenario, on testing.allocator.
 fn replayJobs(jobs: []Job, next: *std.atomic.Value(usize), leaked: *std.atomic.Value(bool)) void {
-    var counted: std.testing.FailingAllocator = .init(std.heap.smp_allocator, .{});
+    var reserve: slab.Reserve = .{};
+    defer reserve.deinit();
+    var tenant: slab.Tenant = .init(&reserve);
+    var counted: std.testing.FailingAllocator = .init(tenant.allocator(), .{});
     defer if (counted.allocated_bytes != counted.freed_bytes) {
         std.debug.print("replays leaked {d} bytes; -Dscenario shows where\n", .{counted.allocated_bytes - counted.freed_bytes});
         leaked.store(true, .monotonic);
