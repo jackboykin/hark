@@ -1,0 +1,118 @@
+; hark: root-hints = 127.0.10.1
+; hark: max-queries = 4
+; hark: client-timeout = 0.35
+; sim-only: live, a UDP client is answered within 2 s, so none gives up while the first is still resolving
+
+SCENARIO_BEGIN a server whose address one asker's budget stopped is looked up for the next
+
+; www.other. is a CNAME to www.example., whose ns1 is silent and whose
+; ns2.other. has no glue. The first client's budget runs out looking up
+; ns2.other. while ns1 is still out, and it gives up. The second client
+; joins its resolution and looks the address up again; once that has run,
+; the answer is held.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.other.
+    SECTION ADDITIONAL
+      ns.other. 3600 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns1.example.
+      example. 3600 IN NS ns2.other.
+    SECTION ADDITIONAL
+      ns1.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.other. IN A
+    SECTION ANSWER
+      www.other. 3600 IN CNAME www.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns2.other. IN A
+    SECTION ANSWER
+      ns2.other. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns2.other. IN AAAA
+    SECTION AUTHORITY
+      other. 3600 IN SOA ns.other. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.other. IN A
+ENTRY_END
+
+STEP 2 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 2
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

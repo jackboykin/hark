@@ -61,8 +61,7 @@ pub const Ask = struct {
     stream_first: bool = false,
     /// An attempt, or a server set's sub-resolution, never left the host.
     local: bool = false,
-    /// The asker's limit kept a server from being asked.
-    cut_short: bool = false,
+    asked_all: bool = false,
     /// The most any send has shown of the question.
     shown: graph.Exposure = .none,
     /// The placement of the cut whose servers this ask took: a delegation
@@ -225,11 +224,6 @@ pub const Ask = struct {
             a.tried |= bit(i);
         };
         if (a.tried == bit(a.nservers) - 1) a.tried = 0;
-    }
-
-    fn blame(a: *Ask, why: Failure) void {
-        a.local = a.local or why.cause == .host;
-        a.cut_short = a.cut_short or why.cause == .asker;
     }
 
     /// Every server failed: bare SERVFAIL. An authority's REFUSED or
@@ -688,9 +682,8 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
 /// Once every server was asked, running out is the servers' failure,
 /// whatever the asker had left (RFC 9520 §3.2); else it is the asker's limit.
 pub fn ended(g: *const Graph, a: *const Ask) Failure {
-    const asked_all = a.nservers > 0 and !a.cut_short and (a.retried or a.untried() == 0);
     const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
-    return if (asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
+    return if (a.nservers > 0 and a.asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
 }
 
 /// A chain starting with a CNAME at `name` is also the fact
@@ -1134,7 +1127,9 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
             switch (ex.state.fact.exchange) {
                 // A wait the deadline cut before the server was due asked
                 // nothing of it.
-                .timeout => a.cut_short = a.cut_short or (!a.retried and ex.scratch.exchange.cut_short),
+                .timeout => if (ex.scratch.exchange.cut_short) {
+                    a.tried &= ~Ask.bit(at.server);
+                },
                 .unsent => a.local = true,
                 .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.need, at.case, qname, qtype) == null) {
                     refused = true;
@@ -1180,8 +1175,9 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
             switch (try gatherServers(g, id, a)) {
                 .ready => continue,
                 .pending => return .pending,
-                .none => {
+                .none, .stopped => |left| {
                     if (a.nattempts > 0) return .pending;
+                    a.asked_all = a.asked_all or left == .none;
                     if (a.retried or a.held != .none) return a.giveUp(g);
                     a.retry(g);
                     continue;
@@ -1235,10 +1231,7 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 
 /// Null: refused, so launch nothing more; what is in flight may still answer.
 fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, need: Need, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
-    const ex = try g.exchange(id, a.servers[server], need, case, qname, qtype, a.nattempts == 0 and last) orelse {
-        a.cut_short = a.cut_short or !a.retried;
-        return null;
-    };
+    const ex = try g.exchange(id, a.servers[server], need, case, qname, qtype, a.nattempts == 0 and last) orelse return null;
     a.tried |= Ask.bit(server);
     a.shown = a.shown.max(ex.exposure);
     a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .need = need, .case = case };
@@ -1246,9 +1239,10 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, need: Need, ca
     return ex;
 }
 
-fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
+fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped, ready } {
     var found = a.gather(g);
     const zone = a.zone;
+    var left: Left = .{};
     if (told(g, zone)) |servers| {
         // Told, not handed over: config holds them to what it allows.
         for (servers) |h| a.hold(&found, .fromAddress(h));
@@ -1256,14 +1250,21 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(.cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
-        if (cut.failure()) |why| {
-            a.blame(why);
-            return .none;
-        }
+        if (cut.failure()) |why| switch (why.cause) {
+            .zone => return .none,
+            .host => {
+                a.local = true;
+                return .none;
+            },
+            .asker => {
+                if (g.spent(g.payer)) return .stopped;
+                a.cut = .none;
+                return gatherServers(g, id, a);
+            },
+        };
         // A shallower cut: no delegation here while it holds.
         const servers: []const graph.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
         const partial = reach(g, a, &found, servers);
-        var left: Left = .{};
         if (found.new == 0 or a.fetched_unglued) try learn(g, id, a, &found, servers, &left);
         a.more = if (a.fetched_unglued) left.awaited else partial;
         // A sibling in progress for someone is waited for only when
@@ -1305,7 +1306,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         var zb: [dns.max_dotted_len + 1]u8 = undefined;
         std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     }
-    return .none;
+    return if (left.stopped) .stopped else .none;
 }
 
 const families = [_]dns.RType{ .a, .aaaa };
@@ -1314,6 +1315,7 @@ const Left = struct {
     busy: std.ArrayList(Key) = .empty,
     awaited: bool = false,
     unknown: std.ArrayList(Unknown) = .empty,
+    stopped: bool = false,
 
     const Unknown = struct { host: Key, families: [families.len]bool };
 };
@@ -1362,7 +1364,20 @@ fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const gra
                 // Ours: a set that lives no time serves its demander, a
                 // failure gives nothing.
                 if (g.holdsInput(id, aid)) {
-                    if (c.failure()) |why| a.blame(why) else for (c.state.fact.addr) |x| a.offer(g, found, x);
+                    const why = c.failure() orelse {
+                        for (c.state.fact.addr) |x| a.offer(g, found, x);
+                        continue;
+                    };
+                    switch (why.cause) {
+                        .zone => {},
+                        .host => a.local = true,
+                        .asker => if (g.spent(g.payer)) {
+                            left.stopped = true;
+                        } else {
+                            left.awaited = true;
+                            try left.busy.append(sa, key);
+                        },
+                    }
                     continue;
                 }
             }
