@@ -935,7 +935,11 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
     defer out.destroy(gpa);
     var s: Server = .{ .in = in, .out = out, .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = @min(fdShare(4), max_conns), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64 }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
-    for (cfg.listen) |addr| try s.listen(addr);
+    for (cfg.listen) |addr| s.listen(addr) catch |err| {
+        var ab: [64]u8 = undefined;
+        log.err("listening on {s}: {s}", .{ na.format(addr, &ab), @errorName(err) });
+        return err;
+    };
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
         try dropPrivileges(cfg.drop_gid, cfg.drop_uid);
         log.info("dropped to uid={?d} gid={?d}", .{ cfg.drop_uid, cfg.drop_gid });
