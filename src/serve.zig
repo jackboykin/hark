@@ -1116,7 +1116,8 @@ fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
     // V6ONLY keeps the families disjoint: the ACL is family-strict, and a
     // v4-mapped-v6 peer would otherwise bypass every v4 allow rule.
     if (af == posix.AF.INET6) try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(one));
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(one));
+    // UDP has no TIME_WAIT, and there the flag lets any later binder take the port.
+    if (sock_type == posix.SOCK.STREAM) try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(one));
     if (sock_type == posix.SOCK.DGRAM) {
         if (na.isUnspecified(addr)) try Batch.tellLocal(sock, af);
         const bufsize: c_int = 1024 * 1024;
