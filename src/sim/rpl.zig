@@ -128,7 +128,7 @@ pub const Scenario = struct {
     serve_stale_ttl: ?u32 = null,
     min_ttl: ?u32 = null,
     prefetch: ?bool = null,
-    client_timeout_ms: u32 = 5000,
+    client_timeout_ms: ?u32 = null,
     /// Zones the harness signs; the first must be the root.
     dnssec_zones: []const []const u8 = &.{},
     /// Seconds the harness's signatures stay valid; null, a year.

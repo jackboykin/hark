@@ -149,14 +149,15 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
             .query => {
                 const sent = try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb);
                 try answered(gpa, report, opts, &s, .steps, st.n, sent);
-                if (sent) |x| last = x.msg else if (opts.chaos == 0) {
+                last = if (sent) |x| x.msg else null;
+                if (sent == null and opts.chaos == 0 and scenario.client_timeout_ms == null) {
                     report.msg = "client timed out";
                     return error.ScenarioFailed;
                 }
             },
             .check_answer => {
                 const actual = last orelse {
-                    report.msg = "CHECK_ANSWER before any QUERY";
+                    report.msg = "no answer to check";
                     return error.ScenarioFailed;
                 };
                 if (answerMismatch(actual, st.entry.?, .cold)) |why| {
@@ -414,7 +415,7 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
 /// The graph driven synchronously: serve parks the client instead.
 fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk) !?answer.Served {
     unholdAll(g, held);
-    const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
+    const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms orelse 5000) * std.time.ns_per_ms;
     const asked = try desk.asked(arena, q, client);
     const root = try g.demandRoot(asked.name, asked.qtype, .new);
     held.roots[0] = root;
@@ -429,10 +430,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
             return served;
         }
     }
-    if (!try settleBy(g, s, root, deadline)) {
-        unholdAll(g, held);
-        return null;
-    }
+    if (!try settleBy(g, s, root, deadline)) return leave(g, held);
     const served = try desk.built(arena, root, q, client);
     const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
     const a = try g.demandRoot(aq.name, aq.qtype, .new);
@@ -440,10 +438,17 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     try g.drain();
     if (!try settleBy(g, s, a, deadline)) {
         served.release(&g.store);
-        unholdAll(g, held);
-        return null;
+        return leave(g, held);
     }
     return try desk.finish(arena, q, client, served, a);
+}
+
+fn leave(g: *graph.Graph, held: *Held) !?answer.Served {
+    for (&held.roots) |*h| if (h.*) |id| {
+        if (g.cell(id).holds == 1) try held.kept.append(g.gpa, id) else g.unhold(id);
+        h.* = null;
+    };
+    return null;
 }
 
 /// False when nothing more arrives before `until`.
