@@ -19,6 +19,9 @@ const fine_max = 128;
 const max_slot = 32 << 10;
 const class_count = fine_max / 16 + (std.math.log2(max_slot) - std.math.log2(fine_max)) * steps;
 
+/// Safe builds check every free.
+const safe = @import("builtin").mode.runtimeSafety();
+
 const slot_sizes: [class_count]u32 = blk: {
     var sizes: [class_count]u32 = undefined;
     for (&sizes, 0..) |*s, c| {
@@ -51,6 +54,8 @@ fn classFor(len: usize, alignment: Alignment) ?u8 {
 
 const Slot = struct { next: ?*Slot };
 
+const most_slots = slab_len / 16;
+
 const Slab = struct {
     node: std.DoublyLinkedList.Node = .{},
     free: ?*Slot = null,
@@ -61,6 +66,8 @@ const Slab = struct {
     where: enum(u8) { reserve, current, partial, full } = .reserve,
     dirty: bool = false,
     owner: ?*Tenant = null,
+    /// Bit i: the slot at `base() + i * size` is handed out.
+    out: if (safe) std.bit_set.Static(most_slots) else void = if (safe) .empty else {},
 
     fn base(slab: *Slab) usize {
         const r: *Region = @ptrFromInt(@intFromPtr(slab) & ~@as(usize, region_len - 1));
@@ -75,6 +82,26 @@ const Slab = struct {
 
     fn from(node: *std.DoublyLinkedList.Node) *Slab {
         return @fieldParentPtr("node", node);
+    }
+
+    fn slot(slab: *Slab, ptr: [*]u8) ?usize {
+        const at = @intFromPtr(ptr);
+        const size = slot_sizes[slab.class];
+        if (at >= slab.fresh or (at - slab.base()) % size != 0) return null;
+        return (at - slab.base()) / size;
+    }
+
+    fn handOut(slab: *Slab, ptr: [*]u8) void {
+        const i = slab.slot(ptr).?;
+        if (slab.out.isSet(i)) @panic("slab: handed out a slot twice");
+        slab.out.set(i);
+    }
+
+    fn fault(slab: *Slab, memory: []u8) ?[]const u8 {
+        const i = slab.slot(memory.ptr) orelse return "slab: freed a pointer that is no slot";
+        if (!slab.out.isSet(i)) return "slab: double free, or a slot never handed out";
+        if (memory.len > slot_sizes[slab.class]) return "slab: freed more than its slot";
+        return null;
     }
 };
 
@@ -182,18 +209,17 @@ pub const Tenant = struct {
     }
 
     fn take(slab: *Slab) ?[*]u8 {
-        if (slab.free) |s| {
+        const ptr: [*]u8 = if (slab.free) |s| blk: {
             slab.free = s.next;
-            slab.used += 1;
-            return @ptrCast(s);
-        }
-        if (slab.fresh < slab.end) {
+            break :blk @ptrCast(s);
+        } else if (slab.fresh < slab.end) blk: {
             const at = slab.fresh;
             slab.fresh += slot_sizes[slab.class];
-            slab.used += 1;
-            return @ptrFromInt(at);
-        }
-        return null;
+            break :blk @ptrFromInt(at);
+        } else return null;
+        slab.used += 1;
+        if (safe) slab.handOut(ptr);
+        return ptr;
     }
 
     fn refill(t: *Tenant, c: u8) ?[*]u8 {
@@ -233,7 +259,15 @@ pub const Tenant = struct {
         }
         const slab = Slab.of(memory.ptr);
         assert(slab.owner == t and slab.used > 0);
-        const s: *Slot = @ptrCast(@alignCast(memory.ptr));
+        if (!safe) return release(slab, memory.ptr);
+        if (slab.fault(memory)) |why| @panic(why);
+        slab.out.unset(slab.slot(memory.ptr).?);
+        release(slab, memory.ptr);
+    }
+
+    fn release(slab: *Slab, ptr: [*]u8) void {
+        const t = slab.owner.?;
+        const s: *Slot = @ptrCast(@alignCast(ptr));
         s.next = slab.free;
         slab.free = s;
         slab.used -= 1;
@@ -323,6 +357,23 @@ test "slabs one class emptied serve another, and the rest go back to the OS" {
     try testing.expectEqual(regions, reserve.newest);
     try testing.expect(reserve.held < peak);
     for (burst) |b| facts.allocator().free(b);
+}
+
+test "a free of anything but a slot handed out is a fault" {
+    if (!safe) return error.SkipZigTest;
+    var reserve: Reserve = .{};
+    defer reserve.deinit();
+    var t: Tenant = .init(&reserve);
+    const a = t.allocator();
+    const x = try a.alloc(u8, 40);
+    const slab = Slab.of(x.ptr);
+    const size = slot_sizes[slab.class];
+    try testing.expectEqual(null, slab.fault(x));
+    try testing.expectEqualStrings("slab: freed more than its slot", slab.fault(x.ptr[0 .. size + 1]).?);
+    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.fault(x.ptr[1..41]).?);
+    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.fault((x.ptr + size)[0..40]).?);
+    a.free(x);
+    try testing.expectEqualStrings("slab: double free, or a slot never handed out", slab.fault(x).?);
 }
 
 fn resident(slab: [*]u8) bool {
