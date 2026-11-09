@@ -203,6 +203,9 @@ const Server = struct {
     late: std.Deque(Tenant) = .empty,
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
+    /// A TCP reply's frame, one at a time: a local this size is filled with
+    /// 0xaa on every call in safe builds.
+    frame: [2 + @as(usize, dns.max_message_len)]u8 = undefined,
     freed: std.ArrayList(u32) = .empty,
     scratch: Arena,
     in: *Batch,
@@ -811,7 +814,6 @@ const Server = struct {
     fn send(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) void {
         defer served.release(&s.g.store);
         const arena = s.scratch.allocator();
-        var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
             .udp, .wildcard => blk: {
                 const claimed = if (query.edns) |e| e.udp_payload_size else dns.max_udp_payload;
@@ -822,7 +824,7 @@ const Server = struct {
         var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
-        const wire = response.buildResponseWire(s.room(reply, &buf), ctx, served.reply(), arena) orelse
+        const wire = response.buildResponseWire(s.room(reply), ctx, served.reply(), arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.question, query.edns);
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
@@ -838,29 +840,28 @@ const Server = struct {
             log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
         s.count(served.rcode, served.ede);
-        s.write(reply, &buf, wire.len);
+        s.write(reply, wire.len);
     }
 
     fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, question: ?dns.Question, edns: ?dns.Edns) void {
-        var buf: [2 + @as(usize, dns.max_udp_payload)]u8 = undefined;
-        const wire = response.serializeErrorResponse(s.room(reply, &buf)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, edns);
+        const wire = response.serializeErrorResponse(s.room(reply)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, edns);
         s.count(rcode, null);
-        s.write(reply, &buf, wire.len);
+        s.write(reply, wire.len);
     }
 
-    fn room(s: *Server, reply: Reply, frame: []u8) []u8 {
+    fn room(s: *Server, reply: Reply) []u8 {
         return switch (reply) {
             inline .udp, .wildcard => |u| s.out.next(u.fd),
-            .tcp => frame[2..],
+            .tcp => s.frame[2..],
         };
     }
 
-    fn write(s: *Server, reply: Reply, frame: []u8, len: usize) void {
+    fn write(s: *Server, reply: Reply, len: usize) void {
         switch (reply) {
             .udp => |u| s.out.push(len, &u.addr),
             .wildcard => |u| s.out.pushFrom(len, &u.addr, u.local),
             .tcp => |c| {
-                const framed = frame[0 .. 2 + len];
+                const framed = s.frame[0 .. 2 + len];
                 mem.writeInt(u16, framed[0..2], @intCast(len), .big);
                 c.owed -= 1;
                 c.last_ns = s.e.now_ns;
