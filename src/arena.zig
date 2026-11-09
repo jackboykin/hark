@@ -41,9 +41,12 @@ pub fn allocator(a: *Arena) Allocator {
     return .{ .ptr = a, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
 
-pub fn reset(a: *Arena, mode: enum { free_all, retain_capacity }) void {
+/// Rewinds, keeping one chunk the size of all it held. What it gives back
+/// is undefined, so a safe build fills it with 0xaa.
+pub fn reset(a: *Arena) void {
     const newest = a.foot orelse return;
-    if (mode == .retain_capacity and newest.older == null) {
+    if (newest.older == null) {
+        @memset(newest.base[0 .. a.at - @intFromPtr(newest.base)], undefined);
         a.at = @intFromPtr(newest.base);
         return;
     }
@@ -52,7 +55,7 @@ pub fn reset(a: *Arena, mode: enum { free_all, retain_capacity }) void {
     while (it) |f| : (it = f.older) room += f.chunk().len - @sizeOf(Foot);
     a.deinit();
     a.* = .{ .child = a.child };
-    if (mode == .retain_capacity) _ = a.open(room, @returnAddress());
+    _ = a.open(room, @returnAddress());
 }
 
 fn open(a: *Arena, size: usize, ra: usize) ?usize {
@@ -129,6 +132,16 @@ test "an arena is an allocator" {
     try std.heap.testAllocatorAlignedShrink(arena.allocator());
 }
 
+test "what a rewind gives back reads 0xaa in a safe build" {
+    if (!@import("builtin").mode.runtimeSafety()) return error.SkipZigTest;
+    var arena: Arena = .init(testing.allocator);
+    defer arena.deinit();
+    const held = try arena.allocator().alloc(u8, 100);
+    @memset(held, 1);
+    arena.reset();
+    try testing.expect(mem.allEqual(u8, held, 0xaa));
+}
+
 test "allocations are aligned, apart, and keep their bytes across chunks" {
     var arena: Arena = .init(testing.allocator);
     defer arena.deinit();
@@ -166,7 +179,7 @@ test "a reset arena gives the same memory again" {
     defer arena.deinit();
     const a = arena.allocator();
     const first = try a.alloc(u8, 100);
-    arena.reset(.retain_capacity);
+    arena.reset();
     try testing.expectEqual(first.ptr, (try a.alloc(u8, 100)).ptr);
 }
 
@@ -185,7 +198,7 @@ test "an allocation the child refuses leaves the arena as it was" {
                 };
                 @memset(bytes, 0xa5);
             }
-            arena.reset(.retain_capacity);
+            arena.reset();
             @memset(try a.alloc(u8, 10), 0x5a);
         }
     }.run, .{});

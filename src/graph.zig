@@ -1669,8 +1669,7 @@ pub const Graph = struct {
             c.holds -= 1;
             g.release(id);
         }
-        // Debug frees it, so a read past its run fails every time, not by luck.
-        g.scratch.reset(if (builtin.mode == .debug) .free_all else .retain_capacity);
+        g.scratch.reset();
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
         g.payer = g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;

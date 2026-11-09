@@ -447,7 +447,7 @@ const Server = struct {
         // BCP 140: a UDP reply is dropped silently, no query; over TCP `validateQuery` answers it.
         if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         if (reply != .tcp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
-        s.scratch.reset(.retain_capacity);
+        s.scratch.reset();
         const arena = s.scratch.allocator();
         const query = dns.readQuery(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
@@ -589,7 +589,7 @@ const Server = struct {
             },
             .nothing => return s.vacate(i),
         };
-        s.scratch.reset(.retain_capacity);
+        s.scratch.reset();
         const arena = s.scratch.allocator();
         const query = p.query;
         const served = try s.shape(arena, p, query.question.?, answer.Client.fromQuery(query)) orelse {
@@ -702,7 +702,7 @@ const Server = struct {
             .reply => |r| r,
             .left, .nothing => return,
         };
-        s.scratch.reset(.retain_capacity);
+        s.scratch.reset();
         const arena = s.scratch.allocator();
         const query = p.query;
         const q = query.question.?;
