@@ -19,8 +19,13 @@ const fine_max = 128;
 const max_slot = 32 << 10;
 const class_count = fine_max / 16 + (std.math.log2(max_slot) - std.math.log2(fine_max)) * steps;
 
-/// Safe builds check every free.
+/// Safe builds check every free. Debug also holds a freed slot back from
+/// reuse until `quarantine_bytes` more have been freed after it; in
+/// ReleaseSafe that cost 8% of a miss and 6 MiB, and a peer that controls
+/// what hark allocates can flush it anyway.
 const safe = @import("builtin").mode.runtimeSafety();
+const quarantined = @import("builtin").mode == .debug;
+const quarantine_bytes = 4 << 20;
 
 const slot_sizes: [class_count]u32 = blk: {
     var sizes: [class_count]u32 = undefined;
@@ -105,6 +110,48 @@ const Slab = struct {
     }
 };
 
+/// Freed slots, oldest first, each filled with 0xaa: one rejoins its slab
+/// once `quarantine_bytes` more have followed it, or the ring is full.
+const Quarantine = struct {
+    ring: [][*]u8 = &.{},
+    head: usize = 0,
+    len: usize = 0,
+    bytes: usize = 0,
+
+    const ring_len = quarantine_bytes / 16;
+
+    fn hold(q: *Quarantine, ptr: [*]u8, size: usize) void {
+        if (q.ring.len == 0) {
+            const raw = std.heap.PageAllocator.map(ring_len * @sizeOf([*]u8), .of([*]u8)) orelse return Tenant.release(Slab.of(ptr), ptr);
+            q.ring = @as([*][*]u8, @ptrCast(@alignCast(raw)))[0..ring_len];
+        }
+        while (q.len == ring_len or q.bytes + size > quarantine_bytes) q.evict();
+        q.ring[(q.head + q.len) % ring_len] = ptr;
+        q.len += 1;
+        q.bytes += size;
+    }
+
+    fn evict(q: *Quarantine) void {
+        const ptr = q.ring[q.head];
+        q.head = (q.head + 1) % ring_len;
+        q.len -= 1;
+        const slab = Slab.of(ptr);
+        const size = slot_sizes[slab.class];
+        q.bytes -= size;
+        if (!mem.allEqual(u8, ptr[0..size], 0xaa)) @panic("slab: a slot was written after it was freed");
+        Tenant.release(slab, ptr);
+    }
+
+    fn drain(q: *Quarantine) void {
+        while (q.len > 0) q.evict();
+    }
+
+    fn deinit(q: *Quarantine) void {
+        if (q.ring.len != 0) std.heap.PageAllocator.unmap(@alignCast(mem.sliceAsBytes(q.ring)));
+        q.* = .{};
+    }
+};
+
 /// Sits in the region's first 64 KiB, which is never a slab.
 const Region = struct {
     slabs: [slabs_per_region]Slab,
@@ -123,6 +170,7 @@ pub const Reserve = struct {
     clean: std.DoublyLinkedList = .{},
     held: usize = 0,
     newest: ?*Region = null,
+    quarantine: if (quarantined) Quarantine else void = if (quarantined) .{} else {},
 
     /// Call every second or so: a slab empty for a whole tick goes back to
     /// the OS, while a load swinging back within one reuses it warm.
@@ -138,7 +186,14 @@ pub const Reserve = struct {
         r.aged = r.dirty_count;
     }
 
+    /// Every slot the quarantine holds rejoins its slab, checked.
+    pub fn drain(r: *Reserve) void {
+        if (quarantined) r.quarantine.drain();
+    }
+
     pub fn deinit(r: *Reserve) void {
+        r.drain();
+        if (quarantined) r.quarantine.deinit();
         var it = r.newest;
         while (it) |region| {
             it = region.older;
@@ -262,7 +317,10 @@ pub const Tenant = struct {
         if (!safe) return release(slab, memory.ptr);
         if (slab.fault(memory)) |why| @panic(why);
         slab.out.unset(slab.slot(memory.ptr).?);
-        release(slab, memory.ptr);
+        if (!quarantined) return release(slab, memory.ptr);
+        const size = slot_sizes[slab.class];
+        @memset(memory.ptr[0..size], 0xaa);
+        t.reserve.quarantine.hold(memory.ptr, size);
     }
 
     fn release(slab: *Slab, ptr: [*]u8) void {
@@ -334,6 +392,7 @@ test "slots keep their bytes, and every slab goes home when all is freed" {
         for (x.bytes) |b| try testing.expectEqual(x.fill, b);
         a.free(x.bytes);
     }
+    reserve.drain();
     try testing.expectEqual(0, reserve.held);
 }
 
@@ -347,6 +406,7 @@ test "slabs one class emptied serve another, and the rest go back to the OS" {
     const regions = reserve.newest;
     const peak = reserve.held;
     for (burst) |b| work.allocator().free(b);
+    reserve.drain();
     try testing.expectEqual(0, reserve.held);
     const at: [*]u8 = @ptrFromInt(mem.alignBackward(usize, @intFromPtr(burst[0].ptr), slab_len));
     reserve.tick();
@@ -374,6 +434,24 @@ test "a free of anything but a slot handed out is a fault" {
     try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.fault((x.ptr + size)[0..40]).?);
     a.free(x);
     try testing.expectEqualStrings("slab: double free, or a slot never handed out", slab.fault(x).?);
+}
+
+test "a freed slot comes back only after the quarantine has moved past it" {
+    if (!quarantined) return error.SkipZigTest;
+    var reserve: Reserve = .{};
+    defer reserve.deinit();
+    var t: Tenant = .init(&reserve);
+    const a = t.allocator();
+    const x = try a.alloc(u8, 40);
+    a.free(x);
+    try testing.expect(mem.allEqual(u8, x.ptr[0..slot_sizes[Slab.of(x.ptr).class]], 0xaa));
+    const y = try a.alloc(u8, 40);
+    try testing.expect(y.ptr != x.ptr);
+    a.free(y);
+    reserve.drain();
+    const z = try a.alloc(u8, 40);
+    try testing.expect(z.ptr == x.ptr or z.ptr == y.ptr);
+    a.free(z);
 }
 
 fn resident(slab: [*]u8) bool {
