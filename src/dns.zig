@@ -582,11 +582,6 @@ fn nameLen(d: []const u8) Error!usize {
     return error.InvalidRDataLength;
 }
 
-fn readMx(d: []const u8) Error!MxData {
-    if (d.len < 2) return error.InvalidRDataLength;
-    return .{ .preference = mem.readInt(u16, d[0..2], .big), .exchange = .of(d[2..]) };
-}
-
 fn readSoa(d: []const u8) Error!SoaData {
     const m = try nameLen(d);
     const r = m + try nameLen(d[m..]);
@@ -822,11 +817,6 @@ pub const ResourceRecord = struct {
     pub fn ptr(rr: ResourceRecord) Name {
         std.debug.assert(rr.rtype == .ptr);
         return .of(rr.rdata);
-    }
-
-    pub fn mx(rr: ResourceRecord) MxData {
-        std.debug.assert(rr.rtype == .mx);
-        return readMx(rr.rdata) catch unreachable;
     }
 
     pub fn soa(rr: ResourceRecord) SoaData {
@@ -1424,10 +1414,6 @@ pub fn hasOption(msg: []const u8, code: u16) Error!bool {
     return false;
 }
 
-fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
-    return std.math.cast(T, val) orelse error.InvalidRDataLength;
-}
-
 /// RFC 1035 §4.1.4 targets. Byte-exact: a pointer must not change a name's case.
 /// A candidate entry spends its label count from `work`; once gone, names go
 /// out whole (Unbound CVE-2024-8508: labels² × entries per name).
@@ -1510,9 +1496,9 @@ pub const Serializer = struct {
         self.pos += data.len;
     }
 
-    /// `compress` only for owner names and RFC 1035 rdata (RFC 3597 §4).
-    fn writeName(self: *Serializer, wire: []const u8, compress: bool) Error!void {
-        if (compress and self.names != null) return self.writeWireName(wire);
+    /// An owner name, compressed when the message keeps a name table.
+    fn writeName(self: *Serializer, wire: []const u8) Error!void {
+        if (self.names != null) return self.writeWireName(wire);
         try self.writeSlice(wire);
     }
 
@@ -1537,13 +1523,13 @@ pub const Serializer = struct {
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
-        try self.writeName(q.spelled orelse q.name.wire, true);
+        try self.writeName(q.spelled orelse q.name.wire);
         try self.writeU16(@backingInt(q.qtype));
         try self.writeU16(@backingInt(q.qclass));
     }
 
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
-        try self.writeName(rr.name.wire, true);
+        try self.writeName(rr.name.wire);
         const at = self.pos;
         try self.writeSlice(&try rr.fixed());
         const e = (if (self.names != null) embedded(rr.rtype) else null) orelse return self.writeSlice(rr.rdata);
@@ -1556,7 +1542,7 @@ pub const Serializer = struct {
             p += n;
         }
         try self.writeSlice(rr.rdata[p..]);
-        mem.writeInt(u16, self.buf[at + 8 ..][0..2], try castOrRDataErr(u16, self.pos - at - 10), .big);
+        mem.writeInt(u16, self.buf[at + 8 ..][0..2], std.math.cast(u16, self.pos - at - 10) orelse return error.InvalidRDataLength, .big);
     }
 
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
@@ -1571,7 +1557,7 @@ pub const Serializer = struct {
         try self.writeU32(ttl);
 
         var rdlength: u16 = 0;
-        for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
+        for (opt.options) |o| rdlength += 4 + (std.math.cast(u16, o.data.len) orelse return error.InvalidRDataLength);
         try self.writeU16(rdlength);
         for (opt.options) |o| {
             try self.writeU16(o.code);

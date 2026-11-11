@@ -228,7 +228,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
             .dname => try checkName(alloc, rr.dname()),
             .ptr => try checkName(alloc, rr.ptr()),
             .rrsig => try checkName(alloc, rr.rrsig().signer_name),
-            .mx => try checkName(alloc, rr.mx().exchange),
+            .mx => try checkName(alloc, .of(rr.rdata[2..])),
             .soa => {
                 try checkName(alloc, rr.soa().mname);
                 try checkName(alloc, rr.soa().rname);
