@@ -1777,7 +1777,7 @@ pub const Graph = struct {
         const rng = g.edge.rng;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();
-        const msg = try dns.buildQuery(arena, qid, qname, qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchors != null }, .case_rng = if (case == .random) rng else null });
+        const msg = try dns.buildQuery(arena, qid, qname, qtype, g.cfg.trust_anchors != null, if (case == .random) rng else null);
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);

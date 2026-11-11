@@ -131,16 +131,16 @@ pub const Header = struct {
     /// Packed LSB→MSB so a host-order u16 (post `mem.readInt(.big)`) bitcasts
     /// directly to the wire bit layout: QR is the MSB, RCODE the low nibble.
     pub const Flags = packed struct(u16) {
-        rcode: RCode,
-        cd: bool,
-        ad: bool,
-        z: u1,
-        ra: bool,
-        rd: bool,
-        tc: bool,
-        aa: bool,
-        opcode: OpCode,
-        qr: bool,
+        rcode: RCode = .no_error,
+        cd: bool = false,
+        ad: bool = false,
+        z: u1 = 0,
+        ra: bool = false,
+        rd: bool = false,
+        tc: bool = false,
+        aa: bool = false,
+        opcode: OpCode = .query,
+        qr: bool = false,
     };
 
     pub fn parse(bytes: *const [12]u8) Header {
@@ -1029,49 +1029,23 @@ fn applyCase0x20(rng: std.Random, wire: []u8) void {
     }
 }
 
-const EdnsConfig = struct {
-    udp_payload_size: u16 = edns_udp_payload,
-    do_bit: bool = false,
-};
-
-const QueryOptions = struct {
-    rd: bool = true,
-    edns: ?EdnsConfig = null,
-    /// RFC draft Vixie/Dagon "Use of Bit 0x20 in DNS Labels": when non-null,
-    /// randomize ASCII letter case in QNAME using this RNG. Caller verifies
-    /// the response echoes byte-for-byte.
-    case_rng: ?std.Random = null,
-};
-
-/// Borrows `qname`; its spelling is `allocator`'s.
-pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, options: QueryOptions) Allocator.Error!Message {
+/// A question for an authority: RD clear, EDNS on. Borrows `qname`; its
+/// spelling is `allocator`'s, its letter case drawn from `case_rng` if given
+/// (draft-vixie-dnsext-dns0x20), for the caller to match in the reply.
+pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, do_bit: bool, case_rng: ?std.Random) Allocator.Error!Message {
     const spelled = try allocator.dupe(u8, qname.wire);
-    if (options.case_rng) |rng| applyCase0x20(rng, spelled);
+    if (case_rng) |rng| applyCase0x20(rng, spelled);
 
     return .{
-        .header = .{
-            .id = id,
-            .flags = .{
-                .qr = false,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = options.rd,
-                .ra = false,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
+        .header = .{ .id = id, .flags = .{} },
         .question = .{ .name = qname, .qtype = qtype, .qclass = .in, .spelled = spelled },
-        .opt = if (options.edns) |edns| .{
-            .udp_payload_size = edns.udp_payload_size,
+        .opt = .{
+            .udp_payload_size = edns_udp_payload,
             .extended_rcode = 0,
             .version = 0,
-            .do_bit = edns.do_bit,
+            .do_bit = do_bit,
             .options = &.{},
-        } else null,
+        },
     };
 }
 
@@ -1855,15 +1829,15 @@ test "EDNS0: serialized OPT has correct wire format" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
+    const msg = try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, true, null);
 
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, wire[10..12], .big));
-    // After the 11-byte question: root owner, type 41, class 4096, a TTL
+    // After the 11-byte question: root owner, type 41, class 1232, a TTL
     // holding only DO, no rdata.
-    try testing.expectEqualSlices(u8, "\x00\x00\x29\x10\x00\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);
+    try testing.expectEqualSlices(u8, "\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);
 }
 
 test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
@@ -2045,7 +2019,7 @@ test "validateResponse: only the one question sent, at any rcode" {
     const other = "\x05other\x03net\x00";
     const reply = struct {
         fn make(spelled: ?[]const u8, rcode: RCode) Message {
-            const f = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = rcode };
+            const f = Header.Flags{ .qr = true, .rcode = rcode };
             const q: ?Question = if (spelled) |s| .{ .name = .root, .qtype = .a, .qclass = .in, .spelled = s } else null;
             return .{ .header = .{ .id = 0, .flags = f }, .question = q };
         }

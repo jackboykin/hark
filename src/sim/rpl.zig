@@ -53,7 +53,7 @@ pub const DsFrom = struct { owner: dns.Name, zone: dns.Name };
 pub const Entry = struct {
     match: Match = .{},
     /// REPLY flags and rcode; the responder forces QR regardless.
-    flags: dns.Header.Flags = no_flags,
+    flags: dns.Header.Flags = .{},
     /// REPLY DO on a STEP QUERY; no-op on responder entries.
     do_bit: bool = false,
     /// REPLY EDNS: send an OPT without DO.
@@ -134,19 +134,6 @@ pub const Scenario = struct {
     sig_validity: ?u32 = null,
     /// Caps the original TTL the harness's signatures carry; null, none.
     sig_original_ttl: ?u32 = null,
-};
-
-const no_flags: dns.Header.Flags = .{
-    .rcode = .no_error,
-    .cd = false,
-    .ad = false,
-    .z = 0,
-    .ra = false,
-    .rd = false,
-    .tc = false,
-    .aa = false,
-    .opcode = .query,
-    .qr = false,
 };
 
 pub const Diag = struct {

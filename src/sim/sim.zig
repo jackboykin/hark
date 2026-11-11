@@ -142,7 +142,7 @@ pub const Sim = struct {
                 return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
             }
             var msg = query;
-            msg.header.flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = query.header.flags.rd, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .refused };
+            msg.header.flags = .{ .qr = true, .rd = query.header.flags.rd, .rcode = .refused };
             msg.answers = &.{};
             // A signed zone's DNSKEY is answered where it signs; anything
             // else unmatched is REFUSED so a coverage gap surfaces instead
