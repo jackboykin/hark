@@ -226,7 +226,7 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
         .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 168, 0, 1 } } }),
         .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 93, 184, 216, 34 } } }),
     };
-    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const scrub_on = rebinding.Config{ .enabled = true };
 
     // Every allocation fails: the scrub cannot keep the public A without
     // the private one, so nothing is sent rather than both.
@@ -421,7 +421,7 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
         .rcode = .no_error,
         .additionals = &.{.fixture(.{ .name = glue, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 168, 1, 1 } } })},
     };
-    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const scrub_on = rebinding.Config{ .enabled = true };
     for ([_]*const rebinding.Config{ &rebinding.Config.off, &scrub_on }, [_]u16{ 1, 0 }) |rb, kept| {
         var buf: [dns.max_udp_payload]u8 = undefined;
         const wire = buildResponseWire(&buf, .{
@@ -444,7 +444,7 @@ test "buildResponseWire: a local answer bypasses the rebinding scrub; any other 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const scrub_on = rebinding.Config{ .enabled = true };
     const localhost = try dns.parseDottedName(a, "localhost");
     const loopback: dns.ResourceRecord = .fixture(.{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } });
     for ([_]bool{ true, false }) |local| {
@@ -470,7 +470,7 @@ test "buildResponseWire: a rebinding scrub clears AD" {
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
-    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const scrub_on = rebinding.Config{ .enabled = true };
     for ([_][4]u8{ .{ 93, 184, 216, 34 }, .{ 192, 168, 1, 1 } }, [_]bool{ true, false }) |ip, ad| {
         const answers = [_]dns.ResourceRecord{.fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } })};
         var buf: [dns.max_udp_payload]u8 = undefined;

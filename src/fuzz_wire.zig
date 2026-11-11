@@ -185,7 +185,7 @@ fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
     } } });
 }
 
-const scrub_cfg: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+const scrub_cfg: rebinding.Config = .{ .enabled = true };
 
 /// The query reader agrees with the full parse on every message the
 /// latter accepts, but where an OPT outside the additional section

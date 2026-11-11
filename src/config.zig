@@ -97,7 +97,7 @@ pub const ServerConfig = struct {
     tcp_queries_per_conn: u32 = 128,
     /// Empty: the IANA root anchors. Test-only.
     trust_anchors: []const dns.DsData = &.{},
-    rebinding: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} },
+    rebinding: rebinding.Config = .{ .enabled = true },
     /// Owns every slice above.
     arena: std.heap.ArenaAllocator,
 

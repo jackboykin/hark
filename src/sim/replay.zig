@@ -119,7 +119,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     const rb: rebinding.Config = .{
         .enabled = scenario.rebinding_enabled orelse false,
         .allow_zones = try config.parseZoneList(arena, scenario.rebinding_allow_zones),
-        .extra_block = &.{},
         .extra_allow = try config.parseCidrList(arena, scenario.rebinding_extra_allow),
         .nat64 = scenario.dns64_prefix,
     };
