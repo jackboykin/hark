@@ -2,13 +2,13 @@
 //! front-ends enforce, and the rebinding scrub's extra sets.
 const std = @import("std");
 const mem = std.mem;
-const na = @import("net_address.zig");
+const Address = std.Io.net.IpAddress;
 
 pub const Cidr = struct {
-    address: na.Address,
+    address: Address,
     prefix: u8,
 
-    pub fn matches(self: Cidr, addr: na.Address) bool {
+    fn matches(self: Cidr, addr: Address) bool {
         return switch (addr) {
             .ip4 => |v4| self.matchesBytes(&v4.bytes),
             .ip6 => |v6| self.matchesBytes(&v6.bytes),
@@ -26,10 +26,10 @@ pub const Cidr = struct {
 pub fn parse(s: []const u8) ?Cidr {
     const slash = mem.findScalar(u8, s, '/');
     const addr_str = s[0 .. slash orelse s.len];
-    var address: na.Address = if (mem.findScalar(u8, addr_str, ':') != null)
-        na.initIp6((std.Io.net.Ip6Address.parse(addr_str, 0) catch return null).bytes, 0)
+    var address: Address = if (mem.findScalar(u8, addr_str, ':') != null)
+        .{ .ip6 = std.Io.net.Ip6Address.parse(addr_str, 0) catch return null }
     else
-        na.initIp4((std.Io.net.Ip4Address.parse(addr_str, 0) catch return null).bytes, 0);
+        .{ .ip4 = std.Io.net.Ip4Address.parse(addr_str, 0) catch return null };
     const bytes: []u8 = switch (address) {
         .ip4 => |*a| &a.bytes,
         .ip6 => |*a| &a.bytes,
@@ -41,7 +41,7 @@ pub fn parse(s: []const u8) ?Cidr {
     return .{ .address = address, .prefix = prefix };
 }
 
-pub fn allow(entries: []const Cidr, addr: na.Address) bool {
+pub fn allow(entries: []const Cidr, addr: Address) bool {
     for (entries) |e| if (e.matches(addr)) return true;
     return false;
 }
@@ -76,6 +76,14 @@ fn normalizeInPlace(buf: []u8, prefix: u8) void {
 
 const testing = std.testing;
 
+fn ip4(bytes: [4]u8) Address {
+    return .{ .ip4 = .{ .bytes = bytes, .port = 0 } };
+}
+
+fn ip6(bytes: [16]u8) Address {
+    return .{ .ip6 = .{ .bytes = bytes, .port = 0 } };
+}
+
 test "parse v4 with prefix" {
     const c = parse("192.168.1.0/24") orelse return error.ParseFailed;
     try testing.expectEqual(@as(u8, 24), c.prefix);
@@ -106,27 +114,27 @@ test "parse rejects invalid prefix" {
 
 test "matches v4 prefix" {
     const c = parse("192.168.1.0/24") orelse return error.ParseFailed;
-    try testing.expect(c.matches(na.initIp4(.{ 192, 168, 1, 5 }, 0)));
-    try testing.expect(c.matches(na.initIp4(.{ 192, 168, 1, 255 }, 0)));
-    try testing.expect(!c.matches(na.initIp4(.{ 192, 168, 2, 0 }, 0)));
-    try testing.expect(!c.matches(na.initIp4(.{ 10, 0, 0, 1 }, 0)));
+    try testing.expect(c.matches(ip4(.{ 192, 168, 1, 5 })));
+    try testing.expect(c.matches(ip4(.{ 192, 168, 1, 255 })));
+    try testing.expect(!c.matches(ip4(.{ 192, 168, 2, 0 })));
+    try testing.expect(!c.matches(ip4(.{ 10, 0, 0, 1 })));
 }
 
 test "matches /32 single host" {
     const c = parse("127.0.0.1/32") orelse return error.ParseFailed;
-    try testing.expect(c.matches(na.initIp4(.{ 127, 0, 0, 1 }, 0)));
-    try testing.expect(!c.matches(na.initIp4(.{ 127, 0, 0, 2 }, 0)));
+    try testing.expect(c.matches(ip4(.{ 127, 0, 0, 1 })));
+    try testing.expect(!c.matches(ip4(.{ 127, 0, 0, 2 })));
 }
 
 test "matches v6 single host" {
     const c = parse("::1/128") orelse return error.ParseFailed;
-    try testing.expect(c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 0)));
-    try testing.expect(!c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, 0)));
+    try testing.expect(c.matches(ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })));
+    try testing.expect(!c.matches(ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 })));
 }
 
 test "matches family mismatch fails" {
     const v4 = parse("0.0.0.0/0") orelse return error.ParseFailed;
-    try testing.expect(!v4.matches(na.initIp6(@splat(0), 0)));
+    try testing.expect(!v4.matches(ip6(@splat(0))));
 }
 
 test "matchesBytes accepts bare rdata bytes" {
@@ -145,7 +153,7 @@ test "matchesBytes accepts bare rdata bytes" {
 test "allow returns false when no entry matches" {
     const c = parse("127.0.0.0/8") orelse return error.ParseFailed;
     const list = [_]Cidr{c};
-    try testing.expect(!allow(&list, na.initIp4(.{ 8, 8, 8, 8 }, 0)));
-    try testing.expect(allow(&list, na.initIp4(.{ 127, 1, 2, 3 }, 0)));
-    try testing.expect(!allow(&.{}, na.initIp4(.{ 127, 1, 2, 3 }, 0)));
+    try testing.expect(!allow(&list, ip4(.{ 8, 8, 8, 8 })));
+    try testing.expect(allow(&list, ip4(.{ 127, 1, 2, 3 })));
+    try testing.expect(!allow(&.{}, ip4(.{ 127, 1, 2, 3 })));
 }
