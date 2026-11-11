@@ -170,7 +170,7 @@ fn roundTrip(bound: na.Address, lo: na.Address) !void {
     try na.bindTo(server, &bound);
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    try sys.getsockname(server, &sa.any, &sa_len);
+    _ = linux.getsockname(server, &sa.any, &sa_len);
     var at = lo;
     at.setPort(na.fromSockaddr(&sa).getPort());
     sa_len = na.toSockaddr(&at, &sa);
@@ -220,7 +220,7 @@ test "a datagram the kernel refuses is dropped and the rest are sent" {
     try na.bindTo(client, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    try sys.getsockname(client, &sa.any, &sa_len);
+    _ = linux.getsockname(client, &sa.any, &sa_len);
     const to = na.fromSockaddr(&sa);
 
     for ([_]na.Address{ to, na.initIp4(.{ 127, 0, 0, 1 }, 0), to }, "abc") |addr, byte| {

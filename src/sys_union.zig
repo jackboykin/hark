@@ -14,5 +14,4 @@ pub const connect = os.connect;
 pub const close = os.close;
 pub const listen = os.listen;
 pub const sendto = os.sendto;
-pub const getsockname = os.getsockname;
 pub const write = os.write;

@@ -87,16 +87,6 @@ pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.s
     }
 }
 
-pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
-    return switch (linux.errno(linux.getsockname(fd, addr, len))) {
-        .SUCCESS => {},
-        .BADF, .NOTSOCK => unreachable,
-        .FAULT => unreachable,
-        .INVAL => error.AddressNotAvailable,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
 /// Retries EINTR, as `sendto` does.
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     while (true) {

@@ -314,7 +314,7 @@ test "a consumer that stops between events leaves nothing behind" {
     try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    try sys.getsockname(server, &sa.any, &sa_len);
+    _ = linux.getsockname(server, &sa.any, &sa_len);
     _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
 
     var stop: [2]i32 = undefined;
@@ -344,7 +344,7 @@ test "a timer whose event can't be queued stays due" {
     try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
     var sa: na.PosixAddress = undefined;
     var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    try sys.getsockname(server, &sa.any, &sa_len);
+    _ = linux.getsockname(server, &sa.any, &sa_len);
     _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = 0 });
 
     failing.fail_index = failing.alloc_index;
