@@ -166,7 +166,7 @@ pub const Canonical = struct {
     }
 };
 
-pub const SignedData = struct {
+const SignedData = struct {
     header: [18 + dns.max_name_wire_len]u8 = undefined,
     header_len: usize,
     labels: u8 = 0,

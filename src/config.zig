@@ -55,7 +55,7 @@ const loopback_cidrs = [_]acl.Cidr{
     .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0), .prefix = 128 },
 };
 
-pub const EncryptedTransport = enum { off, opportunistic };
+const EncryptedTransport = enum { off, opportunistic };
 
 pub const ServerConfig = struct {
     listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53) },

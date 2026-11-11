@@ -14,7 +14,7 @@ const stub = @import("../stub.zig");
 
 const default_ttl: u32 = 3600;
 
-pub const Match = packed struct {
+const Match = packed struct {
     opcode: bool = false,
     qname: bool = false,
     qtype: bool = false,

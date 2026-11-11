@@ -310,12 +310,12 @@ pub const Name = struct {
     }
 };
 
-pub const MxData = struct {
+const MxData = struct {
     preference: u16,
     exchange: Name,
 };
 
-pub const SoaData = struct {
+const SoaData = struct {
     mname: Name,
     rname: Name,
     serial: u32,
@@ -325,10 +325,10 @@ pub const SoaData = struct {
     minimum: u32,
 };
 
-pub const TxtData = struct {
+const TxtData = struct {
     strings: []const []const u8,
 
-    pub const Strings = struct {
+    const Strings = struct {
         rdata: []const u8,
         at: usize = 0,
 
@@ -725,7 +725,7 @@ pub const ResourceRecord = struct {
     /// an NSEC's next name, kept as signed (RFC 6840 §5.1).
     rdata: []const u8,
 
-    pub const Parts = struct {
+    const Parts = struct {
         name: Name,
         rtype: RType,
         rclass: RClass,

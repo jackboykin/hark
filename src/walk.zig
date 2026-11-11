@@ -57,7 +57,7 @@ pub const Ask = struct {
         std.debug.assert(@sizeOf(Ask) <= 640);
     }
 
-    pub const Result = union(enum) {
+    const Result = union(enum) {
         pending,
         reply: Kept,
         exhausted,
@@ -241,7 +241,7 @@ pub const Links = struct {
     owners: [max_links]dns.Name = undefined,
 
     pub const loop: Failure = .{ .code = .other, .text = "cname loop" };
-    pub const too_long: Failure = .{ .code = .other, .text = "alias chain too long" };
+    const too_long: Failure = .{ .code = .other, .text = "alias chain too long" };
 
     pub const Step = union(enum) { done, next: dns.Name, broken: Failure };
 

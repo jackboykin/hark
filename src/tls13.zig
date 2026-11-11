@@ -18,7 +18,7 @@ const suite: u16 = @backingInt(tls.CipherSuite.AES_128_GCM_SHA256);
 
 const secret_len = Sha256.digest_length;
 pub const Secret = [secret_len]u8;
-pub const Secrets = struct { client: Secret, server: Secret };
+const Secrets = struct { client: Secret, server: Secret };
 
 pub const Error = error{
     BadRecordMac,
@@ -50,7 +50,7 @@ pub fn alert(err: Error) tls.Alert.Description {
     };
 }
 
-pub const Offer = struct {
+const Offer = struct {
     alpn: ?[]const u8,
     answerable: []const tls.ExtensionType = &.{},
     quic: ?[]const u8 = null,
@@ -77,7 +77,7 @@ pub const Step = union(enum) {
     handshake: Secrets,
     done: Done,
 
-    pub const Done = struct {
+    const Done = struct {
         application: Secrets,
         buf: [empty_certificate.len + finished_len]u8,
         len: u8,
@@ -533,7 +533,7 @@ pub const Keys = struct {
     }
 };
 
-pub const Opened = struct { kind: tls.ContentType, data: []u8 };
+const Opened = struct { kind: tls.ContentType, data: []u8 };
 
 pub fn recordLen(bytes: []const u8) Error!?usize {
     if (bytes.len < header_len) return null;

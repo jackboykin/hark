@@ -18,7 +18,7 @@ const RR = dns.ResourceRecord;
 
 /// `absent`, for `ds` and `dnskey` only: the parent's signed denial shows no
 /// delegation, so the name is no zone. Bogus is not a value: it fails.
-pub const Proof = enum(u8) { secure, insecure, absent };
+const Proof = enum(u8) { secure, insecure, absent };
 
 pub const Chain = struct {
     status: Proof,

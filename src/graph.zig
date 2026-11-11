@@ -167,7 +167,7 @@ pub const Key = struct {
         return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
     }
 
-    pub const Context = struct {
+    const Context = struct {
         pub fn hash(_: Context, k: Key) u32 {
             return @truncate(k.hash());
         }
@@ -177,7 +177,7 @@ pub const Key = struct {
     };
 };
 
-pub const Asked = struct {
+const Asked = struct {
     key: Key,
     as_of: i64,
 
@@ -253,7 +253,7 @@ pub const Answer = struct {
     };
 };
 
-pub const Outcome = union(enum) {
+const Outcome = union(enum) {
     reply: struct { msg: dns.Message, rtt_ns: i64, stream: bool },
     timeout,
     unsent,
@@ -298,7 +298,7 @@ pub const Value = union(Kind) {
     }
 };
 
-pub const Work = struct {
+const Work = struct {
     child: Allocator,
     bytes: usize = 0,
 
@@ -1194,7 +1194,7 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    pub const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?trust.Chain };
+    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?trust.Chain };
 
     /// The blobs are the store's; the caller refs what it keeps.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: Age) !?[]const Recalled {
@@ -1225,7 +1225,7 @@ pub const Graph = struct {
         }
     }
 
-    pub const Age = enum { fresh, any };
+    const Age = enum { fresh, any };
 
     pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?*store.Blob {
         const own = @call(.always_inline, Key.of, .{ kind, name, qtype });

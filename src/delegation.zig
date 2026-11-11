@@ -7,7 +7,7 @@ const na = @import("net_address.zig");
 pub const max_servers_per_level = 26;
 pub const max_minimize_count = 10;
 
-pub const ProbeStep = union(enum) {
+const ProbeStep = union(enum) {
     referral: Referral,
     nxdomain,
     nodata,

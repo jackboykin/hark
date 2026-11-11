@@ -10,7 +10,7 @@ const rrsig = @import("rrsig.zig");
 
 const Sha1 = std.crypto.hash.Sha1;
 
-pub const SecurityStatus = enum {
+const SecurityStatus = enum {
     /// Proves nothing: incomplete, or spoken from the wrong side of a cut.
     unchecked,
     secure,
@@ -34,7 +34,7 @@ pub fn deepestApex(name: dns.Name, rtype: dns.RType) dns.Name {
     return if (rtype == .ds) name.parent() orelse name else name;
 }
 
-pub const Delegation = enum {
+const Delegation = enum {
     unsigned,
     unproven,
     bogus,
@@ -511,7 +511,7 @@ pub fn proveNoCloserMatch(
     };
 }
 
-pub const NoCloserMatch = union(enum) {
+const NoCloserMatch = union(enum) {
     nsec: dns.Name,
     nsec3: [Sha1.digest_length]u8,
     verdict: SecurityStatus,
