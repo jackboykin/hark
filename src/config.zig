@@ -284,15 +284,13 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
         }
         if (resolver.get("stub-zones", .string_array)) |entries| cfg.stub_zones = try parseStubZones(arena, entries);
         // Test-only knobs: a production binary refuses the key.
-        if (resolver.get("upstream-port", .integer)) |p| {
+        if (try integer(u16, resolver, "upstream-port", 1, 65535)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
-            if (p < 1 or p > 65535) return error.InvalidValue;
-            cfg.upstream_port = @intCast(p);
+            cfg.upstream_port = p;
         }
-        if (resolver.get("dot-port", .integer)) |p| {
+        if (try integer(u16, resolver, "dot-port", 1, 65535)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
-            if (p < 1 or p > 65535) return error.InvalidValue;
-            cfg.dot_port = @intCast(p);
+            cfg.dot_port = p;
         }
         if (resolver.get("allow-loopback-upstreams", .boolean)) |b| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
