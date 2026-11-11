@@ -85,8 +85,6 @@ fn genRR(s: *Smith, w: *Wire) void {
     if (rdlen_at + 2 <= w.len) std.mem.writeInt(u16, w.buf[rdlen_at..][0..2], declared, .big);
 }
 
-/// Field by field, where coverage guidance can steer: random bytes die in
-/// the first parseName.
 fn genMessage(s: *Smith, w: *Wire) []const u8 {
     w.len = 0;
     w.u16be(s.value(u16));
@@ -103,7 +101,6 @@ fn genMessage(s: *Smith, w: *Wire) []const u8 {
     return w.buf[0..w.len];
 }
 
-/// Injectivity: a name that survives the printer must reparse to itself.
 fn checkName(alloc: std.mem.Allocator, name: dns.Name) !void {
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     if (dns.parseDottedName(alloc, name.formatInto(&buf))) |rt| {
@@ -161,8 +158,6 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
     for (again, out) |x, y| if (x.rtype != y.rtype or x.ttl != y.ttl or !x.name.eql(y.name)) return error.NotFixedPoint;
 }
 
-/// Drawn from small pools so sets, rollovers and the cap come up; wire
-/// messages are too few and too random to reach them.
 fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
     const owners = [_]dns.Name{ .lit("example"), .lit("a.example"), .lit("b.example") };
     const signers = [_]dns.Name{ .lit("a.example"), .lit("example"), .lit("other"), .root };
@@ -187,9 +182,6 @@ fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
 
 const scrub_cfg: rebinding.Config = .{ .enabled = true };
 
-/// The query reader agrees with the full parse on every message the
-/// latter accepts, but where an OPT outside the additional section
-/// makes a second (RFC 6891 §6.1.1).
 fn checkQuery(alloc: std.mem.Allocator, input: []const u8, msg: dns.Message) !void {
     var opts: usize = @intFromBool(msg.opt != null);
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities }) |sec| for (sec) |rr| {
@@ -295,8 +287,8 @@ test "fuzz: wire message chain" {
     }.one, .{});
 }
 
-// Global so state accumulates across inputs; the small cap keeps eviction
-// and admission hot.
+// Global on purpose: state builds up across inputs, and the small cap keeps
+// eviction and admission busy.
 var shared_store: ?store.Store = null;
 
 test "fuzz: store round trip" {
@@ -338,7 +330,6 @@ test "fuzz: config" {
     }.one, .{ .corpus = &.{&config_seed} });
 }
 
-// Smith's slice encoding: little-endian u32 length, then the bytes.
 const config_seed = std.mem.toBytes(@as(u32, config_toml.len)) ++ config_toml.*;
 const config_toml =
     \\[server]

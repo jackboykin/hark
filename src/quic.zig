@@ -21,36 +21,28 @@ const initial_salt = hex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
 const retry_key = hex("be0c690b9f66575a1d766b54e368c84e");
 const retry_nonce = hex("461599d35d632bf2239825bb");
 
-/// The floor every path carries (RFC 9000 §14), so no path MTU is discovered.
 pub const max_datagram = 1200;
-/// Hark's max_udp_payload_size: what IPv4 over Ethernet carries in one
-/// datagram. A server may send no larger (RFC 9000 §18.2).
 pub const max_received = 1472;
 const alpn = "doq";
 
-// RFC 9001 §6.6: AES-GCM's limits.
 const packets_per_key = 1 << 23;
 const forgeries_allowed = 1 << 52;
 
-/// One length-prefixed message (RFC 9250 §4.2).
 const stream_window = 2 + 65535;
 const connection_window = 4 * stream_window;
 const idle_ms: u64 = 30_000;
 
-// RFC 9002 §6, §7, Appendix A.2 and B.1.
 const packet_threshold = 3;
 const granularity_ns: i64 = std.time.ns_per_ms;
 const initial_rtt_ns: i64 = 333 * std.time.ns_per_ms;
 const initial_window: u64 = 10 * max_datagram;
 const minimum_window: u64 = 2 * max_datagram;
 const persistent_threshold = 3;
-/// RFC 9002 §7.7: no flush sends more than the initial window.
 pub const burst = initial_window / max_datagram;
 
 const ack_delay_exponent = 3;
 const max_ack_delay_ns: i64 = 25 * std.time.ns_per_ms;
 
-// RFC 9250 §4.3.
 const doq_no_error: u64 = 0x0;
 const doq_protocol_error: u64 = 0x2;
 const doq_request_cancelled: u64 = 0x3;
@@ -168,7 +160,7 @@ const Keys = struct {
         };
     }
 
-    /// RFC 9001 §6.1: header protection never turns.
+    /// RFC 9001 §6.1: a key update never changes the header protection key.
     fn updated(k: *const Keys) Keys {
         const next = tls.hkdfExpandLabel(Hkdf, k.secret, "quic ku", "", Hkdf.prk_length);
         var u = Keys.of(&next);
@@ -228,7 +220,6 @@ fn initialKeys(dcid: []const u8) struct { client: Keys, server: Keys } {
     };
 }
 
-/// RFC 9001 §5.8.
 fn retryValid(retry: []const u8, odcid: []const u8) bool {
     if (retry.len < Aead.tag_length) return false;
     var pseudo: [1 + 20 + 1500]u8 = undefined;
@@ -242,7 +233,6 @@ fn retryValid(retry: []const u8, odcid: []const u8) bool {
     return crypto.timing_safe.eql([Aead.tag_length]u8, tag, retry[retry.len - Aead.tag_length ..][0..Aead.tag_length].*);
 }
 
-/// RFC 9000 §A.3.
 fn decodePn(largest: ?u64, truncated: u64, len: usize) u64 {
     const expected = if (largest) |l| l + 1 else 0;
     const win: u64 = @as(u64, 1) << @intCast(8 * len);
@@ -253,7 +243,6 @@ fn decodePn(largest: ?u64, truncated: u64, len: usize) u64 {
     return candidate;
 }
 
-/// RFC 9000 §A.2.
 fn pnLen(pn: u64, largest_acked: ?u64) usize {
     const unacked = if (largest_acked) |l| pn - l else pn + 1;
     if (unacked <= 1 << 7) return 1;
@@ -283,8 +272,6 @@ const Param = enum(u64) {
     _,
 };
 
-/// No stream the server may open, and an empty source connection id: a
-/// connected socket says whose a datagram is (RFC 9000 §5.1).
 fn ourParams(out: *[tls13.max_quic_params]u8) []const u8 {
     var w: Writer = .{ .buf = out };
     inline for (.{
@@ -366,7 +353,6 @@ const Params = struct {
                 .active_connection_id_limit => {
                     if (try number(&v) < 2) return error.TransportParameterError;
                 },
-                // Hark never migrates, but this id is the server's second (RFC 9000 §5.1.1).
                 .preferred_address => {
                     if (value.len < 41) return error.TransportParameterError;
                     const len = value[40];
@@ -392,8 +378,6 @@ const Params = struct {
     }
 };
 
-/// Disjoint ranges, highest first, at most `cap`: past that the lowest
-/// falls under `floor`, at or below which everything counts as known.
 fn Ranges(comptime cap: usize) type {
     return struct {
         lo: [cap]u64 = undefined,
@@ -476,8 +460,6 @@ const Sent = struct {
     bytes: u16,
     ack_eliciting: bool,
     in_flight: bool,
-    /// Sent with half the window or more in flight, so its ACK may grow the
-    /// window (RFC 9002 §7.8).
     limited: bool,
     streams: ?Span = null,
     state: enum { flying, acked, lost } = .flying,
@@ -551,8 +533,6 @@ const CryptoOut = struct {
     }
 };
 
-/// TLS takes the server's bytes in order; what comes early waits
-/// (RFC 9000 §7.5 asks for 4096 bytes at least).
 const CryptoIn = struct {
     at: u64 = 0,
     window: ?*Window = null,
@@ -569,7 +549,6 @@ pub const End = enum { failed, closed };
 
 pub const Event = union(enum) {
     established,
-    /// Borrowed until the next `input`.
     reply: struct { id: u64, bytes: []u8 },
     refused: u64,
     room,
@@ -578,7 +557,6 @@ pub const Event = union(enum) {
 
 const Stream = struct {
     n: u64,
-    /// The cell's, until the reply or a cancel ends the stream.
     wire: []const u8,
     send: Owed = .due,
     went: bool = false,
@@ -595,8 +573,8 @@ const Stream = struct {
         return 4 * s.n;
     }
 
-    /// Length-prefixed with message id 0 (RFC 9250 §4.2.1), and an empty
-    /// Padding option asking for a padded reply (RFC 7830 §4).
+    /// The 2 is the length prefix; the 4 is an empty Padding option, which
+    /// asks for a padded reply (RFC 7830 §4).
     fn dataLen(s: *const Stream) usize {
         return 2 + s.wire.len + 4;
     }
@@ -771,7 +749,7 @@ pub const Conn = struct {
 
     pub const Taken = union(enum) { id: u64, later };
 
-    /// `wire` must outlive the stream: until its reply or its cancel.
+    /// `wire` is borrowed: it must outlive the stream, until its reply or cancel.
     pub fn query(c: *Conn, wire: []const u8) !Taken {
         if (c.next_n >= c.peer.max_streams) {
             if (!c.blocked) {
@@ -804,7 +782,6 @@ pub const Conn = struct {
     }
 
     fn abandonSend(c: *Conn, st: *Stream) void {
-        // Unless the server has all of it, the reset lets it close the stream.
         if (!(st.went and st.send == .none)) st.reset = .due;
         if (st.send == .due) c.owe_sends -= 1;
         st.send = .none;
@@ -878,9 +855,8 @@ pub const Conn = struct {
         try c.fail(err, @errorName(err));
     }
 
-    /// Reply bytes may point into `datagram`, which must live until the
-    /// events are taken. Assembled replies' buffers go on `delivered`, for
-    /// the caller to free after them.
+    /// Reply bytes may point into `datagram`, which must live until the events
+    /// are taken; the caller then frees what was put on `delivered`.
     pub fn input(c: *Conn, datagram: []u8, now: i64, delivered: *std.ArrayList([]u8)) !void {
         if (c.ended != null) return;
         var rest = datagram;
@@ -894,7 +870,6 @@ pub const Conn = struct {
             rest = rest[used..];
         }
         if (!any) {
-            // RFC 9000 §10.3: a stateless reset.
             if (datagram.len >= 21) for (c.cids) |o| if (o) |id| if (id.token) |t| {
                 if (crypto.timing_safe.eql([16]u8, t, datagram[datagram.len - 16 ..][0..16].*)) return c.end(.closed, "stateless reset");
             };
@@ -908,7 +883,6 @@ pub const Conn = struct {
         const first = rest[0];
         if (first & 0x80 == 0) {
             if (first & 0x40 == 0) return null;
-            // Hark's connection id is empty.
             const s = c.space(.application);
             if (s.rx == null or rest.len < 1 + 20) return null;
             try c.protected(.application, rest, 1, now, delivered, any);
@@ -921,7 +895,6 @@ pub const Conn = struct {
         const scid_len = r.byte() catch return null;
         if (dcid.len > 20 or scid_len > 20) return null;
         const scid = r.bytes(scid_len) catch return null;
-        // A Version Negotiation packet's other bits are anyone's.
         if (v == 0) {
             try c.versionNegotiation(r.rest);
             return null;
@@ -943,7 +916,6 @@ pub const Conn = struct {
         if (c.server_scid) |known| {
             if (!known.eql(scid)) return size;
         } else if (level == .initial) {
-            // RFC 9000 §7.2: the server's first Initial names where packets go.
             c.server_scid = .of(scid);
             c.dcid = .of(scid);
             c.cids[0] = .{ .seq = 0, .cid = .of(scid), .token = null };
@@ -973,7 +945,6 @@ pub const Conn = struct {
         const s = c.space(.initial);
         s.tx = keys.client;
         s.rx = keys.server;
-        // RFC 9000 §17.2.5.3: the same hello again.
         s.out.set(c.hello);
         c.forget(.initial);
         c.heard = true;
@@ -1008,7 +979,6 @@ pub const Conn = struct {
         c.heard = true;
         if (h.first & @as(u8, if (level == .application) 0x18 else 0x0c) != 0) return error.ProtocolViolation;
         if (update) {
-            // RFC 9001 §6.2: hark's keys turn with the server's.
             c.prev_rx = s.rx;
             c.prev_until_ns = now + 3 * c.pto(.application);
             s.rx = keys;
@@ -1069,7 +1039,7 @@ pub const Conn = struct {
                 try c.emit(.{ .refused = id });
                 c.abandonSend(st);
             },
-            // RFC 9250 §4.3.3: a STOP_SENDING to the client is a protocol error.
+            // RFC 9250 §4.3.3: STOP_SENDING toward the client is a protocol error.
             0x05 => {
                 _ = try r.varint();
                 _ = try r.varint();
@@ -1117,16 +1087,14 @@ pub const Conn = struct {
             },
             0x16, 0x17 => if (try r.varint() > 1 << 60) return error.FrameEncodingError,
             0x18 => try c.newCid(r),
-            // Hark gave the server no connection id to retire (RFC 9000 §19.16).
             0x19 => return error.ProtocolViolation,
             0x1a => c.path_response = (try r.bytes(8))[0..8].*,
-            // Hark sends no PATH_CHALLENGE.
             0x1b => return error.ProtocolViolation,
             0x1c, 0x1d => {
                 const code = try r.varint();
                 if (kind == 0x1c) _ = try r.varint();
                 _ = try r.bytes(try r.varint());
-                // No error, or busy: nothing against hark's questions.
+                // No error, or DOQ_EXCESSIVE_LOAD: neither counts against the server.
                 const quiet = code == 0 or (kind == 0x1d and code == 0x4);
                 return c.end(if (quiet) .closed else .failed, if (quiet) "connection close" else "connection close with error");
             },
@@ -1183,14 +1151,14 @@ pub const Conn = struct {
         try c.deliver(st, whole);
     }
 
-    /// RFC 9250 §4.2, §4.3.3.
+    /// RFC 9250 §4.3.3: a nonzero message id or a TCP keepalive option is a
+    /// fatal error.
     fn deliver(c: *Conn, st: *Stream, data: []u8) Error!void {
         if (data.len < 2 + 12 or mem.readInt(u16, data[0..2], .big) != data.len - 2) return error.DoqProtocolError;
         const msg = data[2..];
         if (mem.readInt(u16, msg[0..2], .big) != 0) return error.DoqProtocolError;
         if (dns.hasOption(msg, dns.edns_opt_tcp_keepalive) catch false) return error.DoqProtocolError;
         st.done = true;
-        // It answered, so the server has the whole query.
         if (st.send == .due) c.owe_sends -= 1;
         st.send = .none;
         try c.emit(.{ .reply = .{ .id = st.id(), .bytes = msg } });
@@ -1237,7 +1205,6 @@ pub const Conn = struct {
             .handshake => .handshake,
             .established, .confirmed => .application,
         };
-        // RFC 9001 §4.1.3: each message at its own level.
         if (level != expected) return error.ProtocolViolation;
         if (level == .application) return c.postHandshake(bytes);
         const h = c.hs.?;
@@ -1264,7 +1231,7 @@ pub const Conn = struct {
         }
     }
 
-    /// RFC 9001 §6: tickets pass; anything else, a KeyUpdate first, is unexpected.
+    /// RFC 9001 §6: a TLS KeyUpdate message is an error in QUIC.
     fn postHandshake(c: *Conn, bytes: []const u8) Error!void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -1276,7 +1243,6 @@ pub const Conn = struct {
         }
     }
 
-    /// RFC 9000 §7.3.
     fn adopt(c: *Conn, p: Params) Error!void {
         if (!p.original_dcid.?.eql(c.odcid.slice())) return error.TransportParameterError;
         if (!p.initial_scid.?.eql(c.server_scid.?.slice())) return error.TransportParameterError;
@@ -1333,7 +1299,6 @@ pub const Conn = struct {
         if (first > largest) return error.FrameEncodingError;
         var hi = largest;
         var lo = largest - first;
-        // Ranges come highest first, as the ring walks from its newest.
         var i: usize = s.sent_len;
         var newest_acked: ?*Sent = null;
         var any_eliciting = false;
@@ -1538,7 +1503,6 @@ pub const Conn = struct {
         var flying = false;
         for (c.spaces) |s| flying = flying or s.eliciting();
         if (!flying) {
-            // RFC 9002 §6.2.2.1: the server's amplification limit must not stall the handshake.
             if (c.handshake_acked or c.phase == .confirmed) return null;
             const level: Level = if (c.spaces[@backingInt(Level.handshake)].tx != null) .handshake else .initial;
             return .{ .at = now + c.pto(.initial) * backoff, .level = level };
@@ -1567,7 +1531,6 @@ pub const Conn = struct {
     }
 
     fn idleAt(c: *const Conn) i64 {
-        // RFC 9000 §10.1: never under three probe timeouts.
         return c.idle_from_ns + @max(c.idle_ns, 3 * c.pto(.application));
     }
 
@@ -1624,9 +1587,9 @@ pub const Conn = struct {
             nplans += 1;
         }
         if (nplans == 0) return null;
-        // RFC 9000 §14.1 and RFC 9250 §5.4: a datagram with an Initial or a
-        // question takes all 1200 bytes.
         const last = &plans[nplans - 1];
+        // RFC 9000 §14.1 and RFC 9250 §5.4: a datagram with an Initial or a
+        // question is padded to the full 1200 bytes.
         var pad = if (initial or stream_carried) max_datagram - used else 0;
         if (last.pn_len + last.len + pad < 4) pad = 4 - last.pn_len - last.len;
         @memset(last.body[last.len..][0..pad], 0);
@@ -1669,7 +1632,6 @@ pub const Conn = struct {
             p.acks = true;
         }
         const wanted = s.ackWanted(l, now);
-        // Congestion control holds back what asks for an ACK, except probes.
         const room = s.sent_len < s.sent.len and (s.probes > 0 or c.in_flight + max_datagram <= c.cwnd);
         if (room) {
             for (s.out.all(), 0..) |*ch, i| {
@@ -1755,7 +1717,6 @@ pub const Conn = struct {
                 if (st.send != .due) continue;
                 const n = st.dataLen();
                 if (st.frameLen() > w.room()) continue;
-                // A query goes whole or waits for credit.
                 const fresh = if (st.went) 0 else n;
                 if (n > st.credit or c.tx_data + fresh > c.peer.max_data) {
                     if (c.tx_data + fresh > c.peer.max_data and c.data_blocked == .none) c.data_blocked = .due;
@@ -1833,8 +1794,8 @@ pub const Conn = struct {
         keys.seal(out[0..w.at], head, p.pn_len, p.pn);
         s.next_pn += 1;
         if (p.level == .application) c.sealed += 1;
-        // A padded ACK with no room in the ring goes unremembered: it carries
-        // nothing owed.
+        // With no room in the ring only a padded ACK reaches here (`fill` holds
+        // the rest back); it goes unremembered, as it carries nothing owed.
         if ((p.eliciting or p.in_flight) and s.sent_len < s.sent.len) {
             s.sentAt(s.sent_len).* = .{
                 .pn = p.pn,
@@ -1856,7 +1817,6 @@ pub const Conn = struct {
                 }
             }
         }
-        // RFC 9001 §4.9.1: Initial keys go with the first Handshake packet.
         if (p.level == .handshake) c.discard(.initial);
         return w.at;
     }
@@ -1874,7 +1834,6 @@ pub const Conn = struct {
             var p: Plan = .{ .level = l, .pn = s.next_pn, .pn_len = pnLen(s.next_pn, s.largest_acked), .head = c.headLen(l, s) };
             if (at + p.head + 16 + 32 > max_datagram) break;
             var w: Writer = .{ .buf = &p.body };
-            // RFC 9000 §10.2.3: an application close before 1-RTT is a transport one.
             if (why.app and l == .application) {
                 w.byte(0x1d);
                 w.varint(why.code);
@@ -1898,8 +1857,6 @@ pub const Conn = struct {
 
     pub fn spent(c: *const Conn, now: i64) bool {
         if (c.sealed >= packets_per_key) return true;
-        // RFC 9250 §4.4: a question that might cross the idle close goes on a
-        // new connection.
         return c.established() and now + c.pto(.application) >= c.idleAt();
     }
 };

@@ -17,8 +17,6 @@ pub const Zone = struct {
     servers: []const na.Address,
 };
 
-/// The deepest stub zone at or above `name`. None claims a name whose
-/// answer its RFC fixes.
 pub fn under(zones: []const Zone, name: dns.Name) ?*const Zone {
     var deepest: ?*const Zone = null;
     for (zones) |*z| {
@@ -28,8 +26,7 @@ pub fn under(zones: []const Zone, name: dns.Name) ?*const Zone {
     return if (deepest != null and special_use.fixed(name)) null else deepest;
 }
 
-/// The stub zone a question belongs to: its name's, but for DS, which
-/// is its parent's data (RFC 4035 §2.4), the parent's.
+/// A DS is its parent's data (RFC 4035 §2.4), so it belongs to the parent's stub zone.
 pub fn of(zones: []const Zone, name: dns.Name, qtype: dns.RType) ?*const Zone {
     return under(zones, if (qtype == .ds) name.parent() orelse name else name);
 }
@@ -38,11 +35,8 @@ pub const Scratch = struct {
     ask: ?walk.Ask = null,
 };
 
-/// A told server's referral: the zone is what its servers answer.
 const referred: Failure = .{ .code = .no_reachable_authority, .text = "stub server referred" };
 
-/// `stub(name, type)`: asked of the zone's servers alone, their reply
-/// judged as any authority's and settled as given, never validated.
 pub fn run(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
@@ -57,7 +51,6 @@ pub fn run(g: *Graph, id: CellId) !void {
             return switch (kept.verdict) {
                 .reply => |r| g.settle(id, .{ .stub = r }, walk.replyExpiry(r)),
                 .loop => g.failRemembered(id, walk.Links.loop),
-                // No useful response (RFC 9520 §2).
                 .none => g.failRemembered(id, walk.ended(g, a)),
             };
         },

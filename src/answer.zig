@@ -24,8 +24,6 @@ pub const Client = struct {
     }
 };
 
-/// RFC 6147 at the client's edge, off under CD (§5.5); the cells stay
-/// what the authorities said.
 const Dns64 = struct {
     prefix: dns64.Prefix,
 
@@ -33,7 +31,6 @@ const Dns64 = struct {
         return if (prefix) |p| if (c.cd) null else .{ .prefix = p } else null;
     }
 
-    /// A PTR under the prefix becomes the embedded IPv4's in-addr.arpa PTR (§5.3.1).
     pub fn asked(d: Dns64, arena: Allocator, q: dns.Question) !dns.Question {
         if (q.qtype != .ptr) return q;
         const v6 = dns64.parseIp6Arpa(q.name) orelse return q;
@@ -43,12 +40,10 @@ const Dns64 = struct {
         return .{ .name = try dns.parseDottedName(arena, in_addr), .qtype = .ptr, .qclass = q.qclass };
     }
 
-    /// §5.1.2: an AAAA that came back empty wants the A too.
     pub fn wantsA(q: dns.Question, served: Served) bool {
         return q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers);
     }
 
-    /// PTRs re-owned under the client's name; AAAA embedded from `a` (§5.1.6).
     pub fn shape(d: Dns64, arena: Allocator, q: dns.Question, served: Served, a: ?Served) !Served {
         var out = served;
         if (q.qtype == .ptr and !served.question.name.eql(q.name)) {
@@ -75,24 +70,21 @@ const Dns64 = struct {
     }
 };
 
-/// A reply as it goes out: its records as wire with the TTLs they are
-/// sent with, aliasing the blobs in `held` until `release`.
+/// A reply as it goes out. Its records alias the blobs in `held`, which stay
+/// referenced until `release`.
 pub const Served = struct {
     rcode: dns.RCode,
-    /// Already what the client asked for (RFC 6840 §5.7).
     ad: bool = false,
-    /// What the graph was asked; DNS64 may have asked another name.
+    /// What the graph was asked: DNS64 may have asked another name.
     question: dns.Question,
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
     additionals: []const dns.ResourceRecord = &.{},
-    /// A fact past this instant (TTL 0 is served but never memoised).
     cacheable: bool,
     ede: ?dns.Ede = null,
-    /// Served stale: hold the question stale until then (`Failures`).
     hold_until_ns: i64 = 0,
-    /// A failure of this host's or of the asker's limits, not the DNS's:
-    /// never noted (`Failures`).
+    /// A failure of this host's or the asker's limits, not of the question's
+    /// zone: `Failures` never notes it.
     theirs: bool = false,
     local: bool = false,
     aa: bool = false,
@@ -113,7 +105,6 @@ fn synthesized(q: dns.Question, s: special_use.Synthesized) Served {
 
 fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
     const served = synthesized(q, try special_use.synthesize(arena, q, o));
-    // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
         var qa = q;
         qa.qtype = .a;
@@ -125,38 +116,26 @@ fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64)
     return served;
 }
 
-/// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
 fn hinfo(arena: Allocator, q: dns.Question) !Served {
     const rr: dns.ResourceRecord = try .init(arena, .{ .name = q.name, .rtype = .hinfo, .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } });
     return .{ .rcode = .no_error, .question = q, .answers = try arena.dupe(dns.ResourceRecord, &.{rr}), .cacheable = false };
 }
 
-/// SERVFAIL, and why.
 pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
     return .{ .rcode = .server_failure, .question = q, .cacheable = false, .ede = ede };
 }
 
-/// A cell's failure, as SERVFAIL.
 fn servfailOf(q: dns.Question, why: graph.Failure) Served {
     var s = servfail(q, .{ .code = why.code, .text = why.text });
     s.theirs = why.cause != .zone;
     return s;
 }
 
-/// Serve's policy over what the store still holds past a fact's TTL; the
-/// graph knows nothing of it.
 const Retention = struct {
-    /// Answer from memory, asking nobody, until a reply is this old.
     min_ttl: u32 = 0,
-    /// RFC 8767: serve an answer this long past its retention when it
-    /// cannot be refreshed; 0: never.
     serve_stale_ttl: u32 = 0,
 };
 
-/// The client path, in the one order serve and the replay both take:
-/// RFC 6761, RFC 8482, RRSIG, a fact still live, the failure cache, then
-/// memory past its floor or the graph, which each drives its own way;
-/// past the client's patience, stale.
 pub const Desk = struct {
     g: *graph.Graph,
     retention: Retention,
@@ -167,8 +146,8 @@ pub const Desk = struct {
         d.failures.deinit(d.g.gpa);
     }
 
-    /// `recalled` and `floored` come noted; `replayed` and `held` never are,
-    /// or a hold would extend itself.
+    /// `recalled` and `floored` come already noted in `Failures`. `replayed` and
+    /// `held` must never be, or a hold would extend itself.
     const Early = union(enum) {
         synthesized: Served,
         replayed: Served,
@@ -179,24 +158,21 @@ pub const Desk = struct {
     };
 
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
-        // A stub zone the operator named overrides what hark answers only by
-        // default: home.arpa's and service.arpa's empty zones (RFC 6303 §3),
-        // and test (RFC 6761 §6.2).
+        // A stub zone the operator named wins over hark's own answers, which are
+        // defaults (RFC 6303 §3, RFC 6761 §6.2).
         if (stub.of(d.g.cfg.stub_zones, q.name, q.qtype) == null) if (special_use.classify(q.name, q.qtype, c.do_bit)) |o|
             return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
-        // RRSIGs are never signed (RFC 4035 §2.2): an answer of them can't
-        // be validated, and SERVFAIL would read as bogus. Validating, the
-        // question is a kind not supported (RFC 1035 §4.1.1); under CD, and
-        // unvalidated, the RRSIGs are data.
+        // RRSIGs are never signed (RFC 4035 §2.2), so an answer of them cannot be
+        // validated, and SERVFAIL would read as bogus: NOTIMP instead. Under CD or
+        // without validation they are plain data.
         if (q.qtype == .rrsig and d.g.cfg.trust_anchors != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
         if (try d.hold(q, c)) |held| {
-            // Held, the graph is closed: memory serves the last tenth too.
             if (try d.memory(arena, q, c, .live)) |s| return .{ .recalled = try d.derived(q, c, s) };
             switch (held) {
-                // A hold with nothing left to serve asks afresh.
+                // A stale hold with nothing left to serve falls through and asks afresh.
                 .stale => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
                 .failed => |ede| return .{ .held = servfail(q, ede) },
             }
@@ -211,7 +187,6 @@ pub const Desk = struct {
         return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else held;
     }
 
-    /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.
     pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: How) !?Served {
         const aq = try d.asked(arena, q, c);
         const x = Dns64.on(d.dns64, c) orelse return recall(d, arena, aq, c, how);
@@ -264,7 +239,6 @@ pub const Desk = struct {
         return build(d, arena, root, try d.asked(arena, q, c), c);
     }
 
-    /// Under DNS64, the A to ask for behind `served`, an empty AAAA (§5.1.2).
     pub fn wantsA(d: *Desk, q: dns.Question, c: Client, served: Served) ?dns.Question {
         return if (Dns64.on(d.dns64, c) != null and Dns64.wantsA(q, served)) aOf(q) else null;
     }
@@ -279,36 +253,24 @@ pub const Desk = struct {
         return try x.shape(arena, q, served, from);
     }
 
-    /// Every reply the resolver derived, noted: a failure opens or widens
-    /// its window, stale holds it, an answer forgets it.
     pub fn derived(d: *Desk, q: dns.Question, c: Client, served: Served) !Served {
         try d.failures.note(d.g.gpa, q, c.cd, served, d.g.cfg.servfail_ttl, d.g.now());
         return served;
     }
 };
 
-/// BIND's stale-refresh-time (RFC 8767 §5): after serving stale, how long
-/// the question is answered stale without asking.
 const stale_hold_s = 30;
-/// RFC 8767 §5: a resolution past a stub's patience answers stale instead.
 pub const stale_client_ms = 1800;
-/// RFC 8767 §5: "a common timeout value of 2 seconds". Past it a UDP
-/// client has given up, or never asked (DNSBomb).
 pub const client_timeout_ms = 2000;
 
 const Hop = struct {
     blob: *store.Blob,
     rrset: store.Rrset,
-    /// Record TTLs are raised to this (`min-ttl`), before aging.
     floor: u32,
-    /// Where a verified hop's proof ends; records live no longer.
     life: u32 = std.math.maxInt(u32),
-    /// Past its retention, served under RFC 8767.
     stale: bool = false,
 };
 
-/// When `min-ttl` lets a reply go: its TTL floored, under the negative cap
-/// and its signatures' validity. TTL 0 is never floored.
 fn retainedUntil(d: *const Desk, r: store.Rrset) i64 {
     const g = d.g;
     const ret = d.retention;
@@ -333,21 +295,14 @@ fn hopOf(d: *const Desk, b: *store.Blob, r: store.Rrset) Hop {
     return .{ .blob = b, .rrset = r, .floor = floor };
 }
 
-/// The answer cell shaped for a client: a failure or bogus is SERVFAIL
-/// unless serve-stale has something, bogus data only to CD; a verified
-/// hop's TTLs end with its proof, signatures only to DO, AD only when asked
-/// (RFC 6840 §5.7).
 fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
     const g = d.g;
     if (failureOf(g, root, c.cd)) |why| return try stale(d, arena, q, c) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
     std.debug.assert(a.hops.len > 0);
-    // Secure only if every hop is judged secure; a failed verdict is bogus
-    // (RFC 4035 §4.3).
     var secure = true;
     const hops = try arena.alloc(Hop, a.hops.len);
     for (hops, a.hops) |*hop, h| {
-        // Every rrset cell settles or loads through a blob.
         const b = g.cell(h.set).blob.?;
         hop.* = hopOf(d, b, .of(b));
         const j = h.judge.unwrap() orelse {
@@ -359,7 +314,7 @@ fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, 
                 secure = secure and v.secure.status == .secure;
                 hop.life = lifeOf(g, v.secure.proven_until_ns);
             },
-            // A failed verdict proved nothing, so it bounds nothing (CD only).
+            // Reached only under CD: a failed verdict proved nothing, so it bounds no TTL.
             .failure => secure = false,
             .pending => unreachable,
         }
@@ -402,8 +357,6 @@ fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_las
     return try shape(d, arena, q, c, hops, secure, true);
 }
 
-/// `min-ttl`: a question whose facts have expired but not their floor is
-/// answered from memory, unverified, asking nobody. Null: ask the graph.
 fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
     const g = d.g;
     if (d.retention.min_ttl == 0) return null;
@@ -419,9 +372,6 @@ fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Serve
     return try shape(d, arena, q, c, hops, false, true);
 }
 
-/// RFC 8767: an answer past its retention but inside the stale window,
-/// unverified, with EDE 3 or 19; the question is then held stale for
-/// `stale_hold_s`, or until the window ends. Null: nothing to serve.
 fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
     const g = d.g;
     if (d.retention.serve_stale_ttl == 0) return null;
@@ -442,9 +392,6 @@ fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served 
     return served;
 }
 
-/// The one shaper: every reply from the store or the graph passes here,
-/// and here only the keep rules below and the TTLs are decided. The
-/// rebinding scrub is the wire's (`response.buildResponseWire`).
 fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []const Hop, secure: bool, cacheable: bool) !Served {
     const g = d.g;
     const held = try arena.alloc(*store.Blob, hops.len);
@@ -460,8 +407,8 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     var age: u32 = 0;
     var life: u32 = 0;
     var stale_any = false;
-    // A chain back to a DNAME it passed meets that set again at its owner,
-    // asked for it or its signatures: it goes out once (RFC 2181 §5).
+    // A chain that passed a DNAME meets that set again when the question is
+    // for it or its signatures: it goes out once (RFC 2181 §5).
     var once: Seen = .{ .bound = n };
     const repeats = hops.len > 1 and (q.qtype == .dname or q.qtype == .rrsig);
     for (hops) |hop| {
@@ -469,7 +416,6 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         age = walk.ageOf(hop.rrset.stored_ns, g.now());
         life = hop.life;
         stale_any = stale_any or hop.stale;
-        // A denial's life is the reply's, not a record's.
         if (hop.stale and hop.rrset.kind != .answer and hop.rrset.kind != .alias) {
             age = 0;
             life = stale_hold_s;
@@ -480,22 +426,21 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = proofs };
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
-    // AD vouches for authority (RFC 4035 §3.2.3): under a secure verdict,
-    // only the proofs it judged. Every hop's go out: the client needs each
-    // to validate the chain (RFC 6672 §5.3.3).
+    // AD vouches for the authority section too (RFC 4035 §3.2.3), so a secure
+    // reply carries only the proofs that were judged. Every hop's proofs go
+    // out: the client needs each to validate the chain.
     const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
         const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
         try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
     }
     try appendAged(arena, &authorities, &seen, r.sections[1], keep, age, life, last.floor, last.stale);
-    // Nothing judges additional, so AD vouches for none of it.
+    // Nothing judges additional, so a reply with AD carries none.
     if (!secure) {
         var add = keep;
         add.section = .additional;
         try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
     }
-    // Any hop counts: a stale alias still redirected.
     const ede: ?dns.Ede = if (stale_any)
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
     else if (r.ede) |code|
@@ -506,8 +451,8 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     return .{
         .rcode = r.kind.rcode(),
         .ad = secure and (c.do_bit or c.ad),
-        // A stub zone's servers may give private addresses, and a chain's
-        // addresses are all in its last hop.
+        // A stub zone may rightly give private addresses, and a chain's addresses
+        // are all in its last hop.
         .local = @as(graph.Kind, @fromBackingInt(last.blob.kind)) == .stub,
         .question = q,
         .answers = answers.items,
@@ -519,12 +464,6 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     };
 }
 
-/// What a client is sent of a section. What it needs: the answer (or to
-/// know there is none), the SOA to cache its absence (RFC 2308), and with
-/// DO the proofs to validate it (RFC 4035 §3.1.1, §3.1.3); DNSSEC records
-/// go only to DO or when asked for by type (RFC 3225), never for CD alone
-/// (§3.2.2 turns validation off). Intake keeps nothing more but an NS
-/// answer's NS and glue (`walk.classify`), and DS is never sent there.
 const Keep = struct {
     section: enum { answer, authority, additional },
     qtype: dns.RType,
@@ -543,11 +482,9 @@ const Keep = struct {
                 .soa, .nsec, .nsec3 => true,
                 else => false,
             }) and switch (t) {
-                // A denial's SOA is its lifetime; nothing else owes one.
                 .soa => k.denial,
                 .nsec, .nsec3 => k.do_bit,
                 .ds => false,
-                // A signature goes with what it covers.
                 .rrsig => k.do_bit and switch (rr.covers().?) {
                     .soa => k.denial,
                     .ds => false,
@@ -563,9 +500,6 @@ const Keep = struct {
     }
 };
 
-/// The records `keep` keeps, TTLs aged since the reply, floored to
-/// `floor` and capped by `life`; a record past its TTL in a stale reply
-/// gets the hold (RFC 8767 §4).
 fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
     try out.ensureUnusedCapacity(arena, records.len);
     var it = records.iterator();
@@ -573,22 +507,21 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?
         if (!keep.keeps(rr)) continue;
         if (seen) |s| if (!try s.add(arena, out.items, rr)) continue;
         var aged = rr;
+        // Floored, then aged, then capped by the proof's life. A record past its
+        // TTL in a stale reply gets the hold instead of 0 (RFC 8767 §4).
         aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         out.appendAssumeCapacity(aged);
     }
 }
 
-/// A shared proof goes out once. A set: the proofs are a stranger's, and
-/// a scan per record is quadratic in them. Sized at its first record, so
-/// a reply that keeps no proof pays nothing.
 const Seen = struct {
-    /// The most records it will hold.
     bound: usize,
     slots: []u32 = &.{},
 
     const empty = std.math.maxInt(u32);
 
-    /// False if `out` holds `rr`; else `rr` must be appended to `out` next.
+    /// False if `out` holds `rr`. On true the caller must append `rr` to `out`
+    /// next: the slot stores that index.
     fn add(s: *Seen, arena: Allocator, out: []const dns.ResourceRecord, rr: dns.ResourceRecord) !bool {
         if (s.slots.len == 0) {
             s.slots = try arena.alloc(u32, std.math.ceilPowerOfTwoAssert(usize, 2 * s.bound));
@@ -610,18 +543,14 @@ const Seen = struct {
     }
 };
 
-/// Owner, type, class and data alike; TTLs aside.
 fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
     return a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and std.mem.eql(u8, a.rdata, b.rdata);
 }
 
-/// RFC 9520 §3.2's failure cache: a question that failed is answered here,
-/// asking nobody, for a window that doubles while it keeps failing, to the
-/// RFC's 5 minutes; an answer forgets it. Keyed (qname, qtype, CD), since a
-/// CD client is owed bogus data. Policy over no fact, so it is the server's.
+/// RFC 9520 §3.2's failure cache: a question that failed is answered from
+/// here, asking nobody, for a window that doubles while it keeps failing, up
+/// to 5 minutes. Keyed with CD, since a CD client is owed bogus data.
 const Failures = struct {
-    /// Array-backed: every answer removes, and a tombstoning map's misses
-    /// would probe ever longer.
     map: std.array_hash_map.Custom([]const u8, Entry, Seeded, true) = .empty,
 
     const Entry = struct {
@@ -655,8 +584,6 @@ const Failures = struct {
         return buf[0 .. name.len + 3];
     }
 
-    /// What holds the question while the window lasts. A validation failure
-    /// keeps its reason; any other is RFC 8914's cached error.
     pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?Held {
         if (f.map.count() == 0) return null;
         var buf: [dns.max_name_wire_len + 3]u8 = undefined;
@@ -672,9 +599,6 @@ const Failures = struct {
         } };
     }
 
-    /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
-    /// stale one holds the question, anything else closes it. A failure
-    /// of this host's or the asker's limits says nothing about the question.
     pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
         if (served.theirs) return;
         const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
@@ -688,12 +612,10 @@ const Failures = struct {
         if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .is = .stale });
         const ede = served.ede orelse dns.Ede{ .code = .other };
         if (f.map.getPtr(k)) |e| {
-            // Every client waiting on one failure notes it: once is enough.
             if (now_ns < e.until_ns) return;
             switch (e.is) {
                 .stale => {},
                 .failure => |x| {
-                    // Failing again within a window of the last lapsing: back off.
                     const again = now_ns < e.until_ns + @as(i64, x.window_s) * std.time.ns_per_s;
                     const window_s = if (again) @min(x.window_s * 2, max_window_s) else first_s;
                     e.* = .{ .until_ns = now_ns + @as(i64, window_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = window_s, .ede = ede } } };
@@ -705,8 +627,8 @@ const Failures = struct {
         try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = first_s, .ede = ede } } });
     }
 
-    /// Past `max_entries` another question is forgotten, one the seeded
-    /// hash of this one picks: arbitrary, and no asker's to choose.
+    /// At `max_entries` another entry is evicted, picked by the seeded hash of
+    /// this key so no asker can choose it.
     fn put(f: *Failures, gpa: Allocator, k: []const u8, e: Entry) !void {
         if (f.map.getPtr(k)) |old| {
             old.* = e;
@@ -762,7 +684,6 @@ test "a proof two hops share goes out once" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // NSEC, IN, TTL 3600; rdata: next name the root, an A bitmap.
     const nsec = "\x00\x2f\x00\x01\x00\x00\x0e\x10\x00\x04\x00\x00\x01\x40";
     const ab = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec;
     const ac = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec;
@@ -790,7 +711,6 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     try testing.expectEqual(null, f.get(q, true, 4 * s));
     try testing.expectEqual(null, f.get(q, false, 5 * s));
     try f.note(testing.allocator, q, false, failed, 5, 6 * s);
-    // Clients that shared the failure note it at the same instant.
     try f.note(testing.allocator, q, false, failed, 5, 6 * s);
     try testing.expect(f.get(q, false, 15 * s) != null);
     try testing.expectEqual(null, f.get(q, false, 16 * s));
@@ -798,7 +718,6 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     ok.rcode = .no_error;
     try f.note(testing.allocator, q, false, ok, 5, 17 * s);
     try testing.expectEqual(0, f.map.count());
-    // A hold that lapsed is no failure to back off from.
     var held = ok;
     held.hold_until_ns = 30 * s;
     held.ede = .{ .code = .stale_answer };
@@ -808,7 +727,6 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     try testing.expect(f.get(q, false, 35 * s) != null);
     try testing.expectEqual(null, f.get(q, false, 36 * s));
     try f.note(testing.allocator, q, false, ok, 5, 37 * s);
-    // Past the bound, each question remembered forgets another.
     for (0..Failures.max_entries + 2) |t| {
         var other = q;
         other.qtype = @fromBackingInt(@intCast(t));

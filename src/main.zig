@@ -40,7 +40,6 @@ fn logFn(
 
 const log = std.log;
 
-/// Debug keeps std's allocator, which names every leak.
 var reserve: hark.slab.Reserve = .{};
 var lasting: hark.slab.Tenant = .init(&reserve);
 var work: hark.slab.Tenant = .init(&reserve);
@@ -105,7 +104,6 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
         }
     }
 
-    // Only a missing default config falls back to the built-in defaults.
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
@@ -116,7 +114,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
     defer cfg.deinit();
     log_verbose = cli_verbose or cfg.log_queries;
 
-    // A socket per exchange in flight can exceed systemd's default 1024 soft cap.
+    // A socket per exchange in flight can pass the usual 1024 soft limit.
     if (std.posix.getrlimit(.NOFILE)) |lim| {
         if (lim.cur < lim.max) std.posix.setrlimit(.NOFILE, .{ .cur = lim.max, .max = lim.max }) catch |err|
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
@@ -129,8 +127,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
 }
 
 fn loadDefaultConfig(allocator: std.mem.Allocator, io: Io) !hark.config.ServerConfig {
-    // Never relative to the working directory, which under a service
-    // manager is unrelated to where the operator put the config.
+    // Absolute: a service manager's working directory is not where the config is.
     const default_path = "/etc/hark/hark.toml";
     if (hark.config.parseConfigFile(allocator, io, default_path)) |cfg| {
         return cfg;

@@ -48,26 +48,20 @@ pub const Sim = struct {
     gpa: Allocator,
     scenario: *const rpl.Scenario,
     signer: sign.Signer,
-    /// Signed.
     ranges: []const rpl.Range,
     prng: std.Random.DefaultPrng,
     seed: u64,
     sent: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    /// Monotonic; starts well above zero so deadlines never wrap negative.
     now_ns: i64 = now0_ns,
-    /// Wall seconds, for RRSIG windows.
     wall_sec: i64 = wall0_sec,
-    /// The scenario step in effect, for RANGE windows.
     step: u32 = 0,
-    /// `STEP n UNSENT`: refuse this many of the next upstream queries at the host.
     pending_unsent: u32 = 0,
     events: std.PriorityQueue(Event, void, Event.before) = .empty,
     seq: u32 = 0,
     log: std.ArrayList(LogRow) = .empty,
     heard: Heard = .empty,
-    /// A chaos run's reference: once this run hears what that one never
-    /// did, or heard at another step, the two no longer share a world and
-    /// their answers may differ.
+    /// A chaos run's reference. Once this run hears what that one never did, or
+    /// at another step, the two no longer share a world and answers may differ.
     known: ?*const Heard = null,
     departed: bool = false,
     chaos: ?*chaos.Chaos = null,
@@ -113,8 +107,6 @@ pub const Sim = struct {
         return s.schedule(id, at_ns, try s.tieOf(@as(u64, id) << 32 | gen), .{ .wake = gen });
     }
 
-    /// One upstream query. Its reply or absence is scheduled now; nothing
-    /// depends on later steps.
     fn send(s: *Sim, ex: Exchange) !void {
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         const q = query.question orelse return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
@@ -136,7 +128,6 @@ pub const Sim = struct {
         const tie = try s.tieOf(asked.final());
         const delay = s.latency(ex.server, asked);
         const entry = s.findEntry(ex.server, q, ex.need) orelse {
-            // No RANGE for this address: nothing listens there.
             if (!s.serves(ex.server)) {
                 try s.hear(q, silence);
                 return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
@@ -144,9 +135,7 @@ pub const Sim = struct {
             var msg = query;
             msg.header.flags = .{ .qr = true, .rd = query.header.flags.rd, .rcode = .refused };
             msg.answers = &.{};
-            // A signed zone's DNSKEY is answered where it signs; anything
-            // else unmatched is REFUSED so a coverage gap surfaces instead
-            // of looking like a blackhole.
+            // Unmatched is REFUSED, not silence, so a coverage gap can't pass for a blackhole.
             if (try s.signer.dnskeyAnswer(ex.server, q)) |rrs| {
                 msg.header.flags.aa = true;
                 msg.header.flags.rcode = .no_error;
@@ -191,7 +180,6 @@ pub const Sim = struct {
         const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         try s.hear(query.question.?, std.hash.Wyhash.hash(0, content));
         var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
-        // A UDP reply past the advertised payload arrives truncated.
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
         if (ex.need == .datagram and wire.len > payload) {
             var hdr = msg.header;
@@ -227,7 +215,6 @@ pub const Sim = struct {
         return ch.choose(.tie, ch.named(.tie, event), std.math.maxInt(u64), .none);
     }
 
-    /// Names a query by what it asks and how many times it was asked.
     fn ask(s: *Sim, server: na.Address, q: dns.Question, need: Need) !std.hash.Wyhash {
         var h = std.hash.Wyhash.init(0);
         hashServer(&h, server);
@@ -242,8 +229,6 @@ pub const Sim = struct {
         return h;
     }
 
-    /// Advance to the next completion, or to `until_ns` if none lies
-    /// before it.
     pub fn next(s: *Sim, until_ns: i64) ?struct { id: u32, completion: Completion } {
         const due = if (s.events.peek()) |ev| ev.at_ns <= until_ns else false;
         const ev = if (due) s.events.pop() else null;
@@ -253,14 +238,11 @@ pub const Sim = struct {
         return .{ .id = e.id, .completion = e.completion };
     }
 
-    /// A rule run mid-window judges signatures at its own time.
     fn syncWall(s: *Sim) void {
         s.wall_sec = wall0_sec + @divFloor(s.now_ns - now0_ns, std.time.ns_per_s);
     }
 
-    /// Per-server: 2–40 ms base, ±25% jitter, so seeds exercise different
-    /// interleavings. Keyed by the query rather than draw order, so a run
-    /// that asks in another order meets the same network.
+    /// Keyed by the query, not draw order: a run that asks in another order meets the same network.
     fn latency(s: *Sim, server: na.Address, asked: std.hash.Wyhash) i64 {
         var h = std.hash.Wyhash.init(0);
         hashServer(&h, server);
@@ -274,8 +256,8 @@ pub const Sim = struct {
         return (base_ms + jitter) * std.time.ns_per_ms;
     }
 
-    /// By field: the struct has padding and AddressKey's own hash folds in
-    /// a per-process seed.
+    /// By field: the struct has padding, and AddressKey's own hash folds in a
+    /// per-process seed.
     fn hashServer(h: *std.hash.Wyhash, server: na.Address) void {
         const key = na.AddressKey.fromAddress(server);
         h.update(&key.addr);
@@ -297,7 +279,6 @@ pub const Sim = struct {
         return null;
     }
 
-    /// An empty MATCH means `question` (qname, qtype, qclass).
     fn entryMatches(e: *const rpl.Entry, q: dns.Question, need: Need) bool {
         const eq = e.question orelse return false;
         var m = e.match;

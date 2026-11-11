@@ -17,9 +17,8 @@ pub fn initIp6(bytes: [16]u8, port: u16) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port } };
 }
 
-/// Canonical Murmur3 fmix64. FNV-1a's multiply only propagates leftward, so
-/// without it the bottom bits stay invariant when inputs share theirs (IPv4
-/// keys with addr[0]=0), and the hash map reads both ends. Not cryptographic.
+/// Murmur3's fmix64. FNV-1a's multiply only carries upward, so without it
+/// the low bits, which the hash map reads, barely vary across IPv4 keys.
 fn fmix64(h0: u64) u64 {
     var h = h0;
     h ^= h >> 33;
@@ -30,7 +29,6 @@ fn fmix64(h0: u64) u64 {
     return h;
 }
 
-/// Hashable, equality-comparable address-with-port; the key for per-server state.
 pub const AddressKey = struct {
     family: u8,
     addr: [16]u8,
@@ -66,10 +64,6 @@ pub const AddressKey = struct {
         return if (k.family == posix.AF.INET) initIp4(k.addr[0..4].*, k.port) else initIp6(k.addr, k.port);
     }
 
-    /// Hash context tuned for AddressKey: reads the 16-byte addr as two u64s
-    /// and mixes via FNV-1a-style multiply, avoiding Wyhash's variable-length
-    /// dispatch + final mixing chain. Wyhash showed at ~20% of CPU on miss
-    /// workloads where this key is hashed per upstream selection.
     pub const HashCtx = struct {
         pub fn hash(_: @This(), key: AddressKey) u64 {
             const lo = mem.readInt(u64, key.addr[0..8], .little);
@@ -91,7 +85,6 @@ pub const AddressKey = struct {
     };
 };
 
-/// PosixAddress union for sockaddr conversion (matches Io.Threaded.PosixAddress).
 pub const PosixAddress = extern union {
     any: posix.sockaddr,
     in: posix.sockaddr.in,
@@ -135,7 +128,6 @@ pub fn fromSockaddr(sa: *const PosixAddress) Address {
     };
 }
 
-/// The wildcard: a socket bound to it takes every address of its family.
 pub fn isUnspecified(addr: Address) bool {
     return switch (addr) {
         inline else => |a| mem.allEqual(u8, &a.bytes, 0),
@@ -149,9 +141,6 @@ pub fn afU32(addr: Address) u32 {
     };
 }
 
-/// Format an address as "ip:port" into a caller-provided buffer.
-/// Delegates to std.Io.net.IpAddress.format, which emits IPv6 in
-/// RFC 5952 canonical form ("[::1]:53" rather than "[0000:...:0001]:53").
 pub fn format(addr: Address, buf: []u8) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     addr.format(&w) catch return "?";
@@ -170,7 +159,6 @@ pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
     try sys.bind(fd, &storage.any, sa_len);
 }
 
-/// The same host, whatever the ports.
 pub fn ipEqual(a: Address, b: Address) bool {
     return switch (a) {
         .ip4 => |x| b == .ip4 and mem.eql(u8, &x.bytes, &b.ip4.bytes),
@@ -178,10 +166,8 @@ pub fn ipEqual(a: Address, b: Address) bool {
     };
 }
 
-/// Returns true if the address is in a private, reserved, or loopback range
-/// that should not be contacted during recursive resolution (DNS rebinding defense).
-/// Superset of the shared special-use table: NS contact also refuses multicast,
-/// which the answer scrub (rebinding.zig) deliberately serves.
+/// A superset of the special-use table: nameserver contact also refuses
+/// multicast, which the answer scrub (rebinding.zig) deliberately serves.
 pub fn isNonRoutableNs(addr: AddressKey) bool {
     return if (addr.family == posix.AF.INET) isNonRoutableIp4(addr.addr[0..4].*) else isNonRoutableIp6(addr.addr);
 }
@@ -195,43 +181,26 @@ fn isNonRoutableIp6(b: [16]u8) bool {
     return isSpecialUseIp6(b) or multicast_ip6.holds(mem.readInt(u128, &b, .big));
 }
 
-/// The special-purpose blocks a public answer has no business pointing
-/// into: Knot's set and the IANA registries (RFC 6890). Multicast is
-/// deliberately not here: a recursive resolver returning multicast to a
-/// stub is not a rebinding-attack primitive, so the answer scrub serves
-/// it; NS egress refuses it beside these.
 const special_use_ip4: Prefixes(u32) = .of(&.{
-    // RFC 1122: this network, and loopback.
     "0.0.0.0/8",
     "127.0.0.0/8",
-    // RFC 1918.
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
-    // RFC 6598: shared address space (CGNAT).
     "100.64.0.0/10",
-    // RFC 3927: link-local.
     "169.254.0.0/16",
-    // RFC 6890: IETF protocol assignments.
     "192.0.0.0/24",
-    // RFC 5737: documentation (TEST-NET-1, -2 and -3).
     "192.0.2.0/24",
     "198.51.100.0/24",
     "203.0.113.0/24",
-    // RFC 2544: benchmarking.
     "198.18.0.0/15",
-    // RFC 1112: reserved, with the limited broadcast address.
     "240.0.0.0/4",
 });
 
 const special_use_ip6: Prefixes(u128) = .of(&.{
-    // RFC 4291: unspecified, loopback, and the deprecated IPv4-compatible.
     "::/96",
-    // RFC 3849: documentation.
     "2001:db8::/32",
-    // RFC 4193: unique local.
     "fc00::/7",
-    // RFC 4291: link-local.
     "fe80::/10",
 });
 
@@ -242,8 +211,8 @@ pub fn isSpecialUseIp4(b: [4]u8) bool {
     return special_use_ip4.holds(mem.readInt(u32, &b, .big));
 }
 
-/// An IPv4-mapped address is judged as IPv4, so a mapped 127.0.0.1
-/// doesn't slip through as a v6 address the v6 set has no opinion on.
+/// An IPv4-mapped address is judged as IPv4, so a mapped 127.0.0.1 doesn't
+/// slip through as a v6 address the v6 set has no opinion on.
 pub fn isSpecialUseIp6(b: [16]u8) bool {
     if (isIp4Mapped(&b)) return isSpecialUseIp4(b[12..16].*);
     return special_use_ip6.holds(mem.readInt(u128, &b, .big));
@@ -271,8 +240,6 @@ fn Prefix(comptime Int: type) type {
     };
 }
 
-/// Up to 16 prefixes, indexed by the leading octet an address must have
-/// to fall in each, so most addresses are cleared by one load.
 fn Prefixes(comptime Int: type) type {
     return struct {
         all: []const Prefix(Int),
@@ -307,7 +274,6 @@ fn Prefixes(comptime Int: type) type {
     };
 }
 
-/// ::ffff:0:0/96 — IPv4-mapped IPv6.
 pub fn isIp4Mapped(bytes: []const u8) bool {
     return bytes.len == 16 and mem.readInt(u64, bytes[0..8], .big) == 0 and mem.readInt(u32, bytes[8..12], .big) == 0xffff;
 }
@@ -328,7 +294,6 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     try testing.expect(ctx.hash(a) != ctx.hash(c));
     try testing.expect(!ctx.eql(a, d));
     try testing.expect(ctx.hash(a) != ctx.hash(d));
-    // v4 1.2.3.4 vs v6 ::102:304 share addr bytes — family must disambiguate.
     try testing.expect(!ctx.eql(a, e));
     try testing.expect(ctx.hash(a) != ctx.hash(e));
 }
@@ -383,51 +348,40 @@ test "special-use IPv4 set leaves routable space alone (incl. boundaries + multi
 }
 
 test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
-    try testing.expect(isSpecialUseIp6(@as([16]u8, @splat(0)))); // ::
-    try testing.expect(isSpecialUseIp6(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
-    try testing.expect(isSpecialUseIp6(@as([12]u8, @splat(0)) ++ [_]u8{ 127, 0, 0, 1 })); // ::127.0.0.1
-    try testing.expect(isSpecialUseIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0)))); // fc00::/7
+    try testing.expect(isSpecialUseIp6(@as([16]u8, @splat(0))));
+    try testing.expect(isSpecialUseIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}));
+    try testing.expect(isSpecialUseIp6(@as([12]u8, @splat(0)) ++ [_]u8{ 127, 0, 0, 1 }));
+    try testing.expect(isSpecialUseIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0))));
     try testing.expect(isSpecialUseIp6([_]u8{0xfd} ++ @as([15]u8, @splat(0))));
-    try testing.expect(isSpecialUseIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)))); // fe80::/10
-    try testing.expect(isSpecialUseIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)))); // 2001:db8::/32
-    try testing.expect(isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 })); // mapped 127
-    try testing.expect(!isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 })); // mapped public
-    try testing.expect(!isSpecialUseIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)))); // multicast — not blocked
-    try testing.expect(!isSpecialUseIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)))); // public
+    try testing.expect(isSpecialUseIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0))));
+    try testing.expect(isSpecialUseIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0))));
+    try testing.expect(isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }));
+    try testing.expect(!isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }));
+    try testing.expect(!isSpecialUseIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0))));
+    try testing.expect(!isSpecialUseIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0))));
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv4" {
     try testing.expect(isNonRoutableNs(.ip4(.{ 127, 0, 0, 1 }, 53)));
-    // Multicast — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(.ip4(.{ 224, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(.ip4(.{ 239, 255, 255, 255 }, 53)));
     try testing.expect(isNonRoutableNs(.ip4(.{ 255, 255, 255, 255 }, 53)));
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv6" {
-    // Loopback ::1
     try testing.expect(isNonRoutableNs(.ip6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53)));
-    // Unspecified ::
     try testing.expect(isNonRoutableNs(.ip6(@splat(0), 53)));
-    // Unique local fc00::/7
     try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfc, 0 } ++ @as([14]u8, @splat(0)), 53)));
     try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfd, 0x12 } ++ @as([14]u8, @splat(0)), 53)));
-    // Link-local fe80::/10
     try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53)));
-    // Multicast ff00::/8 — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53)));
-    // Documentation 2001:db8::/32
     try testing.expect(isNonRoutableNs(.ip6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53)));
-    // IPv4-mapped ::ffff:127.0.0.1
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53)));
-    // IPv4-mapped ::ffff:10.0.0.1
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53)));
-    // IPv4-mapped multicast ::ffff:224.0.0.1 — must stay blocked at NS-time
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53)));
 }
 
 test "isNonRoutableNs allows routable IPv6" {
     try testing.expect(!isNonRoutableNs(.ip6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53)));
-    // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
     try testing.expect(!isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53)));
 }

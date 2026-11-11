@@ -24,8 +24,6 @@ const carrier = @import("carrier.zig");
 
 const Socket = @This();
 
-/// TCP and TLS, then the question: hark's Finished and the query leave
-/// together, so a dial costs a reply three round trips.
 pub const dial_rounds = 3;
 
 pub const Shared = struct {
@@ -104,8 +102,8 @@ pub fn rounds(sock: *const Socket) u32 {
     };
 }
 
-/// AES-128-GCM's safe limit for one key (RFC 8446 §5.5 points at 2^24.5):
-/// rather than turn the key, a session this old is left for a new one.
+/// AES-128-GCM's safe limit for one key (RFC 8446 §5.5 gives 2^24.5
+/// records). Rather than update the key, the session is left for a new one.
 pub fn spent(sock: *const Socket) bool {
     return sock.established() and sock.session.write.seq >= 1 << 24;
 }
@@ -148,8 +146,6 @@ fn connected(sock: *Socket) !News {
         sock.sawErrno(@fromBackingInt(@intCast(err)));
         return .{ .ended = .failed };
     }
-    // Keys only now: nearly every first dial meets a closed port, and the
-    // shares cost ~200 µs.
     var entropy: [tls13.entropy_len]u8 = undefined;
     rand.thread.bytes(&entropy);
     defer crypto.secureZero(u8, &entropy);
@@ -161,7 +157,6 @@ fn connected(sock: *Socket) !News {
     return .nothing;
 }
 
-/// What the read in `sh` holds, an event at a time; null once it is spent.
 pub fn next(sock: *Socket, sh: *Shared) !?Event {
     std.debug.assert(sh.out_len == 0);
     while (true) {
@@ -196,7 +191,6 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
     }
 }
 
-/// `wire` readied to leave at the next flush, or sooner if there's no room.
 pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !carrier.Taken {
     if (sh.out_len + dot.max_sealed > sh.out.len and !try sock.flush(sh)) return .gone;
     const q = sock.session.query(sh.out[sh.out_len..], wire);
@@ -204,14 +198,12 @@ pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !carrier.Taken {
     return .{ .sent = q.id };
 }
 
-/// False: gone.
 pub fn flush(sock: *Socket, sh: *Shared) !bool {
     if (sh.out_len == 0) return true;
     defer sh.out_len = 0;
     return sock.put(sh.out[0..sh.out_len]);
 }
 
-/// Written whole, or kept to write when the socket takes it. False: gone.
 fn put(sock: *Socket, bytes: []const u8) !bool {
     var rest = bytes;
     if (sock.unsent.items.len == 0) {

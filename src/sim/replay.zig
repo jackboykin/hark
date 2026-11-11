@@ -20,28 +20,20 @@ const slab = @import("../slab.zig");
 
 const Phase = enum { steps, warm };
 
-/// How many decisions each chaos site took other than hark's own.
 const Fired = std.EnumArray(chaos.Site, u32);
 
 const Report = struct {
-    /// The failing step and why.
     step: u32 = 0,
     msg: []const u8 = "",
     phase: Phase = .steps,
-    /// The upstream query log, one `server <- qname qtype` per line,
-    /// gpa-owned. Two runs of one seed must produce the same text.
     log: []const u8 = "",
-    /// `Graph.schedule`: two runs of one seed must run one.
     schedule: u64 = 0,
     answers: std.ArrayList(Answered) = .empty,
     heard: sim.Sim.Heard = .empty,
     departed: u32 = 0,
     compared: u32 = 0,
-    /// Chaos limited an answer the reference did not, so hark never heard
-    /// what that answer would have held.
     starved: bool = false,
     fired: Fired = .initFill(0),
-    /// The chaos decisions that left hark's own, and under `tell`, named.
     left: chaos.Events = .empty,
     told: std.ArrayList([]const u8) = .empty,
     tally: graph.Tally = .{},
@@ -115,7 +107,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         report.cells = g.cells.items.len;
     }
 
-    // Off unless the scenario turns it on, as the harness runs serve.
     const rb: rebinding.Config = .{
         .enabled = scenario.rebinding_enabled orelse false,
         .allow_zones = try config.parseZoneList(arena, scenario.rebinding_allow_zones),
@@ -124,7 +115,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     };
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
-    // CHECK_ANSWER reads the held roots' hops.
     var held: Held = .{};
     defer held.kept.deinit(g.gpa);
     defer letGoAll(&g, &held);
@@ -192,7 +182,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
                 return error.ScenarioFailed;
             },
             .unsent => s.pending_unsent += 1,
-            // What was due arrives on the way.
             .time_passes => {
                 const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
                 while (s.next(until)) |ev| try g.complete(ev.id, ev.completion);
@@ -201,7 +190,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     }
     report.phase = .warm;
     try requery(gpa, arena, &g, &s, scenario, opts, report, &held, &desk, &rb);
-    // Quiescence: nothing outlives its demand.
     letGoAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
@@ -210,12 +198,9 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     }
 }
 
-/// Every checked question, re-asked against the settled graph, must answer
-/// the same and from memory alone unless the answer was never a fact (TTL
-/// 0). A cell that expired as it settled, or a memoised head that lost its
-/// chain, shows up as an upstream query or a different answer. The last
-/// check of a question is in force; TTLs have aged and are not compared,
-/// and a failure still held answers Cached Error (RFC 8914 §4.14).
+/// Every checked question, asked again of the settled graph, must answer the
+/// same from memory alone, unless the answer was never a fact (TTL 0). Only a
+/// question's last check counts; TTLs have aged and are not compared.
 fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, opts: Options, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
@@ -274,7 +259,6 @@ fn letGoAll(g: *graph.Graph, held: *Held) void {
     while (held.kept.pop()) |id| g.unhold(id);
 }
 
-/// What the client was sent, read back off the wire serve builds.
 const Sent = struct { msg: dns.Message, wire: []const u8, cacheable: bool, limited: bool };
 
 fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, phase: Phase, step: u32, sent: ?Sent) !void {
@@ -328,11 +312,8 @@ fn find(answers: []const Answered, phase: Phase, step: u32) ?Answered {
     return null;
 }
 
-/// TTLs age from when each run fetched, so they are not compared. An
-/// answer's EDNS options say how hark answered (synthesized, say), which is
-/// its state's to say; a failure's say why, which is the answer. A denial
-/// synthesized from what hark holds proves the same answer with other
-/// proofs than the server sent, so its authority is not compared.
+/// TTLs age from each run's own fetch, and a synthesized denial proves the same
+/// answer with other records than the server sent: neither is compared.
 fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
     const af = actual.header.flags;
     const wf = want.header.flags;
@@ -350,8 +331,7 @@ fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
     return null;
 }
 
-/// Null when the client's timer fires first. The roots stay in `held`,
-/// since the answer reads their hops, until the next question.
+/// The roots stay in `held` until the next question: the answer reads their hops.
 fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !?Sent {
     const q = entry.question.?;
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
@@ -380,7 +360,6 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     return .{ .msg = try dns.parseMessage(arena, wire), .wire = wire, .cacheable = served.cacheable, .limited = limited };
 }
 
-/// The bytes serve would send `client` for `served`, bar the query id.
 fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, rb: *const rebinding.Config, served: answer.Served) ![]const u8 {
     const ctx: response.ResponseContext = .{
         .query_id = 0,
@@ -396,8 +375,7 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
     return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, served.reply(), arena) orelse error.OutOfMemory;
 }
 
-/// `recall`'s backstop: what it serves from the store, the graph builds
-/// too, asking nobody, to the byte.
+/// What recall serves from the store, the graph must build too, to the byte, asking nobody.
 fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config, recalled: answer.Served) !void {
     const before = s.log.items.len;
     const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
@@ -409,7 +387,6 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
 
-/// The graph driven synchronously: serve parks the client instead.
 fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk) !?answer.Served {
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms orelse 5000) * std.time.ns_per_ms;
@@ -417,7 +394,6 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     const root = try g.demandRoot(asked.name, asked.qtype, .new);
     held.roots[0] = root;
     try g.drain();
-    // RFC 8767 §5: stale at the client's patience, as serve does.
     const patience = s.now_ns + answer.stale_client_ms * std.time.ns_per_ms;
     if (desk.retention.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
         if (try desk.memory(arena, q, client, .stale)) |served| {
@@ -448,7 +424,6 @@ fn leave(g: *graph.Graph, held: *Held) !?answer.Served {
     return null;
 }
 
-/// False when nothing more arrives before `until`.
 fn settleBy(g: *graph.Graph, s: *sim.Sim, root: graph.CellId, until: i64) !bool {
     while (!g.cell(root).settled()) {
         const ev = s.next(until) orelse return false;
@@ -476,8 +451,6 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
     }
     return out.toOwnedSlice(gpa);
 }
-
-// ── CHECK_ANSWER ───────────────────────────────────────────────────────
 
 fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) ?[]const u8 {
     var m = e.match;
@@ -516,8 +489,7 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) 
 
 const ttl_slack: u32 = 3;
 
-/// Multiset equality. RRSIGs in `actual` count only when `expected`
-/// carries any; their bytes vary run to run.
+/// Multiset equality. RRSIGs in `actual` count only when `expected` carries any.
 fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.ResourceRecord, compare_ttl: bool) bool {
     var want_sigs = false;
     for (expected) |rr| want_sigs = want_sigs or rr.rtype == .rrsig;
@@ -542,13 +514,11 @@ fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.Resource
 }
 
 fn rrEql(a: dns.ResourceRecord, b: dns.ResourceRecord, compare_ttl: bool) bool {
-    // Owners byte-exact: hark scrubs 0x20 case off every owner.
     if (!a.name.eql(b.name) or a.rtype != b.rtype) return false;
     if (compare_ttl and @max(a.ttl, b.ttl) - @min(a.ttl, b.ttl) > ttl_slack) return false;
     return rdataEql(a, b);
 }
 
-/// Names folded, as the harness lowercases rdata text.
 fn rdataEql(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
     return switch (a.rtype) {
         .nsec => blk: {
@@ -569,15 +539,12 @@ fn rdataEql(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
     };
 }
 
-// ── Query-log checks ───────────────────────────────────────────────────
-
 fn rowMatches(rec: sim.LogRow, want: rpl.QueryLogRow) bool {
     if (!rec.qname.eql(want.qname) or rec.qtype != want.qtype) return false;
     if (want.dest) |d| if (!na.ipEqual(rec.server, d)) return false;
     return true;
 }
 
-/// Presence of every row, or an ordered subsequence under `MATCH order`.
 fn queryLogMismatch(log: []const sim.LogRow, e: rpl.Entry) ?[]const u8 {
     if (e.query_log.len == 0) return "CHECK_QUERY_LOG entry has no rows";
     if (e.match.order) {
@@ -606,11 +573,8 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
     return null;
 }
 
-// ── The suite ──────────────────────────────────────────────────────────
-
 const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0, compared: usize = 0, departed: usize = 0, fired: Fired = .initFill(0) };
 
-/// One scenario under every seed, each run twice.
 const Job = struct {
     path: []const u8,
     scenario: rpl.Scenario,
@@ -623,9 +587,6 @@ const Job = struct {
     fired: Fired = .initFill(0),
 };
 
-/// Replay every scenario under `root` across `seeds`, checking
-/// that one seed replays to one upstream query log. Scenarios share
-/// nothing, so debug spreads them over every core.
 fn replayDir(root: []const u8, seeds: u64) !Replayed {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -667,7 +628,6 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
         for (&r.fired.values, j.fired.values) |*a, b| a.* += b;
     }
     if (leaked.load(.monotonic)) r.failed += 1;
-    // Debug numbers mean nothing.
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
     std.debug.print("  chaos compared {d} answers; {d} more were past the reference's world\n", .{ r.compared, r.departed });
@@ -694,10 +654,8 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
     return r;
 }
 
-/// Take jobs until none are left. Leaks are counted, not traced, so the
-/// replays run on the production allocator, a tenant on this thread's
-/// reserve, which in debug checks every free and quarantines freed slots;
-/// a leak's site shows under -Dscenario, on testing.allocator.
+/// Runs on the production allocator, so leaks are counted, not traced;
+/// -Dscenario replays one on testing.allocator to show the site.
 fn replayJobs(jobs: []Job, next: *std.atomic.Value(usize), leaked: *std.atomic.Value(bool)) void {
     var reserve: slab.Reserve = .{};
     defer reserve.deinit();
@@ -760,9 +718,6 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     };
 }
 
-/// The fewest of a failing chaos run's decisions that fail it the same
-/// way, by delta debugging (Zeller and Hildebrandt) over the decisions
-/// that left hark's own; each try replays with only some of them taken.
 fn shrink(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, held: Options, failed: *const Report) !void {
     const Try = struct {
         gpa: Allocator,
@@ -825,8 +780,8 @@ fn shrink(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, held:
     for (named.told.items) |line| std.debug.print("    {s}\n", .{line});
 }
 
-// `zig build test -Dscenario=path/to/x.rpl` replays one scenario with
-// every completion printed, the build passing the path as HARK_SCENARIO.
+// `zig build test -Dscenario=path/to/x.rpl` runs this, the build passing
+// the path as HARK_SCENARIO.
 test "trace one scenario" {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -858,7 +813,6 @@ test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8);
     try testing.expectEqual(223, r.parsed);
     try testing.expectEqual(0, r.failed);
-    // A site that never leaves hark's own choice tests nothing.
     var fired = r.fired;
     var it = fired.iterator();
     while (it.next()) |e| if (e.value.* == 0) {
@@ -922,9 +876,8 @@ const siblings_rpl =
     \\SCENARIO_END
 ;
 
-/// ns1 (127.0.10.3) is glued and listens nowhere. ns2 (127.0.10.4), which
-/// answers, and ns3 (127.0.10.6), which listens nowhere, are reached only
-/// once their own zone gives their addresses.
+/// ns1 (.3) is glued and silent. ns2 (.4) answers and ns3 (.6) is silent;
+/// both are reached only once hosts.com gives their addresses.
 const unglued_rpl =
     \\; hark: root-hints = 127.0.10.1
     \\SCENARIO_BEGIN outranked
@@ -1025,8 +978,6 @@ const Siblings = struct {
     ns2: ?ns_rtt.RttState = null,
 };
 
-/// Times in ms from the start: the answer, then when each sibling was
-/// first asked; the estimates are read after the drain.
 const Walked = struct {
     took_ms: i64,
     ns1_ms: ?i64,
@@ -1036,7 +987,6 @@ const Walked = struct {
     ns2: ?ns_rtt.RttState,
 };
 
-/// Checks the walk answers, then that the graph drains as exchanges settle.
 fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings) !Walked {
     return walk(arena, siblings_rpl, seed, stagger_ms, planted);
 }
@@ -1099,7 +1049,6 @@ test "a silent sibling is hedged past and still records its timeout" {
         try testing.expect(w.ns2 != null);
         if (ns1_first) try testing.expectEqual(1, w.ns1.?.consecutive_timeouts) else try testing.expect(w.ns1 == null);
         if (stagger > 0) {
-            // Walk (≤ 2 × 50 ms), the stagger, then ns2 (≤ 50 ms).
             try testing.expect(w.took_ms < 400);
             if (ns1_first) try testing.expect(w.took_ms >= 150);
         } else if (ns1_first) try testing.expect(w.took_ms >= 400);
@@ -1119,7 +1068,6 @@ test "a dead server is asked only when nothing live is left" {
 test "the last live server waits its whole estimate, unhedged" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    // srtt 1.5 s: a 3 s estimate.
     for (1..9) |seed| {
         const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = .{ .srtt_us = 1500 * std.time.us_per_ms, .min_rtt_us = 1500 * std.time.us_per_ms }, .ns2 = dead });
         try testing.expect(w.ns2_ms.? - w.ns1_ms.? >= 3000);
@@ -1129,7 +1077,6 @@ test "the last live server waits its whole estimate, unhedged" {
 test "servers all dead are hedged through like any list" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    // One stagger, not the 2 s cap.
     var ns1_first_seen = false;
     for (1..9) |seed| {
         const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = dead, .ns2 = dead });
@@ -1156,7 +1103,6 @@ test "a hedge goes to a server that answers before one never timed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // ns1 at a second address, 127.0.10.6, where nothing listens either.
     const glue = "ns1.example.com. 86400 IN A 127.0.10.3";
     const text = try mem.replaceOwned(u8, arena, siblings_rpl, glue, glue ++ "\n ns1.example.com. 86400 IN A 127.0.10.6");
     var hedged = false;
@@ -1175,8 +1121,6 @@ test "a server that has only been silent holds back no other, one never timed do
     var both_seen = false;
     for (1..9) |seed| {
         const w = try walk(arena_state.allocator(), unglued_rpl, seed, 150, .{ .ns1 = silent });
-        // ns1 is all there is to ask at first: the lookups for the others
-        // start, and the first address to land is asked, with no stagger.
         const next = @min(w.ns2_ms.?, w.ns3_ms orelse w.ns2_ms.?);
         try testing.expect(next - w.ns1_ms.? < 150);
         const ns3_ms = w.ns3_ms orelse continue;
@@ -1186,7 +1130,6 @@ test "a server that has only been silent holds back no other, one never timed do
     try testing.expect(both_seen);
 }
 
-/// The root answers every query with www.example.com's address.
 const one_hop_rpl =
     \\; hark: root-hints = 127.0.10.1
     \\SCENARIO_BEGIN one hop
@@ -1228,7 +1171,6 @@ test "the door counts exchanges in flight" {
     try g.drain();
     try testing.expectEqual(1, g.budgets);
     try testing.expectEqual(1, g.flights);
-    // New work is turned away; the same question joins the one in progress.
     try testing.expectError(error.Full, g.demandRoot(other, .a, .new));
     try testing.expectEqual(root, try g.demandRoot(q.name, q.qtype, .new));
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);

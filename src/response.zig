@@ -9,7 +9,6 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 
-/// What is sent: the rcode, AD as the shaper judged it, and the records.
 pub const Reply = struct {
     rcode: dns.RCode,
     ad: bool = false,
@@ -31,14 +30,9 @@ pub const ResponseContext = struct {
     client_edns: bool,
     client_do: bool,
     max_udp_payload: u16,
-    /// RFC 7828 edns-tcp-keepalive TIMEOUT (100-ms units). Emitted only
-    /// when non-null AND the client sent EDNS — null on UDP, or when
-    /// the operator disabled the option. Servers MUST only advertise
-    /// this on stream transports.
     tcp_keepalive: ?u16 = null,
     rebinding: *const rebinding.Config = &rebinding.Config.off,
 
-    /// Takes the question `validateQuery` made sure of.
     pub fn fromQuery(query: dns.Query, max_udp_payload: u16) ResponseContext {
         return .{
             .query_id = query.header.id,
@@ -61,11 +55,9 @@ pub fn buildResponseWire(
 ) ?[]const u8 {
     const rb = (if (reply.local) &rebinding.Config.off else ctx.rebinding).*;
 
-    // Here, so fresh resolution, cache hits and TTL=0 answers (which a
-    // cache-insertion filter would miss) are scrubbed alike. Every section:
-    // negatives pass authority and additional through, and RFC 9460 §4.2
-    // steers clients to Additional-section SVCB/A/AAAA. OOM is null, which
-    // the caller sends as SERVFAIL, never an unscrubbed reply.
+    // Scrubbed here, at the wire, so fresh answers and cache hits pass alike.
+    // Every section: RFC 9460 §4.2 has clients use addresses from additional.
+    // Out of memory returns null, never an unscrubbed reply.
     const answers = rebinding.scrub(alloc, reply.answers, rb) catch return null;
     const authorities = rebinding.scrub(alloc, reply.authorities, rb) catch return null;
     const additionals = rebinding.scrub(alloc, reply.additionals, rb) catch return null;
@@ -73,7 +65,6 @@ pub fn buildResponseWire(
 
     var options_buf: [3]dns.EdnsOption = undefined;
     var options: std.ArrayList(dns.EdnsOption) = .initBuffer(&options_buf);
-    // RFC 7828: never over UDP.
     var keepalive_data: [2]u8 = undefined;
     if (ctx.tcp_keepalive) |timeout| {
         std.mem.writeInt(u16, &keepalive_data, timeout, .big);
@@ -81,12 +72,11 @@ pub fn buildResponseWire(
     }
     var ede_bufs: [2][64]u8 = undefined;
     if (reply.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
-    // A scrubbed reply goes out with what is left, never SERVFAIL or
-    // REFUSED: REFUSED pushes a stub to the next resolver in resolv.conf,
-    // asking one that may not scrub and handing the attacker the rebind.
+    // A scrubbed reply goes out with what is left, never as REFUSED or
+    // SERVFAIL: those send a stub on to its next resolver, which may not
+    // scrub.
     if (scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
-        // RFC 6891 §6.2.3: our own receive limit, not the send budget.
         .udp_payload_size = dns.edns_udp_payload,
         .extended_rcode = 0,
         .version = 0,
@@ -109,17 +99,13 @@ pub fn buildResponseWire(
     };
     const sections: dns.Sections = .{ .answers = answers, .authorities = authorities, .additionals = additionals };
 
-    // Nothing past the client's payload is sent, so none is built; the rewind drops an overrun.
     var ends: dns.SectionEnds = .{};
     if (dns.serializeEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], hdr, ctx.question, sections, opt, &ends) catch null) |wire| return wire;
 
-    // Sections are laid down in order and a name pointer only reaches
-    // backward (RFC 1035 §4.1.4), so a response minus its tail sections is a
-    // prefix of the full wire plus a fresh OPT: rewind to a section boundary
-    // instead of re-serializing. Dropping additionals alone needs no TC
-    // (RFC 1035 §4.2.1: advisory); dropping authority (negative SOA, referral
-    // NS) sets TC=1 so the client retries over TCP (RFC 1035 §4.2.1, RFC 2181
-    // §9). Last resort drops answers too and hard-clips the bytes.
+    // Pointers only reach back, so the message up to a section's end plus a
+    // fresh OPT is a valid message: rewind instead of serializing again.
+    // Dropping additionals alone sets no TC; dropping authority or answers
+    // does (RFC 2181 §9). The last step also clips to the payload.
     for ([_]usize{ ends.authorities, ends.answers, ends.question }, 1..) |end, dropped| {
         if (end == 0) continue;
         var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
@@ -146,7 +132,6 @@ pub fn serializeErrorResponse(
     question: ?dns.Question,
     client: ?dns.Edns,
 ) []const u8 {
-    // RFC 6891 §6.1.1: an OPT in the query obliges one in the response.
     const opt: ?dns.OptRecord = if (client) |o| .{
         .udp_payload_size = dns.edns_udp_payload,
         .extended_rcode = extended_rcode,
@@ -159,7 +144,6 @@ pub fn serializeErrorResponse(
             .id = query_id,
             .flags = .{
                 .qr = true,
-                // RFC 1035 §4.1.1: copied from the query, a NOTIMP included.
                 .opcode = opcode,
                 .rd = rd,
                 .ra = true,
@@ -169,19 +153,16 @@ pub fn serializeErrorResponse(
         .question = question,
         .opt = opt,
     };
-    // RFC 9619 §4: one question at most, so 12 + 259 + 11 bytes at most.
+    // At most one question, so 12 + 259 + 11 octets: it fits.
     return dns.serializeMessage(wire_buf, msg) catch unreachable;
 }
 
 pub fn validateQuery(query: dns.Query) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
-    // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
-    // resolve it. Returning format_error keeps the TCP connection useful
-    // (UDP path drops silently before parse).
     if (query.header.flags.qr) return .{ .rcode = .format_error };
     if (query.header.flags.opcode != .query) return .{ .rcode = .not_implemented };
     const question = query.question orelse return .{ .rcode = .format_error };
-    // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
-    // version. Header RCODE bits = 0; OPT extended_rcode field = 1.
+    // RFC 6891 §6.1.3: BADVERS is 16, split as header RCODE 0 and extended
+    // RCODE 1.
     if (query.edns) |edns| if (edns.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
     if (question.qclass != .in) return .{ .rcode = .refused };
     return null;
@@ -228,8 +209,6 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
     };
     const scrub_on = rebinding.Config{ .enabled = true };
 
-    // Every allocation fails: the scrub cannot keep the public A without
-    // the private one, so nothing is sent rather than both.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var buf: [dns.max_udp_payload]u8 = undefined;
     const result = buildResponseWire(&buf, .{
@@ -288,9 +267,6 @@ test "validateQuery returns BADVERS for unsupported EDNS version" {
 }
 
 test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
-    // OPCODE 5 (Update — not in the named enum, use @enumFromInt). A server
-    // replying NOTIMP must echo the OPCODE so the client can match the
-    // response to its request.
     const opcode_update: dns.OpCode = @fromBackingInt(@intCast(5));
     var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, null, null);
@@ -337,14 +313,11 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
         .additionals = &.{ a_record, a_record, a_record },
     };
 
-    // Compressed: header+question+OPT is 40 bytes; answer 16; authorities
-    // 223; additionals 48.
     const rows = [_]struct { max: u16, tc: bool, an: u16, ns: u16 }{
         .{ .max = 300, .tc = false, .an = 1, .ns = 12 },
         .{ .max = 100, .tc = true, .an = 1, .ns = 0 },
         .{ .max = 40, .tc = true, .an = 0, .ns = 0 },
     };
-    // 300 overflows the buffer mid-additionals; 1024 serializes whole but over max.
     var buf: [1024]u8 = undefined;
     for ([_]usize{ 300, 1024 }) |cap| for (rows) |row| {
         const wire = buildResponseWire(buf[0..cap], .{

@@ -16,17 +16,13 @@ const OptionalCellId = graph.OptionalCellId;
 const Failure = graph.Failure;
 const RR = dns.ResourceRecord;
 
-/// Proven signed or unsigned; for `ds` and `dnskey`, also proven no zone
-/// at all, by the parent's signed denial of a delegation. Bogus is no
-/// fact: it fails.
+/// `absent`, for `ds` and `dnskey` only: the parent's signed denial shows no
+/// delegation, so the name is no zone. Bogus is not a value: it fails.
 pub const Proof = enum(u8) { secure, insecure, absent };
 
-/// A verdict and what it rests on: the verified DS set or keys, or for a
-/// DS proven absent, the signed denial that proves it.
 pub const Chain = struct {
     status: Proof,
     records: []const RR = &.{},
-    /// `secure` only: where the signatures' validity ends (`rrsig.Cap`).
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
@@ -40,35 +36,24 @@ pub const DsScratch = struct {
 };
 pub const DnskeyScratch = struct { ds: OptionalCellId = .none, rrset: OptionalCellId = .none };
 pub const AheadScratch = struct {
-    /// The payer of the walk that began it, shared.
     budget: *graph.Budget = undefined,
     rrset: OptionalCellId = .none,
     judge: OptionalCellId = .none,
 };
 pub const SecureScratch = struct {
-    /// The rrset version under judgement; ids recycle, so its generation too.
     target: CellId = 0,
     target_gen: u32 = 0,
-    /// `ds(zone)`: is the answering zone expected to sign at all.
     zone_ds: OptionalCellId = .none,
-    /// `dnskey(signer)` of the claim at `next`, held one at a time: the
-    /// rest are fetched alongside by `ahead` roots.
     key: OptionalCellId = .none,
-    /// The reply was checked for a flood and its signers' keys fetched.
     fetched: bool = false,
-    /// Insecure once a claim before `next` sits below a proven insecure cut.
     status: Proof = .secure,
-    /// The claim judged next, or the one faulted awaiting its probe.
     next: u8 = 0,
-    /// The lifetime the claims before `next` allow.
     expires: i64 = std.math.maxInt(i64),
-    /// Where the signatures of the claims before `next` stop proving.
     proven: i64 = std.math.maxInt(i64),
-    /// The claim at `next` is signed by a zone shallower than this: the
+    /// The claim at `next` must be signed by a zone shallower than this: the
     /// deeper signers it named are proven no zone.
     below: u8 = no_bound,
     /// Per proof claim, the depth of the zone its set verified under.
-    /// Only these feed a derivation (`verifiedProofs`).
     proved: [max_proof_claims]u8 = @splat(unproved),
     proved_until: [max_proof_claims]i64 = @splat(std.math.maxInt(i64)),
     fault: ?Fault = null,
@@ -78,8 +63,6 @@ pub const SecureScratch = struct {
 const no_bound = std.math.maxInt(u8);
 const unproved = std.math.maxInt(u8);
 
-/// A failed input stays pinned, its failure readable, until this cell
-/// settles.
 const Fault = union(enum) {
     bogus,
     input: CellId,
@@ -97,14 +80,11 @@ const Fault = union(enum) {
 };
 
 const bogus: Failure = .{ .code = .dnssec_bogus };
-/// Verified, and still no proof of the insecure cut asked about.
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
-/// Proven bogus, the bytes end with the verdict: their TTL was the forger's
-/// to set (RFC 4035 §4.7), and a version an earlier verdict kept leaves
-/// the store. With the validation budget spent nothing was proven: the
-/// stop is the limit's, named, and a zone draining its own budget must not
-/// drop a victim's bytes.
+/// Bogus bytes leave the store now: their TTL was the forger's to set (RFC
+/// 4035 §4.7). Not when a budget stopped the judgement: nothing was proven,
+/// and a zone draining its own budget must not evict a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (g.payer.validationStop()) |why| return g.fail(id, why);
     if (g.limit(g.payer) == null) {
@@ -115,28 +95,18 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, bogus);
 }
 
-/// A zone's DS or keys proven bogus: demanding them again is refused for
-/// `servfail_ttl`, since judging them again per question is KeyTrap's lever
-/// (RFC 9520 §3.4).
+/// A bogus DS or keyset is remembered (RFC 9520 §3.4): judging it again per
+/// question is KeyTrap's lever.
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
     if (g.payer.validationStop() == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
     try failBogus(g, id, rid);
 }
 
-/// Where `cap` ends a set stored at `stored_ns`.
 fn capExpiry(g: *Graph, cap: rrsig.Cap, stored_ns: i64) i64 {
     const ns = std.time.ns_per_s;
     return @min(stored_ns + @as(i64, cap.original_ttl) * ns, g.now() + @as(i64, cap.window_s) * ns);
 }
 
-/// `ds(zone)`: the anchor at the root; below it, `rrset(zone, DS)` judged
-/// under the keys of whatever signed it, a proper ancestor of the zone:
-/// the walked parent may hide a cut on its own servers, or fold one (901).
-/// A signed set with a usable algorithm is secure, a proven absence or
-/// unusable set insecure. Bytes that prove nothing, or a failed input, are
-/// insecure only below a proven insecure cut between the walked parent
-/// and the zone; otherwise the bytes are bogus or the failure stands. An
-/// insecure parent is inherited, and so is a failed one.
 pub fn runDs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.ds;
@@ -158,8 +128,8 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
     switch (parent_keys.state.fact.dnskey.status) {
-        // The walk's parent proven no zone: the zone above it speaks for
-        // the child, and the DS names it.
+        // `absent`: the walked parent is no zone, so a zone above it signs
+        // this DS. `judgeDs` finds which.
         .secure, .absent => {},
         .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires()),
     }
@@ -178,8 +148,8 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             try g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
         },
-        // Unremembered, every probe below judges this zone again, doubling
-        // per label.
+        // Remembered: otherwise every probe below judges this zone again,
+        // doubling per label.
         .none => if (s.fault.?.failure(g)) |why| try g.failRemembered(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
 }
@@ -193,14 +163,14 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             const keys = g.cell(kid);
             if (!keys.settled()) return null;
             if (keys.failure() != null) return .{ .input = kid };
-            // A signer proven no zone holds nothing: the set sits higher.
+            // A signer proven no zone holds nothing: retry with the next one up.
             if (r.kind != .answer or keys.state.fact.dnskey.status != .absent) break keys;
             below = keys.name.depth();
         }
         const signer = switch (r.kind) {
             .answer => dnssec.signerBelow(r.answers, zone, .ds, below),
             .nodata, .nxdomain => proof.denialZone(r.authorities, zone),
-            // A name that is no cut may alias (a hidden-cut probe).
+            // A hidden-cut probe may land on a name that is an alias, not a cut.
             .alias => return .no_cut,
             .yxdomain => null,
         } orelse return .bogus;
@@ -223,7 +193,6 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires(), keys.expires()));
         },
         .nodata, .nxdomain => {
-            // RFC 4034 §3.1.3.
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
                 return .bogus;
             const cap = try dnssec.verifyAuthorityProofSigs(g.scratch.allocator(), r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
@@ -235,7 +204,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                     try g.keep(s.rrset.unwrap().?);
                     try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
                 },
-                // A signed denial of the DS showing no delegation: no zone.
+                // A signed denial of the DS that shows no delegation either: no zone.
                 .unproven => switch (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget)) {
                     .secure => {
                         try g.keep(s.rrset.unwrap().?);
@@ -251,10 +220,6 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     return null;
 }
 
-/// `ahead(name, type)` holds the judge of `rrset(name, type)` until it
-/// settles: `dnskey` for keys, so the chain of trust overlaps the walk
-/// below; `ds` for a referral's DS; `secure` for whatever else a reply
-/// published.
 pub fn runAhead(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.ahead;
     const name = g.cell(id).name;
@@ -266,8 +231,6 @@ pub fn runAhead(g: *Graph, id: CellId) !void {
     if (g.cell(s.judge.unwrap().?).settled()) try g.settle(id, .ahead, g.now());
 }
 
-/// Every cut from `zone` up is proven secure or, unproven yet, delegated
-/// with a DS hark can follow, to the root or to a cut proven secure.
 pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
     var z = zone;
     while (true) {
@@ -275,22 +238,19 @@ pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
         if (z.isRoot()) return true;
         const ds = try g.peek(graph.Key.of(.rrset, z, .ds)) orelse return false;
         if (ds.value.rrset.kind != .answer or !dnssec.anySupportedDs(ds.value.rrset.answers)) return false;
-        // The DS came from the zone above, whichever cut lies between.
         const above = ds.value.rrset.zone;
         if (!proof.isProperAncestor(above, z)) return false;
         z = above;
     }
 }
 
-/// `dnskey(zone)`: `rrset(zone, DNSKEY)` verified under `ds(zone)`.
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
     if (s.ds == .none) s.ds = .wrap(try g.demand(id, graph.Key.of(.ds, zone, .a), zone) orelse
         return g.fail(id, .unreachable_authority));
-    // Signed all the way down, proven or not yet, says the keys will be
-    // needed: fetch them alongside the proof instead of a round trip per
-    // level after it.
+    // Looks redundant with the demand below, but this one runs before the
+    // DS settles: a zone likely to be signed gets its keys fetched alongside.
     if (s.rrset == .none and try signedDown(g, zone))
         s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .dnskey), zone));
     const ds = g.cell(s.ds.unwrap().?);
@@ -318,9 +278,6 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires(), ds.expires()));
 }
 
-/// The judgement of one rrset version; a fresh cell per version, since
-/// the verdict is about those bytes; one already stamped on them settles
-/// the cell without a rule.
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     const t = g.cell(rid);
     std.debug.assert(t.state == .fact);
@@ -342,10 +299,6 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     return sid;
 }
 
-/// `secure(rrset)`: nothing to prove where `ds` says the answering zone
-/// is unsigned; otherwise each claim the reply makes is judged on its own.
-/// A claim that proves nothing may sit below a hidden insecure cut, which
-/// only its DS can say (RFC 4035 §4.3, §5.2); else the reply is bogus.
 pub fn runSecure(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
@@ -356,8 +309,6 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
     switch (zd.state.fact.ds.status) {
-        // Proven no zone, a folded child: its claims are judged as any
-        // (RFC 6840 §4.1).
         .secure, .absent => {},
         .insecure => return g.settle(id, .{ .secure = .{ .status = .insecure } }, zd.expires()),
     }
@@ -367,9 +318,9 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             if (g.payer.validationStop()) |why| return g.fail(id, why);
         }
         const c = Claims.at(&t.state.fact.rrset, t.key.rtype, s.next);
-        // A proof is excused only where the data it speaks for is: the
-        // name denied, while that is the zone's; else its own owner.
         const r = &t.state.fact.rrset;
+        // A proof may sit below an insecure cut only where the data it speaks
+        // for does: the name denied, if that is the zone's, else its own owner.
         const deepest = if (c.is == .proof and r.target.isSubdomainOf(zone)) proof.deepestApex(r.target, t.key.rtype) else proof.deepestApex(c.owner, c.rtype);
         switch (try s.probe.run(g, id, zone, deepest)) {
             .pending => return,
@@ -387,14 +338,11 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     }
 }
 
-/// Judge the claims from `s.next` on, settling once the last proves
-/// itself; a claim that proves nothing is the fault returned.
 fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: i64) !?Fault {
     const r = &t.state.fact.rrset;
     const qtype = t.key.rtype;
-    // A zone proven no cut belongs to the zone that proved it (a folded
-    // child's parent).
     const zd = g.cell(s.zone_ds.unwrap().?).state.fact.ds;
+    // A name proven no zone belongs to the zone whose denial proved it.
     const within = if (zd.status == .absent) proof.denialZone(zd.records, r.zone).? else r.zone;
     if (!s.fetched) {
         if (flooded(r, qtype)) {
@@ -436,13 +384,13 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 switch (keys.status) {
                     .secure => {},
                     .insecure => {
-                        // Insecure keys above a secure zone contradict its DS.
+                        // Insecure keys above a zone whose DS is secure contradict that DS.
                         if (!signer.isSubdomainOf(r.zone)) break :f .bogus;
                         s.status = .insecure;
                         break :f null;
                     },
-                    // The signer is proven no zone: a set sits in one
-                    // above it, and a denial that named it is forged.
+                    // The signer is proven no zone. A set may be signed by one
+                    // above it; a denial naming it is forged.
                     .absent => {
                         if (c.is == .denial) break :f .bogus;
                         s.below = signer.depth();
@@ -504,12 +452,9 @@ fn keysOf(g: *Graph, key: OptionalCellId, signer: dns.Name) bool {
     return g.cell(kid).name.eql(signer);
 }
 
-/// The most claims a reply `classify` keeps can make: a CNAME and a DNAME
-/// set per link, the data at the end, a denial and its proofs. More is
-/// refused unread.
 const max_claims = 2 * graph.max_links + 2 + max_proof_claims;
-/// A proof's worth of NSEC or NSEC3 and one SOA (RFC 2308 §3). Proof
-/// claims come first, so this bounds their slots.
+/// `Claims` yields proof claims first, so their slots stay below this and
+/// may index `proved`.
 const max_proof_claims = proof.max_proof_records + 1;
 
 fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
@@ -525,8 +470,6 @@ fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
     return false;
 }
 
-/// What a reply claims, one set at a time: the authority's NSEC, NSEC3 and
-/// SOA sets, the answer's RRsets in order, then a negative's denial.
 const Claims = struct {
     r: *const graph.Reply,
     qtype: dns.RType,
@@ -543,7 +486,6 @@ const Claims = struct {
         is: union(enum) {
             rrset,
             proof,
-            /// Proven by the derivation from the DNAME (RFC 6672 §5.3.1).
             synthesised: struct { cname: RR, dname: RR },
             denial,
         },
@@ -566,8 +508,6 @@ const Claims = struct {
             it.i += 1;
             const rr = answers[i];
             if (rr.rtype == .rrsig or !firstOfRrset(answers, i)) continue;
-            // A CNAME under a DNAME of the reply is its synthesis (RFC 6672
-            // §2.4); of several, the deepest, as classify takes.
             var dname: ?RR = null;
             if (rr.rtype == .cname) for (answers) |d| {
                 if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
@@ -596,10 +536,6 @@ const Claims = struct {
     }
 };
 
-/// The zone a claim is judged under, if it may speak for the owner (RFC
-/// 4034 §3.1.3): its deepest signer shallower than `below` labels, an
-/// RRset's only from within `within`; a denial's, which may come from
-/// above, is `proof.denialZone`'s.
 fn signerOf(r: *const graph.Reply, c: Claims.Claim, within: dns.Name, below: u8) ?dns.Name {
     const signer = switch (c.is) {
         .rrset => dnssec.signerBelow(r.answers, c.owner, c.rtype, below),
@@ -612,14 +548,10 @@ fn signerOf(r: *const graph.Reply, c: Claims.Claim, within: dns.Name, below: u8)
     return signer;
 }
 
-/// `ds(candidate)` one label at a time below `above`, down to `deepest`,
-/// for a proven insecure cut; each candidate is asked once.
 const Probe = struct {
     cell: OptionalCellId = .none,
     depth: u8 = 0,
 
-    /// `stopped`: a candidate failed on an asker's own limit, or could
-    /// not be demanded, so no candidate below it was ruled out.
     fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, stopped: Failure } {
         while (true) {
             if (p.cell.unwrap()) |pid| {
@@ -638,16 +570,14 @@ const Probe = struct {
     }
 };
 
-/// The proof sets that verified under `signer` as claims, with its
-/// signatures: what a derivation in its zone may read. A set excused below
-/// an insecure cut or passed under insecure keys proved nothing, so it is
-/// left out. Proof claims come first, so all are judged.
 fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !struct { rrs: []const RR, until: []const i64 } {
     const a = g.scratch.allocator();
     var keep: std.ArrayList(RR) = .empty;
     var until: std.ArrayList(i64) = .empty;
     var it: Claims = .{ .r = r, .qtype = qtype };
     while (it.next()) |c| {
+        // Proof claims come first, and all are judged before any claim that
+        // reads them. Sets excused or passed under insecure keys stay out.
         if (c.is != .proof) break;
         if (s.proved[c.slot] != signer.depth() or !c.owner.isSubdomainOf(signer)) continue;
         for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rrsig().signer_name.eql(signer)) {
@@ -658,9 +588,8 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const 
     return .{ .rrs = keep.items, .until = until.items };
 }
 
-/// A proven set keeps only the signatures its zone's verifier weighs; the
-/// rest go before a verdict is stamped on its bytes. Only signatures go, so
-/// every claim keeps its place.
+/// Drops the signatures the verifier did not weigh before a verdict is
+/// stamped on the bytes. Only signatures go, so claim slots do not move.
 fn keepWeighed(g: *Graph, target: CellId, r: *const graph.Reply, c: *const Claims.Claim, zone: dns.Name, now: u32) !void {
     const section = if (c.is == .proof) r.authorities else r.answers;
     const set = dnssec.setFrom(section, c.head);
@@ -679,16 +608,13 @@ fn synthesisedUnder(rr: RR, dname: RR) bool {
     return rr.rtype == .cname and rr.name.depth() > dname.name.depth() and rr.name.isSubdomainOf(dname.name);
 }
 
-/// A reply's sets sit together: a record heads its set unless the one
-/// before is of it.
+/// Assumes `bindSets` order: a set's records are adjacent.
 fn firstOfRrset(rrs: []const RR, i: usize) bool {
     return i == 0 or rrs[i - 1].rtype != rrs[i].rtype or !rrs[i - 1].name.eql(rrs[i].name);
 }
 
-/// What a referral from `zone` says about `rrset(child, DS)`: the signed
-/// DS set, or a denial carrying the referral's NSEC or NSEC3 proof and
-/// nothing else of it: the child's NS in a denial's authority reads as a
-/// referral to a stub. Null when it says nothing.
+/// On a denial only the NSEC or NSEC3 proof is kept: the child's NS in a
+/// denial's authority would read as a referral.
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !?graph.Reply {
     const ds = dnssec.setAt(msg.authorities, child, .ds);
     if (ds.len > 0) {

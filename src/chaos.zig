@@ -9,7 +9,6 @@ pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch
 
 pub const Events = std.array_hash_map.Auto(u64, void);
 
-/// What an event decided about, for a shrunk failure's report.
 const About = union(enum) {
     key: graph.Key,
     server: na.AddressKey,
@@ -20,15 +19,10 @@ pub const Chaos = struct {
     gpa: std.mem.Allocator,
     seed: u64,
     decided: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    /// Hark forgot something it would have held: a limit, unseen by any
-    /// one answer.
     forgot: bool = false,
-    /// Shrinking: only these events may draw other than 0.
     only: ?*const Events = null,
-    /// Every event that drew other than 0.
     left: Events = .empty,
     fired: std.EnumArray(Site, u32) = .initFill(0),
-    /// Names each event that left, gpa-owned.
     told: ?std.ArrayList([]const u8) = null,
 
     pub fn deinit(c: *Chaos) void {
@@ -40,30 +34,20 @@ pub const Chaos = struct {
         }
     }
 
-    /// Each site is on or off for the whole run (swarm testing): a
-    /// feature left off cannot hide a bug the others reach. A site that is
-    /// off and random by design (pick, gather, prefetch) draws from the
-    /// edge's rng in order, as without chaos.
     pub fn live(c: *const Chaos, site: Site) bool {
         return std.hash.Wyhash.hash(c.seed, std.mem.asBytes(&site)) & 1 == 1;
     }
 
-    /// The event of `key`'s next decision at `site`.
     pub fn peek(c: *const Chaos, site: Site, key: graph.Key) u64 {
         const of = c.keyed(site, key);
         return c.named(site, of ^ @as(u64, c.decided.get(of) orelse 0));
     }
 
-    /// After which `key` decides afresh.
     pub fn spend(c: *Chaos, site: Site, key: graph.Key) !void {
         const n = try c.decided.getOrPut(c.gpa, c.keyed(site, key));
         n.value_ptr.* = if (n.found_existing) n.value_ptr.* + 1 else 1;
     }
 
-    /// The event at `site` that `name` stands for: a key's nth decision,
-    /// or what a draw no key decides is about. Draws are keyed by the event
-    /// they decide, not by draw order, so a run that decides one thing
-    /// differently decides no other live site's differently.
     pub fn named(c: *const Chaos, site: Site, name: u64) u64 {
         var h = std.hash.Wyhash.init(c.seed);
         h.update(std.mem.asBytes(&site));
@@ -80,16 +64,14 @@ pub const Chaos = struct {
         return h.final();
     }
 
-    /// One of `n` for `event`, unnoted; the bias, n / 2^64, never shows. A
-    /// draw of 0 is what hark does without chaos, or, where hark draws too,
-    /// the first.
+    /// A draw of 0 is what hark does without chaos: every caller relies on it.
     fn draw(c: *const Chaos, event: u64, n: u64) u64 {
         if (c.only) |only| if (!only.contains(event)) return 0;
         return @intCast(std.math.mulWide(u64, std.hash.Wyhash.hash(event, "draw"), n) >> 64);
     }
 
     /// Fails having noted nothing, so a caller that takes 0 on failure
-    /// decided what a replay without this event decides.
+    /// decides what a replay without this event decides.
     pub fn choose(c: *Chaos, site: Site, event: u64, n: u64, about: About) !u64 {
         const v = c.draw(event, n);
         if (v != 0) try c.note(site, event, about);

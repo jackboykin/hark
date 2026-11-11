@@ -14,28 +14,24 @@ const Key = graph.Key;
 const Value = graph.Value;
 const RR = dns.ResourceRecord;
 
-/// `secure(rrset)` over exactly these bytes.
 pub const Verdict = extern struct {
-    /// Read through `standing`: 0 decodes to secure, and zeroed is unjudged.
+    /// Read it through `standing`: 0 decodes to secure, and a zeroed verdict is
+    /// unjudged.
     status: u8 = 0,
     _pad: [3]u8 = @splat(0),
     judged_s: u32 = 0,
     proven_until_ns: i64 = 0,
     until_ns: i64 = 0,
 
-    /// A verdict ending where it did is the same life: it keeps its
-    /// judgment.
     pub fn stamp(v: *Verdict, c: trust.Chain, until_ns: i64, now_ns: i64) void {
         const judged_s = if (v.until_ns == until_ns) v.judged_s else @as(u32, @intCast(@divFloor(now_ns, std.time.ns_per_s)));
         v.* = .{ .status = @backingInt(c.status), .judged_s = judged_s, .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
     }
 
-    /// Zeroed is never judged.
     pub fn judged(v: Verdict) bool {
         return v.until_ns != 0;
     }
 
-    /// Where a version expiring at `expires_ns` stops serving under it.
     pub fn end(v: Verdict, expires_ns: i64) i64 {
         return if (v.judged()) @min(expires_ns, v.until_ns) else expires_ns;
     }
@@ -46,8 +42,8 @@ pub const Verdict = extern struct {
     }
 };
 
-/// One key's version: this header, the key's name, then the value as
-/// `build` writes it.
+/// One version of a key's value, in one allocation: this header, the key's
+/// name, then the value as `build` writes it.
 pub const Blob = extern struct {
     refs: u32,
     len: u32,
@@ -89,8 +85,6 @@ fn isReply(b: *Blob) bool {
     return kind == .rrset or kind == .stub or kind == .parental;
 }
 
-/// While a version serves: from its storing to its expiry, or from its
-/// verdict's judgment to the verdict's end when that comes first.
 pub const Life = struct {
     start_ns: i64,
     end_ns: i64,
@@ -105,36 +99,31 @@ pub const Life = struct {
     }
 };
 
-/// Handed the store itself, so whatever embeds one finds itself by the
-/// field (`@fieldParentPtr`) and never pins its address.
 const OnEvict = *const fn (*Store, *Blob) void;
 
 pub const Store = struct {
     gpa: Allocator,
     map: std.array_hash_map.Custom(Ref, void, ByRef, false) = .empty,
-    /// Every live blob's bytes, whoever holds it.
+    /// Every live blob's bytes, whoever holds a reference.
     bytes: usize = 0,
-    /// The bytes of the blobs the map holds; the cap is on this.
+    /// The bytes of the blobs the map holds; `cap` bounds this.
     held: usize = 0,
     cap: usize,
     visited: std.bit_set.Dynamic = .{},
     hand: usize = 0,
-    /// Over the cap a key is turned away the first time and admitted the
+    /// Over the cap a new key is turned away the first time and admitted the
     /// next, so a flood of names never seen twice evicts nothing.
     door: [door_bits / 8]u8 = @splat(0),
     door_set: u32 = 0,
     evictions: u64 = 0,
     unadmitted: u64 = 0,
-    /// Fires as a key's version leaves the map: evicted, dropped or
-    /// replaced. The version named is live for the call.
     on_evict: ?OnEvict = null,
     stage: []u8,
 
     const door_bits = 1 << 16;
 
-    /// A blob and its key's fingerprint, in the 16 bits a user address
-    /// leaves free: a probe passes other keys' blobs without loading them.
-    /// Linux maps a process above 2^48 only when asked to by a hint.
+    /// A blob's address with its key's fingerprint in the 16 bits a user address
+    /// leaves free: Linux maps above 2^48 only when a hint asks for it.
     const Ref = packed struct(u64) {
         addr: u48,
         tag: u16,
@@ -149,7 +138,6 @@ pub const Store = struct {
         }
     };
 
-    /// The map draws slots from the hash's low 32 bits; the tag is its top 16.
     fn tagOf(h: u64) u16 {
         return @truncate(h >> 48);
     }
@@ -204,19 +192,16 @@ pub const Store = struct {
         return b;
     }
 
-    /// Any age; not a SIEVE hit.
     pub fn any(s: *Store, key: Key) ?*Blob {
         return s.map.keys()[s.find(key) orelse return null].blob();
     }
 
-    /// Forgets this version of a fact; a newer version is not its business.
     pub fn drop(s: *Store, blob: *Blob) void {
         const i = s.map.getIndex(Ref.of(blob)) orelse return;
         if (s.map.keys()[i].blob() == blob) s.removeAt(i);
     }
 
-    /// Takes the caller's reference on success; on any error it stays
-    /// theirs. A new key over the cap must have knocked before.
+    /// Takes the caller's reference on success; on any error it stays theirs.
     pub fn put(s: *Store, blob: *Blob) !void {
         const ref = Ref.of(blob);
         const gop = try s.map.getOrPut(s.gpa, ref);
@@ -246,16 +231,16 @@ pub const Store = struct {
 
     fn removeAt(s: *Store, i: usize) void {
         const last = s.map.count() - 1;
+        // swapRemove moves the last entry into `i`: its visited bit and the hand
+        // follow it.
         if (i != last) s.visited.setValue(i, s.visited.isSet(last));
         const b = s.map.keys()[i].blob();
         if (s.on_evict) |f| f(s, b);
         s.map.swapRemoveAt(i);
         s.letGo(b);
-        // Swap-remove moved only the last entry, into `i`.
         if (s.hand == last) s.hand = i;
     }
 
-    /// SIEVE, its scan capped; past the cap the entry at the hand goes.
     fn evict(s: *Store) void {
         const n = s.map.count();
         var probes: usize = 0;
@@ -286,7 +271,6 @@ pub const Store = struct {
         return false;
     }
 
-    /// One reference, the caller's.
     pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) !*Blob {
         std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
         var w: Writer = .{ .buf = s.stage, .pos = @sizeOf(Blob) };
@@ -309,7 +293,7 @@ pub const Store = struct {
                 for (c.servers) |server| for (server.glue) |gl| try w.addr(gl);
             },
             .rrset, .stub => |r| {
-                // `Rrset.of` reads these in place.
+                // `Rrset.read` and `Rrset.answered` read this layout in place.
                 try w.int(u8, @backingInt(r.kind));
                 try w.int(u8, @intFromBool(r.aa) | @as(u8, @intFromBool(r.ede != null)) << 1);
                 try w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
@@ -391,26 +375,21 @@ pub const Store = struct {
     }
 };
 
-/// An rrset's blob read in place, no allocation: the reply's scalars,
-/// its names and records as `build` wrote them.
 pub const Rrset = struct {
     kind: graph.Reply.Of,
     aa: bool,
     ede: ?dns.Ede.Code,
     ttl: u32,
     stored_ns: i64,
-    /// Uncompressed wire names.
     target: []const u8,
     zone: []const u8,
     sections: [3]Records,
 
-    /// `build`'s layout, which wrote it; so it cannot fail.
     pub fn of(b: *Blob) Rrset {
         std.debug.assert(isReply(b));
         return read(.{ .buf = b.payload(), .pos = b.name_len }) catch unreachable;
     }
 
-    /// An `answer`'s answer section, without `of`'s walk over every record.
     pub fn answered(b: *Blob) ?Answered {
         std.debug.assert(isReply(b));
         const p = b.payload();
@@ -467,7 +446,6 @@ pub const Rrset = struct {
     }
 };
 
-/// A section's records, as stored; each read with the TTL it came with.
 pub const Records = struct {
     payload: []const u8,
     start: usize,
@@ -500,8 +478,8 @@ pub const Records = struct {
     };
 };
 
-/// Whole, or two bytes in RFC 1035's pointer form at a suffix of a name
-/// stored whole, so it reads as one slice.
+/// A name stored whole, or a two-byte pointer (offset from the payload's
+/// start) to a suffix of one stored whole, so either reads as one slice.
 fn stored(payload: []const u8, at: usize) struct { name: []const u8, len: usize } {
     if (payload[at] < 0xc0) {
         const n = dns.wireNameLen(payload[at..]);
@@ -514,8 +492,6 @@ fn stored(payload: []const u8, at: usize) struct { name: []const u8, len: usize 
 const Writer = struct {
     buf: []u8,
     pos: usize,
-    /// Names stored whole that a later one may end with: the key's, the
-    /// value's first, and its latest.
     anchors: [3]?Anchor = @splat(null),
 
     const payload_at = @sizeOf(Blob);
@@ -558,7 +534,6 @@ const Writer = struct {
         try w.slice(&k.addr);
     }
 
-    /// As `Records.Iterator` reads them.
     fn records(w: *Writer, rrs: []const RR) !void {
         for (rrs) |rr| {
             try w.name(rr.name);
@@ -648,7 +623,6 @@ test "a fact survives the blob byte for byte" {
     const blob = try s.build(key, .{ .rrset = reply }, 1000);
     try s.put(blob);
     try testing.expectEqual(blob, s.get(key, 999).?);
-    // Whole in the key and rdata alone: the target, zone and owners refer back.
     try testing.expectEqual(2, mem.count(u8, blob.bytes(), "\x03www\x07example\x03com\x00"));
     try testing.expectEqual(4, mem.count(u8, blob.bytes(), "\x07example\x03com\x00"));
     try testing.expectEqual(null, s.get(key, 1000));

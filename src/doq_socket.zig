@@ -20,16 +20,13 @@ const carrier = @import("carrier.zig");
 
 const Socket = @This();
 
-/// The handshake, then the question: it leaves with hark's Finished.
 pub const dial_rounds = 2;
 
-/// Datagrams a read takes at most.
 const batch = 16;
 
 pub const Shared = struct {
     rx: [batch][quic.max_received]u8 = undefined,
     tx: [quic.burst][quic.max_datagram]u8 = undefined,
-    /// Replies put together from several packets; the edge has taken them by the next read.
     delivered: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(sh: *Shared, gpa: std.mem.Allocator) void {
@@ -38,12 +35,9 @@ pub const Shared = struct {
     }
 };
 
-/// A connected socket: the kernel says whose a datagram is, and closing it
-/// ends closing and draining (RFC 9000 §10.2).
 pub fn open(edge: *Edge, sh: *Shared, server: na.Address, port: u16, token: u32) !Socket {
     const fd = try sys.socket(na.afU32(server), posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
-    // RFC 9000 §14: never fragmented, and hark's datagrams fit any path.
     const probe: i32 = linux.IP.PMTUDISC_PROBE;
     if (server == .ip4) {
         _ = linux.setsockopt(fd, linux.IPPROTO.IP, linux.IP.MTU_DISCOVER, std.mem.asBytes(&probe), @sizeOf(i32));
@@ -116,8 +110,6 @@ pub fn fire(sock: *Socket, sh: *Shared) !carrier.News {
     return sock.news(sh);
 }
 
-/// After its timers: what the connection owes leaves, and whatever it said
-/// waits for `next`.
 fn news(sock: *Socket, sh: *Shared) !carrier.News {
     if (sock.conn.ended == null and !try sock.flush(sh)) return .{ .ended = .closed };
     return sock.said();
@@ -127,9 +119,6 @@ fn said(sock: *const Socket) carrier.News {
     return if (sock.conn.event_at < sock.conn.events.items.len) .read else .nothing;
 }
 
-/// What has come, a batch of datagrams in one call, each in a buffer of
-/// its own: a reply may point into one until the edge has taken it. What
-/// the connection owes leaves with the turn's other sends.
 pub fn ready(sock: *Socket, sh: *Shared, _: u32) !carrier.News {
     for (sh.delivered.items) |b| sock.edge.work.free(b);
     sh.delivered.clearRetainingCapacity();
@@ -143,14 +132,13 @@ pub fn ready(sock: *Socket, sh: *Shared, _: u32) !carrier.News {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .AGAIN, .INTR => return sock.said(),
-        // ICMP unreachable and kin: nobody speaks QUIC there.
         else => |err| {
             sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";
             return .{ .ended = .failed };
         },
     }
     for (msgs[0..rc], sh.rx[0..rc]) |m, *b| {
-        // Past what the server was told it may send: lost, as on the wire.
+        // Larger than the server was told it may send: lost, as on the wire.
         if (m.hdr.flags & linux.MSG.TRUNC != 0) continue;
         try sock.conn.input(b[0..m.len], sock.edge.now_ns, &sh.delivered);
         if (sock.conn.ended != null) break;
@@ -172,7 +160,6 @@ pub fn next(sock: *Socket, _: *Shared) !?carrier.Event {
     };
 }
 
-/// False: gone.
 pub fn flush(sock: *Socket, sh: *Shared) !bool {
     var msgs: [quic.burst]linux.mmsghdr = undefined;
     var iov: [quic.burst]posix.iovec = undefined;
@@ -185,7 +172,8 @@ pub fn flush(sock: *Socket, sh: *Shared) !bool {
     if (n == 0) return true;
     const rc = linux.sendmmsg(sock.fd, &msgs, @intCast(n), 0);
     switch (linux.errno(rc)) {
-        // What the kernel didn't take is lost as on the wire, and recovered so.
+        // What the kernel didn't take is lost as on the wire, and QUIC's loss
+        // recovery sends it again.
         .SUCCESS, .AGAIN, .INTR, .NOBUFS => return true,
         else => |err| {
             sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";

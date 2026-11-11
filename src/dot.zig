@@ -11,8 +11,6 @@ const Keys = tls13.Keys;
 
 pub const Error = tls13.Error || error{AlertHeard};
 
-/// A session's read bytes between reads, opened or not: `buf[frame..opened]`
-/// is the DNS stream, `buf[at..end]` records still sealed.
 pub const Rx = struct {
     buf: []u8,
     frame: usize = 0,
@@ -20,15 +18,12 @@ pub const Rx = struct {
     at: usize = 0,
     end: usize = 0,
 
-    /// The most a session leaves unread, plus room to read past it: a
-    /// message short of its last byte and a record short of its.
     pub const min_buf = 96 * 1024;
 };
 
 pub const Event = union(enum) {
     established: []const u8,
     send: []const u8,
-    /// A whole DNS message; lives until `Rx` is written to.
     reply: []u8,
     closed,
 };
@@ -70,14 +65,13 @@ pub const Session = struct {
         s.handshake = null;
     }
 
-    /// The message id is the session's: out of a counter, none is in use twice
-    /// on it, and inside TLS it guards nothing.
+    /// The message id is replaced by a session counter: no id is in use twice
+    /// on a session, and inside TLS its unpredictability guards nothing.
     pub fn query(s: *Session, out: []u8, wire: []const u8) struct { id: u16, sealed: []u8 } {
         var frame: [max_frame]u8 = undefined;
         std.debug.assert(wire.len >= 12 + 11 and wire.len <= 512);
         const id = s.next_id;
         s.next_id +%= 1;
-        // Every exchange's wire carries an OPT.
         const padded = dns.pad(frame[2..], wire, pad_block) catch unreachable;
         mem.writeInt(u16, frame[0..2], @intCast(padded.len), .big);
         mem.writeInt(u16, frame[2..4], id, .big);
@@ -112,8 +106,6 @@ pub const Session = struct {
         }
     }
 
-    /// What `rx` left unread, to go back at the front of its buffer, in order.
-    /// Replies it gave out still lie in the buffer, so it moves nothing.
     pub fn leftover(s: *Session, rx: *const Rx) struct { plain: []const u8, sealed: []const u8 } {
         s.plain = @intCast(rx.opened - rx.frame);
         return .{ .plain = rx.buf[rx.frame..rx.opened], .sealed = rx.buf[rx.at..rx.end] };
@@ -126,7 +118,7 @@ pub const Session = struct {
     fn onRecord(s: *Session, record: []u8, rx: *Rx, out: []u8) Error!?Event {
         const kind: tls.ContentType = @fromBackingInt(record[0]);
         if (s.phase == .hello or kind == .change_cipher_spec) {
-            // §5: dropped until the peer's Finished, whatever else it says.
+            // RFC 8446 §5: ignored at any point before the peer's Finished.
             if (kind == .change_cipher_spec) {
                 if (s.phase == .application or record.len != tls13.header_len + 1 or record[tls13.header_len] != 1) return error.UnexpectedMessage;
                 return null;
@@ -167,7 +159,6 @@ pub const Session = struct {
         }
         return switch (opened.kind) {
             .application_data => blk: {
-                // §5.1: nothing comes between a handshake message's records.
                 if (s.post.head_len != 0) break :blk error.UnexpectedMessage;
                 mem.copyForwards(u8, rx.buf[rx.opened..], opened.data);
                 rx.opened += opened.data.len;
@@ -178,8 +169,8 @@ pub const Session = struct {
         };
     }
 
-    /// §4.6: a ticket hark can't use (it offers no resumption, and a server
-    /// only SHOULD NOT send one then) passes; a key update turns.
+    /// RFC 8446 §4.6. A ticket is skipped, not an error: hark offers no
+    /// resumption, but a server only SHOULD NOT send one then.
     fn postHandshake(s: *Session, bytes: []const u8, out: []u8) Error!?Event {
         if (bytes.len == 0) return error.UnexpectedMessage;
         var rest = bytes;
@@ -242,8 +233,6 @@ test "a server's key update turns both ways when it asks" {
     _ = try client.open(s.query(&out, &wire).sealed);
 }
 
-/// A server that speaks properly until the fuzzer has it lie, checking what
-/// the session says back against a transcript of its own.
 const Fake = struct {
     smith: *std.testing.Smith,
     s: *Session,
@@ -270,7 +259,6 @@ const Fake = struct {
         var rest = bytes;
         while (rest.len > 0 and !f.ended) {
             const room = f.rx.buf.len - f.rx.end;
-            // What a read leaves must leave a read room, or it reads as closed.
             try testing.expect(room > 0);
             const most = @min(rest.len, room);
             const n = if (f.smith.boolWeighted(3, 1)) most else 1 + f.smith.index(most);

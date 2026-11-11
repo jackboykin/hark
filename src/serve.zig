@@ -26,16 +26,8 @@ const log = std.log.scoped(.serve);
 
 const max_frame = 4096;
 const udp_recv_max = 4096;
-/// Reads per wake. A hit answers inline, so only the cap on misses, which
-/// start upstream work, keeps replies from starving: at 64 misses per
-/// wake they fell 13%, at 8 they held.
 const udp_per_wake = 64;
 const udp_misses_per_wake = 8;
-/// Eighths of a listener's receive buffer past which it is crowded: once
-/// full, the kernel drops blindly, hits and misses alike. Below it sits a
-/// client keeping 1000 queries outstanding, ~55% of the 2 MB buffer at
-/// ~1.1 KB a datagram; above it, 512 KB of room, ~2 ms of arrivals at four
-/// times the miss ceiling.
 const crowded_eighths = 6;
 
 const Conn = struct {
@@ -48,7 +40,6 @@ const Conn = struct {
     last_ns: i64,
     owed: u32 = 0,
     draining: bool = false,
-    /// Reply bytes the socket has not taken; while any wait, nothing more is asked.
     out: std.ArrayList(u8) = .empty,
     blocked_ns: i64 = 0,
 
@@ -60,23 +51,18 @@ const Conn = struct {
 
 const Reply = union(enum) {
     udp: struct { fd: posix.fd_t, addr: na.Address },
-    /// It leaves from the address its query was sent to.
     wildcard: struct { fd: posix.fd_t, addr: na.Address, local: Batch.Local },
     tcp: *Conn,
 };
 
 const Owes = union(enum) {
     reply: Reply,
-    /// Its TCP connection closed; `drop` left it the UDP timeout to keep
-    /// its resolution wanted. Never answered.
     left,
-    /// Answered stale, it stays only to keep its resolution wanted (RFC 8767 §5).
     nothing,
 };
 
 const Watched = union(enum) {
     udp: posix.fd_t,
-    /// A UDP listener on every address of its family.
     wildcard: posix.fd_t,
     listen: posix.fd_t,
     conn: *Conn,
@@ -84,8 +70,6 @@ const Watched = union(enum) {
     free,
 };
 
-/// A token is a slot and its generation: an event queued for a dropped
-/// connection must not land on the slot's next tenant.
 const Slot = struct {
     gen: u32 = 0,
     w: Watched = .free,
@@ -94,29 +78,21 @@ const slot_bits = 20;
 const slot_mask = (1 << slot_bits) - 1;
 const max_conns = 1 << (slot_bits - 1);
 
-/// A client parked on a cell, and the query it asked: the graph never
-/// holds client bytes.
 const Pending = struct {
     root: graph.CellId,
-    /// Under DNS64, the A behind an empty AAAA.
     a: ?graph.CellId = null,
     query: dns.Query,
-    /// The question's name and spelling, once parked; until then the read's.
     question_bytes: []u8 = &.{},
     owes: Owes,
     asked_ns: i64,
     phase: enum {
         vacant,
         waiting,
-        /// Past mattering, it stays only for its resolution, until `reap`.
         late,
         echoing,
     } = .waiting,
-    /// The slot is reused; a timer names the tenant it was set for.
     gen: u32 = 0,
-    /// When the loop looks at it next; a timer for any other time is spent.
     at_ns: i64 = never,
-    /// The other clients parked on the same cell.
     prev: u32 = none,
     next: u32 = none,
 
@@ -156,30 +132,22 @@ const Timer = struct {
 
 const Tenant = struct { slot: u32, gen: u32 };
 
-/// Each query ends in one reply or one silent fate, or is still parked:
-/// `queries` is `replies`, `unanswered` and the process plane's `parked`.
 const Clients = struct {
     queries: struct { udp: u64 = 0, tcp: u64 = 0 } = .{},
     replies: struct { noerror: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, other: u64 = 0 } = .{},
     unanswered: struct {
         dropped: u64 = 0,
-        /// Turned away while crowded, naming nothing in flight or answered before.
         shed: u64 = 0,
-        /// Past the UDP timeout, or its TCP connection closed.
         late: u64 = 0,
-        /// Late, let go to bring the work under its ceiling.
         reaped: u64 = 0,
     } = .{},
     cache: struct {
-        /// Synthesized answers and held failures are neither.
         hit: u64 = 0,
         miss: u64 = 0,
         stale: u64 = 0,
     } = .{},
     detail: struct {
-        /// Of `hit`, those from the store before the graph was asked.
         recalled: u64 = 0,
-        /// Replies held to leave spaced as their questions came.
         echoed: u64 = 0,
         delay_ms: u64 = 0,
         paused: u64 = 0,
@@ -192,19 +160,14 @@ const Server = struct {
     e: *Edge,
     g: *graph.Graph,
     watched: std.ArrayList(Slot) = .empty,
-    /// Clients parked on unsettled cells, in stable slots.
     pending: std.ArrayList(Pending) = .empty,
     vacant: std.ArrayList(u32) = .empty,
     holding: u32 = 0,
-    /// Ever parked: a wake counts its misses by it, since `reap` may unpark mid-wake.
     parks: u64 = 0,
-    /// By cell id, the first slot parked on it.
     heads: std.ArrayList(u32) = .empty,
     late: std.Deque(Tenant) = .empty,
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
-    /// A TCP reply's frame, one at a time: a local this size is filled with
-    /// 0xaa on every call in safe builds.
     frame: [2 + @as(usize, dns.max_message_len)]u8 = undefined,
     freed: std.ArrayList(u32) = .empty,
     scratch: Arena,
@@ -232,9 +195,6 @@ const Server = struct {
         return @intCast(s.watched.items.len - 1);
     }
 
-    /// TERM and INT stop the loop; USR1 and HUP print the stats.
-    /// A handler is not optional: as PID 1 of a container the kernel drops
-    /// every signal the process has no disposition for, TERM included.
     fn onSignal(s: *Server, fd: posix.fd_t) void {
         var infos: [4]linux.signalfd_siginfo = undefined;
         const rc = linux.read(fd, @ptrCast(&infos), @sizeOf(@TypeOf(infos)));
@@ -252,8 +212,8 @@ const Server = struct {
         const udp = try listenOn(addr, posix.SOCK.DGRAM);
         try s.e.watch(udp, try s.token(if (na.isUnspecified(addr)) .{ .wildcard = udp } else .{ .udp = udp }), linux.EPOLL.IN);
         const tcp = try listenOn(addr, posix.SOCK.STREAM);
-        // Edge-triggered, so a paused listener doesn't spin the loop; `reopen`
-        // drains what queued meanwhile.
+        // Edge-triggered, so a listener paused at the connection limit doesn't
+        // spin the loop; `reopen` accepts what queued meanwhile.
         try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN | linux.EPOLL.ET);
         try s.listeners.append(s.gpa, tcp);
         var ab: [64]u8 = undefined;
@@ -270,21 +230,19 @@ const Server = struct {
                 s.paused = true;
                 s.clients.detail.paused += 1;
             },
-            // RFC 7766 §6.2.4: a client that closed its session is sent nothing more.
+            // RFC 7766 §6.2.4: a client that closed its side is sent nothing more,
+            // even with answers owed.
             .conn => |c| if (events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) s.close(c) else if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c),
             .signal => |fd| s.onSignal(fd),
             .free => {},
         }
     }
 
-    /// Drains the socket in one wake: an epoll call per query cost a third
-    /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t, comptime wildcard: bool) !void {
         const crowded = crowdedQueue(fd);
         const parks = s.parks;
         var read: usize = 0;
         while (true) {
-            // What is read is asked, so no more is read than may still park.
             const want = @min(udp_per_wake - read, Batch.max, udp_misses_per_wake -| (s.parks - parks));
             if (want == 0) return;
             const got = s.in.recv(fd, want);
@@ -311,7 +269,7 @@ const Server = struct {
                 .AGAIN => return true,
                 .MFILE, .NFILE, .NOBUFS, .NOMEM => return false,
                 .BADF, .FAULT, .INVAL, .NOTSOCK => unreachable,
-                // accept(2): the rest are one connection's.
+                // accept(2): the remaining errors belong to one connection, not the listener.
                 else => continue,
             }
             const cfd: posix.fd_t = @intCast(rc);
@@ -320,7 +278,6 @@ const Server = struct {
                 sys.close(cfd);
                 continue;
             }
-            // A small kernel queue, so write progress measures the client.
             posix.setsockopt(cfd, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(client_sndbuf)) catch {};
             const c = try s.gpa.create(Conn);
             c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
@@ -345,7 +302,6 @@ const Server = struct {
             else => return s.drop(c),
         }
         if (rc == 0) return s.close(c);
-        // Only a whole frame resets the idle clock.
         c.len += rc;
         try s.frames(c);
     }
@@ -360,9 +316,8 @@ const Server = struct {
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;
-            // Its window paces a TCP client: no queue overflows for it.
             try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c }, false);
-            // Turned away, or a failed write: the connection is gone.
+            // `ask` may have dropped the connection; `c` is then freed.
             if (s.watched.items[tok & slot_mask].w != .conn) return;
             start += 2 + flen;
             if (c.served >= s.cfg.tcp_queries_per_conn) return s.drain(c);
@@ -371,7 +326,6 @@ const Server = struct {
         c.len -= start;
     }
 
-    /// Clients still waiting get nothing; the graph frees their roots.
     fn deinit(s: *Server) void {
         for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
         for (s.pending.items) |p| if (p.phase != .vacant) s.release(p);
@@ -399,8 +353,8 @@ const Server = struct {
         return true;
     }
 
-    /// Unread bytes would turn the close into a reset, which can lose the
-    /// answers just sent. Bounded, so a client can't hold the loop by sending.
+    /// Closing with unread bytes sends a reset, which can destroy answers just
+    /// sent. The read is bounded so a client can't hold the loop by sending.
     fn close(s: *Server, c: *Conn) void {
         var unread: [max_frame]u8 = undefined;
         for (0..64) |_| {
@@ -415,7 +369,6 @@ const Server = struct {
             p.owes = .left;
             if (p.at_ns != Pending.never) continue;
             p.at_ns = @max(p.timeout(), s.e.now_ns);
-            // Without room for a timer, it stays until its root settles.
             s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
         };
         sys.close(c.fd);
@@ -436,7 +389,6 @@ const Server = struct {
                 .conn => |c| c,
                 .udp, .wildcard, .listen, .signal, .free => continue,
             };
-            // A client owed an answer gets the resolve deadline on top.
             const since = if (c.out.items.len != 0) c.blocked_ns else c.last_ns;
             const owed_ns = if (c.owed > 0 and c.out.items.len == 0) @as(i64, s.g.cfg.resolve_ms) * std.time.ns_per_ms else 0;
             if (s.e.now_ns - since >= idle_ns + owed_ns) s.drop(c);
@@ -444,7 +396,8 @@ const Server = struct {
     }
 
     fn ask(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
-        // BCP 140: a UDP reply is dropped silently, no query; over TCP `validateQuery` answers it.
+        // BCP 140: a UDP datagram with QR set is dropped silently, so two servers
+        // can't be made to answer each other. Over TCP `validateQuery` answers it.
         if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         if (reply != .tcp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
         s.scratch.reset();
@@ -475,7 +428,6 @@ const Server = struct {
             .graph => {},
         }
         const asked = try s.desk.asked(arena, q, client);
-        // BCP 140 again: turned away is silence on UDP, SERVFAIL on TCP.
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
         const admit: graph.Graph.Admit = if (crowded and !s.known(asked)) .join else .new;
         const root = s.g.demandRoot(asked.name, asked.qtype, admit) catch |err| {
@@ -484,8 +436,6 @@ const Server = struct {
                 error.Novel => &c.unanswered.shed,
                 else => return err,
             };
-            // Hark's limits, not the name's failure: never noted. A close
-            // would take the connection's other queries with it (RFC 7766 §6.2.1).
             if (reply == .tcp) return s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
             fate.* += 1;
             return;
@@ -494,8 +444,6 @@ const Server = struct {
         var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns };
         {
             errdefer s.release(p);
-            // Recall declined what the graph holds: inside the refresh window, a
-            // verdict it could not stamp, a put the store refused, DNS64's A.
             if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
                 c.cache.hit += 1;
                 try s.answered(reply, query, served, p.asked_ns);
@@ -512,14 +460,10 @@ const Server = struct {
         try s.hold(p);
     }
 
-    /// Answered once, at any age: worth new work while the core is behind,
-    /// unlike a name never seen (a random-subdomain flood).
     fn known(s: *Server, q: dns.Question) bool {
-        // A chain's first hop is always one to take.
         return s.g.storedHop(s.g.hopKind(null, q.name, q.qtype).?, q.name, q.qtype, .any) != null;
     }
 
-    /// Parks `p` on the cell it waits for; released if it cannot be.
     fn hold(s: *Server, p: Pending) !void {
         errdefer s.release(p);
         try s.reach(p.a orelse p.root);
@@ -534,7 +478,6 @@ const Server = struct {
         s.pending.items[i].gen = gen;
         s.parks += 1;
         s.link(i);
-        // Its capacity is reserved above.
         s.schedule(i) catch unreachable;
     }
 
@@ -597,14 +540,12 @@ const Server = struct {
             if (p.phase == .echoing) p.phase = .waiting;
             return s.link(i);
         };
-        // DNSBomb: a UDP client that joined a resolution is answered as long
-        // after its ask as the first still waiting was, so replies leave
-        // spaced as their questions came, never in one burst. TCP cannot be
-        // spoofed.
+        // DNSBomb: a UDP client that joined a resolution is answered as long after
+        // its ask as the first one still waiting, so replies leave spaced as their
+        // questions came, never in one burst. TCP cannot be spoofed.
         const echo = if (reply != .tcp) p.asked_ns - first_ns else 0;
         if (echo > 0) {
             served.release(&s.g.store);
-            // Shaped again when it leaves, so its TTLs age to then.
             p.at_ns = s.e.now_ns + echo;
             std.debug.assert(p.at_ns < p.timeout());
             try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
@@ -658,14 +599,10 @@ const Server = struct {
         try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
     }
 
-    /// Past `lapses` a client lets go, unless it alone holds the
-    /// resolution: the outcome is still wanted for the next ask, while
-    /// there is room for it (`reap`).
     fn gone(s: *Server, i: u32) !bool {
         const p = s.pending.items[i];
         if (s.e.now_ns < p.lapses()) return false;
         if (s.g.cell(p.a orelse p.root).holds == 1) {
-            // Each is done within its resolution's deadline: the front goes stale first.
             while (s.late.front()) |l| if (s.parkedAs(l) == null) {
                 _ = s.late.popFront();
             } else break;
@@ -677,9 +614,6 @@ const Server = struct {
         return true;
     }
 
-    /// Over the work ceiling, the late clients `gone` kept let go, oldest
-    /// first, until it is met: their resolutions end as orphans. Nothing
-    /// failed, so nothing is noted.
     fn reap(s: *Server) void {
         while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
             const l = s.late.popFront() orelse return;
@@ -695,8 +629,6 @@ const Server = struct {
         return if (p.phase == .late and p.gen == l.gen) l.slot else null;
     }
 
-    /// RFC 8767 §5: past the client's patience, stale if there is any, held;
-    /// the resolution goes on without it.
     fn impatient(s: *Server, p: *Pending) !void {
         const reply = switch (p.owes) {
             .reply => |r| r,
@@ -736,7 +668,6 @@ const Server = struct {
         logCounts("store", .{
             .held = Kib{ .bytes = g.store.held },
             .facts = g.store.map.count(),
-            // Versions the map let go of that a cell or a reply still holds.
             .pinned = Kib{ .bytes = g.store.bytes - g.store.held },
             .evictions = g.store.evictions,
             .unadmitted = g.store.unadmitted,
@@ -750,7 +681,6 @@ const Server = struct {
         });
     }
 
-    /// When the loop must look at a parked client next.
     fn nextTimer(s: *Server) i64 {
         const t = s.timers.peek() orelse return std.math.maxInt(i64);
         return t.at_ns;
@@ -762,8 +692,6 @@ const Server = struct {
             served.release(&s.g.store);
             return err;
         };
-        // Its waiter kept the resolution going; past a UDP client's
-        // timeout the outcome is noted and the reply goes nowhere.
         if (reply != .tcp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
             s.clients.unanswered.late += 1;
             return served.release(&s.g.store);
@@ -810,7 +738,6 @@ const Server = struct {
         };
     }
 
-    /// Releases `served`.
     fn send(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) void {
         defer served.release(&s.g.store);
         const arena = s.scratch.allocator();
@@ -895,7 +822,6 @@ const Server = struct {
         try s.frames(c);
     }
 
-    /// Null: the connection is gone.
     fn take(s: *Server, c: *Conn, bytes: []const u8) ?usize {
         return sys.write(c.fd, bytes) catch |err| switch (err) {
             error.WouldBlock => 0,
@@ -952,7 +878,6 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
     var sweep_at = e.now_ns + std.time.ns_per_s;
     var stats_at = e.now_ns + stats_every;
     while (!s.stopping) {
-        // Under load `next` always has an event; the timers run here, not on idle.
         if (e.now_ns >= sweep_at) {
             sweep_at = e.now_ns + std.time.ns_per_s;
             s.sweep();
@@ -963,7 +888,6 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
             stats_at = e.now_ns + stats_every;
             s.logSummary();
         }
-        // No reply waits out a wait.
         s.out.flush();
         const ev = try e.next(@min(sweep_at, stats_at, s.nextTimer())) orelse {
             try s.settle();
@@ -983,14 +907,11 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
 
 const stats_every = 5 * std.time.ns_per_min;
 
-/// A part of the fd limit `main` raised: flights get half and TCP clients
-/// a quarter, so idle clients can't take the sockets upstream needs.
 fn fdShare(part: u32) u32 {
     const lim = posix.getrlimit(.NOFILE) catch return std.math.maxInt(u32);
     return @intCast(@min(lim.cur / part, std.math.maxInt(u32)));
 }
 
-/// Each counter under `path`, named by its field path.
 fn logCounts(comptime path: []const u8, v: anytype) void {
     const T = @TypeOf(v);
     if (@typeInfo(T) == .@"struct" and !@hasDecl(T, "format")) {
@@ -1002,7 +923,6 @@ fn logCounts(comptime path: []const u8, v: anytype) void {
     stat(path, text catch unreachable);
 }
 
-/// Out of line, or every counter inlines its own copy of the log call.
 noinline fn stat(path: []const u8, text: []const u8) void {
     log.info("stats {s: <27} {s: >12}", .{ path, text });
 }
@@ -1013,7 +933,6 @@ fn sum(group: anytype) u64 {
     return n;
 }
 
-/// Padded so both lines' figures line up.
 fn summaryLine(comptime what: []const u8, summary: Summary, tail: []const u8) void {
     var buf: [32]u8 = undefined;
     const head = std.mem.print(&buf, what ++ " ({f}):", .{Span{ .ns = summary.ns }}) catch unreachable;
@@ -1031,7 +950,6 @@ const Summary = struct {
         const unanswered = minus(s.now.unanswered, s.then.unanswered);
         const cache = minus(s.now.cache, s.then.cache);
         const n = sum(queries);
-        // Tenths of a query a second; u128, as a count times ns overflows u64.
         const tenths: u64 = if (s.ns > 0) @intCast(@as(u128, n) * 10 * std.time.ns_per_s / @as(u128, @intCast(s.ns))) else 0;
         try w.print("{d} queries, {d}.{d} qps, {f} hit, {d} servfail, {d} unanswered", .{
             n,
@@ -1075,7 +993,6 @@ const Kib = struct {
     }
 };
 
-/// To a tenth: at a 99% hit rate, 99.0 and 99.8 are five times the misses apart.
 const Percent = struct {
     permille: u64,
 
@@ -1102,10 +1019,8 @@ fn rssBytes() ?u64 {
     return pages * std.heap.pageSize();
 }
 
-/// Past `crowded_eighths` of its receive buffer (SO_MEMINFO, Linux 4.12):
-/// one getsockopt a wake, not a control message a datagram.
 fn crowdedQueue(fd: posix.fd_t) bool {
-    // SK_MEMINFO_RMEM_ALLOC, SK_MEMINFO_RCVBUF, and the rest.
+    // SO_MEMINFO: [0] is SK_MEMINFO_RMEM_ALLOC, [1] is SK_MEMINFO_RCVBUF.
     var info: [9]u32 = undefined;
     var len: posix.socklen_t = @sizeOf(@TypeOf(info));
     if (linux.errno(linux.getsockopt(fd, posix.SOL.SOCKET, linux.SO.MEMINFO, @ptrCast(&info), &len)) != .SUCCESS) return false;
@@ -1118,9 +1033,8 @@ fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
     errdefer sys.close(sock);
     const one: c_int = 1;
     // V6ONLY keeps the families disjoint: the ACL is family-strict, and a
-    // v4-mapped-v6 peer would otherwise bypass every v4 allow rule.
+    // v4-mapped-v6 peer would otherwise bypass every v4 rule.
     if (af == posix.AF.INET6) try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(one));
-    // UDP has no TIME_WAIT, and there the flag lets any later binder take the port.
     if (sock_type == posix.SOCK.STREAM) try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(one));
     if (sock_type == posix.SOCK.DGRAM) {
         if (na.isUnspecified(addr)) try Batch.tellLocal(sock, af);
@@ -1133,8 +1047,8 @@ fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
     return sock;
 }
 
-/// INT/TERM stop, USR1/HUP print stats. The reader exists before the signals
-/// are blocked: blocked with nothing reading them is unkillable but by KILL.
+/// The reader exists before the signals are blocked: blocked with nothing
+/// reading them, the process is unkillable but by KILL.
 fn signalFd() !posix.fd_t {
     var mask = linux.sigemptyset();
     linux.sigaddset(&mask, linux.SIG.INT);
@@ -1146,10 +1060,8 @@ fn signalFd() !posix.fd_t {
     return fd;
 }
 
-/// Raw syscalls credential the calling thread only (no libc, no SIGSETXID
-/// broadcast), so this runs before any thread exists. Clears supplementary
-/// groups, then r/e/s gid, then r/e/s uid; euid 0 → non-zero drops the
-/// permitted caps. Ambient caps and the bounding set are systemd's job.
+/// Raw syscalls change the calling thread's credentials only (libc is what
+/// broadcasts them), so this must run before any other thread exists.
 fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     if (linux.geteuid() == 0) {
         const rc = if (@hasField(linux.SYS, "setgroups32")) linux.syscall2(.setgroups32, 0, 0) else linux.syscall2(.setgroups, 0, 0);
@@ -1159,7 +1071,6 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     if (uid) |u| if (linux.setresuid(u, u, u) != 0) return error.SetUidFailed;
 }
 
-/// `_advance-clock.<seconds>.testharness.invalid`, the harness's clock jump.
 fn advanceClockSeconds(name: dns.Name) ?i64 {
     if (name.depth() != 4 or !mem.eql(u8, name.leaf(), "_advance-clock") or !name.isSubdomainOf(.lit("testharness.invalid"))) return null;
     return std.fmt.parseInt(i64, name.parent().?.leaf(), 10) catch null;

@@ -1,7 +1,6 @@
 //! The live edge: one epoll, a socket per exchange, a timer heap.
 //! Listener fds and sessions ride the same epoll under a token.
 gpa: Allocator,
-/// TCP buffers are work in progress: the graph's `Work` counts them.
 work: Allocator,
 epfd: posix.fd_t,
 now_ns: i64 = 0,
@@ -9,12 +8,8 @@ wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
 flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
-/// Events that own nothing. A session's replies borrow its read buffer, which
-/// no read touches until they have left.
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
-/// A reply is read only when its turn comes, so the consumer may stop at
-/// any event.
 batch: [64]linux.epoll_event = undefined,
 batch_len: usize = 0,
 batch_at: usize = 0,
@@ -50,8 +45,8 @@ const Timer = struct {
     at_ns: i64,
     seq: u32,
     id: CellId,
-    /// The cell's generation for a wake, the flight's sequence for a timeout,
-    /// a session's token for its own, whose wake sequence is then `id`.
+    /// By kind: a wake's cell generation, a timeout's flight sequence, or a
+    /// session's token, whose wake sequence then rides in `id`.
     gen: u32,
     kind: Kind,
 
@@ -65,7 +60,6 @@ const Timer = struct {
     }
 };
 
-/// Ids recycle: a flight is told from its predecessors by its timer's sequence.
 const Flight = struct {
     fd: posix.fd_t,
     tcp: ?*Tcp = null,
@@ -79,7 +73,6 @@ const Tcp = struct {
     got: usize = 0,
 };
 
-/// Tells a token from a cell id.
 const client_tag: u64 = 1 << 32;
 pub const session_tag: u64 = 1 << 33;
 
@@ -151,7 +144,6 @@ fn send(e: *Edge, ex: Exchange) !graph.Exposure {
 }
 
 fn open(e: *Edge, ex: Exchange) !Flight {
-    // Reserved before the fd exists, so nothing after registering it can fail.
     try e.timers.ensureUnusedCapacity(e.gpa, 1);
     try e.flights.ensureUnusedCapacity(e.gpa, 1);
     const kind: u32 = if (ex.need == .datagram) posix.SOCK.DGRAM else posix.SOCK.STREAM;
@@ -210,7 +202,6 @@ fn pop(e: *Edge) ?Event {
     return ev;
 }
 
-/// The next event, or null once `until_ns` passes with nothing due.
 pub fn next(e: *Edge, until_ns: i64) !?Event {
     while (true) {
         if (e.pop()) |ev| return ev;
@@ -240,13 +231,9 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
     }
 }
 
-/// A timeout for a finished flight, or a later one under its recycled id,
-/// is stale; a wake carries its cell's generation for the graph to check.
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
-        // Reserved before the timer leaves the heap, so its events can't be
-        // lost; a session's rearm takes the slot the timer leaves.
         try e.queue.ensureUnusedCapacity(e.gpa, 1);
         _ = e.timers.pop();
         switch (t.kind) {
@@ -272,7 +259,6 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     return switch (linux.errno(rc)) {
         .SUCCESS => e.finish(id, .{ .reply = .{ .bytes = e.rx[0..rc] } }),
         .AGAIN, .INTR => null,
-        // ICMP unreachable and kin: nobody there.
         else => e.finish(id, .timeout),
     };
 }

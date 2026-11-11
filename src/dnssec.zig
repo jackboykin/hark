@@ -14,10 +14,7 @@ const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
 const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 
-// ── Root Trust Anchors (IANA root-anchors.xml) ───────────────────────
-
 pub const root_ds_records = [_]dns.DsData{
-    // KSK-2017 (active signer)
     .{
         .key_tag = 20326,
         .algorithm = .rsasha256,
@@ -29,7 +26,6 @@ pub const root_ds_records = [_]dns.DsData{
             0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D,
         },
     },
-    // KSK-2024 (pre-published, signing starts Oct 2026)
     .{
         .key_tag = 38696,
         .algorithm = .rsasha256,
@@ -43,16 +39,13 @@ pub const root_ds_records = [_]dns.DsData{
     },
 };
 
-/// RFC 4034 §2.1.1–2: a DNSKEY is usable for RRSIG verification only if
-/// the Zone Key flag (bit 7) is set and the protocol field is 3.
-/// RFC 5011 §2.1 additionally bars revoked keys (bit 8) from validating.
 fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
-/// RFC 4509 §3: a SHA-1 DS is ignored when the RRset also carries a SHA-256
-/// one hark can use — one for an unsupported key algorithm anchors nothing
-/// (RFC 6840 §5.2), so it must not silence the SHA-1 that does.
+/// RFC 4509 §3: a SHA-1 DS is ignored when the set has a SHA-256 one. Only
+/// a usable one counts: a SHA-256 DS for an unsupported key algorithm
+/// anchors nothing and must not silence the SHA-1 that does.
 fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
     if (ds.digest_type != .sha1) return true;
     for (ds_records) |ds2| if (ds2.digest_type == .sha256 and rrsig.isSupportedAlgorithm(ds2.algorithm)) return false;
@@ -75,8 +68,6 @@ test "dsEligible: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not
     try testing.expect(dsEligible(ds(1, .ecdsap256sha256, .sha256), &.{ds(2, .ecdsap256sha256, .sha256)}));
 }
 
-/// The signature that verified the DNSKEY set under a DS-anchored key, or
-/// null for bogus.
 pub fn validateDnskeyRrset(
     scratch: mem.Allocator,
     dnskey_records: []const dns.ResourceRecord,
@@ -102,8 +93,8 @@ pub fn validateDnskeyRrset(
     anchored.keys = anchored.keys[0..n];
     anchored.tags = anchored.tags[0..n];
 
-    // A DS advertising ML-DSA-44 makes an ML-DSA-44 RRSIG the only one that
-    // counts (draft-westerbaan-dnssec-mldsa §7.2, RFC 4035 §5.3.3 policy).
+    // A DS advertising ML-DSA-44 makes its RRSIG the only one that counts
+    // (draft-westerbaan-dnssec-mldsa §7.2), or stripping it is a downgrade.
     const pq = hasMlDsaDs(ds_records);
     var tried: usize = 0;
     for (dnskey_records) |rrsig_rr| {
@@ -119,15 +110,12 @@ pub fn validateDnskeyRrset(
     return null;
 }
 
-/// A DS hark can't digest anchors nothing (RFC 4035 §5.2), so it demands
-/// nothing either; the DS RRset is signed, so that is the zone's choice.
 fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
     for (ds_records) |ds| if (ds.algorithm == .mldsa44 and digestSupported(ds.digest_type) and dsEligible(ds, ds_records)) return true;
     return false;
 }
 
-/// ML-DSA-44's 2420 B signatures outgrow a 1232 B UDP payload. Transport
-/// only: the zone signs with it whatever digest its DS names.
+/// ML-DSA-44 signatures (2420 B) do not fit a 1232 B UDP payload.
 pub fn dsExceedsUdp(rrs: []const dns.ResourceRecord) bool {
     for (rrs) |rr| if (rr.rtype == .ds and rr.ds().algorithm == .mldsa44) return true;
     return false;
@@ -140,14 +128,9 @@ fn digestSupported(digest_type: dns.DigestType) bool {
     };
 }
 
-/// The keys a verified keyset may validate with below the apex. Under a
-/// DS advertising ML-DSA-44 only the ML-DSA-44 keys survive: the apex
-/// already refused every other signature, and verifyRrsig binds an RRSIG
-/// to a key of its own algorithm, so a classical RRSIG has nothing left to
-/// verify against. No per-RRset check, no flag. The apex RRSIGs are dropped
-/// too: no keyset consumer reads them and they would not verify over the
-/// subset. Any other DS set leaves the keyset whole (RFC 6840 §5.11). The
-/// result borrows `records` or lives in `allocator`; free it with an arena.
+/// Under an ML-DSA-44 DS only those keys validate below the apex, so no
+/// classical RRSIG finds a key. The result borrows `records` or lives in
+/// `allocator`.
 pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord, ds_records: []const dns.DsData) ![]const dns.ResourceRecord {
     if (!hasMlDsaDs(ds_records)) return records;
     var kept: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -155,7 +138,6 @@ pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord,
     return kept.items;
 }
 
-/// RFC 4034 §5.1.4: digest of canonical owner name || DNSKEY RDATA.
 pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) [Hash.digest_length]u8 {
     var h = Hash.init(.{});
     h.update(owner.wire);
@@ -175,13 +157,8 @@ fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) rrsig.
     if (!ok) return error.InvalidSignature;
 }
 
-/// RFC 4035 §5.2: a DS contributes an authentication path only when both its
-/// key algorithm and digest type are implemented here. An authenticated DS
-/// RRset with no such member must be treated as proven-no-DS (insecure), not
-/// secure — otherwise every zone signed only with an unimplemented algorithm
-/// SERVFAILs (live shape: ed448.nl / ed448.no, Ed448-only). Unbound's
-/// equivalent is the "zone has no known algorithms" → sec_status_insecure
-/// check; the digest arms mirror verifyDs.
+/// RFC 4035 §5.2: a verified DS set with no supported algorithm and digest
+/// pair means insecure, not bogus, or every Ed448-only zone fails.
 pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     for (records) |rr| {
         if (rr.rtype != .ds) continue;
@@ -191,7 +168,6 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     return false;
 }
 
-/// Zone keys with tags computed once per call, not per RRSIG tried (TagTrap).
 const Keyset = struct {
     keys: []dns.DnskeyData,
     tags: []u16,
@@ -217,8 +193,8 @@ const Keyset = struct {
     }
 };
 
-/// The `rtype` set in `rrs` at `owner`, or at any owner with null, whole
-/// however large: verifying part of it would vouch for the rest.
+/// The whole set, however large: verifying part of it would vouch for the
+/// rest.
 fn collect(scratch: mem.Allocator, rrs: []const dns.ResourceRecord, owner: ?dns.Name, rtype: dns.RType) !rrsig.Canonical {
     var n: usize = 0;
     for (rrs) |rr| n += @intFromBool(rr.rtype == rtype and (owner == null or rr.name.eql(owner.?)));
@@ -250,9 +226,8 @@ fn rrsetVerifiesWithAnyKey(
     return false;
 }
 
-/// The deepest signer of (`owner`, `rtype`) in `rrs` shallower than `below`
-/// labels. `bindSets` binds only signers that could hold the set (RFC 4035
-/// §5.3.1), each on the owner's path to the root, so depth alone picks.
+/// Depth alone picks the signer: `bindSets` keeps only signatures whose
+/// signer is on the owner's path to the root.
 pub fn signerBelow(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType, below: usize) ?dns.Name {
     var best: ?dns.Name = null;
     for (rrs) |rr| {
@@ -270,26 +245,24 @@ pub fn signedBy(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RTy
     return false;
 }
 
-/// The signatures over one set worth a verify: room for a rollover's;
-/// more is stuffing.
 const max_sigs_per_set = 8;
 
 fn usable(sig: dns.RrsigData, now: u32) bool {
     return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, now);
 }
 
-/// The signatures over a set its zone's verifier weighs: the zone's own
-/// (RFC 4035 §5.3.1), usable now, up to `max_sigs_per_set`.
+/// Iterates the signatures worth a verify: the zone's own, usable now, at
+/// most `max_sigs_per_set`. `passed` records that some covering one was
+/// skipped.
 pub const Weighed = struct {
     rrs: []const dns.ResourceRecord,
     owner: dns.Name,
     rtype: dns.RType,
     zone: dns.Name,
     now: u32,
-    /// Proof material, served under its own owner and never expanded (RFC
-    /// 4035 §3.1.3.3): a signature naming other labels is over another set,
-    /// and the proofs read the owner as served. A real `*.zone NSEC`
-    /// signature would verify under any name.
+    /// For proof records, which are never wildcard-expanded (RFC 4035
+    /// §3.1.3.3). Else a real `*.zone NSEC` signature verifies under any
+    /// owner, and the proof reads the owner as served.
     unexpanded: bool = false,
     at: usize = 0,
     n: usize = 0,
@@ -318,13 +291,10 @@ pub const Weighed = struct {
 
 const Verified = struct { sig: dns.RrsigData, unweighed: bool };
 
-/// A section read as sets (RFC 2181 §5), in place: each set where it first
-/// appears, then the signatures bound to it, all at their lowest TTL (RFC
-/// 2181 §5.2, RFC 4035 §5.3.3). A set binds the signatures of every zone
-/// that could hold it (RFC 4035 §5.3.1); which one does is the chain of
-/// trust's to prove, not the reply's to say. With `bare_sigs`, signatures
-/// over no set are an RRSIG question's data and stay, unfiltered and
-/// unlevelled; without, they go.
+/// Regroups a section in place into sets (RFC 2181 §5): each set where it
+/// first appears, followed by its signatures, all at their lowest TTL. A
+/// signature stays only if its signer could hold the set. Signatures over
+/// no set are dropped unless `bare_sigs` (an RRSIG query's data).
 pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bool) ![]dns.ResourceRecord {
     if (rrs.len < 2) return if (rrs.len == 1 and rrs[0].rtype == .rrsig and !bare_sigs) rrs[0..0] else rrs;
     const By = struct {
@@ -346,7 +316,7 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bo
     const by: By = .{ .rrs = src };
     const at = try scratch.alloc(u32, rrs.len);
     for (at, 0..) |*x, i| x.* = @intCast(i);
-    // Stable: a set keeps the order it came in.
+    // Must be stable: a set keeps the order it arrived in.
     std.mem.sort(u32, at, by, By.lessThan);
     const Kept = struct { lo: u32 = 0, hi: u32 = 0 };
     const kept = try scratch.alloc(Kept, rrs.len);
@@ -384,7 +354,8 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bo
     return rrs[0..n];
 }
 
-/// The set `rrs[i]` heads and its signatures, as `bindSets` lays them out.
+/// Only valid on `bindSets` output, where a set and its signatures are
+/// contiguous.
 pub fn setFrom(rrs: []const dns.ResourceRecord, i: usize) []const dns.ResourceRecord {
     const t = covers(rrs[i]);
     var j = i + 1;
@@ -401,14 +372,9 @@ pub fn covers(rr: dns.ResourceRecord) dns.RType {
     return if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype;
 }
 
-/// Validate the RRset at (`owner`, `covered_type`), trying every covering
-/// RRSIG and every key matching its tag and algorithm (RFC 6840 §5.4).
-/// `dnskey_records` must be *this* RRset's signer's keyset, which in a chain
-/// crossing a zone cut differs between hops.
-///
-/// Returns the signature that verified, or null for bogus. TTL and wildcard
-/// facts are read from that signature and nowhere else: deriving them from
-/// the RRSIGs present would let an appended unverifiable one drive them.
+/// `dnskey_records` must be the keyset of this set's signer. Callers read
+/// TTL and wildcard facts from the returned signature only: an appended
+/// unverifiable RRSIG must not drive them.
 pub fn validateRrset(
     scratch: mem.Allocator,
     records: []const dns.ResourceRecord,
@@ -428,21 +394,16 @@ pub fn validateRrset(
     while (it.next()) |i| {
         const sig = records[i].rrsig();
         if (rrsetVerifiesWithAnyKey(sig, &keyset, set, now_u32, budget, memo) catch return null) {
+            // Drain so `passed` covers the signatures after the one that verified.
             while (it.next()) |_| {}
             return .{ .sig = sig, .unweighed = it.passed };
         }
     }
-    // Nothing verified on a zone already proven secure — bogus, even when
-    // every candidate RRSIG used an unsupported algorithm: real supported
-    // signatures existed (the zone's DS says so, RFC 4035 §5.2 filtered the
-    // all-unsupported case to .insecure at the delegation) and were stripped.
-    // A softer verdict here is a keyless downgrade; Unbound and BIND agree.
     return null;
 }
 
-/// The tightest signature bound over the authority's NSEC, NSEC3 and SOA
-/// sets, each verified under the signer's keys, or null for bogus. NS and
-/// glue are exempt: unsigned delegation data.
+/// Null is bogus, including a section with no NSEC or NSEC3 at all. NS and
+/// glue are unsigned delegation data and are not checked.
 pub fn verifyAuthorityProofSigs(
     scratch: mem.Allocator,
     authorities: []const dns.ResourceRecord,
@@ -461,7 +422,6 @@ pub fn verifyAuthorityProofSigs(
     var cap: rrsig.Cap = .none;
     for (authorities, 0..) |rr, i| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
-        // A duplicated owner re-collects the same set; verify it once.
         const seen = for (authorities[0..i]) |prev| {
             if (prev.rtype == rr.rtype and prev.name.eql(rr.name)) break true;
         } else false;
@@ -479,17 +439,12 @@ pub fn verifyAuthorityProofSigs(
 }
 
 test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
-    // ZSK (flags=256, protocol=3) — valid
     try testing.expect(isValidZoneKey(.{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
-    // KSK (flags=257, protocol=3) — valid (SEP + zone key)
     try testing.expect(isValidZoneKey(.{ .flags = 257, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
-    // flags=0 — no zone key bit
     try testing.expect(!isValidZoneKey(.{ .flags = 0, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
-    // SEP-only (flags=1) — no zone key bit
     try testing.expect(!isValidZoneKey(.{ .flags = 1, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 0, .algorithm = .rsasha256, .public_key = &.{} }));
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 1, .algorithm = .rsasha256, .public_key = &.{} }));
-    // RFC 5011 §2.1: REVOKE bit set — must reject even with zone key + correct protocol
     try testing.expect(!isValidZoneKey(.{ .flags = 256 | 0x80, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
     try testing.expect(!isValidZoneKey(.{ .flags = 257 | 0x80, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
 }
@@ -556,13 +511,9 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
         }
     }.make;
 
-    // Ed448-only (the live ed448.nl shape) — no path.
     try testing.expect(!anySupportedDs(&.{ds_rr(.ed448, .sha256)}));
-    // Supported algorithm, unknown digest — still no path.
     try testing.expect(!anySupportedDs(&.{ds_rr(.ecdsap256sha256, @fromBackingInt(3))}));
-    // Non-DS records are ignored; empty set has no path.
     try testing.expect(!anySupportedDs(&.{}));
-    // One supported member is enough, wherever it sits.
     try testing.expect(anySupportedDs(&.{ ds_rr(.ed448, .sha256), ds_rr(.ecdsap256sha256, .sha256) }));
     try testing.expect(anySupportedDs(&.{ds_rr(.mldsa44, .sha256)}));
 }
@@ -580,8 +531,6 @@ test "validateDnskeyRrset: 65 keys verify whole, and a signature over 64 launder
         });
     }
 
-    // The signing key must itself be in the RRset and DS-anchored, or the
-    // refusal could be blamed on anchoring rather than on the signature.
     const kp = std.crypto.sign.Ed25519.KeyPair.generate(testing.io);
     var signer_pub = kp.public_key.toBytes();
     recs[0] = dnskeyRr(rrsig.test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .ed25519, .public_key = &signer_pub });
@@ -604,17 +553,12 @@ test "validateDnskeyRrset: 65 keys verify whole, and a signature over 64 launder
     var budget: rrsig.ValidationBudget = .{};
     _ = (try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget, test_memo)).?;
 
-    // The 65th key must not ride in on a signature over the other 64.
     set[65] = rrsigRr(rrsig.test_owner, part.rrsig);
     var budget2: rrsig.ValidationBudget = .{};
     try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget2, test_memo) == null);
 }
 
 test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the budget" {
-    // CVE-2023-50387: colliding-tag keys × DNSKEY-covering RRSIGs force an N×M
-    // verify cross-product. consumeVerify charges before any crypto, so the walk
-    // halts at the ceiling however large N·M grows. Pins that against the walk's
-    // next refactor.
     var digest = dsDigest(Sha256, rrsig.test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = rrsig.keyTag(test_dnskey),
@@ -623,8 +567,6 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
         .digest = &digest,
     };
 
-    // 3 anchored copies of the DS-matching key × 40 tag-matching RRSIGs with
-    // unverifiable signatures = 120 candidate attempts; the budget permits 8.
     var records: [43]dns.ResourceRecord = undefined;
     for (records[0..3]) |*r| r.* = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } });
     for (records[3..43]) |*r| r.* = .fixture(.{
@@ -766,7 +708,6 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
 }
 
 test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
-    // Every RRSIG's tag matches the key, so each one tried draws on the budget.
     const zone: dns.Name = .lit("example.com");
     const next_owner: [20]u8 = @splat(0xFF);
     const key: dns.ResourceRecord = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } });
@@ -846,8 +787,6 @@ test "verifyAuthorityProofSigs: a signature over part of a set verifies none of 
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
-    // RFC 4035 §5.3.1. The signature is valid for this RRset; only the
-    // record carrying it moved.
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
@@ -870,10 +809,6 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
-    // The zone's real `*.example.com NSEC a.example.com`, replayed under owner
-    // `v.example.com`: labels 2 < 3 reconstructs `*.example.com` for the
-    // signature, which verifies. As `v NSEC a` it is an apex wrap covering
-    // every name after `v`, including ones that exist.
     const star = dns.Name.lit("*.example.com");
     const a = dns.Name.lit("a.example.com");
     const v = dns.Name.lit("v.example.com");
@@ -892,8 +827,6 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     var budget2: rrsig.ValidationBudget = .{};
     try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &genuine, &dnskeys, 1_700_000_000, &budget2, test_memo) != null);
 
-    // A stray naming fewer labels is no signature over the set, and the
-    // one that is still proves it (RFC 6840 §5.4).
     var fewer = signed.rrsig;
     fewer.labels -= 1;
     const stray = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = fewer } });
@@ -956,20 +889,16 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const ed_ds = dns.DsData{ .key_tag = rrsig.keyTag(ed_key), .algorithm = .ed25519, .digest_type = .sha256, .digest = &ed_digest };
     const pq_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha256, .digest = &pq_digest };
 
-    // Downgrade: ML-DSA-44 signature stripped, classical one intact. Bogus.
     const stripped = keys ++ [_]dns.ResourceRecord{key.sig(ed.rrsig)};
     var b1: rrsig.ValidationBudget = .{};
     try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b1, test_memo) == null);
 
-    // Both present, either order: the ML-DSA-44 one is what verifies.
     const dual = keys ++ [_]dns.ResourceRecord{ key.sig(ed.rrsig), key.sig(pq) };
     var b2: rrsig.ValidationBudget = .{};
     try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b2, test_memo)).?.algorithm);
     const dual_rev = keys ++ [_]dns.ResourceRecord{ key.sig(pq), key.sig(ed.rrsig) };
     try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual_rev, &.{ pq_ds, ed_ds }, rrsig.test_owner, 1_700_000_000, &b2, test_memo)).?.algorithm);
 
-    // An ML-DSA-44 DS that anchors nothing demands nothing: unknown digest,
-    // or SHA-1 beside a usable SHA-256 DS (RFC 4509 §3).
     const odd_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
     var b4: rrsig.ValidationBudget = .{};
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, 1_700_000_000, &b4, test_memo)).?.algorithm);
@@ -977,8 +906,6 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const sha1_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, 1_700_000_000, &b4, test_memo)).?.algorithm);
 
-    // Only the ML-DSA-44 key survives into the keyset used below the apex;
-    // without an ML-DSA-44 DS the keyset stays whole.
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqual(dual.len, (try usableKeys(arena.allocator(), &dual, &.{ed_ds})).len);
@@ -986,18 +913,13 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].dnskey().algorithm);
 
-    // No ML-DSA-44 DS: the key's presence in the DNSKEY RRset alone demands
-    // nothing (RFC 6840 §5.11 MUST NOT; RFC 6781 §4.1.4 liberal rollover).
     var b3: rrsig.ValidationBudget = .{};
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ed_ds}, rrsig.test_owner, 1_700_000_000, &b3, test_memo)).?.algorithm);
 }
 
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
-    // Ed25519 key labelled `.rsasha256`; the RRSIG says .ed25519 and carries the
-    // key's tag, so only the algorithm comparison can refuse it.
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
-    // recs[0] aliases pub_bytes, which testSignRrset fills before signing.
     var recs: [2]dns.ResourceRecord = undefined;
     recs[0] = dnskeyRr(rrsig.test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &pub_bytes });
     const signed = try rrsig.testSignRrset(recs[0..1], .dnskey, rrsig.test_owner, .rsasha256, &sig_bytes, &pub_bytes);
@@ -1015,12 +937,6 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
 }
 
 test "validateRrset: the TTL cap comes from the signature that verified" {
-    // Reducing over every RRSIG would let one unverifiable, freely appended
-    // RRSIG zero a `.secure` entry's TTL. Unbound and Knot use the verifying one.
-    //
-    // `testSignRrset` signs original_ttl 300 / expiration 1_800_000_000, and
-    // those fields are inside the signature, so the genuine values cannot be
-    // edited after the fact — the junk RRSIG carries the hostile ones instead.
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
@@ -1029,8 +945,6 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     var pub_bytes: [32]u8 = undefined;
     const signed = try rrsig.testSignRrset(&recs, .a, rrsig.test_owner, .ed25519, &sig_bytes, &pub_bytes);
 
-    // Appended, unverifiable, and expiring in one second. Placed FIRST so a
-    // naive scan would reach it before the real one.
     var junk = signed.rrsig;
     junk.key_tag = signed.rrsig.key_tag ^ 0x5555;
     junk.original_ttl = 1;
@@ -1044,13 +958,10 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     };
     var budget: rrsig.ValidationBudget = .{};
     const sig = (try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, test_memo)).?.sig;
-    // The verifying signature's original TTL, never the junk record's 1.
     try testing.expectEqual(@as(u32, 300), rrsig.Cap.of(sig, now).original_ttl);
 }
 
 test "validateRrset: 70 records verify whole, and a signature over 64 launders no other 6" {
-    // The caller sets AD on the *unpruned* response, so a signature over
-    // answers[0..64] must not authenticate a 70-record answer section.
     var recs: [70]dns.ResourceRecord = undefined;
     for (&recs, 0..) |*r, i| r.* = .fixture(.{
         .name = rrsig.test_owner,

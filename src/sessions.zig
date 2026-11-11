@@ -6,13 +6,11 @@ plain_port: u16,
 dot_port: u16,
 standing: *ns_rtt.ServerTable(Standings),
 conns: std.ArrayList(*Conn) = .empty,
-/// Each server's sessions, by carrier.
 by_server: std.HashMapUnmanaged(na.AddressKey, std.EnumArray(Kind, ?*Conn), na.AddressKey.HashCtx, 80) = .empty,
 flights: std.array_hash_map.Auto(CellId, *Carried) = .empty,
 next_token: u32 = 0,
 stats: std.EnumArray(Kind, Stats) = .initFill(.{}),
 shared: carrier.Shared = .{},
-/// Whose queries wait in `shared.out`, to leave in one write.
 unflushed: ?*Conn = null,
 
 const std = @import("std");
@@ -36,7 +34,6 @@ const Event = Edge.Event;
 
 const Sessions = @This();
 
-/// RFC 9539 §4.3's defaults.
 const persistence_ns: i64 = 3 * std.time.ns_per_day;
 const damping_ns: i64 = std.time.ns_per_day;
 const dial_timeout_ns: i64 = 4 * std.time.ns_per_s;
@@ -55,7 +52,6 @@ const Standing = struct {
     }
 };
 
-/// RFC 9539 §4.5: a server's standing is per transport.
 const Standings = struct {
     by: std.EnumArray(Kind, Standing) = .initFill(.unknown),
 
@@ -90,12 +86,9 @@ const Conn = struct {
     queued: std.ArrayList(*Carried) = .empty,
     pending: std.array_hash_map.Auto(carrier.QueryId, *Carried) = .empty,
     last_reply_ns: ?i64 = null,
-    /// It held a question past its wait, dialing or out of streams: until it
-    /// can take questions, they go plain rather than queue on it.
     overdue: bool = false,
     last_ns: i64,
     dial_by_ns: i64,
-    /// The one wake of its that stands: earlier ones are stale.
     wake_ns: i64 = std.math.maxInt(i64),
     wake_seq: u32 = 0,
 };
@@ -130,11 +123,8 @@ const Way = union(enum) {
 
 const Best = struct { way: Way, known: u32 };
 
-/// The fewest round trips over a carrier known to work, and the fewest a
-/// dial over one would take.
 fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Best {
     var b: Best = .{ .way = .plain, .known = std.math.maxInt(u32) };
-    // A server told at another port: nothing says what its 853 is.
     if (key.port != s.plain_port) return b;
     var fewest: u32 = std.math.maxInt(u32);
     for (std.enums.values(Kind)) |kind| {
@@ -170,13 +160,11 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     if (key.port != s.plain_port) return false;
     const standings = s.standing.get(key);
     const r = s.best(key, standings);
-    // An unknown carrier is probed only while its dial would beat every
-    // carrier known to work.
     for (std.enums.values(Kind)) |kind| {
         const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
         if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= r.known) continue;
-        // Nobody else's dial starts while this one is out, or for as long
-        // if it could not start.
+        // Damped for the dial's length, so no second probe starts while this one
+        // is out, or for as long if it could not start.
         s.setStanding(key, kind, dial_timeout_ns, false);
         _ = s.dial(kind, ex.server, key) catch {};
     }
@@ -212,8 +200,6 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     return true;
 }
 
-/// What a turn sealed for a session leaves now, so its queries share
-/// segments: one segment each would spend a busy session's window.
 pub fn flush(s: *Sessions) !void {
     const c = s.unflushed orelse return;
     s.unflushed = null;
@@ -221,8 +207,6 @@ pub fn flush(s: *Sessions) !void {
     try s.rearm(c);
 }
 
-/// Room in `pending` is the caller's to have made. What isn't sent, the
-/// caller keeps queued.
 fn send(s: *Sessions, c: *Conn, at: *Carried) !carrier.Taken {
     const taken = try c.carrier.query(&s.shared, at.wire);
     if (taken != .sent) return taken;
@@ -233,7 +217,6 @@ fn send(s: *Sessions, c: *Conn, at: *Carried) !carrier.Taken {
     return taken;
 }
 
-/// False: gone.
 fn drain(s: *Sessions, c: *Conn) !bool {
     try c.pending.ensureUnusedCapacity(s.edge.gpa, c.queued.items.len);
     c.overdue = false;
@@ -311,7 +294,6 @@ fn evictIdle(s: *Sessions) !bool {
     return true;
 }
 
-/// What it held moves: the walk asks again, and by then its standing says how.
 fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
     const e = s.edge;
     try e.queue.ensureUnusedCapacity(e.gpa, c.pending.count() + c.queued.items.len);
@@ -327,9 +309,9 @@ fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
         c.carrier.unflush(&s.shared);
     }
     const kind: Kind = c.carrier;
-    // A handshake that ended failed, however it ended, and so did a session
-    // that took queries and answered none: only that keeps asking again from
-    // going round forever on a server that hangs up.
+    // A handshake that ended has failed, however it ended, and so has a
+    // session that took queries and answered none: otherwise a server that
+    // hangs up would be asked again forever.
     if (how == .failed or !c.carrier.established() or (c.pending.count() > 0 and c.last_reply_ns == null)) {
         s.setStanding(c.key, kind, damping_ns, false);
         s.stats.getPtr(kind).failed += 1;
@@ -339,8 +321,6 @@ fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
         }
     } else {
         s.stats.getPtr(kind).closed += 1;
-        // §4.6.7: what a close leaves pending goes plain. A dial for it would
-        // have a server that answers once a connection serve one query a dial.
         if (c.pending.count() > 0) s.setStanding(c.key, kind, dial_timeout_ns, false);
     }
     s.stats.getPtr(kind).moved += c.pending.count() + c.queued.items.len;
@@ -370,8 +350,6 @@ pub fn ready(s: *Sessions, token: u32, events: u32) !void {
     try s.onNews(c, try c.carrier.ready(&s.shared, events));
 }
 
-/// Replies borrow the carrier's buffers, which no read touches until they
-/// have left.
 fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
     switch (news) {
         .nothing => {},
@@ -393,7 +371,6 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
                 s.setStanding(c.key, c.carrier, persistence_ns, true);
                 try s.edge.push(s.completed(at, .{ .reply = .{ .bytes = r.bytes, .stream = true, .queued_ns = at.queued_ns } }));
             },
-            // The server turned the question down, as a refusing port does.
             .refused => |id| {
                 const at = (c.pending.fetchSwapRemove(id) orelse continue).value;
                 s.stats.getPtr(c.carrier).refused += 1;
@@ -401,19 +378,17 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
             },
         },
     }
-    // What it owes back, ACKs included, leaves with the turn's other sends.
     if (s.unflushed != c) try s.flush();
     s.unflushed = c;
     try s.rearm(c);
 }
 
-/// False: gone.
 fn onEstablished(s: *Sessions, c: *Conn) !bool {
     c.last_ns = s.edge.now_ns;
     s.stats.getPtr(c.carrier).established += 1;
     s.setStanding(c.key, c.carrier, persistence_ns, true);
-    // Left idle, a probe would meet the server's idle timer, and a first query
-    // crossing that close would damp the server for a day.
+    // False with nothing to ask, which closes the probe: left idle, a first
+    // query crossing the server's idle close would damp it for a day.
     const asked = c.queued.items.len != 0;
     if (!try s.drain(c)) return false;
     return try c.carrier.flush(&s.shared) and asked;
@@ -435,7 +410,6 @@ pub fn flightDue(s: *Sessions, id: CellId, seq: u32) !void {
     c.carrier.cancel(wire_id);
     s.stats.getPtr(c.carrier).timed_out += 1;
     queue.appendAssumeCapacity(s.completed(at, .timeout));
-    // A handshake can front a backend that never answers.
     const heard = c.last_reply_ns orelse return s.drop(c, .failed);
     if (heard < left_ns) return s.drop(c, .closed);
     if (s.unflushed != c) try s.flush();
@@ -478,7 +452,6 @@ test "a write lost while queries leave the handshake moves each query once" {
     };
     try s.conns.append(testing.allocator, c);
     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
-    // More than one write's worth, so the write that fails finds some sealed.
     const queries = 2 * s.shared.dot.out.len / dot.max_sealed * 8;
     for (0..queries) |i| {
         const at = try testing.allocator.create(Carried);

@@ -17,7 +17,6 @@ const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
 const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
 
-// See verifyRsa for why we drive std.crypto.ff directly.
 const RsaModulus = std.crypto.ff.Modulus(4096);
 const RsaFe = RsaModulus.Fe;
 
@@ -26,27 +25,22 @@ pub const VerifyError = error{
     UnsupportedAlgorithm,
     InvalidKey,
     SignatureExpired,
-    /// CVE-2023-50387 (KeyTrap) defense: per-resolution signature-verify budget
-    /// exhausted. Callers map this to .bogus; the response SERVFAILs.
     ValidationBudgetExhausted,
 };
 
-/// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per resolution. Sized for a
-/// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
-/// zones SERVFAIL during rollover windows.
+/// KeyTrap (CVE-2023-50387) cap. Sized for a cold five-level chain with
+/// two algorithms mid key rollover.
 const max_sig_verify_per_resolution: u32 = 96;
 
 const max_nsec3_blocks_per_resolution: u32 = 8192;
 
-/// Per-resolution DNSSEC CPU budget, shared by every cell a client question
-/// demands (`graph.Budget`). Exactly `max` draws succeed; the rest refuse.
 pub const ValidationBudget = struct {
     sig_verify_spent: u32 = 0,
     max_sig_verify: u32 = max_sig_verify_per_resolution,
     nsec3_blocks_spent: u32 = 0,
     max_nsec3_blocks: u32 = max_nsec3_blocks_per_resolution,
-    /// The pot that refused a draw, if one did: only then did the limit,
-    /// not the data, end a judgement. A budget filled exactly refused none.
+    /// Set only when a draw was refused. A budget filled exactly refused
+    /// none, so the data, not the limit, decided.
     stopped: ?enum { verify, nsec3 } = null,
 
     fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
@@ -71,8 +65,8 @@ pub const ValidationBudget = struct {
     }
 };
 
-/// Lengths framed: an RSA key and signature are both variable, and bytes
-/// moved across their boundary must not name the same entry.
+/// Lengths are hashed in: RSA keys and signatures both vary in size, and
+/// bytes shifted across their boundary must not produce the same tag.
 fn framed(algorithm: dns.DnssecAlgorithm, key: []const u8, signature: []const u8) Blake3 {
     var frame: [5]u8 = undefined;
     frame[0] = @backingInt(algorithm);
@@ -85,28 +79,24 @@ fn framed(algorithm: dns.DnssecAlgorithm, key: []const u8, signature: []const u8
     return h;
 }
 
-/// Signatures that verified, remembered by what the math saw: algorithm,
-/// key, signature and the digest of the signed data (RFC 4034 §3.1.8.1).
-/// The RRSIG header is in that data, so an entry for an expired signature
-/// is unreachable once `verifyRrsig` refuses the window; nothing expires or
-/// invalidates. A hit decides nothing the math wouldn't: every check before
-/// the crypto still runs, and the budget is charged first.
+/// Remembers signatures that verified, keyed by what the math saw. It holds
+/// no clock and needs none: every check in `verifyRrsig` before the crypto,
+/// the validity window included, still runs on a hit.
 pub const VerifyMemo = struct {
-    /// Empty remembers nothing.
     sets: []Set = &.{},
     hits: u64 = 0,
     misses: u64 = 0,
 
-    /// 256 bits: an attacker plants tags with their own zone's valid
-    /// signatures, so a forgery is a birthday search over the tag width.
+    /// Full width on purpose: anyone can plant tags with their own zone's
+    /// valid signatures, so a forgery is a birthday search over the tag.
     const Tag = [32]u8;
-    /// One cache line; way 0 is the more recent.
     const Set = extern struct { ways: [2]Tag align(64) };
+    /// The set count must stay a power of two: `set` masks the index.
     const bytes = 256 * 1024;
 
     pub fn init(gpa: mem.Allocator) !VerifyMemo {
         const sets = try gpa.alloc(Set, bytes / @sizeOf(Set));
-        // Tags are public: reused memory holding one would be a forgery.
+        // Leftover memory that happened to hold a tag would be a forgery.
         @memset(sets, .{ .ways = @splat(@splat(0)) });
         return .{ .sets = sets };
     }
@@ -127,7 +117,6 @@ pub const VerifyMemo = struct {
         return &m.sets[mem.readInt(u32, t[0..4], .little) & (m.sets.len - 1)];
     }
 
-    /// A miss is counted even when empty: the math runs either way.
     fn recall(m: *VerifyMemo, t: *const Tag) bool {
         if (m.sets.len != 0) {
             const s = m.set(t);
@@ -153,7 +142,6 @@ pub const VerifyMemo = struct {
     }
 };
 
-/// RFC 4034 Appendix B.
 pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     var ac: u32 = dnskey.flags;
     ac += @as(u32, dnskey.protocol) << 8 | @backingInt(dnskey.algorithm);
@@ -162,16 +150,12 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     return @truncate(ac);
 }
 
-// ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
-
-/// An RRset in canonical order (RFC 4034 §6.3), the order a signature
-/// covers it in.
 pub const Canonical = struct {
     records: []const dns.ResourceRecord,
 
-    /// Sorts `records` in place, by RDATA alone: a set's records share
-    /// owner, type and class, and RDLENGTH must not order them, or records
-    /// of different sizes (mixed 1024/2048-bit DNSKEY) mis-sort.
+    /// RFC 4034 §6.3 order, by RDATA alone: RDLENGTH must not take part, or
+    /// records of different sizes sort wrong. Relies on stored rdata already
+    /// being in canonical form.
     pub fn sort(records: []dns.ResourceRecord) Canonical {
         mem.sortUnstable(dns.ResourceRecord, records, {}, struct {
             fn lessThan(_: void, a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
@@ -182,9 +166,6 @@ pub const Canonical = struct {
     }
 };
 
-/// RFC 4034 §3.1.8.1 signed data: RRSIG_RDATA (sans signature) followed by
-/// the RRset in canonical form. A record's rdata is kept canonical, so it is
-/// fed as it stands.
 pub const SignedData = struct {
     header: [18 + dns.max_name_wire_len]u8 = undefined,
     header_len: usize,
@@ -195,7 +176,6 @@ pub const SignedData = struct {
     pub fn feed(self: *const SignedData, hasher: anytype) void {
         hasher.update(self.header[0..self.header_len]);
         for (self.set.records) |rr| {
-            // RFC 4035 §5.3.2: fewer labels than the owner's sign the wildcard.
             var wc: dns.Name.Buf = undefined;
             const owner = if (self.labels < rr.name.depth()) dns.Name.child(&wc, "*", rr.name.ancestor(self.labels)).? else rr.name;
             var signed = rr;
@@ -221,10 +201,9 @@ pub fn buildSignedData(rrsig: dns.RrsigData, set: Canonical) SignedData {
     return out;
 }
 
-// RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
-// Inception grace forgives a signer with a slightly-ahead clock (misconfig, no
-// replay value). Expiration grace would widen an attacker's replay window for
-// a captured RRSIG, so it stays zero.
+/// Seconds. RFC 4035 §5.3.1 allows no grace. Inception gets some, for a
+/// signer whose clock runs ahead; expiration gets none, since that would
+/// widen the replay window of a captured signature.
 const inception_skew_tolerance: u32 = 60;
 
 pub fn verifyRrsig(
@@ -235,31 +214,23 @@ pub fn verifyRrsig(
     budget: *ValidationBudget,
     memo: *VerifyMemo,
 ) VerifyError!void {
-    // KeyTrap (CVE-2023-50387) mitigation: charge before any work so attempts
-    // count even when the cheap pre-checks below would reject.
+    // Charged before any check, so attempts the cheap checks reject count
+    // too (KeyTrap).
     try budget.consumeVerify();
 
-    // RFC 4035 §5.3.1; else an RRSIG naming a weaker algorithm hands the key to that verifier.
+    // Else an RRSIG naming a weaker algorithm hands the key to that verifier.
     if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
 
     for (set.records) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.depth()) return error.InvalidSignature;
-        // An expansion's wildcard must sit in the signer's zone: its key speaks for none above.
+        // The wildcard an expansion came from must sit inside the signer's zone.
         if (rrsig.labels < signedLabels(rr.name) and rrsig.labels < rrsig.signer_name.depth()) return error.InvalidSignature;
     }
 
-    // An SOA or NS RRset *defines* the name it sits at: SOA marks an apex, and
-    // a signed NS marks a child-side apex, since RFC 4035 §2.2 forbids signing
-    // the parent-side delegation NS. Either way the containing zone is the
-    // owner itself, so a strictly-higher signer is wrong by definition — no
-    // knowledge of where the cuts are required. This is the one case where the
-    // §5.3.1 rule "the Signer's Name MUST be the name of the zone that contains
-    // the RRset" is decidable from the record alone; everywhere else the signer
-    // is an ancestor of the owner for every non-apex record in DNS and the test
-    // says nothing. BIND names it "SOA signer mismatch" / "NS signer mismatch"
-    // (lib/dns/validator.c:1473-1483); it is the only such check in Unbound or
-    // BIND.
+    // A signed SOA or NS sits at an apex (RFC 4035 §2.2 leaves the parent's
+    // delegation NS unsigned), so its signer must be its owner. A parent's
+    // key must not sign these for a child.
     if (rrsig.type_covered == .soa or rrsig.type_covered == .ns) {
         for (set.records) |rr| {
             if (!rr.name.eql(rrsig.signer_name)) return error.InvalidSignature;
@@ -278,7 +249,6 @@ pub fn verifyRrsig(
             hash.final(&digest);
             const t = VerifyMemo.tag(alg, dnskey.public_key, rrsig.signature, &digest);
             if (memo.recall(&t)) {
-                // The gate runs Debug: every hit meets the math, once per thread.
                 if (builtin.mode == .debug) proveMath(alg, rrsig.signature, &data, &digest, dnskey.public_key) catch unreachable;
                 return;
             }
@@ -289,9 +259,8 @@ pub fn verifyRrsig(
     }
 }
 
-/// What an algorithm signs: RSA and ECDSA sign this digest of the data, so
-/// the memo assumes nothing the algorithm doesn't. Ed25519 and ML-DSA hash
-/// the data themselves; SHA-256 only names their entries.
+/// RSA and ECDSA sign this digest. Ed25519 and ML-DSA hash the data
+/// themselves; for them it only names the memo entry.
 fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
     return switch (algorithm) {
         .rsasha256, .ecdsap256sha256, .ed25519, .mldsa44 => Sha256,
@@ -301,13 +270,11 @@ fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
     };
 }
 
-/// RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
 pub fn inWindow(rrsig: dns.RrsigData, now_u32: u32) bool {
     const skew_ahead = now_u32 +% inception_skew_tolerance;
     return !dns.serialAfter(rrsig.sig_inception, skew_ahead) and !dns.serialAfter(now_u32, rrsig.sig_expiration);
 }
 
-/// The same set as `verifyRrsig`'s prongs.
 pub fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
         .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => true,
@@ -315,9 +282,9 @@ pub fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     };
 }
 
-/// The Debug gate replays every scenario many times over, so each thread
-/// proves a signature once. Keyed apart from the memo's tag, by the signed
-/// data itself, so a hit the memo got wrong still meets the math.
+/// Debug test builds only: each thread runs the math for a signature once,
+/// so Debug's re-check of every memo hit stays cheap. Keyed by the signed
+/// data, not the memo's tag, so a wrong memo hit is still caught.
 threadlocal var proven: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
 
 fn proveMath(
@@ -337,8 +304,9 @@ fn proveMath(
     proven.put(std.heap.smp_allocator, t, {}) catch {};
 }
 
-/// A function of its arguments alone, or remembered hits would bypass the
-/// change: policy (distrusting an algorithm, a key-size floor) runs before.
+/// Must stay a pure function of its arguments, or memo hits bypass the
+/// change. Policy (distrusting an algorithm, a key-size floor) goes before
+/// the memo lookup.
 fn verifyMath(
     comptime algorithm: dns.DnssecAlgorithm,
     signature: []const u8,
@@ -356,10 +324,7 @@ fn verifyMath(
     };
 }
 
-/// Parse an RFC 3110 RSA public key and verify a PKCS#1 v1.5 signature.
 fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.digest_length]u8, key_data: []const u8) VerifyError!void {
-    // RFC 3110: first byte is exponent length (if < 256), then exponent, then modulus
-    // If first byte is 0, next 2 bytes are exponent length
     if (key_data.len < 3) return error.InvalidKey;
 
     var exp_len: usize = key_data[0];
@@ -374,30 +339,21 @@ fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.di
     var exponent = key_data[offset..][0..exp_len];
     const modulus = key_data[offset + exp_len ..];
 
-    // Strip leading zeros: `[00 00 00 01]` would read as e=1 and forge sig=EM.
+    // Strip leading zeros first: `00 00 00 01` is e=1, which accepts sig == EM.
     while (exponent.len > 1 and exponent[0] == 0) exponent = exponent[1..];
     if (exponent[exponent.len - 1] & 1 == 0) return error.InvalidKey;
     if (exponent.len == 1 and exponent[0] <= 1) return error.InvalidKey;
 
-    // powPublic is square-and-multiply, so its cost is linear in the exponent's
-    // bit length. Measured on a 4096-bit modulus: e=65537 costs 0.8 ms and a
-    // 511-byte exponent costs 31.6 ms. The KeyTrap budget caps the verify
-    // *count* at 96, not the cost of each, so a fat exponent multiplies the
-    // whole budget — 96 x 31.6 ms = 3.0 s of CPU for one query on the one
-    // graph thread.
-    //
-    // 8 bytes admits xelerance.com's 5-byte e = 2^32+1 with room;
-    // RsaFe.fromBytes alone only bounds it below the modulus (511 bytes).
+    // Verify cost is linear in exponent bits and the budget caps only the
+    // count: a 511-byte exponent costs about 40 times e=65537. Eight bytes
+    // still admits the 5-byte e = 2^32+1 seen in the wild.
     if (exponent.len > 8) return error.InvalidKey;
 
-    // RFC 3110 §3 allows 512 bits; 1024 is hark's floor, as 1024-bit ZSKs
-    // are still common, TLDs included. No step: gob.cl's KSK is 2024 bits.
     if (modulus.len < 128 or modulus.len > 512) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
-    // ff.Modulus is what Certificate.rsa wraps; calling it directly sidesteps
-    // the 4-byte exponent cap (Windows-CryptoAPI parity) that would lock out
-    // zones like xelerance.com (e = 2^32 + 1).
+    // `ff` directly, not std's RSA wrapper, whose 4-byte exponent cap would
+    // refuse those keys.
     const n = RsaModulus.fromBytes(modulus, .big) catch return error.InvalidKey;
     if (n.bits() < 1024) return error.InvalidKey;
     const e = RsaFe.fromBytes(n, exponent, .big) catch return error.InvalidKey;
@@ -409,14 +365,11 @@ fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.di
     var em_expected: [512]u8 = undefined;
     pkcs1v15Encode(em_expected[0..modulus.len], Hash, digest);
 
-    // Xor-fold compare: no data-dependent branch, so still constant-time —
-    // though EM in signature *verification* is public data anyway.
     var diff: u8 = 0;
     for (em_dec[0..modulus.len], em_expected[0..modulus.len]) |a, b| diff |= a ^ b;
     if (diff != 0) return error.InvalidSignature;
 }
 
-/// EMSA-PKCS1-v1_5 (RFC 8017 §9.2); the stdlib's is private.
 fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_length]u8) void {
     const hash_der: []const u8 = &switch (Hash) {
         Sha256 => .{
@@ -431,8 +384,6 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_len
         },
         else => @compileError("unsupported hash for PKCS#1 v1.5"),
     };
-    // RFC 8017 §9.2 step 3: PS ≥ 8 octets, else @memset wraps. Guaranteed
-    // by verifyRsa's `modulus.len >= 128` gate — Sha512 needs at most 94.
     std.debug.assert(em.len >= hash_der.len + Hash.digest_length + 11);
 
     var idx: usize = em.len;
@@ -447,7 +398,6 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_len
     em[0] = 0x00;
 }
 
-/// Verify an ECDSA signature (RFC 6605: raw x||y key, r||s signature).
 fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, digest: *const [Ecdsa.Hash.digest_length]u8, key_data: []const u8) VerifyError!void {
     const len = Ecdsa.Curve.scalar.encoded_length;
     if (key_data.len != 2 * len) return error.InvalidKey;
@@ -467,8 +417,6 @@ fn verifyEd25519(signature: []const u8, data: *const SignedData, key_data: []con
     verifier.verify() catch return error.InvalidSignature;
 }
 
-/// draft-westerbaan-dnssec-mldsa §3-4: raw FIPS 204 encodings, pure
-/// (non-prehash) ML-DSA-44 with an empty context string.
 fn verifyMlDsa(signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
     if (key_data.len != MlDsa44.PublicKey.encoded_length) return error.InvalidKey;
     if (signature.len != MlDsa44.Signature.encoded_length) return error.InvalidSignature;
@@ -480,10 +428,8 @@ fn verifyMlDsa(signature: []const u8, data: *const SignedData, key_data: []const
     verifier.verify() catch return error.InvalidSignature;
 }
 
-/// How long an RRset its signatures verified may be held (RFC 4035
-/// §5.3.3): the original TTL, which ages from receipt as the set's own TTL
-/// does, and the window left before a signature expires, which runs from
-/// now. Two clocks, so two terms.
+/// RFC 4035 §5.3.3. Two clocks: `original_ttl` ages from when the set was
+/// received, `window_s` is seconds from now until the signature expires.
 pub const Cap = struct {
     original_ttl: u32,
     window_s: u32,
@@ -499,7 +445,6 @@ pub const Cap = struct {
     }
 };
 
-/// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
 pub fn signedLabels(name: dns.Name) u8 {
     const star = !name.isRoot() and mem.eql(u8, name.leaf(), "*");
     return name.depth() - @intFromBool(star);
@@ -544,31 +489,27 @@ test "buildSignedData produces correct header" {
     buildSignedData(rrsig, .sort(&rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
-    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
-    try testing.expectEqual(@as(u8, 13), signed[2]); // algorithm
-    try testing.expectEqual(@as(u8, 3), signed[3]); // labels
-    try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[4..8], .big)); // original_ttl
-    try testing.expectEqual(@as(u32, 1700000000), mem.readInt(u32, signed[8..12], .big)); // expiration
-    try testing.expectEqual(@as(u32, 1699000000), mem.readInt(u32, signed[12..16], .big)); // inception
-    try testing.expectEqual(@as(u16, 12345), mem.readInt(u16, signed[16..18], .big)); // key_tag
+    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big));
+    try testing.expectEqual(@as(u8, 13), signed[2]);
+    try testing.expectEqual(@as(u8, 3), signed[3]);
+    try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[4..8], .big));
+    try testing.expectEqual(@as(u32, 1700000000), mem.readInt(u32, signed[8..12], .big));
+    try testing.expectEqual(@as(u32, 1699000000), mem.readInt(u32, signed[12..16], .big));
+    try testing.expectEqual(@as(u16, 12345), mem.readInt(u16, signed[16..18], .big));
 
-    // After the header comes the canonical signer name
     try testing.expectEqualSlices(u8, "\x07example\x03com\x00", signed[18..31]);
 
-    // Then the RR: canonical owner name + type(2) + class(2) + original_ttl(4) + rdlength(2) + rdata
     const rr_start = 31;
-    // \x03www\x07example\x03com\x00 = 4+8+4+1 = 17 bytes
     try testing.expectEqualSlices(u8, "\x03www\x07example\x03com\x00", signed[rr_start..][0..17]);
     const after_name = rr_start + 17;
-    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[after_name..][0..2], .big)); // type A
-    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[after_name + 2 ..][0..2], .big)); // class IN
-    try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[after_name + 4 ..][0..4], .big)); // original_ttl (not 200)
-    try testing.expectEqual(@as(u16, 4), mem.readInt(u16, signed[after_name + 8 ..][0..2], .big)); // rdlength
-    try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, signed[after_name + 10 ..][0..4]); // rdata
+    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[after_name..][0..2], .big));
+    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[after_name + 2 ..][0..2], .big));
+    try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[after_name + 4 ..][0..4], .big));
+    try testing.expectEqual(@as(u16, 4), mem.readInt(u16, signed[after_name + 8 ..][0..2], .big));
+    try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, signed[after_name + 10 ..][0..4]);
 }
 
 test "buildSignedData reconstructs wildcard owner name" {
-    // RFC 4035 §5.3.2: when rrsig.labels < owner label count, reconstruct wildcard
     const signer_name = dns.Name.lit("example.com");
     const rrsig = dns.RrsigData{
         .type_covered = .a,
@@ -582,7 +523,6 @@ test "buildSignedData reconstructs wildcard owner name" {
         .signature = &.{},
     };
 
-    // Owner has 3 labels but RRSIG says 2 — wildcard expansion
     const owner_name = dns.Name.lit("foo.example.com");
 
     var rrset = [_]dns.ResourceRecord{.fixture(.{
@@ -597,10 +537,7 @@ test "buildSignedData reconstructs wildcard owner name" {
     buildSignedData(rrsig, .sort(&rrset)).feed(&flat);
     const signed = flat.buf[0..flat.len];
 
-    // After the RRSIG header (18 bytes) + signer name (13 bytes) = offset 31
     const rr_start = 31;
-    // Owner in signed data must be *.example.com = \x01*\x07example\x03com\x00 (16 bytes)
-    // NOT \x03foo\x07example\x03com\x00 (17 bytes)
     const expected_wc_owner = "\x01*\x07example\x03com\x00";
     try testing.expectEqualSlices(u8, expected_wc_owner, signed[rr_start..][0..expected_wc_owner.len]);
 }
@@ -638,7 +575,6 @@ test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
 }
 
 test "ECDSA P-384 signature verification" {
-    // The sim signs only P-256; this is P-384's one gate.
     const key_pair = EcdsaP384.KeyPair.generate(testing.io);
     const dnssec_key = key_pair.public_key.toUncompressedSec1()[1..];
     const msg = "test DNSSEC signed data";
@@ -667,7 +603,6 @@ test "VerifyMemo: a remembered signature binds its key and still expires" {
     try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
     try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
     try testing.expectEqual(1, memo.hits);
-    // Same signature and data under another key of the same algorithm.
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, .sort(&recs), now, &budget, &memo));
     try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), signed.rrsig.sig_expiration + 1, &budget, &memo));
     try testing.expectEqual(1, memo.hits);
@@ -691,21 +626,15 @@ test "invalid key sizes are rejected" {
     const sig64: [64]u8 = @splat(0);
     const sig96: [96]u8 = @splat(0);
 
-    // ECDSA P-256: key must be 64 bytes
     try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, &sig64, &testDigest(EcdsaP256.Hash, msg), &.{ 0x01, 0x02 }));
-    // ECDSA P-384: key must be 96 bytes
     try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, &sig96, &testDigest(EcdsaP384.Hash, msg), &.{ 0x01, 0x02 }));
-    // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &signed, &.{ 0x01, 0x02 }));
-    // ML-DSA-44: key 1312 bytes, signature 2420 bytes
     const pq_sig: [MlDsa44.Signature.encoded_length]u8 = @splat(0);
     try testing.expectError(error.InvalidKey, verifyMlDsa(&pq_sig, &signed, &.{ 0x01, 0x02 }));
     try testing.expectError(error.InvalidSignature, verifyMlDsa(&sig64, &signed, &@as([MlDsa44.PublicKey.encoded_length]u8, @splat(0))));
 }
 
 test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
-    // KSK 26346 uses e = 2^32 + 1 (5 bytes). RFC 3110: 1-byte exp_len || exp || mod.
-    // Synthetic 1024-bit modulus: any odd number with high bit set, so n.bits() == 1024.
     var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     key_data[6] = 0x80;
     const signature: [128]u8 = @splat(0xaa);
@@ -713,22 +642,17 @@ test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK
 }
 
 test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
-    // Without the strip, [00 00 00 01] reads as e=1 and any sig == EM verifies.
     var k1 = [_]u8{ 4, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     k1[5] = 0x80;
     const sig: [128]u8 = @splat(0);
     try testing.expectError(error.InvalidKey, verifyRsa(Sha256, &sig, &testDigest(Sha256, "x"), &k1));
 
-    // 2-byte exp_len encoding with 8-byte padded exponent.
     var k2 = [_]u8{ 0, 0, 8 } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x01} ++ @as([128]u8, @splat(0x55));
     k2[11] = 0x80;
     try testing.expectError(error.InvalidKey, verifyRsa(Sha256, &sig, &testDigest(Sha256, "x"), &k2));
 }
 
 test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
-    // EM = 00 || 01 || PS (0xff..) || 00 || T (DER) || H. Pinning the bytes
-    // per hash defends the OID-typo class — a bad byte in a DER prefix would
-    // silently SERVFAIL every zone signed with that algorithm.
     const Case = struct {
         Hash: type,
         digest_len: usize,
@@ -744,7 +668,6 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
                 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
                 0x00, 0x04, 0x20,
             },
-            // NIST SHA-256("abc").
             .hash_abc = &.{
                 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
                 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
@@ -760,7 +683,6 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
                 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
                 0x00, 0x04, 0x40,
             },
-            // NIST SHA-512("abc").
             .hash_abc = &.{
                 0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba,
                 0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31,
@@ -785,9 +707,6 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
     }
 }
 
-// Shared fixture for the verifyRrsig time-window tests. Empty key/signature
-// means the ECDSA path always returns InvalidSignature — anything before
-// it (the time check) is what gates the assertion.
 const test_window_rrsig = dns.RrsigData{
     .type_covered = .a,
     .algorithm = .ecdsap256sha256,
@@ -809,7 +728,6 @@ const test_window_empty_set: Canonical = .{ .records = &.{} };
 
 test "verifyRrsig rejects expired signature" {
     var budget: ValidationBudget = .{};
-    // Expiration tolerance is 0 — any time strictly past expiration rejects.
     try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, 1700000000 + 1, &budget, &test_memo));
 }
 
@@ -824,14 +742,11 @@ test "verifyRrsig tolerates clock skew within window" {
         1700000000, // at expiration boundary
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
-        // Time check passes; empty key fails verifyEcdsa's length check first.
         try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, now, &budget, &test_memo));
     }
 }
 
 test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.1.3)" {
-    // Cross-zone signer ("example.org" trying to sign "example.com" record):
-    // the crypto layer rejects independently of the bailiwick check upstream.
     const cross_signer = dns.Name.lit("example.org");
     const rrsig = dns.RrsigData{
         .type_covered = .a,
@@ -856,8 +771,6 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
 
 test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
     var budget: ValidationBudget = .{ .max_sig_verify = 2 };
-    // Each call charges one unit, even when later checks would reject (empty
-    // key here trips InvalidKey). Two attempts deplete the budget.
     inline for (0..2) |_| {
         try testing.expectError(error.InvalidKey, verifyRrsig(
             test_window_rrsig,
@@ -915,12 +828,6 @@ test "verifyRrsig takes an expansion only from a wildcard inside the signer's zo
 }
 
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
-    // The signature is genuine and every other rule passes — RFC 4034 §3.1.3
-    // is satisfied because the signer *is* an ancestor of the owner, which is
-    // true of every non-apex record in DNS. Only the type-specific rule
-    // rejects: a signed NS marks a child-side apex (RFC 4035 §2.2 forbids
-    // signing the parent-side delegation NS) and an SOA marks an apex, so the
-    // containing zone is the owner itself.
     const parent = dns.Name.lit("example.com");
     const child = dns.Name.lit("sub.example.com");
     var budget: ValidationBudget = .{};
@@ -940,7 +847,6 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
             else => unreachable,
         };
 
-        // Owner strictly below the signer: rejected however good the signature.
         var sig_buf: [64]u8 = undefined;
         var pub_buf: [32]u8 = undefined;
         var below = [_]dns.ResourceRecord{
@@ -952,8 +858,6 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
             verifyRrsig(signed.rrsig, signed.dnskey, .sort(&below), 1_700_000_000, &budget, &test_memo),
         );
 
-        // Owner == signer is the apex shape and must still verify, or the rule
-        // would reject every legitimate apex NS/SOA in existence.
         var apex_sig_buf: [64]u8 = undefined;
         var apex_pub_buf: [32]u8 = undefined;
         var at_apex = [_]dns.ResourceRecord{
@@ -964,7 +868,6 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
     }
 }
 
-/// Remembers nothing; unit tests exercise the math alone.
 pub var test_memo: VerifyMemo = .{};
 
 fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
@@ -973,8 +876,6 @@ fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
     return d;
 }
 
-/// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
-/// that verifies it. Buffers are caller-owned so the slices outlive the call.
 const TestSigned = struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData };
 
 pub fn testSignRrset(
@@ -988,7 +889,8 @@ pub fn testSignRrset(
     return testSignRrsetBy(Ed25519.KeyPair.generate(testing.io), rrset, covered, signer, key_algo, sig_buf, pub_buf);
 }
 
-/// `testSignRrset` by a key made beforehand, so the set may hold it.
+/// `key_algo` labels the DNSKEY only. The RRSIG always says Ed25519, so a
+/// test can make the two disagree.
 pub fn testSignRrsetBy(
     kp: Ed25519.KeyPair,
     rrset: []const dns.ResourceRecord,
@@ -1038,12 +940,6 @@ test "verifyRsa rejects exponents 0, 1 and even" {
 }
 
 test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
-    // powPublic is linear in exponent bits and the KeyTrap budget caps only the
-    // verify count, so an oversized exponent multiplies the entire per-query
-    // budget. RsaFe.fromBytes already forces e < n, but with a 4096-bit modulus
-    // that still left 511 bytes -- 31.6 ms a verify, 3.0 s a query.
-    //
-    // 8 bytes must still pass: xelerance.com's e = 2^32+1.
     var buf: [1024]u8 = undefined;
     var sig: [256]u8 = undefined;
     @memset(&sig, 0xAB);
@@ -1057,10 +953,8 @@ test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
         const key_data = buf[0 .. 1 + elen + 256];
         const res = verifyRsa(Sha256, &sig, &testDigest(Sha256, "hello"), key_data);
         if (want_rejected) {
-            // Rejected on the key, before any modular arithmetic runs.
             try testing.expectError(error.InvalidKey, res);
         } else {
-            // Got past every key check and died on the signature instead.
             try testing.expectError(error.InvalidSignature, res);
         }
     }

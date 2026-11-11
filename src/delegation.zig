@@ -5,14 +5,10 @@ const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 
 pub const max_servers_per_level = 26;
-/// QMIN probe ceiling; past it, queries go straight to the full qname
-/// (RFC 9156's MAX_MINIMIZE_COUNT).
 pub const max_minimize_count = 10;
 
-/// What a minimised probe's reply does to the walk.
 pub const ProbeStep = union(enum) {
     referral: Referral,
-    /// Stop minimising; RFC 8020 when vouched for.
     nxdomain,
     nodata,
     answered,
@@ -21,7 +17,6 @@ pub const ProbeStep = union(enum) {
 
 pub fn probeStep(response: dns.Message, target: dns.Name, zone: dns.Name) ProbeStep {
     switch (response.header.flags.rcode) {
-        // Error replies can carry authority NS that delegate nothing.
         .no_error => {},
         .name_error => return .nxdomain,
         else => return .failed,
@@ -30,16 +25,12 @@ pub fn probeStep(response: dns.Message, target: dns.Name, zone: dns.Name) ProbeS
     return if (response.answers.len > 0) .answered else .nodata;
 }
 
-/// Borrows from the response.
 pub const Referral = struct {
     zone_cut: dns.Name,
     ns_names: [max_servers_per_level]dns.Name,
     ns_count: usize,
 };
 
-/// Which addresses a walk may send to.
-/// Defaults are production-safe; tests override to redirect at scripted
-/// authorities on non-privileged ports in 127/8.
 pub const AddrPolicy = struct {
     upstream_port: u16 = 53,
     allow_loopback: bool = false,
@@ -58,13 +49,9 @@ pub const AddrPolicy = struct {
 };
 
 pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Name) ?Referral {
-    // Servers that set AA on referrals still refer: only answers or an SOA
-    // make the NS the zone's own.
+    // Some servers set AA on a referral: only an answer or an SOA makes the NS the zone's own.
     if (response.header.flags.aa and response.answers.len > 0) return null;
     if (soaAbove(response.authorities, target)) return null;
-    // The deepest NS owner above the target, and strictly below the zone
-    // asked: NS at the zone itself are its own, not a delegation (RFC 1034
-    // §4.2.1).
     var zc = parent_zone;
     for (response.authorities) |rr| {
         if (rr.rtype == .ns and target.isSubdomainOf(rr.name) and rr.name.depth() > zc.depth()) zc = rr.name;
@@ -87,10 +74,6 @@ pub fn soaAbove(authorities: []const dns.ResourceRecord, name: dns.Name) bool {
     return false;
 }
 
-/// RFC 1034 §5.3.3: drop this reply and ask a sibling. Any rcode but an
-/// answer's, extended ones too (RFC 6891 §6.1.3; hark never retries
-/// without EDNS on FORMERR or BADVERS), and a recursor's cache: RA set, AA
-/// clear. A recursor's referral is still followed.
 pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     const flags = response.header.flags;
     if (response.opt) |o| if (o.extended_rcode != 0) return true;
@@ -98,6 +81,8 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
         .no_error, .name_error, .yx_domain => {},
         else => return true,
     }
+    // RA without AA is a recursor's cache (RFC 1034 §5.3.3): ask a sibling,
+    // unless it refers, which is still followed.
     if (!flags.ra or flags.aa) return false;
     return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.question.?.name, parent_zone) == null;
 }

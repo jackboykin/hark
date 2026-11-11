@@ -30,14 +30,12 @@ const walk = @import("walk.zig");
 const stub = @import("stub.zig");
 const chaos = @import("chaos.zig");
 
-/// CNAME and DNAME links one question may follow, a DNAME and its
-/// synthesised CNAME counting once. Chains in the wild run to 12;
-/// resolvers stop at 10 to 19.
+/// A DNAME and its synthesised CNAME count once. Chains in the wild run to
+/// 12; resolvers stop at 10 to 19.
 pub const max_links = 14;
 
 pub const CellId = u32;
 
-/// A `?CellId` in half the bytes.
 pub const OptionalCellId = enum(CellId) {
     none = std.math.maxInt(CellId),
     _,
@@ -53,12 +51,10 @@ pub const OptionalCellId = enum(CellId) {
     }
 };
 
-/// What an exchange needs of its carrier. Encrypted sessions are streams.
 pub const Need = enum {
     datagram,
     stream,
 
-    /// Handshake included.
     pub fn plainRounds(n: Need) u32 {
         return switch (n) {
             .datagram => 1,
@@ -76,7 +72,6 @@ pub const Exchange = struct {
     deadline_ns: i64,
 };
 
-/// What an on-path observer sees of a question, least first.
 pub const Exposure = enum(u2) {
     none,
     encrypted,
@@ -95,7 +90,6 @@ pub const Quote = struct {
 pub const Heard = struct {
     /// Borrowed for the call: the cell parses its own copy.
     bytes: []const u8,
-    /// Came over a stream, whatever was asked: no datagram's limit applies.
     stream: bool = false,
     queued_ns: i64 = 0,
 };
@@ -103,18 +97,12 @@ pub const Heard = struct {
 pub const Completion = union(enum) {
     reply: Heard,
     timeout,
-    /// Never left the host: out of sockets, buffers or memory, or no
-    /// route there. Says nothing about the server.
     unsent,
-    /// Its carrier gave up before the server could answer. Asked again, it
-    /// goes another way. Says nothing about the server.
     moved,
-    /// Run again at this time; carries the cell's generation, since ids recycle.
+    /// The cell's generation, since ids recycle.
     wake: u32,
 };
 
-/// What the graph asks of the world; the simulator and the live edge
-/// both implement it.
 pub const Edge = struct {
     ctx: *anyopaque,
     now_ns: *const i64,
@@ -139,22 +127,16 @@ pub const Edge = struct {
     }
 };
 
-/// `stub`: a stub zone's reply, asked of its servers alone, never judged.
-/// `refresh`: `answer` derived again for the store; nobody waits.
-/// `ahead`: an rrset's judge, started before anyone asks.
-/// `parental`: a parent's NSEC at a delegation, held for the denial index
-/// alone: the child's answers there (RFC 4035 §5.3.2). Never a cell.
+/// `parental` is held for the denial index alone and is never a cell.
 pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
 
 pub const Key = struct {
     kind: Kind,
     rtype: dns.RType,
-    /// The name's wire bytes; none for an exchange.
     name: []const u8,
-    /// `name`'s, taken once: every key at the name mixes its own from it.
     name_hash: u32,
 
-    /// Borrows `name`: whatever keeps a key dupes it (`newCell`, `remember`).
+    /// Borrows `name`: whatever keeps a key dupes it.
     pub fn of(kind: Kind, name: dns.Name, rtype: dns.RType) Key {
         return .init(kind, name.wire, rtype);
     }
@@ -167,7 +149,6 @@ pub const Key = struct {
         return .{ .kind = kind, .rtype = rtype, .name = name, .name_hash = hashName(name) };
     }
 
-    /// Another key at the same name, whose hash it keeps.
     pub fn at(k: Key, kind: Kind, rtype: dns.RType) Key {
         return .{ .kind = kind, .rtype = rtype, .name = k.name, .name_hash = k.name_hash };
     }
@@ -176,10 +157,6 @@ pub const Key = struct {
         return @truncate(std.hash.Wyhash.hash(rand.hash_seed, name));
     }
 
-    /// A Fibonacci multiply, folded: the kind and type reach the low bits,
-    /// which pick the slot. Keys at one name land in related slots; probing
-    /// ran no longer for it than under a full mix, which takes three
-    /// multiplies.
     pub fn hash(k: Key) u64 {
         if (builtin.mode == .debug) std.debug.assert(k.name_hash == hashName(k.name));
         const x = @as(u64, k.name_hash) << 32 | @as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype);
@@ -191,8 +168,6 @@ pub const Key = struct {
         return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
     }
 
-    /// For array hash maps: they delete without tombstones, so a map
-    /// under steady churn keeps its probes short.
     pub const Context = struct {
         pub fn hash(_: Context, k: Key) u32 {
             return @truncate(k.hash());
@@ -219,60 +194,38 @@ pub const Config = struct {
     addr_policy: delegation.AddrPolicy = .{},
     max_queries: u32 = 100,
     resolve_ms: u32 = 7000,
-    /// The hedge stagger before a server has answered; 0: no hedge.
     stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
     max_flights: u32 = std.math.maxInt(u32),
     max_work_bytes: usize = std.math.maxInt(usize),
-    /// The first window a failure is remembered: by the server per
-    /// question, by trust per zone (RFC 9520 §3.2).
     servfail_ttl: u32 = 5,
-    /// Refresh a fact hit just before it expires.
     prefetch: bool = false,
-    /// The root's DS set. Null: DNSSEC off, nothing is judged.
     trust_anchors: ?[]const dns.DsData = null,
     store_bytes: usize = 12 << 20,
     trace: bool = false,
 };
 
-// ── Values ─────────────────────────────────────────────────────────────
-
-/// The zone cut above a name, as learned from the parent's servers.
 pub const Cut = struct {
     zone: dns.Name,
-    /// `zone`'s, from a referral. None at the root: hints carry addresses.
     servers: []const Server = &.{},
-    /// How long the delegation stands, glue aside: its NS TTL, capped by
-    /// the referring zone's. One that `zone`'s servers give lives no longer.
-    /// Unbounded for a name inside a zone, which is no delegation.
     placed_until_ns: i64 = std.math.maxInt(i64),
 };
 
 pub const Server = struct {
-    /// The host as a key, so no walk formats or hashes its name: each
-    /// family's `rrset` and `addr` key is `at` it.
     key: Key,
     glue: []const na.AddressKey = &.{},
 };
 
-/// The RRset at (name, type), as the reply sections that settled it, so
-/// the client sees what the authority said. A section holds each set
-/// whole and together, followed by its signatures (`dnssec.bindSets`).
 pub const Reply = struct {
     kind: Of,
     aa: bool,
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
     additionals: []const dns.ResourceRecord = &.{},
-    /// Where the chain in `answers` ends: an alias's next name, or the
-    /// name a negative denies.
     target: dns.Name = .root,
-    /// The zone whose servers answered; what `secure` judges it against.
     zone: dns.Name = .root,
     ede: ?dns.Ede.Code = null,
-    /// TTLs age from here.
     stored_ns: i64 = 0,
-    /// Seconds the reply stays a fact (`replyTtl`).
     ttl: u32 = 0,
 
     pub const Of = enum {
@@ -282,8 +235,6 @@ pub const Reply = struct {
         nxdomain,
         yxdomain,
 
-        /// Only rcodes that answer are kept; a chain's is its final query
-        /// cycle's (RFC 6604 §3).
         pub fn rcode(k: Of) dns.RCode {
             return switch (k) {
                 .answer, .alias, .nodata => .no_error,
@@ -294,15 +245,11 @@ pub const Reply = struct {
     };
 };
 
-/// A client question: the alias chain from `rrset(name, type)` to the
-/// RRset that ends it.
 pub const Answer = struct {
-    /// In chain order; every one but the last is an alias.
     hops: []const Hop,
 
     pub const Hop = struct {
         set: CellId,
-        /// `secure(set)`, held; none where no verdict is awaited.
         judge: OptionalCellId = .none,
     };
 };
@@ -312,9 +259,7 @@ pub const Outcome = union(enum) {
     timeout,
     unsent,
     moved,
-    /// Parses, but a wrong id, question or 0x20 case: not the reply sent for.
     mismatch,
-    /// Does not parse.
     malformed,
     oversized,
 };
@@ -322,22 +267,13 @@ pub const Outcome = union(enum) {
 /// Plain goes only by stream, where a forger cannot follow.
 pub const Case = enum { random, plain };
 
-/// Why a cell settled on no fact: nothing about the DNS, so it is never
-/// stored and expires as it settles. Its demanders read it; the next
-/// demand starts afresh, and remembering it is the server's policy.
 pub const Failure = struct {
     code: dns.Ede.Code,
     text: []const u8 = "",
-    /// Only the zone's failures are remembered: never what failed to
-    /// leave the host, nor what an asker's own limit ended.
     cause: enum { zone, host, asker } = .zone,
-    /// Refused at demand: an earlier failure, remembered.
     remembered: bool = false,
-    /// No probe could place the cut: ask in full from the deepest one known.
     unplaced: bool = false,
 
-    /// Nobody answered usefully, or the walk to them was refused
-    /// (`Graph.demand`'s null): nothing more is proven.
     pub const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
 };
 
@@ -363,9 +299,6 @@ pub const Value = union(Kind) {
     }
 };
 
-/// Bytes held by work in progress, counted where they are allocated:
-/// cells, their pins and arenas (by the chunk), budgets, the edge's TCP
-/// buffers, the query bytes of clients waiting.
 pub const Work = struct {
     child: Allocator,
     bytes: usize = 0,
@@ -402,19 +335,12 @@ pub const Work = struct {
     }
 };
 
-/// A question's: its root holds it, and every run the root waits on pays
-/// from it (`payerOf`).
 pub const Budget = struct {
     queries: u32 = 0,
-    /// A question's end is its deadline too: the key fetches its walk
-    /// began stop with it.
     deadline_ns: i64,
-    /// The roots sharing it: a question and the key fetches its walk began.
     refs: u32 = 1,
-    /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: rrsig.ValidationBudget = .{},
 
-    /// A draw the validation budget refused is the asker's limit, never bogus.
     pub fn validationStop(b: *const Budget) ?Failure {
         return switch (b.validation.stopped orelse return null) {
             .nsec3 => .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
@@ -423,22 +349,18 @@ pub const Budget = struct {
     }
 };
 
-/// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
     resolver: struct {
         exchanges: struct { datagram: u64 = 0, stream: u64 = 0 } = .{},
         faults: struct {
             timeout: u64 = 0,
-            /// Never left the host.
             unsent: u64 = 0,
             moved: u64 = 0,
         } = .{},
         early: struct { refresh: u64 = 0 } = .{},
         detail: struct {
             retry: u64 = 0,
-            /// Not begun, over half the flights or work.
             unrefreshed: u64 = 0,
-            /// DNSKEY fetches begun ahead of need.
             ahead: u64 = 0,
         } = .{},
     } = .{},
@@ -449,10 +371,8 @@ const max_failed = 4096;
 
 const Refusal = struct { until_ns: i64, why: Failure };
 
-/// So a refresh does not time the client; never past half the life left.
 const refresh_jitter_ns = std.time.ns_per_s;
 
-/// The model should cost less than a parse.
 pub const Tally = struct {
     runs: u64 = 0,
     settles: u64 = 0,
@@ -464,11 +384,9 @@ pub const Tally = struct {
     store_ns: u64 = 0,
     reruns: u64 = 0,
     rerun_ns: u64 = 0,
-    /// Cycle checks, and cells they walked.
     reaches: u64 = 0,
     reaches_visits: u64 = 0,
 
-    /// Only the replay reads the timings; serve skips the clock reads.
     pub const timed = builtin.is_test;
 
     pub const Clock = struct {
@@ -486,7 +404,6 @@ pub const Tally = struct {
 
 const ExchangeScratch = struct {
     id: u16,
-    /// The question's spelling, 0x20 case and all.
     sent: []const u8,
     qtype: dns.RType,
     server: na.Address,
@@ -494,11 +411,10 @@ const ExchangeScratch = struct {
     case: Case,
     sent_ns: i64,
     /// The payer's deadline came before the wait the server is owed, so a
-    /// timeout says nothing about it, nor about its zone.
+    /// timeout says nothing about the server or its zone.
     cut_short: bool,
 };
 
-/// In the cell's arena: a cell pays for its own kind's, not the largest.
 pub const Scratch = union(enum) {
     none,
     cut: *walk.CutScratch,
@@ -526,43 +442,30 @@ pub const Scratch = union(enum) {
     }
 };
 
-/// Alive while pinned, by demanders (`waiters`) or clients and the edge
-/// (`holds`). Orphaned, it spends nothing more; freed once nothing holds
-/// it and nothing of its own is in flight, its id recycled.
 pub const Cell = struct {
     key: Key,
     name: dns.Name,
-    /// The instant whose facts it reads: 0, a client's, is now; a refresh's
-    /// is when the life it renews lapses. A client and a refresh never
-    /// share a cell.
+    /// The instant whose facts the cell reads: 0 is now, a client's; a refresh's
+    /// is when the life it renews lapses. The two never share a cell.
     as_of: i64,
     orphan: bool = false,
-    /// The cycle check that last walked through here.
     seen: u64 = 0,
     state: State = .pending,
-    /// The end of a state with no blob; one in a blob ends with it
-    /// (`expires`).
     bare_expires_ns: i64 = 0,
     waiters: std.DoublyLinkedList = .{},
-    /// Unpinned at settle; an answer's at free.
     inputs: std.SinglyLinkedList = .{},
     holds: u32 = 0,
-    /// Waiters not orphaned.
     backers: u32 = 0,
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
-    /// Everything the cell owns; freed with it.
     arena: Arena,
 
     comptime {
         std.debug.assert(@sizeOf(Cell) <= 176);
     }
 
-    /// What it settled on lives in its arena: pending, it carries none.
     pub const State = union(enum) { pending, fact: *Value, failure: *const Failure };
 
-    /// A version's end is its blob's, so every cell holding it sees the
-    /// same one, whichever shortened it.
     pub fn expires(c: *const Cell) i64 {
         return if (c.blob) |b| b.expires_ns else c.bare_expires_ns;
     }
@@ -599,7 +502,6 @@ pub const Cell = struct {
     }
 };
 
-/// `by` waits on `on`.
 const Pin = struct {
     on: CellId,
     by: CellId,
@@ -642,50 +544,31 @@ const Slot = struct {
     next: OptionalCellId = .none,
 };
 
-// ── Graph ──────────────────────────────────────────────────────────────
-
 pub const Graph = struct {
     gpa: Allocator,
     work: Work,
     cfg: Config,
     edge: Edge,
-    /// One run's transients, reset at every run.
     scratch: Arena,
-    /// Rule-held pointers survive appends.
     cells: std.ArrayList(Slot) = .empty,
     empty: OptionalCellId = .none,
     checks: u64 = 0,
     live: u32 = 0,
     budgets: u32 = 0,
-    /// Who pays for the running rule: derived at each run, never stored.
     payer: *Budget = undefined,
-    /// The running cell's `as_of`.
     as_of: i64 = 0,
-    /// A run nobody waits on spends nothing.
     unpaid: Budget = undefined,
-    /// Exchanges the edge holds.
     flights: u32 = 0,
-    /// Work that failed, refused at `demand` rather than tried again
-    /// (RFC 9520 §3.2): an upstream fetch, a zone's DS or keys. Policy,
-    /// outside cells.
     failed: std.array_hash_map.Custom(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
-    /// Live cells by key and instant. An entry is the id alone, so every call is
-    /// adapted, and stored hashes spare the map from hashing one.
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
     ready: std.ArrayList(Queued) = .empty,
-    /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,
-    /// Per-server estimate, capped.
     rtt: *ns_rtt.Table,
     tally: Tally = .{},
-    /// Under test, the keys of the cells run, in order, folded: the replay
-    /// holds one seed to one schedule.
     schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    /// Verified NSEC facts in span order (denial.zig).
     denial: denial.Index = .{},
-    /// Signatures already verified, by content: a speedup, never a verdict.
     verify_memo: rrsig.VerifyMemo = .{},
     store: store.Store,
 
@@ -734,7 +617,7 @@ pub const Graph = struct {
         return g.edge.now_ns.*;
     }
 
-    /// Signature times are serials, wall seconds mod 2^32 (RFC 4034 §3.1.5).
+    /// Truncated on purpose: signature times are serials, wall seconds mod 2^32 (RFC 4034 §3.1.5).
     pub fn wallNow(g: *const Graph) u32 {
         return @truncate(@as(u64, @bitCast(g.edge.wall_sec.*)));
     }
@@ -751,13 +634,8 @@ pub const Graph = struct {
         return g.cells.items[id].gen;
     }
 
-    /// What a client may start: `join`, only what is settled or in
-    /// progress; `new`, a resolution of its own.
     pub const Admit = enum { join, new };
 
-    /// Held for the client until `unhold`. `Novel`: a new resolution
-    /// `admit` does not allow. `Full`: anything unsettled past
-    /// `max_work_bytes` (a joiner is work too), or new work past `max_flights`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !CellId {
         const key = Key.of(.answer, name, qtype);
         if (g.asking(.{ .key = key, .as_of = 0 })) |id| if (!g.cell(id).settled() or g.fresh(id)) {
@@ -779,13 +657,10 @@ pub const Graph = struct {
         g.release(id);
     }
 
-    /// `dnskey(zone)` ahead of need.
     pub fn fetchKeys(g: *Graph, zone: dns.Name) !void {
         _ = try g.ahead(Key.of(.rrset, zone, .dnskey), zone);
     }
 
-    /// One per key at a time, holding itself until its judge settles, on the
-    /// running payer's budget; null once that is spent.
     fn ahead(g: *Graph, key: Key, name: dns.Name) !?CellId {
         if (g.spent(g.payer) or try g.skips(.ahead, key)) return null;
         const akey = key.at(.ahead, key.rtype);
@@ -802,8 +677,6 @@ pub const Graph = struct {
         return id;
     }
 
-    /// The question asked again as of when the life it renews lapses. One
-    /// per key and instant at a time; holds itself until it settles.
     pub fn refresh(g: *Graph, key: Key, name: dns.Name, lapses_ns: i64) !void {
         std.debug.assert(lapses_ns > 0);
         const rkey = key.at(.refresh, key.rtype);
@@ -833,9 +706,6 @@ pub const Graph = struct {
         while (try g.nextReady()) |q| if (g.gen(q.id) == q.gen) try g.run(q.id);
     }
 
-    /// A cell with nothing left to run goes first: its slot may hold no key.
-    /// Among two or more, every priority drawn is a decision, the LIFO
-    /// top's too: replayed without it, another cell would win.
     fn nextReady(g: *Graph) !?Queued {
         const ch = g.chaosAt(.settle) orelse return g.ready.pop();
         const n = g.ready.items.len;
@@ -858,14 +728,12 @@ pub const Graph = struct {
         return q;
     }
 
-    /// Null outside tests, so serve's every site folds to hark's own.
     fn chaosAt(g: *const Graph, site: chaos.Site) ?*chaos.Chaos {
         if (!builtin.is_test) return null;
         const ch = g.edge.chaos orelse return null;
         return if (ch.live(site)) ch else null;
     }
 
-    /// One of `n`, `key`'s next decision at `site`; 0 is hark's own.
     fn decide(g: *Graph, site: chaos.Site, key: Key, n: u64) !u64 {
         const ch = g.chaosAt(site) orelse return 0;
         const event = ch.peek(site, key);
@@ -931,7 +799,6 @@ pub const Graph = struct {
                 dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // After the match, so a forger gains nothing over a mismatch.
                 if (!heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
-                // Asked in IN, a record of another class answers nothing.
                 inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
                     var n: usize = 0;
                     for (section.*) |rr| if (rr.rclass == .in) {
@@ -957,7 +824,6 @@ pub const Graph = struct {
                 std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
             }
         }
-        // A timeout the root's deadline cut short says nothing about the server.
         switch (outcome) {
             .reply => |r| g.observe(sc.server, r.rtt_ns),
             .timeout => {
@@ -974,14 +840,10 @@ pub const Graph = struct {
         try g.drain();
     }
 
-    // ── Cells ──────────────────────────────────────────────────────────
-
-    /// A question's cell, holding its budget.
     fn newRoot(g: *Graph, key: Key, name: dns.Name, as_of: i64, budget: Budget) !CellId {
         const b = try g.work.allocator().create(Budget);
         errdefer g.work.allocator().destroy(b);
         b.* = budget;
-        // Under chaos, spent in part before it starts.
         b.queries += @intCast(try g.decide(.budget, key, @as(u64, g.cfg.max_queries) + 1));
         const v = &b.validation;
         v.max_sig_verify -= @intCast(try g.decide(.budget, key, v.max_sig_verify + 1));
@@ -993,7 +855,6 @@ pub const Graph = struct {
         return id;
     }
 
-    /// All or nothing.
     pub fn newCell(g: *Graph, key: Key, name: dns.Name, as_of: i64) !CellId {
         if (g.empty == .none) {
             try g.cells.append(g.gpa, .{});
@@ -1010,7 +871,7 @@ pub const Graph = struct {
         var own_key = key;
         if (key.kind != .exchange) {
             own_key.name = own_name.wire;
-            // In progress keeps the slot; a settled owner yields it.
+            // A cell in progress keeps the index entry; a settled one yields it.
             const gop = try g.index.getOrPutAdapted(g.gpa, Asked{ .key = key, .as_of = as_of }, Indexed{ .g = g });
             if (!gop.found_existing or g.cell(gop.key_ptr.*).settled()) gop.key_ptr.* = id;
         }
@@ -1029,8 +890,6 @@ pub const Graph = struct {
         g.created += 1;
         return id;
     }
-
-    // ── Pins ───────────────────────────────────────────────────────────
 
     pub fn pin(g: *Graph, id: CellId, by: CellId) !void {
         const c = g.cell(id);
@@ -1065,7 +924,6 @@ pub const Graph = struct {
         }
     }
 
-    /// Nothing live pins it: an orphan, and so is everything it waits on.
     fn release(g: *Graph, id: CellId) void {
         const c = g.cell(id);
         if (c.holds + c.backers > 0) return;
@@ -1109,8 +967,6 @@ pub const Graph = struct {
         g.work.allocator().destroy(c);
     }
 
-    /// Copies out: the value becomes the blob's parse, the blob the store's
-    /// version while fresh; a verdict is stamped on the bytes it judged.
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
@@ -1153,8 +1009,6 @@ pub const Graph = struct {
         try g.woken(id, value == .answer);
     }
 
-    /// Settles on another key's judged version. Stores nothing: the
-    /// question's judge settles on the stamped verdict and keeps it.
     pub fn settleAs(g: *Graph, id: CellId, v: *store.Blob) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
@@ -1172,9 +1026,6 @@ pub const Graph = struct {
         try g.woken(id, false);
     }
 
-    /// An rrset's bytes as its judge read them, set before the verdict is
-    /// stamped on them (`trust.keepWeighed`). In place: the judge reads
-    /// on through the fact it holds.
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
         const c = g.cell(id);
         const blob = try g.store.build(c.key, .{ .rrset = reply }, c.expires());
@@ -1204,8 +1055,6 @@ pub const Graph = struct {
         };
     }
 
-    /// Settles on no fact (`Failure`): nothing is stored, nothing outlives
-    /// this instant but what its demanders read now.
     pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
@@ -1228,23 +1077,19 @@ pub const Graph = struct {
         if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
         // An answer serves from its hops; everything else has copied out.
         if (!keep_inputs) g.unpinAll(c);
-        // The run's hold still pins a self-held root; one release, below.
+        // The run's hold still pins a self-held root; the one release is below.
         if (c.key.kind == .refresh or c.key.kind == .ahead) c.holds -= 1;
         g.release(id);
     }
 
-    /// Remembered for the window (RFC 9520 §3.2), unless the asker may have
-    /// caused it: a spent budget or deadline, an orphan, an address lookup's
-    /// depth, a refresh, or a send that never left the host. A failure
-    /// already remembered is held by its own window, never another's.
+    /// Remembered (RFC 9520 §3.2) unless the asker may have caused it: its
+    /// limits, an orphan, a refresh, an address lookup's depth, a send that never left.
     pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
         if (why.cause == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) try g.remember(c.key, why);
         try g.fail(id, why);
     }
 
-    /// Refuse new work for `key` with `why` for `servfail_ttl`; past
-    /// `max_failed` keys a random other one is forgotten.
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
         const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why };
         if (g.failed.getPtr(key)) |u| {
@@ -1272,8 +1117,7 @@ pub const Graph = struct {
         return why;
     }
 
-    /// RFC 4035 §5.3.3: an rrset accepted as authentic ends with the
-    /// signatures that authenticated it.
+    /// An rrset accepted as authentic ends with the signatures that authenticated it (RFC 4035 §5.3.3).
     pub fn authenticUntil(g: *Graph, id: CellId, until_ns: i64) void {
         g.cell(id).blob.?.shorten(until_ns);
     }
@@ -1283,12 +1127,10 @@ pub const Graph = struct {
         return c.settled() and c.expires() > g.now();
     }
 
-    /// What the running cell reads must hold past.
     pub fn instant(g: *const Graph) i64 {
         return @max(g.now(), g.as_of);
     }
 
-    /// The running cell's own cell for `key`, if live.
     pub fn indexed(g: *const Graph, key: Key) ?CellId {
         return g.asking(.{ .key = key, .as_of = g.as_of });
     }
@@ -1327,8 +1169,6 @@ pub const Graph = struct {
         return if (g.cell(id).settled()) null else id;
     }
 
-    /// What `demand` hands the running rule without running it; the one
-    /// predicate `lookup`, `holds` and `held` share.
     const Served = union(enum) { stored: *store.Blob, live: CellId };
 
     fn served(g: *Graph, key: Key, live: ?CellId) ?Served {
@@ -1336,8 +1176,6 @@ pub const Graph = struct {
         return .{ .live = g.liveServed(live) orelse return null };
     }
 
-    /// Its own cells serve the running cell while merely fresh: they are
-    /// its own fetches.
     fn liveServed(g: *Graph, live: ?CellId) ?CellId {
         const id = live orelse return null;
         return if (g.fresh(id)) id else null;
@@ -1348,14 +1186,11 @@ pub const Graph = struct {
         return if (g.cell(id).blob == b) id else null;
     }
 
-    /// The stored fact `demand` would hand the running rule.
     fn stored(g: *Graph, key: Key) ?*store.Blob {
         const e = g.store.get(key, g.now()) orelse return null;
         return if (e.expires_ns > g.instant()) e else null;
     }
 
-    /// A stored rrset its judge would pass without running: with DNSSEC
-    /// on, an entry may outlive its verdict.
     pub fn proven(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         const e = g.stored(key) orelse return null;
@@ -1363,17 +1198,12 @@ pub const Graph = struct {
         return e;
     }
 
-    /// Would `demand` hand the running rule a fact for `key` without
-    /// running it?
     pub fn holds(g: *Graph, key: Key) bool {
-        // `served`'s order, without reading the index when the store has it.
         if (g.stored(key) != null) return true;
         const id = g.liveServed(g.indexed(key)) orelse return false;
         return g.cell(id).state == .fact;
     }
 
-    /// The version `demand` would hand the running rule, not merely a
-    /// fresh one.
     pub fn held(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         return switch (g.served(key, g.indexed(key)) orelse return null) {
@@ -1382,7 +1212,6 @@ pub const Graph = struct {
         };
     }
 
-    /// A stored fact, read from its live version when there is one.
     fn factOf(g: *Graph, live: ?CellId, e: *store.Blob) !Fact {
         if (g.liveVersion(live, e)) |id| if (g.liveFact(id)) |f| return .{ .value = f.value, .expires_ns = e.expires_ns };
         return .{ .value = try store.Store.parse(g.scratch.allocator(), e), .expires_ns = e.expires_ns };
@@ -1407,13 +1236,7 @@ pub const Graph = struct {
 
     pub const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?trust.Chain };
 
-    /// The answer rule read against the store, building no cell: the
-    /// question's chain as stored, into `arena`. `.fresh` is what the rule
-    /// would settle on for a client, asked as of now; `.any` is every
-    /// age, for the callers that decide what age serves. Null where the
-    /// rule would have work to do: a hop not stored, not judged or no
-    /// longer proven (DNSSEC on), or a broken chain. The blobs are the
-    /// store's; the caller refs what it keeps.
+    /// The blobs are the store's; the caller refs what it keeps.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: Age) !?[]const Recalled {
         var hops: std.ArrayList(Recalled) = .empty;
         var links: walk.Links = .{};
@@ -1444,7 +1267,6 @@ pub const Graph = struct {
 
     pub const Age = enum { fresh, any };
 
-    /// `demandHop`, read from the store. Inline: it is a hit's lookup.
     pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?*store.Blob {
         const own = @call(.always_inline, Key.of, .{ kind, name, qtype });
         if (g.entry(own, age)) |e| return e;
@@ -1453,8 +1275,6 @@ pub const Graph = struct {
         return if (store.Rrset.of(e).kind == .alias) e else null;
     }
 
-    /// The kind of the hop at `name` after one of kind `from`. Null: a
-    /// public chain would enter a stub zone.
     pub fn hopKind(g: *const Graph, from: ?Kind, name: dns.Name, qtype: dns.RType) ?Kind {
         const kind: Kind = if (stub.of(g.cfg.stub_zones, name, qtype) != null) .stub else .rrset;
         return if (from == .rrset and kind == .stub) null else kind;
@@ -1464,8 +1284,8 @@ pub const Graph = struct {
         return if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key);
     }
 
-    /// No cell, no wait: `demand` is the only pin. The store is read as of
-    /// now: a speedup's guess, never a cause.
+    /// Pins nothing and reads the store as of now: good for a speedup's guess,
+    /// never as the cause of a fact.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.indexed(key);
         if (g.store.get(key, g.now())) |e| return try g.factOf(live, e);
@@ -1480,10 +1300,6 @@ pub const Graph = struct {
         return g.demandFound(by, key, name, live, g.served(key, live));
     }
 
-    /// `demand` for a step of an answer's chain, `own` the hop at `name`:
-    /// the type's own set where held, as it may hold more of the chain;
-    /// else an alias held at the name; else the own set, to fetch. Each key
-    /// is read once.
     pub fn demandHop(g: *Graph, by: CellId, own: Key, name: dns.Name) !?CellId {
         const live = g.indexed(own);
         const found = g.served(own, live);
@@ -1514,9 +1330,6 @@ pub const Graph = struct {
         return id;
     }
 
-    /// The first question waiting on `id`, depth first in pin order, whose
-    /// budget has room; under chaos, any whose budget has room. Else the
-    /// first one at all. None for an orphan.
     fn payerOf(g: *Graph, id: CellId) ?*Budget {
         g.checks += 1;
         var first: ?*Budget = null;
@@ -1559,8 +1372,6 @@ pub const Graph = struct {
         g.budgets -= 1;
     }
 
-    /// The deadline or query budget that stops `b` asking: the asker's
-    /// reasons, never the servers'.
     pub fn limit(g: *const Graph, b: *const Budget) ?Failure {
         if (g.now() >= b.deadline_ns) return .{ .code = .other, .text = "resolution deadline passed", .cause = .asker };
         if (b.queries >= g.cfg.max_queries) return .{ .code = .other, .text = "query budget spent", .cause = .asker };
@@ -1571,8 +1382,8 @@ pub const Graph = struct {
         return g.limit(b) != null or b.validation.exhausted();
     }
 
-    /// NS-address sub-resolutions (an addr's own rrsets) between `id` and
-    /// its nearest question, along the shortest demand chain; 0 for an orphan.
+    /// NS-address sub-resolutions between `id` and its nearest question, along
+    /// the shortest demand chain; 0 for an orphan.
     pub fn level(g: *Graph, id: CellId) u8 {
         g.checks += 1;
         const gpa = g.scratch.allocator();
@@ -1597,9 +1408,6 @@ pub const Graph = struct {
         }
     }
 
-    /// Does settling `from` transitively wake `target`? Then `from`
-    /// demanding `target` would be a cycle. Walks the waiters above
-    /// `from`: the demand chain, not the graph.
     fn reaches(g: *Graph, from: CellId, target: CellId) bool {
         g.checks += 1;
         g.tally.reaches += 1;
@@ -1617,16 +1425,13 @@ pub const Graph = struct {
         return false;
     }
 
-    /// What a reply says for another key: settles a cell in progress for it,
-    /// except the publisher's own; else a fact, or, awaiting a verdict, held
-    /// by an `ahead` root for its judge. A served version stands: bytes
-    /// nobody judged displace none.
     pub fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !void {
         if (g.indexed(key)) |id| if (id != by and !g.cell(id).settled()) return g.settle(id, value, expires_ns);
         if (!g.awaitsVerdict(key.kind)) {
             _ = try g.fact(key, value, expires_ns);
             return;
         }
+        // A served version stands: bytes nobody judged displace none.
         if (expires_ns <= g.now() or g.holds(key)) return;
         const root = try g.ahead(key, name) orelse return;
         const s = g.cell(root).scratch.ahead;
@@ -1637,8 +1442,6 @@ pub const Graph = struct {
         try g.settle(id, value, expires_ns);
     }
 
-    /// Judged already, or of a kind nobody judges. The bytes the store
-    /// kept, borrowed; null when it kept none.
     pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !?*store.Blob {
         if (expires_ns <= g.now()) return null;
         const blob = try g.store.build(key, value, expires_ns);
@@ -1652,10 +1455,8 @@ pub const Graph = struct {
         return if (e == blob) blob else null;
     }
 
-    // ── Rules ──────────────────────────────────────────────────────────
-
-    /// Held for the run: what it publishes may settle and free its own
-    /// readers while the rule still has the cell in hand.
+    /// Held for the run: what it publishes may settle and free its own readers
+    /// while the rule still has the cell in hand.
     fn run(g: *Graph, id: CellId) !void {
         const c = g.cell(id);
         if (c.settled()) return;
@@ -1674,7 +1475,6 @@ pub const Graph = struct {
         if (builtin.is_test) g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
-        // Ended waiting and created nothing: the model's own cost.
         const created_before = g.created;
         defer if (!c.settled() and g.created == created_before) {
             g.tally.reruns += 1;
@@ -1726,7 +1526,6 @@ pub const Graph = struct {
         return g.track(server) == .dead;
     }
 
-    /// Under chaos every timed server ties, so chaos picks among them.
     pub fn wait(g: *Graph, est: *const ns_rtt.RttState, rounds: u32, bits: u64) u64 {
         if (g.chaosAt(.pick) != null) return 0;
         const hold_ms = if (est.loss == 0) 0 else g.holdMs(est.*, rounds);
@@ -1743,16 +1542,12 @@ pub const Graph = struct {
         return (est.hedgeStagger() orelse g.cfg.stagger_ms) * rounds;
     }
 
-    // ── Exchanges ──────────────────────────────────────────────────────
-
     pub const Sent = struct { id: CellId, est: ns_rtt.RttState, rounds: u32, exposure: Exposure };
 
-    /// Null, like `demand`, when the payer's budget or deadline, or the
-    /// asker's orphaning, refuses the work.
     pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, need: Need, case: Case, qname: dns.Name, qtype: dns.RType, uncapped: bool) !?Sent {
         std.debug.assert(case == .random or need == .stream);
-        // The run's payer may spend itself mid-run while another waiter
-        // still has room: the shared work goes on at that one's cost.
+        // The run's payer may spend itself mid-run while another waiter still has
+        // room: the shared work goes on at that one's cost.
         if (g.limit(g.payer) != null) g.payer = g.payerOf(by) orelse g.payer;
         const budget = g.payer;
         const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text else null;
@@ -1779,9 +1574,9 @@ pub const Graph = struct {
         const est = g.rtt.get(server);
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
-        // Silent past the capped wait is silent, however long this send waits.
         const addr = server.toAddress();
         const rounds = g.edge.quote(server, need).rounds;
+        // Silent past the capped wait is silent, however long this send waits.
         const owed_at = g.now() + patience * state.timeout(false, rounds) * std.time.ns_per_ms;
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
@@ -1801,7 +1596,6 @@ pub const Graph = struct {
     }
 };
 
-/// A graph whose edge sends nothing and never wakes it, its clock in hand.
 const Quiet = struct {
     now: i64 = std.time.ns_per_s,
     wall: i64 = 0,
@@ -1862,7 +1656,6 @@ test "a joiner starts nothing, and past the work ceiling joins only what is sett
     const name = try dns.parseDottedName(arena.allocator(), "example.");
     try testing.expectError(error.Novel, g.demandRoot(name, .a, .join));
     const first = try g.demandRoot(name, .a, .new);
-    // Its own bytes are past the ceiling: nothing unsettled is joined or started.
     try testing.expectError(error.Full, g.demandRoot(name, .a, .join));
     try testing.expectError(error.Full, g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .new));
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, q.now + std.time.ns_per_s);
@@ -1899,8 +1692,6 @@ test "a version shortened through one instant's cell ends for every cell holding
     defer g.unhold(now);
     try g.settle(now, .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rrs, .target = name, .zone = .root, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
     const version = g.cell(now).blob.?;
-    // A refresh's instant materialises the stored version, and its judge
-    // shortens it.
     const lapse = q.now + 200 * std.time.ns_per_s;
     const refresh = try g.newCell(Key.of(.refresh, name, .a), name, lapse);
     g.cell(refresh).holds += 1;
@@ -1910,7 +1701,6 @@ test "a version shortened through one instant's cell ends for every cell holding
     try testing.expectEqual(version, g.cell(later).blob.?);
     g.authenticUntil(later, q.now + 250 * std.time.ns_per_s);
     g.as_of = 0;
-    // Out of the store, the version is read through the live cell.
     g.store.drop(version);
     try testing.expectEqual(version, g.held(key).?);
     try testing.expectEqual(q.now + 250 * std.time.ns_per_s, g.cell(now).expires());
@@ -1931,7 +1721,6 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(second).scratch.answer.budget, g.payerOf(shared).?);
-    // Nobody with room: the first still pays, and is refused.
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.payer = g.cell(first).scratch.answer.budget;

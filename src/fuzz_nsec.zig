@@ -14,7 +14,6 @@ const qtypes = [_]dns.RType{ .a, .ns, .cname, .soa, .txt, .dname, .ds, .aaaa };
 const max_names = 6;
 const max_depth = 3;
 const max_chain = 32;
-/// Single-octet labels above the apex, the apex, the root.
 const max_wire = 2 * max_depth + 1 + apex.len + 1;
 
 const Types = packed struct(u8) {
@@ -42,7 +41,6 @@ const Types = packed struct(u8) {
     }
 };
 
-// What one owner may hold: a delegation only NS(+DS), a CNAME nothing else.
 const shapes = [_]Types{ .{ .a = true }, .{ .cname = true }, .{ .ns = true }, .{ .ns = true, .ds = true }, .{ .dname = true }, .{ .dname = true, .a = true } };
 
 const Entry = struct {
@@ -84,8 +82,8 @@ const Zone = struct {
         return null;
     }
 
-    /// Opt-Out signers leave unsigned delegations out of the chain, and
-    /// (RFC 5155 §7.1) any empty non-terminal that exists only for those.
+    /// Opt-Out chains leave out unsigned delegations and, per RFC 5155 §7.1,
+    /// empty non-terminals that exist only for those.
     fn omitted(z: *const Zone, e: *const Entry) bool {
         if (!z.nsec3 or !z.optout) return false;
         if (e.types.delegation()) return !e.types.ds;
@@ -99,8 +97,6 @@ const Zone = struct {
         return !z.omitted(e);
     }
 
-    /// A proper ancestor that ends this zone's authority. Omitted delegations
-    /// don't count: to the validator that cut is invisible.
     fn cutAbove(z: *const Zone, name: dns.Name) bool {
         var up = name.parent();
         while (up) |anc| : (up = anc.parent()) {
@@ -120,7 +116,6 @@ const Zone = struct {
         return name;
     }
 
-    /// `name` or its nearest existing ancestor, in the chain or not.
     fn realEncloser(z: *const Zone, name: dns.Name) dns.Name {
         var up: ?dns.Name = name;
         while (up) |n| : (up = n.parent()) {
@@ -137,17 +132,14 @@ const Zone = struct {
             if (e.types.dname or e.types.delegation()) return .referral;
         }
         if (z.find(qname)) |e| return answerAt(e.types, qtype);
-        // RFC 4592 §2.2.1: the wildcard sits at the real closest encloser,
-        // which an omitted ENT is even though the chain can't see it.
         var wl: dns.Name.Buf = undefined;
         if (z.find(dns.Name.child(&wl, "*", z.realEncloser(qname)).?)) |e| return answerAt(e.types, qtype);
         return .nxdomain;
     }
 
-    /// A signer may omit an ENT (§7.1) under a wildcard at the provable
-    /// encloser. The honest denial is then indistinguishable from a replay
-    /// over that wildcard's data, so every validator refuses it (§8.4,
-    /// Unbound "wildcard had qtype, bogus"). The signer's problem.
+    /// An omitted empty non-terminal under a wildcard at the provable encloser.
+    /// Its honest denial looks exactly like a replay over that wildcard, so
+    /// every validator refuses it; the oracle excuses the refusal.
     fn shadowed(z: *const Zone, qname: dns.Name) bool {
         var wl: dns.Name.Buf = undefined;
         return !z.inChain(z.realEncloser(qname)) and z.find(dns.Name.child(&wl, "*", z.closestEncloser(qname)).?) != null;
@@ -159,8 +151,6 @@ const Zone = struct {
         return if (t.has(qtype) or t.cname) .positive else .nodata;
     }
 
-    /// The chain record that speaks for `name`: owner match or the span
-    /// around it. A circular chain leaves no name out.
     fn relevant(z: *const Zone, name: dns.Name) usize {
         var h: [20]u8 = undefined;
         if (z.nsec3) h = proof.nsec3Hash(name, z.salt[0..z.salt_len], z.iterations);
@@ -183,12 +173,10 @@ const Zone = struct {
         return z.recs[z.relevant(name)].nsec3();
     }
 
-    /// The only honest source of an `.insecure` verdict.
     fn optoutCovered(z: *const Zone, name: dns.Name) bool {
         return (z.coverer(name) orelse return false).flags == 1;
     }
 
-    /// The ancestor-or-self of `name` one label below its closest encloser.
     fn nextCloser(z: *const Zone, name: dns.Name) dns.Name {
         return name.ancestor(@min(z.closestEncloser(name).depth() + 1, name.depth()));
     }
@@ -241,7 +229,6 @@ fn draw(z: *Zone, s: *Smith) void {
         n += 1;
     }
 
-    // Names under a cut or DNAME are occluded: the zone never serves them.
     z.n = 0;
     outer: for (raw[0..n]) |e| {
         var up = e.name().parent();
@@ -251,7 +238,6 @@ fn draw(z: *Zone, s: *Smith) void {
         z.entries[z.n] = e;
         z.n += 1;
     }
-    // Empty non-terminals exist too; NSEC3 chains give them records.
     for (0..z.n) |i| {
         const e = z.entries[i];
         var up = e.name().parent();
@@ -270,7 +256,7 @@ fn draw(z: *Zone, s: *Smith) void {
     z.iterations = ([_]u16{ 0, 1, 2, 51, 150 })[s.valueRangeAtMost(u8, 0, 4)];
     const all_optout = z.optout and s.boolWeighted(1, 1);
 
-    // Hashes are entry-indexed here and record-indexed once sorted.
+    // `ehash` is indexed by entry; `z.hashes` by record, in chain order.
     var ehash: [max_chain][20]u8 = undefined;
     var order: [max_chain]usize = undefined;
     z.n_recs = 0;
@@ -302,7 +288,6 @@ fn draw(z: *Zone, s: *Smith) void {
             continue;
         }
         const owner = dns.Name.child(&z.owners[r], proof.base32HexEncode(&z.enc[r], &z.hashes[r]), .lit(apex)).?;
-        // RFC 5155 §7.1: the flag marks spans hiding an unsigned delegation.
         var optout = all_optout;
         for (z.entries[0..z.n], 0..) |*o, j| if (z.omitted(o)) {
             if (between(std.mem.order(u8, &z.hashes[r], &ehash[j]), std.mem.order(u8, &ehash[j], &z.hashes[nr]), std.mem.order(u8, &z.hashes[r], &z.hashes[nr]))) optout = true;
@@ -318,8 +303,6 @@ fn draw(z: *Zone, s: *Smith) void {
     }
 }
 
-/// What an honest server sends for `qname`: whatever speaks for it, each
-/// ancestor, and the closest encloser's wildcard.
 fn honest(z: *const Zone, qname: dns.Name, mask: *[max_chain]bool) void {
     @memset(mask, false);
     var up: ?dns.Name = qname;
@@ -367,8 +350,8 @@ fn dump(z: *const Zone, auth: []const dns.ResourceRecord, qname: dns.Name, qtype
     std.debug.print("\nqname={s} qtype={t} {any}\n", .{ qname.formatInto(&b), qtype, extra });
 }
 
-// After a fuzz failure, `cp .zig-cache/f/in0 .zig-cache/f/crash` (the mmap
-// of the input that died) and plain `zig build test` replays it with the dump.
+// After a fuzz failure, copy the dying input (`.zig-cache/f/in0`) to
+// `.zig-cache/f/crash`; a plain `zig build test` then replays it with the dump.
 test "replay" {
     const data = std.Io.Dir.cwd().readFileAlloc(testing.io, ".zig-cache/f/crash", testing.allocator, .limited(1 << 32)) catch return;
     defer testing.allocator.free(data);
@@ -378,8 +361,6 @@ test "replay" {
     try fuzzOne({}, &smith);
 }
 
-/// The zone is the oracle: a verdict contradicting it is a replay hole, and
-/// an honest proof failing to verify is a SERVFAIL on a real zone.
 fn fuzzOne(_: void, s: *Smith) anyerror!void {
     var z: Zone = undefined;
     draw(&z, s);
@@ -405,17 +386,13 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     switch (v1) {
         .secure => if (t == .positive or t == .referral or (is_nxdomain and t != .nxdomain)) return error.UnsoundDenial,
         .insecure => {
-            // The only honest source of .insecure is an Opt-Out span over the
-            // next closer or the wildcard: §12.2's concession. A name outside
-            // the chain can always be passed off as unsigned, and with it the
-            // wildcard expansion it would have had (errata 3441; Unbound
-            // `nsec3_do_prove_nodata` case 5 takes the same replay).
+            // An Opt-Out span over the next closer or the wildcard is the only honest
+            // source of `.insecure`.
             if (!(z.optoutCovered(nc) or z.optoutCovered(wc))) return error.UnsoundOptOut;
         },
         .bogus, .unchecked => if (exact and (t == .nodata or t == .nxdomain) and !z.shadowed(qname)) return error.HonestDenialRefused,
     }
 
-    // Wildcard expansion: no closer match below the RRSIG's encloser.
     budget = .{};
     const labels: u8 = if (exact) ce.depth() else s.valueRangeAtMost(u8, 0, qname.depth());
     const v2 = proof.proveNoCloserMatch(auth, qname, labels, zone, &budget);
@@ -447,9 +424,6 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     switch (v3) {
         .unsigned => {
             if (child.depth() == 1 or z.cutAbove(child)) return error.UnsoundDelegation;
-            // An omitted ENT hashes into an Opt-Out span: to a validator it
-            // doesn't exist, and the clause below grants those §12.2's
-            // forged-cut concession.
             if (e != null and !insecure_delegation and !z.omitted(e.?)) return error.UnsoundDelegation;
             if (!z.inChain(child) and !z.optoutCovered(z.nextCloser(child))) return error.UnsoundDelegation;
         },

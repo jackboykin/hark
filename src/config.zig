@@ -19,16 +19,11 @@ const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
 const build_options = @import("build_options");
 
-/// Error variants can't carry the offending key name, so log it at rejection
-/// time. Silent under test: the schema tests trigger these intentionally and
-/// the test runner fails on error-level logs.
 fn errLog(comptime fmt: []const u8, args: anytype) void {
     if (@import("builtin").is_test) return;
     std.log.err(fmt, args);
 }
 
-/// a.root-servers.net through m.root-servers.net, in order, as
-/// https://www.internic.net/domain/named.root lists them.
 const root_servers = [_]struct { ip4: []const u8, ip6: []const u8 }{
     .{ .ip4 = "198.41.0.4", .ip6 = "2001:503:ba3e::2:30" },
     .{ .ip4 = "170.247.170.2", .ip6 = "2801:1b8:10::b" },
@@ -60,17 +55,13 @@ const loopback_cidrs = [_]acl.Cidr{
     .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0), .prefix = 128 },
 };
 
-/// Each default is the value `hark.toml.example` shows.
 pub const EncryptedTransport = enum { off, opportunistic };
 
 pub const ServerConfig = struct {
     listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53) },
-    /// Empty: the IANA roots.
     root_hints: []const Address = &.{},
-    /// Where glue points. Test-only: production always asks port 53.
     upstream_port: u16 = 53,
     dot_port: u16 = 853,
-    /// Lets upstreams sit on 127/8. Test-only.
     allow_loopback_upstreams: bool = false,
     stub_zones: []const stub.Zone = &.{},
     cache_size: usize = 12 * 1024 * 1024,
@@ -78,27 +69,21 @@ pub const ServerConfig = struct {
     encrypted_transport: EncryptedTransport = .off,
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
-    /// The first window a failed question is answered from memory (RFC 9520 §3.2).
     servfail_ttl: u32 = 5,
     dnssec: bool = true,
     qname_minimization: bool = true,
     dns64: ?dns64.Prefix = null,
     stagger_ms: u32 = 150,
-    /// Upstream exchanges one resolution may spend.
     max_queries: u32 = 100,
     log_queries: bool = false,
     max_udp_payload: u16 = dns.edns_udp_payload,
-    /// Numeric: names would need NSS.
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
     clients: []const acl.Cidr = &loopback_cidrs,
-    /// RFC 7766 §6.2.3.
     tcp_idle_timeout_ms: u32 = 5_000,
     tcp_queries_per_conn: u32 = 128,
-    /// Empty: the IANA root anchors. Test-only.
     trust_anchors: []const dns.DsData = &.{},
     rebinding: rebinding.Config = .{ .enabled = true },
-    /// Owns every slice above.
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *ServerConfig) void {
@@ -113,7 +98,6 @@ pub const ServerConfig = struct {
         return .{ .upstream_port = self.upstream_port, .allow_loopback = self.allow_loopback_upstreams };
     }
 
-    /// A production build has only the IANA anchors.
     pub fn trustAnchors(self: ServerConfig) []const dns.DsData {
         if (comptime !build_options.testing_enabled) return &dnssec.root_ds_records;
         return if (self.trust_anchors.len > 0) self.trust_anchors else &dnssec.root_ds_records;
@@ -126,20 +110,11 @@ const ConfigError = error{
     TooManyRootHints,
     InvalidValue,
     InvalidAclEntry,
-    /// Operator set a key gated behind `-Dtesting=true` in a production build.
     TestOnlyConfigKey,
-    /// Key or section not in the schema — almost always a typo. Fail loud
-    /// rather than silently serve with the default.
     UnknownConfigKey,
     ConfigFileTooLarge,
     OutOfMemory,
 };
-
-// ── Schema ─────────────────────────────────────────────────────────────
-// Every key the parser reads, with its expected TOML type — validated before
-// parsing so a typo'd key or wrong-typed value (`dnssec = "true"`) errors
-// instead of silently keeping the default. Test-only keys are listed too;
-// their `-Dtesting` gate stays in the parser for the distinct error.
 
 const KeySpec = struct { name: []const u8, kind: std.meta.Tag(toml.Value) };
 const SectionSpec = struct { name: []const u8, keys: []const KeySpec };
@@ -222,8 +197,6 @@ fn validateSchema(root: toml.Table) ConfigError!void {
     }
 }
 
-/// Refused outside `min` to `max`, never clamped: `stagger-ms = 5000` meant
-/// five seconds to whoever wrote it.
 fn integer(comptime T: type, table: toml.Table, key: []const u8, min: T, max: T) ConfigError!?T {
     const v = table.get(key, .integer) orelse return null;
     if (v < min or v > max) {
@@ -233,17 +206,12 @@ fn integer(comptime T: type, table: toml.Table, key: []const u8, min: T, max: T)
     return @intCast(v);
 }
 
-/// Neither `(uid_t)-1` (setresuid's "leave unchanged" sentinel) nor 0 is an id
-/// worth dropping to; both make the drop a no-op that reports success.
 fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
     const v = try integer(u32, table, key, 0, maxInt(u32)) orelse return null;
     if (v == maxInt(u32)) {
         errLog("config: {s} must be a real id, got the 'unchanged' sentinel {d}", .{ key, v });
         return error.InvalidValue;
     }
-    // 0 reaches the same no-op by a likelier route than the sentinel: a
-    // template substituting an unset variable. Dropping *to* root is not
-    // something these keys can express; omitting them is how you stay put.
     if (v == 0) {
         errLog("config: {s} must not be 0 — omit the key to run as the current user", .{key});
         return error.InvalidValue;
@@ -283,7 +251,6 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
             }
         }
         if (resolver.get("stub-zones", .string_array)) |entries| cfg.stub_zones = try parseStubZones(arena, entries);
-        // Test-only knobs: a production binary refuses the key.
         if (try integer(u16, resolver, "upstream-port", 1, 65535)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.upstream_port = p;
@@ -308,7 +275,6 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
                 return error.InvalidValue;
             };
         };
-        // Past a second, most stubs have given up.
         if (try integer(u32, resolver, "stagger-ms", 0, 1000)) |v| cfg.stagger_ms = v;
         if (try integer(u32, resolver, "max-queries", 1, maxInt(u32))) |v| cfg.max_queries = v;
         if (resolver.get("encrypted-transport", .string)) |s| {
@@ -341,13 +307,9 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
 
     cfg.rebinding.nat64 = cfg.dns64;
 
-    // Told servers skip the ask's policy, so the root's are held to it
-    // here: a private root hint is a footgun, not a steer. Loopback ones
-    // only if the operator opted in (tests do).
+    // Configured servers are not screened when asked, so the policy is applied here.
     for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(.fromAddress(addr))) return error.InvalidRootHintAddress;
 
-    // hark recurses for any question: a stub server that is hark itself
-    // asks hark, which asks hark.
     for (cfg.stub_zones) |z| for (z.servers) |server| for (cfg.listen) |l| if (reaches(l, server)) {
         errLog("config: stub-zones names an address hark itself listens on", .{});
         return error.InvalidValue;
@@ -356,9 +318,8 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
     return cfg;
 }
 
-/// A socket bound to `l` would take a query sent to `to`: the same address,
-/// or, bound to the family's wildcard, one certain to be this host's. Each
-/// family listens apart (IPV6_V6ONLY).
+/// A socket bound to `l` takes a query sent to `to`: the same address, or `l`
+/// is a wildcard and `to` is surely this host. Listeners are IPV6_V6ONLY.
 fn reaches(l: Address, to: Address) bool {
     if (l.getPort() != to.getPort()) return false;
     if (net_addr.ipEqual(l, to)) return true;
@@ -377,8 +338,6 @@ pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !Serv
     return parseConfig(allocator, contents);
 }
 
-/// Each `"<key-tag> <algorithm> <digest-type> <hex-digest>"`, in decimal
-/// IANA numbers, for the root.
 fn parseTrustAnchors(arena: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
     const list = try arena.alloc(dns.DsData, strs.len);
     for (list, strs) |*ta, s| ta.* = try parseTrustAnchor(arena, s);
@@ -396,12 +355,9 @@ fn parseTrustAnchor(arena: Allocator, s: []const u8) ConfigError!dns.DsData {
     const key_tag = std.fmt.parseInt(u16, tag_str, 10) catch return error.InvalidValue;
     const alg_int = std.fmt.parseInt(u8, alg_str, 10) catch return error.InvalidValue;
     const dtype_int = std.fmt.parseInt(u8, dtype_str, 10) catch return error.InvalidValue;
-    // Both enums are open: an unnamed value is a typo, refused here rather
-    // than met later as a SERVFAIL.
     const algorithm: dns.DnssecAlgorithm = @fromBackingInt(@intCast(alg_int));
     if (std.enums.tagName(dns.DnssecAlgorithm, algorithm) == null) return error.InvalidValue;
     const digest_type: dns.DigestType = @fromBackingInt(@intCast(dtype_int));
-    // RFC 4034 §5.1.4 + RFC 6605 §3: digest length is fixed per digest type.
     const digest_len: usize = switch (digest_type) {
         .sha1 => 20,
         .sha256 => 32,
@@ -424,8 +380,7 @@ fn parseTrustAnchor(arena: Allocator, s: []const u8) ConfigError!dns.DsData {
 pub fn parseZoneList(arena: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
     const list = try arena.alloc(dns.Name, strs.len);
     for (list, strs) |*zone, s| {
-        // The root holds every name: `allow-zones = [""]` would turn the
-        // scrub off entirely.
+        // The root holds every name: allowing it turns the scrub off entirely.
         if (s.len == 0 or mem.eql(u8, s, ".")) {
             errLog("config: allow-zones entry must name a zone, got '{s}'", .{s});
             return error.InvalidValue;
@@ -504,10 +459,6 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
         return net_addr.initIp6(ip6.bytes, port);
     }
 
-    // First vs last colon distinguish the three remaining shapes:
-    //   no colons     → bare IPv4
-    //   one colon     → IPv4:port (first == last)
-    //   many colons   → bare IPv6 (first != last)
     const first = mem.findScalar(u8, s, ':');
     const last = mem.findScalarLast(u8, s, ':');
 
@@ -521,8 +472,6 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
         return net_addr.initIp6(ip6.bytes, default_port);
     }
 
-    // Same strict dotted-quad grammar as acl.zig's CIDR parsing —
-    // one config file, one IPv4 grammar.
     const ip4 = std.Io.net.Ip4Address.parse(s, default_port) catch return null;
     return .{ .ip4 = ip4 };
 }
@@ -571,7 +520,6 @@ test "unknown key rejected, not silently ignored" {
         \\[resolvers]
         \\dnssec = true
     ));
-    // Underscore instead of dash — the most likely real-world typo.
     try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
         \\[resolver]
         \\qname_minimization = false
@@ -600,12 +548,9 @@ test "trust-anchors rejects malformed entries" {
         "20326 8 2",
         "20326 8 2 AB EXTRA",
         "20326 8 2 ZZZZ",
-        // Unknown algorithm (255 is reserved/unassigned per IANA DNSSEC alg registry)
         "20326 255 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
         "20326 8 99 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
-        // 16-byte digest is too short for any standard digest type
         "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D084",
-        // Digest length doesn't match digest type (SHA-256 declared, 20-byte SHA-1 supplied)
         "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E88040",
     }) |s| try testing.expectError(error.InvalidValue, parseTrustAnchor(arena.allocator(), s));
 }
@@ -737,7 +682,6 @@ test "parseConfig handles OOM without leaking" {
         \\extra-block = ["192.0.2.0/24"]
         \\extra-allow = ["203.0.113.0/24"]
     ;
-    // Refusing resize makes every growth an injectable alloc and the count deterministic.
     var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(backing.allocator(), parseConfigOomProbe, .{contents});
 }

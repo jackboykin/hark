@@ -17,8 +17,6 @@ const Graph = graph.Graph;
 const CellId = graph.CellId;
 const RR = dns.ResourceRecord;
 
-/// One NSEC's geometry, and the judged bytes it was cut from, so no later
-/// reply can change what the span says.
 const Span = struct {
     owner: dns.Name,
     nsec: dns.NsecData,
@@ -51,11 +49,9 @@ const Span = struct {
 };
 
 const Zone = struct {
-    /// In canonical owner order.
     spans: std.ArrayList(Span) = .empty,
     soa: ?struct { judged: *store.Blob, expires_ns: i64 } = null,
 
-    /// Drop what has expired, so the neighbour of a name is a live proof.
     fn prune(z: *Zone, g: *Graph) void {
         if (z.soa) |soa| if (soa.expires_ns <= g.now()) z.release(g);
         var w: usize = 0;
@@ -71,7 +67,6 @@ const Zone = struct {
         z.soa = null;
     }
 
-    /// Where `name` sorts among the owners.
     fn position(z: *const Zone, name: dns.Name) usize {
         var lo: usize = 0;
         var hi: usize = z.spans.items.len;
@@ -89,12 +84,12 @@ const Zone = struct {
         return if (sp.owner.eql(name) and sp.expires_ns > g.instant()) sp else null;
     }
 
-    /// The span whose range holds `name` (RFC 6840 §4.1); the last owner
-    /// wraps to cover what sorts before the first.
     fn span(z: *const Zone, g: *Graph, name: dns.Name) ?*const Span {
         const n = z.spans.items.len;
         if (n == 0) return null;
         const pos = z.position(name);
+        // The owner just before `name`, or the last owner, whose range wraps to
+        // cover what sorts before the first.
         for ([_]usize{ if (pos > 0) pos - 1 else n - 1, n - 1 }) |i| {
             const sp = &z.spans.items[i];
             if (sp.expires_ns > g.instant() and proof.nsecCovers(sp.owner, sp.nsec, name)) return sp;
@@ -118,8 +113,6 @@ pub const Index = struct {
     }
 };
 
-/// So the index cannot outgrow its facts: what goes is what was judged
-/// from `blob`.
 pub fn evicted(g: *Graph, blob: *store.Blob) void {
     const key = blob.key();
     if (key.rtype != .nsec and key.rtype != .soa) return;
@@ -167,8 +160,6 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
     return gop.value_ptr;
 }
 
-/// A secure negative's SOA and NSECs become facts, each for as long as
-/// its own proof holds (RFC 8198 §5.4). A flood never proved anything.
 pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const i64, keys_until: i64) !void {
     std.debug.assert(!proof.proofFlood(r.authorities));
     const zkey = signer.wire;
@@ -182,7 +173,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         const kind: graph.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
-        // `fact` can re-enter `evicted` and drop this zone: look it up after.
+        // `fact` can re-enter `evicted` and drop this zone: look it up only after.
         const judged = (try g.fact(graph.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {
             g.store.unref(judged);
@@ -208,15 +199,13 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
     }
 }
 
-/// Of the two NSECs at a cut, the child's is the one at its own apex,
-/// whatever either bitmap claims.
 fn delegated(rr: RR, zone: dns.Name) bool {
     var next: dns.Name.Buf = undefined;
     return !rr.name.eql(zone) and dns.typeBitmapContains(rr.nsec(&next).type_bit_maps, .ns);
 }
 
-/// A range of one name (`owner NSEC \000.owner`, "black lies") denies
-/// nothing but types at its owner.
+/// `owner NSEC \000.owner` ("black lies") spans one name and denies only
+/// types at its owner, so it is no use as a range.
 fn minimal(rr: RR) bool {
     var buf: dns.Name.Buf = undefined;
     const next = rr.nsec(&buf).next_domain_name;
@@ -224,20 +213,13 @@ fn minimal(rr: RR) bool {
     return std.mem.eql(u8, next.leaf(), "\x00") and up.eql(rr.name);
 }
 
-/// Never a DS: that is the parent's word at the cut alone (RFC 6840 §4.4),
-/// and a proof from before the delegation would deny it (dnssec/033).
-/// Never a DNSKEY: the chain of trust takes only keys (`trust.runDnskey`),
-/// and a denial from memory would fail it without asking.
+/// Never DS: only the parent may deny it at a cut (RFC 6840 §4.4), and a
+/// proof from before the delegation existed would. Never DNSKEY: a denial
+/// from memory would fail the chain of trust without asking.
 pub fn denies(g: *const Graph, qtype: dns.RType) bool {
     return g.cfg.trust_anchors != null and qtype != .ds and qtype != .dnskey;
 }
 
-/// Settle `rrset(name, type)` as a denial from indexed proofs, if the
-/// closest zone holding any can prove one: a span covering the name with
-/// the wildcard at its closest encloser matched (NODATA) or covered
-/// (NXDOMAIN), an exact owner (NODATA), or a span whose next name descends
-/// below it (an empty non-terminal, NODATA). The verdict is stamped on the
-/// reply; nothing is re-verified.
 pub fn deny(g: *Graph, id: CellId) !bool {
     if (g.denial.zones.count() == 0 or !denies(g, g.cell(id).key.rtype)) return false;
     const name = g.cell(id).name;
@@ -296,7 +278,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .stored_ns = now,
     };
     reply.ttl = @min(walk.replyTtl(reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
-    // RFC 2308 §5: the SOA's minimum may end it before its proofs do.
+    // RFC 2308 §5: the SOA minimum may end the denial before its proofs do.
     const minimum = for (soa.answers) |rr| {
         if (rr.rtype == .soa) break rr.soa().minimum;
     } else 0;
@@ -306,7 +288,6 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     return true;
 }
 
-/// Append `rrs` with the TTL they have left.
 fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !void {
     const age = walk.ageOf(stored_ns, g.now());
     for (rrs) |rr| {

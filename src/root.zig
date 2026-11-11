@@ -5,10 +5,7 @@ pub const monotonic = @import("monotonic.zig");
 pub const serve = @import("serve.zig");
 pub const slab = @import("slab.zig");
 
-// Explicit per-file imports drive test discovery by reachability, so tests run
-// regardless of pub-ness — unlike refAllDecls, which sees only pub decls (a
-// dropped `pub` silently drops a file's tests) and is on its way out of std.
-// Add a line here when you add a module file.
+// Tests are found by reachability from here: a file not listed runs none.
 test {
     _ = @import("acl.zig");
     _ = @import("answer.zig");

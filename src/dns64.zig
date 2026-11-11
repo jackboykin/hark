@@ -10,7 +10,6 @@ const na = @import("net_address.zig");
 
 pub const Prefix = struct {
     bytes: [16]u8,
-    /// RFC 6052 §2.2: 32, 40, 48, 56, 64 or 96.
     len: u8,
 
     pub const well_known: Prefix = .{ .bytes = .{ 0, 0x64, 0xff, 0x9b } ++ @as([12]u8, @splat(0)), .len = 96 };
@@ -28,7 +27,7 @@ pub const Prefix = struct {
         return mem.eql(u8, v6[0 .. p.len / 8], p.bytes[0 .. p.len / 8]);
     }
 
-    /// RFC 6052 §2.2: byte of the i-th IPv4 octet; the u-octet at 8 is skipped.
+    /// RFC 6052 §2.2: the i-th IPv4 octet's place; reserved octet 8 is skipped.
     fn slot(p: Prefix, i: usize) usize {
         const k = p.len / 8 + i;
         return if (p.len < 96 and k >= 8) k + 1 else k;
@@ -47,20 +46,16 @@ pub const Prefix = struct {
     }
 };
 
-/// §5.1.2, §5.1.4: NOERROR with no AAAA beyond `::ffff:0:0/96`. A
-/// SERVFAILed AAAA stays SERVFAIL: §5.1.2 says treat it as empty, §5.5
-/// forbids laundering a bogus one, and bogus is indistinguishable from lame
-/// here. A set mixing real and `::ffff` members passes untouched: stripping
-/// members would orphan its RRSIG.
+/// RFC 6147 §5.1.2, §5.1.4. A failed AAAA is not treated as empty: it may
+/// be bogus, which §5.5 forbids replacing. A set mixing real and `::ffff`
+/// addresses is left whole, since stripping members would orphan its RRSIG.
 pub fn wantsSynthesis(rcode: dns.RCode, answers: []const dns.ResourceRecord) bool {
     if (rcode != .no_error) return false;
     for (answers) |rr| if (rr.rtype == .aaaa and !na.isIp4Mapped(rr.rdata)) return false;
     return true;
 }
 
-/// The A reply's answers with each A embedded under `p` and the A RRSIG
-/// dropped; null when there is no A to embed. §5.1.7: TTL capped by the
-/// negative's SOA, else 600 s. AD is the caller's to clear.
+/// RFC 6147 §5.1.7: TTLs are capped by the AAAA negative's SOA, else 600 s.
 pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: []const dns.ResourceRecord, negative_authorities: []const dns.ResourceRecord) !?[]dns.ResourceRecord {
     for (a) |rr| {
         if (rr.rtype == .a) break;
@@ -96,9 +91,8 @@ pub fn parseIp6Arpa(name: dns.Name) ?[16]u8 {
     return out;
 }
 
-/// The PTRs re-owned under the client's name, as Unbound renames, not
-/// §5.3.1's CNAME. CNAMEs (RFC 2317) and RRSIGs are untrue under the new
-/// owner.
+/// Re-owns the PTRs under the client's name, not RFC 6147 §5.3.1's CNAME.
+/// CNAMEs and RRSIGs are dropped: they are untrue under the new owner.
 pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.ResourceRecord, qname: dns.Name) ![]dns.ResourceRecord {
     const owner = try qname.clone(alloc);
     const out = try alloc.alloc(dns.ResourceRecord, answers.len);
@@ -112,7 +106,6 @@ pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.ResourceRecord, qnam
     return out[0..n];
 }
 
-/// RFC 6052 §2.4.
 const rfc6052_examples = [_]struct { len: u8, text: []const u8 }{
     .{ .len = 32, .text = "2001:db8:c000:221::" },
     .{ .len = 40, .text = "2001:db8:1c0:2:21::" },
@@ -141,7 +134,6 @@ test "parseIp6Arpa round-trips through the nibble order" {
     try testing.expectEqualSlices(u8, &addr, &parseIp6Arpa(name).?);
     try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(.lit("1.0.0.127.in-addr.arpa.")));
     try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(name.parent().?));
-    // As long as 32 nibbles, but one label holds three.
     try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(.lit("abc.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.")));
 }
 

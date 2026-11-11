@@ -19,10 +19,6 @@ const fine_max = 128;
 const max_slot = 32 << 10;
 const class_count = fine_max / 16 + (std.math.log2(max_slot) - std.math.log2(fine_max)) * steps;
 
-/// Safe builds check every free. Debug also holds a freed slot back from
-/// reuse until `quarantine_bytes` more have been freed after it; in
-/// ReleaseSafe that cost 8% of a miss and 6 MiB, and a peer that controls
-/// what hark allocates can flush it anyway.
 const safe = @import("builtin").mode.runtimeSafety();
 const quarantined = @import("builtin").mode == .debug;
 const quarantine_bytes = 4 << 20;
@@ -40,16 +36,14 @@ const slot_sizes: [class_count]u32 = blk: {
     break :blk sizes;
 };
 
-/// The 16-byte steps below `fine_max` are its first doubling's eighths,
-/// so one formula covers both ranges.
 fn classOf(len: usize) u8 {
     const n = len -| 1;
     const k: usize = std.math.log2_int(usize, n | fine_max);
     return @intCast((k - std.math.log2(fine_max) << std.math.log2(steps)) + (n >> @intCast(k - std.math.log2(steps))));
 }
 
-/// Slots sit at multiples of their size from a slab's start, and a class
-/// `steps` times the alignment or larger is a multiple of it.
+/// Slots sit at multiples of their size from the slab's start, and every
+/// class of at least `steps` times the alignment is a multiple of it.
 fn classFor(len: usize, alignment: Alignment) ?u8 {
     const a = alignment.toByteUnits();
     const n = if (a <= 16) len else @max(len, a * steps);
@@ -71,7 +65,6 @@ const Slab = struct {
     where: enum(u8) { reserve, current, partial, full } = .reserve,
     dirty: bool = false,
     owner: ?*Tenant = null,
-    /// Bit i: the slot at `base() + i * size` is handed out.
     out: if (safe) std.bit_set.Static(most_slots) else void = if (safe) .empty else {},
 
     fn base(slab: *Slab) usize {
@@ -110,8 +103,6 @@ const Slab = struct {
     }
 };
 
-/// Freed slots, oldest first, each filled with 0xaa: one rejoins its slab
-/// once `quarantine_bytes` more have followed it, or the ring is full.
 const Quarantine = struct {
     ring: [][*]u8 = &.{},
     head: usize = 0,
@@ -152,7 +143,7 @@ const Quarantine = struct {
     }
 };
 
-/// Sits in the region's first 64 KiB, which is never a slab.
+/// Lives in the region's first 64 KiB, so `slabs[0]` is never handed out.
 const Region = struct {
     slabs: [slabs_per_region]Slab,
     older: ?*Region,
@@ -165,19 +156,16 @@ const Region = struct {
 pub const Reserve = struct {
     dirty: std.DoublyLinkedList = .{},
     dirty_count: usize = 0,
-    /// The oldest of `dirty`: empty since the last tick at least.
     aged: usize = 0,
     clean: std.DoublyLinkedList = .{},
     held: usize = 0,
     newest: ?*Region = null,
     quarantine: if (quarantined) Quarantine else void = if (quarantined) .{} else {},
 
-    /// Call every second or so: a slab empty for a whole tick goes back to
-    /// the OS, while a load swinging back within one reuses it warm.
+    /// Call about once a second: a slab empty for a whole tick goes back to the OS.
     pub fn tick(r: *Reserve) void {
         for (0..r.aged) |_| {
             const cold = Slab.from(r.dirty.popLast().?);
-            // Refused, it stays resident; it is empty either way.
             posix.madvise(@ptrFromInt(cold.base()), slab_len, std.os.linux.MADV.DONTNEED) catch {};
             cold.dirty = false;
             r.clean.append(&cold.node);
@@ -186,7 +174,6 @@ pub const Reserve = struct {
         r.aged = r.dirty_count;
     }
 
-    /// Every slot the quarantine holds rejoins its slab, checked.
     pub fn drain(r: *Reserve) void {
         if (quarantined) r.quarantine.drain();
     }
@@ -238,8 +225,6 @@ pub const Reserve = struct {
     }
 };
 
-/// One lifetime's memory, on slabs no other tenant shares, so long-lived
-/// facts and bursty work can't pin each other's memory.
 pub const Tenant = struct {
     reserve: *Reserve,
     current: [class_count]?*Slab = @splat(null),
@@ -292,6 +277,8 @@ pub const Tenant = struct {
         return take(slab).?;
     }
 
+    /// `free` tells a mapping from a slot by length alone, so no resize may
+    /// carry an allocation across `max_slot`.
     fn resize(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
         if (classFor(memory.len, alignment) == null) {
             if (classFor(new_len, alignment) != null) return false;
@@ -329,7 +316,6 @@ pub const Tenant = struct {
         s.next = slab.free;
         slab.free = s;
         slab.used -= 1;
-        // An empty slab is always the reserve's.
         switch (slab.where) {
             .full => {
                 slab.where = .partial;

@@ -48,7 +48,7 @@ pub const Carrier = union(Kind) {
         };
     }
 
-    /// `wire` must outlive its query.
+    /// `wire` is borrowed and must outlive its query.
     pub fn query(c: *Carrier, sh: *Shared, wire: []const u8) !Taken {
         return switch (c.*) {
             inline else => |*x, kind| try x.query(&@field(sh, @tagName(kind)), wire),
@@ -61,7 +61,6 @@ pub const Carrier = union(Kind) {
         }
     }
 
-    /// False: gone.
     pub fn flush(c: *Carrier, sh: *Shared) !bool {
         return switch (c.*) {
             inline else => |*x, kind| try x.flush(&@field(sh, @tagName(kind))),
@@ -129,12 +128,10 @@ pub const Shared = struct {
     doq: DoqSocket.Shared = .{},
 };
 
-/// How a query is told from its neighbours on a session.
 pub const QueryId = u64;
 
 pub const Taken = union(enum) {
     sent: QueryId,
-    /// It waits for `room`.
     later,
     gone,
 };
@@ -143,13 +140,11 @@ pub const End = enum { failed, closed };
 
 pub const News = union(enum) {
     nothing,
-    /// `next` has events to take.
     read,
     ended: End,
 };
 
 pub const Event = union(enum) {
-    /// Queries may go; those before the next flush leave with the handshake's last flight.
     established,
     reply: struct { id: QueryId, bytes: []u8 },
     refused: QueryId,

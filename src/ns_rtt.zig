@@ -9,10 +9,8 @@ const AddressKey = @import("net_address.zig").AddressKey;
 
 const initial_timeout_ms: u32 = 400;
 
-/// RFC 6298's first RTO, R + 4 * R/2, with the initial timeout as R.
 const silent_base_ms: u32 = 3 * initial_timeout_ms;
 
-/// At 50 a two-round-trip exchange to a 20 ms server timed out once in ~400.
 const min_timeout_ms: u32 = 100;
 const min_stagger_ms: u32 = 50;
 
@@ -27,33 +25,26 @@ const dead_probe_timeout_ms: u32 = 2_000;
 
 const max_backoff_shifts: u8 = 8;
 
-/// Every glue address is attacker-chosen.
 pub const max_entries: u32 = 4_096;
 
-/// Roughly p95 of a well-behaved RTT distribution (Dean–Barroso, "The Tail at Scale").
 const hedge_multiplier: u32 = 3;
 
 const hedge_decay_ms: i64 = 30_000;
 
 const max_hedge_stagger_ms: u32 = 300;
 
-/// srtt averages about 15 samples at its gain of 1/8, so it is unsure by
-/// their spread over √15, about 4.
 const sure_divisor = 4;
 
 const forget_ms: i64 = 10 * std.time.ms_per_min;
 
 const loss_one: u16 = 1 << 15;
 
-/// Near standard normal from 64 random bits: four 16-bit uniforms summed,
-/// centred and scaled to unit variance.
 pub fn normal(bits: u64) f64 {
     var sum: u64 = 0;
     inline for (0..4) |k| sum += bits >> (16 * k) & 0xffff;
     return (@as(f64, @floatFromInt(sum)) - 2 * 65535.0) * (@sqrt(3.0) / 65536.0);
 }
 
-/// In the order servers are asked.
 pub const Track = enum {
     timed,
     untimed,
@@ -68,10 +59,8 @@ pub const Track = enum {
     }
 };
 
-/// RFC 1035 §4.2.1 ≥2 s.
 const failover_timeout_cap_ms: u32 = 2000;
 
-/// Round trips in µs fit 32 bits: no reply outlives its deadline.
 pub const RttState = struct {
     srtt_us: u32 = 0,
     rttvar_us: u32 = 0,
@@ -84,7 +73,6 @@ pub const RttState = struct {
 
     pub const unknown: RttState = .{};
 
-    /// Any reply, whatever its rcode.
     pub fn observe(s: *RttState, rtt_us: i64, now_ms: i64) void {
         const rtt: u32 = @intCast(std.math.clamp(rtt_us, 1, std.math.maxInt(u32)));
         if (s.min_rtt_us == 0) {
@@ -92,14 +80,12 @@ pub const RttState = struct {
             s.rttvar_us = rtt / 2;
             s.loss = 0;
         } else {
-            // RFC 6298
             const delta = @max(s.srtt_us, rtt) - @min(s.srtt_us, rtt);
             s.rttvar_us = 3 * (s.rttvar_us / 4) + delta / 4;
             s.srtt_us = 7 * (s.srtt_us / 8) + rtt / 8;
             s.loss -= s.loss / 8;
         }
         s.heard_ms = now_ms;
-        // Re-anchoring lets the floor follow a route change upward.
         if (s.min_rtt_us == 0 or rtt < s.min_rtt_us or now_ms - s.min_rtt_stamp_ms > hedge_decay_ms) {
             s.min_rtt_us = rtt;
             s.min_rtt_stamp_ms = now_ms;
@@ -129,7 +115,6 @@ pub const RttState = struct {
         return .timed;
     }
 
-    /// One draw, in µs, from a standard normal `z`.
     pub fn wait(s: RttState, now_ms: i64, rounds: u32, hold_ms: u32, z: f64) u64 {
         const srtt: f64 = @floatFromInt(s.srtt_us);
         const sure = @as(f64, @floatFromInt(s.rttvar_us)) / sure_divisor;
@@ -163,7 +148,7 @@ pub const RttState = struct {
         return @intCast(@max(min_timeout_ms, @min(backed_off, cap)));
     }
 
-    /// RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0 and
+    /// RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0, and
     /// then any jitter times out.
     fn estimateMs(s: RttState) u32 {
         const srtt: i64 = s.srtt_us;
@@ -179,14 +164,9 @@ pub const RttState = struct {
 
 pub const Table = ServerTable(RttState);
 
-/// What hark holds per server, in a table sized once: `ways` slots a set, the
-/// set the address's seeded hash picks. A newcomer takes an empty slot in
-/// its set, else the one written longest ago, so a flood of glue addresses
-/// displaces its own estimates before those in use, and nothing allocates
-/// or leaves a tombstone after init.
 pub fn ServerTable(comptime State: type) type {
     return struct {
-        /// A slot's hash, high bit set; zero is empty.
+        /// A slot's hash with the high bit set; zero is empty.
         tags: [slots]u32,
         keys: [slots]AddressKey,
         written_ms: [slots]i64,
@@ -198,7 +178,7 @@ pub fn ServerTable(comptime State: type) type {
         const slots = max_entries;
         const sets = slots / ways;
 
-        /// Only the tags are written, so a slot's page stays untouched until
+        /// Only the tags are initialised, so a slot's pages stay untouched until
         /// a server lands in it.
         pub fn create(gpa: Allocator) !*Self {
             const t = try gpa.create(Self);
@@ -221,7 +201,6 @@ pub fn ServerTable(comptime State: type) type {
             return &t.states[t.find(at.set, at.tag, key) orelse return null];
         }
 
-        /// The state to write for `key`, made unknown if it had none.
         pub fn write(t: *Self, key: AddressKey, now_ms: i64) *State {
             const at = slot(key);
             const i = t.find(at.set, at.tag, key) orelse claim: {

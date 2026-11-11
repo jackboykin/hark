@@ -5,9 +5,6 @@ const mem = std.mem;
 const na = @import("net_address.zig");
 
 pub const Cidr = struct {
-    /// Network address. Bytes are normalized so all bits past `prefix` are
-    /// zero. The address's union tag (`ip4` / `ip6`) carries family. Port
-    /// is always 0 — Cidr is a network mask, not an endpoint.
     address: na.Address,
     prefix: u8,
 
@@ -18,8 +15,6 @@ pub const Cidr = struct {
         };
     }
 
-    /// Match against raw network-byte-order address bytes (4 for v4, 16 for
-    /// v6). Returns false on length / family mismatch — public API guard.
     pub fn matchesBytes(self: Cidr, bytes: []const u8) bool {
         return switch (self.address) {
             .ip4 => |v4| bytes.len == 4 and prefixMatch(bytes, &v4.bytes, self.prefix),
@@ -28,8 +23,6 @@ pub const Cidr = struct {
     }
 };
 
-/// Parse "192.168.1.0/24" or "2001:db8::/32" into a Cidr. Bare addresses
-/// take an implied /32 (v4) or /128 (v6).
 pub fn parse(s: []const u8) ?Cidr {
     const slash = mem.findScalar(u8, s, '/');
     const addr_str = s[0 .. slash orelse s.len];
@@ -53,8 +46,6 @@ pub fn allow(entries: []const Cidr, addr: na.Address) bool {
     return false;
 }
 
-/// Network-mask byte for a partial-byte prefix: the top `rem` bits set
-/// (`rem` in 1..7). Used to compare/zero a CIDR's boundary byte.
 fn netmaskByte(rem: u3) u8 {
     return ~(@as(u8, 0xFF) >> rem);
 }

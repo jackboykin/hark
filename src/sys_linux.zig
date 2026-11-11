@@ -32,7 +32,6 @@ pub fn bind(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !
     };
 }
 
-/// Surfaces Interrupted: whether to retry depends on the caller.
 pub fn connect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
     return switch (linux.errno(linux.connect(fd, addr, len))) {
         .SUCCESS => {},
@@ -67,9 +66,6 @@ pub fn listen(fd: posix.fd_t, backlog: u31) !void {
     };
 }
 
-/// Retries EINTR. SIGINT and SIGTERM are blocked and come by signalfd, but
-/// other signals (SIGPIPE, profilers) still interrupt, and giving up would
-/// drop a query in flight.
 pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, len: posix.socklen_t) !usize {
     while (true) {
         const rc = linux.sendto(fd, buf.ptr, buf.len, flags, addr, len);
@@ -87,7 +83,6 @@ pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.s
     }
 }
 
-/// Retries EINTR, as `sendto` does.
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     while (true) {
         const rc = linux.write(fd, buf.ptr, buf.len);
@@ -105,11 +100,8 @@ pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     }
 }
 
-/// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`. The two are the
-/// same array only in a no-libc build; linking libc widens the posix one to
-/// glibc's 128 bytes and the mismatch fails to compile. Every caller
-/// already builds its mask with `linux.sigemptyset`, so stay on the kernel ABI
-/// end to end.
+/// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`: linking libc
+/// widens the posix one to glibc's 128 bytes, which is not the kernel ABI.
 pub fn signalfd(fd: posix.fd_t, mask: *const linux.sigset_t, flags: u32) !posix.fd_t {
     const rc = linux.signalfd(fd, mask, flags);
     return switch (linux.errno(rc)) {

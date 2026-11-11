@@ -13,42 +13,19 @@ const na = @import("net_address.zig");
 
 const log = std.log.scoped(.rebinding);
 
-/// Operator-supplied rebinding policy. Lives in `ServerConfig` and is
-/// referenced (not copied) by `ResponseContext`.
 pub const Config = struct {
     enabled: bool,
-    /// Owner-name allowlist. RRs whose owner name equals or is a subdomain
-    /// of any entry bypass the filter entirely. Use for split-horizon
-    /// zones like `homelab.lan` whose authoritative legitimately returns
-    /// RFC 1918 space. `home.arpa` is intercepted by `special_use.zig`
-    /// upstream of recursion, so including it here is a no-op. Each RR is
-    /// judged by its own owner: for `home.example.com → box.lan.example →
-    /// A 192.168.1.1` the A's owner is `box.lan.example`, so a
-    /// `lan.example` entry passes the chain, as in Unbound and BIND. A
-    /// public CNAME into an allowlisted zone passes too; hark has no
-    /// deny-answer-aliases.
     allow_zones: []const dns.Name = &.{},
-    /// Additive block CIDRs on top of the built-in default set.
     extra_block: []const acl.Cidr = &.{},
-    /// Subtractive allow CIDRs (DNSBL escape hatch). RRs whose address
-    /// matches any entry are kept even if they'd otherwise be blocked —
-    /// the canonical use is `["127.0.0.0/8"]` for operators running
-    /// RFC 5782 DNSBL lookups that *want* 127/8 answers.
     extra_allow: []const acl.Cidr = &.{},
     nat64: ?dns64.Prefix = null,
 
     pub const off: Config = .{ .enabled = false };
 };
 
-/// Returns true if this RR should be dropped from the section.
-/// Inspects A/AAAA addresses and SVCB/HTTPS address hints; every other
-/// rtype passes through. The allowlist walk runs only on records that
-/// would otherwise drop, so public records never pay a name comparison.
 fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     const private = switch (rr.rtype) {
         .a, .aaaa => isPrivate(rr.rdata, cfg),
-        // The whole RR, as Unbound 1.25.0 drops it: rewriting its hints in
-        // place breaks its signature (RFC 9460 §7.3).
         .svcb, .https => svcbHintsPrivate(rr.rdata, cfg),
         else => false,
     };
@@ -59,20 +36,13 @@ fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     return true;
 }
 
-/// RFC 9460 §14.3.2.
 const SvcParamKey = enum(u16) { ipv4hint = 4, ipv6hint = 6, _ };
 
-/// SVCB/HTTPS RDATA (RFC 9460 §2.2): SvcPriority u16 · uncompressed
-/// TargetName · SvcParams as (key u16, len u16, value) triples. Scan
-/// the ipv4hint and ipv6hint params for blocked addresses.
-///
-/// Malformation bias follows Unbound's rebinding fix: past the
-/// TargetName, a length overrun is clamped and the bytes inspected
-/// anyway — a lenient client must never out-parse the scrubber. The
-/// TargetName itself is strict: one truncated, compressed or with an
-/// invalid label makes the hints unlocatable, so the RR is treated as
-/// carrying one. Rdata too short to begin a TargetName holds nothing a
-/// client could read as an address.
+/// RFC 9460 §2.2 rdata. Malformed input is biased so a lenient client never
+/// out-parses the scrub: a TargetName that is truncated, compressed or has a
+/// bad label counts as private, and a param length past the end is clamped
+/// and its bytes still inspected. Rdata too short for a TargetName holds no
+/// address and passes.
 fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
     if (rdata.len < 3) return false;
     var pos: usize = @sizeOf(u16);
@@ -103,11 +73,6 @@ fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
     return false;
 }
 
-/// The section without what `shouldDrop` marks, nor the RRSIGs over a set
-/// that lost a member: they no longer match it. A section that loses
-/// nothing is returned as is, allocating nothing. Without it a
-/// browser-side attacker could point `attacker.com` at the victim's
-/// `127.0.0.1:8765` and call the local dev server cross-origin.
 pub fn scrub(
     alloc: mem.Allocator,
     records: []const dns.ResourceRecord,
@@ -133,6 +98,7 @@ pub fn scrub(
 
     for (records, 0..) |rr, i| {
         if (marks[i]) continue;
+        // An RRSIG over a set that lost a member no longer matches it.
         const covered = rr.covers() orelse continue;
         for (records, 0..) |other, k| {
             if (!marks[k] or other.rtype != covered) continue;
@@ -153,11 +119,8 @@ pub fn scrub(
     return out;
 }
 
-/// Address is private by this policy when it matches the built-in default
-/// set or an `extra_block` entry, AND does not match an `extra_allow`
-/// entry. Allow takes precedence so DNSBL operators can carve back 127/8.
-///
-/// The embedded v4 (mapped or NAT64) is judged at every step.
+/// `extra_allow` wins over the built-in set, so a DNSBL operator can carve
+/// 127/8 back. An embedded IPv4 is judged alongside at every step.
 fn isPrivate(bytes: []const u8, cfg: Config) bool {
     const inner = embeddedIp4(bytes, cfg);
 
@@ -174,8 +137,8 @@ fn isPrivate(bytes: []const u8, cfg: Config) bool {
     return false;
 }
 
-/// Only `dns64-prefix` is unwrapped: 6to4 (`2002::/16`) and any other
-/// translation prefix are the operator's to add to `extra_block`.
+/// Only IPv4-mapped and the configured NAT64 prefix are unwrapped. 6to4 and
+/// other translation prefixes are the operator's to add to `extra_block`.
 fn embeddedIp4(bytes: []const u8, cfg: Config) ?[4]u8 {
     if (bytes.len != 16) return null;
     if (na.isIp4Mapped(bytes)) return bytes[12..16].*;
@@ -205,7 +168,6 @@ fn rrHttps(name: dns.Name, rdata: []const u8) dns.ResourceRecord {
     return .fixture(.{ .name = name, .rtype = .https, .rclass = .in, .ttl = 60, .rdata = .{ .unknown = rdata } });
 }
 
-/// SvcPriority 1 · TargetName "."
 const svc_prefix: []const u8 = &.{ 0, 1, 0 };
 
 fn svcParam(comptime key: u16, comptime value: []const u8) []const u8 {
@@ -228,9 +190,6 @@ fn rrsigOver(covered: dns.RType) dns.ResourceRecord {
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {
-    // The default v6 set defers to v4 via the mapped-prefix recursion; an
-    // operator's v4 `extra_allow` must therefore match the mapped form too,
-    // or AAAA-DNSBL silently stops working when v4-DNSBL does not.
     const allow127 = acl.parse("127.0.0.0/8") orelse return error.ParseFailed;
     const cfg = Config{ .enabled = true, .extra_allow = &.{allow127} };
     const mapped_listed = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 2 };
@@ -257,34 +216,27 @@ test "svcb hints: private ipv4hint/ipv6hint drop the RR, public hints pass" {
     const cfg = Config{ .enabled = true };
     const private_v4 = comptime svc_prefix ++ svcParam(4, &.{ 192, 168, 1, 1 });
     const public_v4 = comptime svc_prefix ++ svcParam(4, &.{ 8, 8, 8, 8 });
-    const private_v6 = comptime svc_prefix ++ svcParam(6, &(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
+    const private_v6 = comptime svc_prefix ++ svcParam(6, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
     const public_after_alpn = comptime svc_prefix ++ svcParam(1, "\x02h2") ++ svcParam(4, &.{ 1, 1, 1, 1 });
     try testing.expect(shouldDrop(rrHttps(public_name, private_v4), cfg));
     try testing.expect(shouldDrop(rrHttps(public_name, private_v6), cfg));
     try testing.expect(!shouldDrop(rrHttps(public_name, public_v4), cfg));
     try testing.expect(!shouldDrop(rrHttps(public_name, public_after_alpn), cfg));
-    // second address in the hint list is the private one
     const second_private = comptime svc_prefix ++ svcParam(4, &.{ 8, 8, 8, 8, 10, 0, 0, 1 });
     try testing.expect(shouldDrop(rrHttps(public_name, second_private), cfg));
 }
 
 test "svcb hints: malformed rdata is drop-biased past the TargetName, pass-biased before it" {
     const cfg = Config{ .enabled = true };
-    // Declared SvcParam length overruns rdata: clamp and inspect anyway.
     const overrun = [_]u8{ 0, 1, 0, 0, 4, 0xff, 0xff, 127, 0, 0, 1 };
     try testing.expect(shouldDrop(rrHttps(public_name, &overrun), cfg));
-    // Compression pointer in TargetName: hints unlocatable → drop.
     const pointer = [_]u8{ 0, 1, 0xc0, 0x0c, 0, 4, 0, 4, 8, 8, 8, 8 };
     try testing.expect(shouldDrop(rrHttps(public_name, &pointer), cfg));
-    // Truncated TargetName (label runs off the end) → drop.
     const truncated = [_]u8{ 0, 1, 5, 'a', 'b' };
     try testing.expect(shouldDrop(rrHttps(public_name, &truncated), cfg));
-    // Too short to hold any address → pass (nothing to hide).
     try testing.expect(!shouldDrop(rrHttps(public_name, &.{ 0, 1 }), cfg));
-    // Trailing partial address chunk is not a dialable address → pass.
     const partial = comptime svc_prefix ++ svcParam(4, &.{ 8, 8, 8, 8, 192, 168 });
     try testing.expect(!shouldDrop(rrHttps(public_name, partial), cfg));
-    // TargetName with real labels, then a private hint → still found.
     const named = comptime &[_]u8{ 0, 1, 3, 'c', 'd', 'n', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 } ++ svcParam(4, &.{ 172, 16, 0, 1 });
     try testing.expect(shouldDrop(rrHttps(public_name, named), cfg));
 }

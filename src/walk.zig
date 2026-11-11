@@ -33,52 +33,33 @@ const max_hedge = 3;
 
 const Attempt = struct { exchange: CellId, server: u8, need: Need, case: graph.Case };
 
-/// The sibling loop, hedged: the next server starts a stagger after the
-/// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
     zone: dns.Name,
-    /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
     cut: OptionalCellId = .none,
-    /// Every address gathered so far; a later gather appends what is new.
     servers: [max_servers]na.AddressKey = undefined,
     nservers: u8 = 0,
-    /// Bit i: `servers[i]` sent to or given up on.
     tried: u32 = 0,
     fetched_unglued: bool = false,
-    /// A family not yet asked for, or a lookup still out: the last server
-    /// known is then no last resort.
     more: bool = false,
-    /// Every server silent once: one more attempt each, at the backed-off timeout.
     retried: bool = false,
-    /// In flight, oldest first.
     attempts: [max_hedge]Attempt = undefined,
     nattempts: u8 = 0,
-    /// When the next attempt may start early.
     hedge_at: i64 = 0,
-    /// The first failing reply: an rcode from someone, as opposed to silence.
     held: OptionalCellId = .none,
-    /// The zone's DS names ML-DSA-44, whose DO answers truncate: a stream from the start.
     stream_first: bool = false,
-    /// An attempt, or a server set's sub-resolution, never left the host.
     local: bool = false,
     asked_all: bool = false,
-    /// The most any send has shown of the question.
     shown: graph.Exposure = .none,
-    /// The placement of the cut whose servers this ask took: a delegation
-    /// they give lives no longer.
     placed_until_ns: i64 = std.math.maxInt(i64),
 
     comptime {
         std.debug.assert(max_servers < 32);
-        // A waiting walk's scratch is a comptime constant, not a stack; the
-        // server list is most of it.
         std.debug.assert(@sizeOf(Ask) <= 640);
     }
 
     pub const Result = union(enum) {
         pending,
         reply: Kept,
-        /// No reply from anyone: no rcode to surface.
         exhausted,
     };
 
@@ -86,13 +67,9 @@ pub const Ask = struct {
         return @as(u32, 1) << @intCast(i);
     }
 
-    /// An address is new against the servers held before the gather;
-    /// `new` counts those, room or not.
     const Found = struct { held: u8, new: usize = 0 };
 
     fn gather(a: *Ask, g: *Graph) Found {
-        // Told servers are learned from no delegation: no DS hark holds
-        // describes them.
         if (a.nservers == 0) a.stream_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
         return .{ .held = a.nservers };
     }
@@ -105,8 +82,8 @@ pub const Ask = struct {
         a.nservers += 1;
     }
 
-    /// The send policy is hark's, not the authorities' word: facts keep
-    /// every address, and the public DNS never steers an ask at the inside.
+    /// The send policy filters only what the DNS hands over, so the public DNS
+    /// never steers an ask at the inside; told servers go through `hold` unfiltered.
     fn offer(a: *Ask, g: *Graph, found: *Found, x: na.AddressKey) void {
         if (g.cfg.addr_policy.allows(x)) a.hold(found, x);
     }
@@ -128,13 +105,10 @@ pub const Ask = struct {
 
     const Pick = struct {
         server: u8,
-        /// The best untried: a never-timed first pick ties with it.
         track: ns_rtt.Track,
-        /// Last untried of its kind, live or dead: waits uncapped.
         last: bool,
     };
 
-    /// Chosen per send, so a timeout earlier in this ask already counts.
     fn pick(a: *const Ask, g: *Graph, by: Key, need: Need) !?Pick {
         var best: u64 = std.math.maxInt(u64);
         var best_track: ns_rtt.Track = .dead;
@@ -163,11 +137,9 @@ pub const Ask = struct {
             } else if (r == best) ties |= bit(i);
         }
         if (ties == 0) return null;
-        // Nothing says a server never timed is slower than the best that
-        // answer, or faster: an ask's first attempt goes to it as readily.
-        // Every later one goes to a server that answers while any is left.
+        // Nothing says a never-timed server is slower than the best that answer:
+        // an ask's first attempt goes to it as readily, later ones do not.
         if (a.untouched()) ties |= untimed[@backingInt(best_shows)];
-        // Every dead server ties.
         const last = if (best_track == .dead) @popCount(ties) == 1 else live == 1;
         var k = try g.uniform(.pick, by, @popCount(ties));
         while (k > 0) : (k -= 1) ties &= ties - 1;
@@ -176,10 +148,8 @@ pub const Ask = struct {
 
     const unheard: u64 = (1 << 60) - 1;
 
-    /// Lower goes first. A server that may answer beats a silent one, and a
-    /// silent one the dead, so privacy never stalls an answer. Then the less
-    /// a send shows wins, however much faster a server that shows more.
-    /// Then the sooner wait.
+    /// Lower goes first. Liveness outranks exposure, so privacy never stalls an
+    /// answer; exposure outranks speed, however much faster the server showing more.
     fn rank(t: ns_rtt.Track, shows: graph.Exposure, soon: u64) u64 {
         const class: u64 = switch (t) {
             .timed, .untimed => 0,
@@ -204,8 +174,6 @@ pub const Ask = struct {
         return true;
     }
 
-    /// The first pass, from the cut in hand: a cut learned this instant
-    /// may be one the store refused, or one that lives no time.
     fn seed(a: *Ask, g: *Graph, cut: graph.Cut) void {
         var found = a.gather(g);
         a.more = reach(g, a, &found, a.take(cut));
@@ -216,7 +184,6 @@ pub const Ask = struct {
         return cut.servers;
     }
 
-    /// Once more, skipping the dead unless all are.
     fn retry(a: *Ask, g: *Graph) void {
         a.retried = true;
         a.tried = 0;
@@ -226,9 +193,8 @@ pub const Ask = struct {
         if (a.tried == bit(a.nservers) - 1) a.tried = 0;
     }
 
-    /// Every server failed: bare SERVFAIL. An authority's REFUSED or
-    /// FORMERR passed through reads as hark's own policy at the stub, and
-    /// the randomised server order must not change what the stub sees.
+    /// Bare SERVFAIL, never the held rcode: a REFUSED or FORMERR passed through
+    /// reads as hark's own policy, and server order must not change what a client sees.
     fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
         var msg = g.cell(a.held.unwrap() orelse return .exhausted).state.fact.exchange.reply.msg;
@@ -240,20 +206,15 @@ pub const Ask = struct {
     }
 };
 
-/// A reply `ask` settled on, judged against the question it asked.
 pub const Kept = struct { msg: dns.Message, verdict: Verdict };
 
-/// `none`: an rcode that answers nothing.
 const Verdict = union(enum) { reply: Reply, loop, none };
 
-/// A held fact above a name that speaks for every name below it, and its judge.
 const Above = struct { fact: OptionalCellId = .none, judge: OptionalCellId = .none };
 
 pub const RrsetScratch = struct {
     cut: OptionalCellId = .none,
-    /// Watched before the cut is sought (RFC 6672 §3.4.1).
     dname: Above = .{},
-    /// Watched once the cut is known (RFC 8020 §2).
     denial: Above = .{},
     ask: ?Ask = null,
 };
@@ -263,27 +224,18 @@ pub const CutScratch = struct {
     ask: ?Ask = null,
 };
 
-/// Inputs are held by id: a version that expires the moment it settles (a
-/// non-authoritative denial) still answers the rule that asked for it
-/// instead of being re-demanded on every wake.
 pub const AddrScratch = struct {
     rrset: OptionalCellId = .none,
     judge: OptionalCellId = .none,
 };
 
 pub const AnswerScratch = struct {
-    /// The question's; set as the root is made, freed with it.
     budget: *graph.Budget = undefined,
-    /// Every hop but the last is an alias, a link at least.
     hops: [max_links + 1]graph.Answer.Hop = undefined,
     n: u8 = 0,
-    /// Hops whose judge is decided.
     judged: u8 = 0,
 };
 
-// ── Rules ──────────────────────────────────────────────────────────────
-
-/// Each CNAME owner a chain has passed, over every hop.
 pub const Links = struct {
     n: u8 = 0,
     owners: [max_links]dns.Name = undefined,
@@ -293,7 +245,6 @@ pub const Links = struct {
 
     pub const Step = union(enum) { done, next: dns.Name, broken: Failure };
 
-    /// A CNAME a hop passes, at `owner`.
     pub fn pass(l: *Links, owner: dns.Name) ?Failure {
         if (l.left(owner)) return loop;
         if (l.n == max_links) return too_long;
@@ -302,8 +253,6 @@ pub const Links = struct {
         return null;
     }
 
-    /// Where the chain goes once a hop's CNAMEs are passed. A CNAME
-    /// question stops at its name.
     pub fn end(l: *const Links, kind: Reply.Of, target: dns.Name, qtype: dns.RType) Step {
         if (kind != .alias or qtype == .cname) return .done;
         if (l.left(target)) return .{ .broken = loop };
@@ -316,9 +265,7 @@ pub const Links = struct {
     }
 };
 
-/// Can a CNAME at a name answer a `qtype` question there? A CNAME is the
-/// name's only data, so yes (RFC 1034 §3.6.2), except for the CNAME itself
-/// and the types allowed beside it (RFC 4035 §2.5).
+/// A CNAME answers every type at its name but itself and those allowed beside it (RFC 4035 §2.5).
 pub fn cnameAnswers(qtype: dns.RType) bool {
     return switch (qtype) {
         .cname, .rrsig, .nsec, .key => false,
@@ -328,10 +275,6 @@ pub fn cnameAnswers(qtype: dns.RType) bool {
 
 const into_stub: Failure = .{ .code = .no_reachable_authority, .text = "public chain into a stub zone", .cause = .host };
 
-/// `answer(name, type)`: follows aliases from `name`, one hop per name as
-/// `Graph.demandHop` picks, until an RRset ends the chain. Length and loop
-/// checks run at demand time; a chain that fails them is a resolution
-/// failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
@@ -344,9 +287,8 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             const last = g.cell(hop.set);
             if (!last.settled()) return;
             if (last.failure()) |why| return failAnswer(g, id, why);
-            // Judged as it lands, so its zone's chain of trust overlaps the
-            // rest of the walk. The RRSIGs ending an RRSIG question are
-            // never signed (RFC 4035 §2.2): nothing can judge them.
+            // The RRSIGs ending an RRSIG question are never signed (RFC 4035 §2.2):
+            // nothing can judge them.
             const signatures = qtype == .rrsig and last.state.fact.reply().kind == .answer;
             if (s.judged == i) {
                 if (g.awaitsVerdict(last.key.kind) and !signatures) hop.judge = .wrap(try trust.demandSecure(g, id, hop.set) orelse
@@ -370,9 +312,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         }
         const from: ?graph.Kind = if (s.n == 0) null else g.cell(s.hops[s.n - 1].set).key.kind;
         const hop_kind = g.hopKind(from, next, qtype) orelse return failAnswer(g, id, into_stub);
-        // The first step is at the answer's own name, keyed already.
         const own = if (s.n == 0) g.cell(id).key.at(hop_kind, qtype) else Key.of(hop_kind, next, qtype);
-        // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = .{ .set = try g.demandHop(id, own, next) orelse
             return failAnswer(g, id, .unreachable_authority) };
         s.n += 1;
@@ -382,20 +322,16 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         expires = @min(expires, g.cell(h.set).expires());
         if (h.judge.unwrap()) |j| {
             if (!g.cell(j).settled()) return;
-            // A verdict that failed is bogus, and lives no longer.
             expires = @min(expires, g.cell(j).expires());
         } else if (g.awaitsVerdict(g.cell(h.set).key.kind)) {
-            // Nothing can judge RRSIGs, so nothing keeps them.
             expires = @min(expires, g.now());
         }
     }
     try settleAnswer(g, id, .{ .hops = s.hops[0..s.n] }, expires);
-    // Best effort.
     if (kind == .answer and g.cfg.prefetch) if (lapsing(g, s.hops[0..s.n])) |end|
         g.refresh(g.cell(id).key, g.cell(id).name, end) catch {};
 }
 
-/// A refresh's inputs are its point; its own answer is nobody's.
 fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
@@ -418,16 +354,9 @@ fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
     return if (life.inLastTenth(g.now())) life.end_ns else null;
 }
 
-/// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
-/// servers; a referral is a deeper cut, an answer or a denial puts the
-/// name inside the parent's zone, silence fails, and any other reply
-/// places no cut. Only strict ancestors of a question are probed; the
-/// question itself goes out as `rrset`.
 pub fn runCut(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
-    // The axiom, re-derived after eviction.
     const parent_name = name.parent() orelse return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
-    // Past minimising's reach only a referral places a cut.
     if (!probeable(g, name)) return g.fail(id, unplaced);
     const s = g.cell(id).scratch.cut;
     if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(.cut, parent_name, .a), parent_name) orelse
@@ -437,8 +366,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
     // No cut below a name that does not exist (RFC 8020), and none kept, or
-    // every name below a denial would store one. A fact from below the
-    // parent's zone says nothing about it.
+    // every name below a denial would store one.
     if (deniedAbove(g, name, pc.zone) != null) return settleInside(g, id, parent, g.now());
     if (g.held(Key.of(.rrset, name, .a))) |known| if (named(store.Rrset.of(known).zone, pc.zone))
         return settleInside(g, id, parent, serving(g, known));
@@ -457,10 +385,8 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     const cut = try absorbReferral(g, id, ref, msg, pc.zone, a.placed_until_ns);
                     try g.settle(id, cut.value, cut.expires_ns);
                 },
-                // Each puts the name inside the parent's zone. Only an
-                // NXDOMAIN is published, as deeper cuts read it (RFC 8020).
-                // An answer may be data the parent occludes (bailiwick/006);
-                // a NODATA is read by nothing and would cost a judgement.
+                // Not published, unlike an NXDOMAIN: an answer may be data the parent
+                // occludes, and nothing reads a NODATA.
                 .answered, .nodata => try settleInside(g, id, parent, switch (kept.verdict) {
                     .reply => |r| replyExpiry(r),
                     .loop, .none => g.now(),
@@ -475,13 +401,10 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     }
 }
 
-/// Walks below the name ask the servers of the cut above, so it lives no
-/// longer than that cut, glue and all.
 fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64) !void {
     try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone } }, @min(parent.expires(), until_ns));
 }
 
-/// An authoritative NXDOMAIN at a probe name, published.
 fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !bool {
     if (!kept.msg.header.flags.aa) return false;
     const reply = switch (kept.verdict) {
@@ -498,9 +421,6 @@ fn probeable(g: *const Graph, name: dns.Name) bool {
     return g.cfg.qmin and name.depth() <= delegation.max_minimize_count;
 }
 
-/// The cut a question for `qname` starts from, walking up from `from`:
-/// the deepest one known, unless a strict ancestor of `qname` a probe may
-/// place comes first.
 fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
     var n = from;
     while (n.parent()) |up| : (n = up) {
@@ -512,8 +432,6 @@ fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
 
 const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
 
-/// Waits on `startAt`'s cut, or on the deepest one known if no probe
-/// could place it.
 pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *OptionalCellId) !Start {
     if (slot.* == .none) {
         const n = startAt(g, qname, from, true);
@@ -541,7 +459,6 @@ fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name
     return null;
 }
 
-/// Bytes awaiting their verdict serve no time: it may yet find them bogus.
 fn serving(g: *const Graph, e: *store.Blob) i64 {
     if (g.awaitsVerdict(.rrset) and !e.verdict.judged()) return g.now();
     return e.end();
@@ -551,10 +468,6 @@ fn named(wire: []const u8, n: dns.Name) bool {
     return dns.Name.of(wire).eql(n);
 }
 
-/// `addr(host, family)`: the addresses in the host's own A or AAAA set,
-/// judged. Never stored: the fact is the rrset's, and a walk reads that
-/// (`reach`). A cell to a family, so neither's life or failure touches
-/// the other's.
 pub fn runAddr(g: *Graph, id: CellId) !void {
     if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
     const s = g.cell(id).scratch.addr;
@@ -566,7 +479,6 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     if (!g.cell(rid).settled()) return;
     if (g.cell(rid).failure()) |why| return g.fail(id, why);
     var expires = g.cell(rid).expires();
-    // A denial too: unjudged it is no fact, and nothing keeps it.
     if (g.cfg.trust_anchors != null) {
         if (s.judge == .none) s.judge = .wrap(try trust.demandSecure(g, id, rid) orelse
             return g.fail(id, .unreachable_authority));
@@ -582,9 +494,8 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     try g.settle(id, .{ .addr = try g.cell(id).arena.allocator().dupe(na.AddressKey, addrs.items) }, expires);
 }
 
-/// A chain is kept in the order followed (`classify`), so a set at the
-/// name asked leads its answer. One led by anything else is another
-/// name's: an NS name must not be an alias (RFC 2181 §10.3).
+/// A stored chain is kept in the order followed, so the host's own set leads.
+/// One led by anything else is another name's: an NS name must not be an alias (RFC 2181 §10.3).
 fn ownAddresses(g: *const Graph, blob: *store.Blob, family: dns.RType) OwnAddresses {
     return .{ .own = store.Rrset.answered(blob), .family = family, .policy = g.cfg.addr_policy };
 }
@@ -605,8 +516,6 @@ const OwnAddresses = struct {
     }
 };
 
-/// `rrset(name, type)`: from the deepest known cut at or above the name,
-/// ask its servers; follow referrals; settle on the first kept reply.
 pub fn runRrset(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
@@ -622,7 +531,6 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 },
                 .silent => {},
             }
-            // Indexed proofs deny the name without a packet.
             if (try denial.deny(g, id)) return;
         }
         const from = proof.deepestApex(name, qtype);
@@ -650,14 +558,10 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 const msg = kept.msg;
                 const zone = a.zone;
                 if (delegation.extractReferral(msg, name, zone)) |ref| {
-                    // Each referral descends toward the name, so its depth
-                    // bounds the walk.
                     std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.depth() > zone.depth());
                     const cut = try absorbReferral(g, id, ref, msg, zone, a.placed_until_ns);
-                    // The parent's referral to the zone itself is its
-                    // answer about the zone's DS (RFC 4035 §3.1.4.1).
+                    // The parent's referral to the zone is its answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
-                        // No proof is no fact to keep.
                         const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .aa = true, .target = name, .zone = zone, .stored_ns = g.now() };
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
@@ -668,7 +572,6 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 const reply = switch (kept.verdict) {
                     .reply => |r| r,
                     .loop => return g.failRemembered(id, Links.loop),
-                    // No useful response (RFC 9520 §2).
                     .none => return g.failRemembered(id, ended(g, a)),
                 };
                 try publishAlias(g, id, name, qtype, reply);
@@ -679,30 +582,23 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     }
 }
 
-/// Once every server was asked, running out is the servers' failure,
-/// whatever the asker had left (RFC 9520 §3.2); else it is the asker's limit.
 pub fn ended(g: *const Graph, a: *const Ask) Failure {
     const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
     return if (a.nservers > 0 and a.asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
 }
 
-/// A chain starting with a CNAME at `name` is also the fact
-/// `rrset(name, CNAME)`, so any later type finds the hop.
 fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: Reply) !void {
     if (qtype == .cname or reply.answers.len == 0) return;
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
     const set = dnssec.setFrom(reply.answers, 0);
-    // A wildcard's expansion carries its own no-closer-match proof; the
-    // reply's other proofs are other names' facts.
     const a = g.scratch.allocator();
     const kept = try a.alloc(bool, reply.authorities.len);
     @memset(kept, false);
     for (set) |sig| if (sig.rtype == .rrsig and sig.rrsig().labels < rrsig.signedLabels(name)) {
         const zone = sig.rrsig().signer_name;
         const p = proof.noCloserMatch(reply.authorities, name, sig.rrsig().labels, zone, &g.payer.validation);
-        // A hash the budget refused chose no proof, and an alias without
-        // its own is no fact.
+        // The budget refused a hash, so no proof was chosen: an alias without its own is no fact.
         if (p == .verdict and g.payer.validation.stopped != null) return;
         for (reply.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and p.restsOn(rr, zone)) {
             for (reply.authorities, kept) |of, *k| if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) {
@@ -725,8 +621,6 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     try g.publish(Key.of(.rrset, name, .cname), name, by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
-/// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
-/// so later names under it redirect from memory.
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
     for (reply.answers, 0..) |d, i| {
         if (d.rtype != .dname) continue;
@@ -746,10 +640,6 @@ fn aboveSays(g: *Graph, above: *const Above) enum { waits, answers, silent } {
     return if (j.failure() == null and j.state.fact.secure.status == .secure) .answers else .silent;
 }
 
-/// RFC 9156 §3 step 6d, below a secure denial only (RFC 8020 §2): settle
-/// on one whose verdict stands, or watch one awaiting it. One with no NSEC
-/// or NSEC3 can never be judged secure (RFC 4035 §3.1.3.2), so it is not
-/// waited on.
 fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
     if (!denial.denies(g, g.cell(id).key.rtype)) return false;
     const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
@@ -769,9 +659,6 @@ fn provable(b: *store.Blob) bool {
     return false;
 }
 
-/// The owner of the closest DNAME fact above `name`, as `demand` would
-/// hand it: the redirect never waits on a new ask nor reads a version it
-/// did not judge.
 fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
     var up = name.parent();
     while (up) |owner| : (up = owner.parent()) {
@@ -785,14 +672,11 @@ fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
     return null;
 }
 
-/// A DNAME answer reached through a CNAME may hold another name's DNAME.
 fn dnameAt(answers: []const dns.ResourceRecord, owner: dns.Name) ?dns.ResourceRecord {
     for (answers) |rr| if (rr.rtype == .dname and rr.name.eql(owner)) return rr;
     return null;
 }
 
-/// The alias a DNAME fact synthesises for `name`, aged from when the
-/// DNAME was taken.
 fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     const d = g.cell(did).state.fact.rrset;
     const dname = dnameAt(d.answers, g.cell(did).name).?;
@@ -802,19 +686,18 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
         try keep.append(g.scratch.allocator(), try .init(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } }));
         return .{ .kind = .alias, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
     }
-    // RFC 6672 §3.3: the substituted name is too long; YXDOMAIN.
+    // The substituted name is too long (RFC 6672 §3.3).
     return .{ .kind = .yxdomain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
-/// A glued server has no other address, so the cut lives no longer than
-/// its glue. Its placement never outlives the referring zone's: that is a
-/// ghost (Jiang et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name, zone_placed_until_ns: i64) !Graph.Fact {
     const now = g.now();
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
     };
+    // A delegation never outlives the referring zone's own, or a revoked one
+    // renews itself: a ghost domain (Jiang et al., NDSS 2012).
     const placed = @min(zone_placed_until_ns, now + @as(i64, ns_ttl) * std.time.ns_per_s);
     var expires = placed;
     const sa = g.scratch.allocator();
@@ -833,20 +716,13 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     }
     const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
     try g.publish(Key.of(.cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
-    // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchors != null) {
         if (try trust.referralDs(g, msg, zone, ref.zone_cut)) |ds| try g.publish(Key.of(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
-        // A signed delegation from a zone signed all the way down: whatever
-        // the walk finds below, its proof runs through these keys, so they
-        // are fetched as it descends.
         if (try trust.signedDown(g, ref.zone_cut)) try g.fetchKeys(ref.zone_cut);
     }
     return .{ .value = cut, .expires_ns = expires };
 }
 
-/// Null when the rcode contradicts the records: bizarre contents (RFC 1034
-/// §5.3.3). A referral is judged too, as the nodata it reads as; its
-/// asker follows the cut and never reads the verdict.
 fn judge(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Kept {
     return .{ .msg = msg, .verdict = switch (msg.header.flags.rcode) {
         .no_error, .name_error, .yx_domain => try classify(g, msg, zone, name, qtype) orelse return null,
@@ -863,46 +739,28 @@ fn deepestDname(answers: []const dns.ResourceRecord, cur: dns.Name, zone: dns.Na
     return dname;
 }
 
-/// A chain may pass one DNAME twice; its set is kept once.
 fn keepDname(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), answers: []const dns.ResourceRecord, d: dns.ResourceRecord) !void {
     for (keep.items) |k| if (k.rtype == .dname and k.name.eql(d.name)) return;
     try keep.appendSlice(g.scratch.allocator(), dnssec.setAt(answers, d.name, .dname));
 }
 
-/// What a kept, non-referral reply says about (name, type). The answer
-/// section is reduced to the chain from `name`: CNAMEs (and the DNAMEs
-/// that synthesise them), then the asked type at the end. Anything else
-/// is unsolicited (RFC 2181 §5.4.1) and dropped, NXDOMAIN included.
-/// The rcode is one of the three that answer. YXDOMAIN is derived, not
-/// taken: the chain must reach an in-zone DNAME whose substitution
-/// overflows (RFC 6672 §2.2), and an rcode DNSSEC does not sign must
-/// agree (RFC 6604 §4). Where the chain leaves the zone, the final query
-/// cycle speaks for a name outside it (RFC 6604 §3): its rcode and its
-/// out-of-zone records are dropped and the reply is an alias. A CNAME
-/// question reads only the CNAME at its name, synthesised or not: the rest
-/// and its rcode go unread. Null: bizarre, or a denial without its SOA.
 fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
     var hops: usize = 0;
     var seen: [max_links + 1]dns.Name = undefined;
-    // A CNAME question's answer: the target of the CNAME it matched.
     var asked_alias: ?dns.Name = null;
-    // What the links before `cur` kept: `keep[0..passed]`.
     var passed: usize = 0;
-    // NXDOMAIN denies the end of the chain; records there are noise.
     const denied = msg.header.flags.rcode == .name_error;
     const end: enum { answered, asked_alias, overflow, clipped, left, dead_end } = chain: while (true) : (hops += 1) {
         if (hops > 0 and !speaksFor(g, zone, cur)) break :chain .left;
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         passed = keep.items.len;
-        // Nothing lives below a DNAME's owner (RFC 6672 §2.4): its
-        // substitution is the alias, whatever the reply holds at `cur`.
+        // Nothing lives below a DNAME's owner (RFC 6672 §2.4): its substitution
+        // is the alias, whatever the reply holds at `cur`.
         const dname = deepestDname(msg.answers, cur, zone);
         const here: []const dns.ResourceRecord = if (dname == null) msg.answers else &.{};
-        // A chain back to a DNAME it passed ends at its owner, where that set
-        // and its signatures are already kept (RFC 2181 §5).
         const looped = for (keep.items[0..passed]) |k| {
             if (k.rtype == .dname and k.name.eql(cur)) break true;
         } else false;
@@ -916,7 +774,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             }
         }
         if (answered) {
-            // Asked for RRSIG, collecting already took every signature.
             if (qtype != .rrsig and keep.items.len > passed) try keepSigs(g, &keep, here, cur, qtype);
             break :chain if (asked_alias != null) .asked_alias else .answered;
         }
@@ -925,8 +782,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             cname = rr;
             break;
         };
-        // Past the question's limit the rest is left unread: an alias to
-        // where it stopped, so the answer finds the chain too long.
         if ((cname != null or dname != null) and hops == max_links) break :chain .clipped;
         if (dname) |d| {
             try keepDname(g, &keep, msg.answers, d);
@@ -943,6 +798,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         cur = c.cname();
     };
     const yx = msg.header.flags.rcode == .yx_domain;
+    // YXDOMAIN is derived from an overflowing substitution and must match the rcode
+    // (RFC 6604 §4). Where the chain leaves the zone the rcode speaks for a name outside it (§3).
     const kind: Reply.Of = switch (end) {
         .left, .clipped, .asked_alias => .alias,
         .overflow => if (yx) .yxdomain else return null,
@@ -957,17 +814,13 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .zone = zone,
         .stored_ns = g.now(),
     };
-    // A denial names its zone by its SOA (RFC 2308 §3); an answerless
-    // NOERROR may refer instead.
     switch (reply.kind) {
         .nxdomain => if (!delegation.soaAbove(msg.authorities, cur)) return null,
         .nodata => if (!delegation.soaAbove(msg.authorities, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
         .answer, .alias, .yxdomain => {},
     }
-    // Past its proofs and a denial's SOA, only an answer to NS keeps
-    // authority and additional: its NS and glue are its answer (RFC 8109
-    // priming). No client is sent the rest: stubs do not follow referrals,
-    // and NS in authority invites section confusion (CVE-2025-11411).
+    // Only an answer to NS keeps the other authority and additional records. No client
+    // is sent the rest: NS in authority invites section confusion (CVE-2025-11411).
     const rest = reply.kind == .answer and qtype == .ns;
     if (rest) reply.additionals = msg.additionals;
     const authorities = if (end == .left) try inZone(g, msg.authorities, zone) else msg.authorities;
@@ -976,19 +829,15 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     return .{ .reply = reply };
 }
 
-/// The proof a reply owes (RFC 4035 §3.1.3): a denial's from the zone it
-/// speaks for, a wildcard expansion's from the wildcard's zone. A flood's
-/// are kept unbound for the validator to refuse.
 fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: bool) ![]const dns.ResourceRecord {
     const a = g.scratch.allocator();
+    // A flood's proofs are kept whole on purpose, for the validator to refuse.
     const flood = proof.proofFlood(rrs);
     const negative = reply.kind == .nodata or reply.kind == .nxdomain;
     const zone = if (negative) proof.denialZone(rrs, reply.target) else null;
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
     for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rrsig().labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rrsig().signer_name);
-    // A denial's SOA, and the signatures over it, go out with the denial's
-    // life (RFC 2308 §3), whatever TTL the server sent.
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
         life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);
@@ -1018,8 +867,6 @@ fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const d
     return keep.items;
 }
 
-/// Whether `zone`'s servers speak for `name`: inside it, and not inside a
-/// stub zone below it, which only its own servers speak for.
 fn speaksFor(g: *const Graph, zone: dns.Name, name: dns.Name) bool {
     const zones = g.cfg.stub_zones;
     return name.isSubdomainOf(zone) and stub.under(zones, name) == stub.under(zones, zone);
@@ -1029,10 +876,6 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
     for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rrsig().type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
 }
 
-/// The answer's shortest TTL, signatures included (RFC 4034 §3), capped by
-/// a wildcard expansion's proof (RFC 9077 §4.1). A denial's comes from an
-/// SOA above the name denied (RFC 2308 §3); one above the zone asked (a
-/// folded child's parent) counts only signed, for the validator to judge.
 pub fn replyTtl(reply: Reply) u32 {
     var ttl: u32 = std.math.maxInt(u32);
     for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
@@ -1044,6 +887,7 @@ pub fn replyTtl(reply: Reply) u32 {
             var found = false;
             if (reply.aa) for (reply.authorities) |rr| {
                 if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
+                // An SOA above the zone asked counts only signed, for the validator to judge.
                 if (!rr.name.isSubdomainOf(reply.zone) and !dnssec.signedBy(reply.authorities, rr.name, .soa, rr.name)) continue;
                 ttl = @min(ttl, rr.ttl, rr.soa().minimum);
                 found = true;
@@ -1054,13 +898,10 @@ pub fn replyTtl(reply: Reply) u32 {
     return ttl;
 }
 
-/// A `graph.Reply` or a `store.Rrset`.
 pub fn replyExpiry(reply: anytype) i64 {
     return reply.stored_ns + @as(i64, reply.ttl) * std.time.ns_per_s;
 }
 
-/// Rounded up: a TTL less its age never promises a fraction more than
-/// is left.
 pub fn ageOf(stored_ns: i64, now_ns: i64) u32 {
     return @intCast(@divFloor(now_ns - stored_ns + std.time.ns_per_s - 1, std.time.ns_per_s));
 }
@@ -1106,10 +947,7 @@ test "a send that shows less goes first, however slower, until the ask has shown
     try testing.expectEqual(0, (try a.pick(&g, by, .datagram)).?.server);
 }
 
-// ── The sibling loop ───────────────────────────────────────────────
-
 pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
-    // The question never changes, so it is checked until a server is touched.
     if (a.untouched() and !mayHear(g, a.zone, qname, qtype)) {
         a.local = true;
         return .exhausted;
@@ -1125,8 +963,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
             }
             const at = a.end(i);
             switch (ex.state.fact.exchange) {
-                // A wait the deadline cut before the server was due asked
-                // nothing of it.
+                // The deadline cut the wait before the server was due: it was asked
+                // nothing, and may be tried again.
                 .timeout => if (ex.scratch.exchange.cut_short) {
                     a.tried &= ~Ask.bit(at.server);
                 },
@@ -1134,17 +972,16 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.need, at.case, qname, qtype) == null) {
                     refused = true;
                 },
-                // The server's breach: no TCP retry, only a sibling.
+                // The server's breach: no stream retry, only a sibling.
                 .oversized => {},
-                // Over a stream a forger cannot follow, and a server that
-                // normalizes case answers; a garbled datagram gets the
-                // same second chance.
+                // Once more over a stream with plain case: a forger cannot follow there,
+                // and a server that normalises 0x20 case answers.
                 .mismatch, .malformed => if (at.case == .random) {
                     if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .plain, qname, qtype) == null) refused = true;
                 },
                 .reply => |r| {
                     if (r.msg.header.flags.tc) {
-                        // TC over a stream: a broken server, as good as a timeout.
+                        // TC over a stream is a broken server, as good as a timeout.
                         if (!r.stream) {
                             if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .random, qname, qtype) == null) refused = true;
                         }
@@ -1159,19 +996,13 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
                 },
             }
         }
-        // A later run may have a payer with room, so the pass carries on.
         if (refused) return if (a.nattempts > 0) .pending else a.giveUp(g);
         if (a.nattempts > 0 and (g.cfg.stagger_ms == 0 or a.nattempts == max_hedge)) return .pending;
-        // The stagger is the time a server is given before it is late. One
-        // that has only ever been silent is given none: a server with
-        // nothing against it goes at once.
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
         if (!due and waited.mayAnswer()) return .pending;
         const need: Need = if (a.stream_first) .stream else .datagram;
         const p = try a.pick(g, g.cell(id).key, need) orelse {
-            // No server left to try or to hedge to: before a timeout is
-            // sat out, gather what settled since and ask for what is unknown.
             switch (try gatherServers(g, id, a)) {
                 .ready => continue,
                 .pending => return .pending,
@@ -1185,7 +1016,6 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
             }
         };
         if (!due and !p.track.mayAnswer()) return .pending;
-        // The dead are hedged to only once nothing live is in flight.
         if (p.track == .dead and waited != .dead) return .pending;
         const last = p.last and !a.more;
         const sent = try sendTo(g, id, a, p.server, last, need, .random, qname, qtype) orelse {
@@ -1196,30 +1026,22 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         const stagger = try g.stretch(.stagger, g.cell(id).key, g.holdMs(sent.est, sent.rounds));
         a.hedge_at = g.now() + @as(i64, stagger) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
-        // Sent to one that may answer, the ask waits. Behind one that never
-        // has, it goes round to gather, and to ask for what is unknown.
         if (p.track.mayAnswer()) return .pending;
     }
 }
 
-/// Servers hark is told rather than handed by a delegation: the root's
-/// hints, a stub zone's own.
 fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
     if (zone.isRoot()) return g.cfg.root_hints;
     const z = stub.under(g.cfg.stub_zones, zone) orelse return null;
     return if (z.apex.depth() == zone.depth()) z.servers else null;
 }
 
-/// May `zone`'s servers hear the question? A stub zone's questions go to
-/// its own servers alone, and those servers hear no other. A question hark
-/// answers itself never leaves the host (RFC 6761 §6, RFC 8375 §4.4.B)
-/// unless a stub zone the operator named covers it; an own zone's DS
-/// reaches here only for a DO client, its RFC's one exception, so it is
-/// classified as one.
 fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) bool {
     const zones = g.cfg.stub_zones;
     const own = stub.of(zones, qname, qtype);
     if (own != stub.under(zones, zone)) return false;
+    // A question hark answers itself never leaves the host (RFC 6761 §6). An own
+    // zone's DS gets here only for a DO client, so it is classified as one.
     return own != null or special_use.classify(qname, qtype, true) == null;
 }
 
@@ -1229,7 +1051,6 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
-/// Null: refused, so launch nothing more; what is in flight may still answer.
 fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, need: Need, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
     const ex = try g.exchange(id, a.servers[server], need, case, qname, qtype, a.nattempts == 0 and last) orelse return null;
     a.tried |= Ask.bit(server);
@@ -1244,7 +1065,6 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
     const zone = a.zone;
     var left: Left = .{};
     if (told(g, zone)) |servers| {
-        // Told, not handed over: config holds them to what it allows.
         for (servers) |h| a.hold(&found, .fromAddress(h));
     } else {
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(.cut, zone, .a), zone) orelse return .none);
@@ -1262,13 +1082,10 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
                 return gatherServers(g, id, a);
             },
         };
-        // A shallower cut: no delegation here while it holds.
         const servers: []const graph.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
         const partial = reach(g, a, &found, servers);
         if (found.new == 0 or a.fetched_unglued) try learn(g, id, a, &found, servers, &left);
         a.more = if (a.fetched_unglued) left.awaited else partial;
-        // A sibling in progress for someone is waited for only when
-        // nothing else is left, and only if it isn't waiting on us.
         if (found.new == 0) {
             var pending = false;
             for (left.busy.items) |key| {
@@ -1320,10 +1137,8 @@ const Left = struct {
     const Unknown = struct { host: Key, families: [families.len]bool };
 };
 
-/// The referral alone decides where a server is reached: at its glue, the
-/// parent's word, if it gave any, else at its own zone's stored sets, a
-/// family at a time. Nothing else held is read, so what a glued server's
-/// zone says of it never changes how it is reached.
+/// A glued server is reached at its glue alone: what its own zone says of it
+/// never changes how it is reached.
 fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const graph.Server) bool {
     var partial = false;
     for (servers) |server| {
@@ -1343,9 +1158,6 @@ fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const graph.Server) b
     return partial;
 }
 
-/// What `reach` found no stored set for: this walk's own settled lookups,
-/// lookups in progress, and the unknown. Unknown is never none: a set
-/// that lapsed, failed or was never asked for says nothing of the host.
 fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const graph.Server, left: *Left) !void {
     const sa = g.scratch.allocator();
     for (servers) |server| {
@@ -1361,8 +1173,6 @@ fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const gra
                     try left.busy.append(sa, key);
                     continue;
                 }
-                // Ours: a set that lives no time serves its demander, a
-                // failure gives nothing.
                 if (g.holdsInput(id, aid)) {
                     const why = c.failure() orelse {
                         for (c.state.fact.addr) |x| a.offer(g, found, x);

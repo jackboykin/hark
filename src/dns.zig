@@ -8,8 +8,6 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 
-/// A wire enum for `{f}`: its name, or its number where it has none. `{t}`
-/// is `@tagName`, which panics on an unnamed value.
 pub fn tag(val: anytype) Tag(@TypeOf(val)) {
     return .{ .val = val };
 }
@@ -28,26 +26,16 @@ fn Tag(comptime E: type) type {
 
 pub const max_label_len = 63;
 const max_name_len = 253;
-/// RFC 1035 §3.1, the root's length octet included.
 pub const max_name_wire_len = 255;
-/// Every label one octet long, beside the root's zero.
 const max_label_count = (max_name_wire_len - 1) / 2;
-/// Presentation-format ceiling: every content byte can escape to `\DDD`
-/// (4 chars), separators are free relative to the wire length budget.
 pub const max_dotted_len = 4 * max_name_len;
 const header_len = 12;
-/// A root owner, then type, class, TTL and rdlength.
 const min_rr_len = 1 + 2 + 2 + 4 + 2;
 pub const max_udp_payload = 512;
-/// A week (BIND's max-cache-ttl): a chosen 0xFFFFFFFF would outlive its delegation.
 const max_ttl: u32 = 604_800;
-/// A negative, NSEC and NSEC3 included, is trusted three hours at most
-/// (RFC 2308 §5, RFC 9077 §3.4).
+/// Bounds a negative answer, its NSEC and NSEC3 included (RFC 2308 §5).
 pub const max_negative_ttl: u32 = 10_800;
 pub const edns_udp_payload: u16 = 1232;
-/// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
-/// message can be at most 65535 bytes. Also the ceiling for any DNS
-/// response buffer we might parse.
 pub const max_message_len: u16 = 65535;
 
 pub const OpCode = enum(u4) {
@@ -78,16 +66,12 @@ pub const RType = enum(u16) {
     rp = 17,
     afsdb = 18,
     rt = 21,
-    /// May sit beside a CNAME (RFC 4035 §2.5).
     key = 25,
     px = 26,
     aaaa = 28,
     srv = 33,
     naptr = 35,
     kx = 36,
-    /// RFC 6672. RFC 6840 §4.1 also requires recognizing the bit in an
-    /// NSEC/NSEC3 bitmap: names beneath a DNAME owner are synthesized,
-    /// not absent.
     dname = 39,
     opt = 41,
     ds = 43,
@@ -127,9 +111,8 @@ pub const Header = struct {
     ns_count: u16 = 0,
     ar_count: u16 = 0,
 
-    /// Wire-format flag bits (RFC 1035 §4.1.1 + RFC 2535 §6.1 for AD/CD).
-    /// Packed LSB→MSB so a host-order u16 (post `mem.readInt(.big)`) bitcasts
-    /// directly to the wire bit layout: QR is the MSB, RCODE the low nibble.
+    /// Fields run from the least significant bit: RCODE is the low nibble, QR
+    /// the top bit, so the big-endian u16 read off the wire bitcasts to this.
     pub const Flags = packed struct(u16) {
         rcode: RCode = .no_error,
         cd: bool = false,
@@ -164,9 +147,8 @@ pub const Header = struct {
     }
 };
 
-/// RFC 4034 §6.2 canonical form: uncompressed wire labels, lowercase,
-/// at most 255 octets. Case someone wrote lives in `Question.spelled`
-/// and an NSEC's rdata, never here.
+/// Canonical form (RFC 4034 §6.2): uncompressed wire labels, lowercase, at
+/// most 255 octets, so names compare byte for byte.
 pub const Name = struct {
     wire: []const u8,
 
@@ -257,7 +239,6 @@ pub const Name = struct {
         return .{ .wire = a.wire[if (i == sa.len) a.wire.len - 1 else sa[i]..] };
     }
 
-    /// RFC 4034 §6.1 canonical order.
     pub fn order(a: Name, b: Name) std.math.Order {
         var ab: [max_label_count]u8 = undefined;
         var bb: [max_label_count]u8 = undefined;
@@ -283,7 +264,6 @@ pub const Name = struct {
         return .of(buf[0..len]);
     }
 
-    /// RFC 4343 §2.1 presentation form, which `parseDottedName` reads back.
     pub fn formatInto(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
         var pos: usize = 0;
         var i: usize = 0;
@@ -318,8 +298,8 @@ pub const Name = struct {
         return mem.eql(u8, a.wire, b.wire);
     }
 
-    /// Its tail is `zone`'s bytes, starting on one of its labels: matching
-    /// bytes alone can start mid-label.
+    /// The label walk is needed: `zone`'s bytes can also match starting inside
+    /// one of this name's labels.
     pub fn isSubdomainOf(self: Name, zone: Name) bool {
         if (zone.wire.len > self.wire.len) return false;
         const at = self.wire.len - zone.wire.len;
@@ -361,8 +341,6 @@ pub const TxtData = struct {
     };
 };
 
-// ── DNSSEC types (RFC 4034, 5155) ──────────────────────────────────
-
 pub const DnssecAlgorithm = enum(u8) {
     rsamd5 = 1,
     dh = 2,
@@ -387,7 +365,6 @@ pub const DigestType = enum(u8) {
     _,
 };
 
-/// RFC 5155 §8.1: the only NSEC3 hash algorithm defined is SHA-1.
 pub const Nsec3HashAlgorithm = enum(u8) {
     sha1 = 1,
     _,
@@ -405,15 +382,12 @@ pub const RrsigData = struct {
     signature: []const u8,
 };
 
-/// Seconds from `now` to an RRSIG timestamp, saturating at 0. For the RFC
-/// 4035 §5.3.3 TTL ceiling, not the validator's freshness check, which
-/// needs the clock-skew-tolerant comparison in dnssec.zig.
 pub fn secondsUntil(expiration: u32, now: u32) u32 {
     return if (serialAfter(expiration, now)) expiration -% now else 0;
 }
 
-/// RFC 1982 serial comparison. RRSIG timestamps are mod-2^32 serials (RFC
-/// 4034 §3.1.5) and must never be compared or subtracted directly.
+/// RFC 1982 serial comparison. RRSIG times are serials mod 2^32 (RFC 4034
+/// §3.1.5), so a plain `<` or `-` on them is wrong.
 pub fn serialAfter(s1: u32, s2: u32) bool {
     return s1 != s2 and (s1 -% s2) < 0x80000000;
 }
@@ -422,7 +396,6 @@ test "serialAfter: basic comparisons" {
     try testing.expect(serialAfter(10, 5));
     try testing.expect(!serialAfter(5, 10));
     try testing.expect(!serialAfter(5, 5));
-    // Wrap: 0xFFFFFFFF is "before" 0x00000001.
     try testing.expect(serialAfter(0x00000001, 0xFFFFFFFF));
     try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
 }
@@ -431,7 +404,6 @@ test "secondsUntil: saturates at zero and wraps as a serial" {
     try testing.expectEqual(@as(u32, 400), secondsUntil(1000, 600));
     try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1000));
     try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1001));
-    // Expiration just past the 2^32 wrap is still in the future.
     try testing.expectEqual(@as(u32, 10), secondsUntil(5, 0xFFFFFFFB));
 }
 
@@ -441,16 +413,12 @@ pub const DnskeyData = struct {
     algorithm: DnssecAlgorithm,
     public_key: []const u8,
 
-    /// RFC 4034 §2.1.1: bit 7, counting from the most significant.
     pub const zone_flag: u16 = 0x100;
 
     pub fn isZoneKey(self: DnskeyData) bool {
         return self.flags & zone_flag != 0;
     }
 
-    /// RFC 5011 §2.1: bit 8 (REVOKE). A revoked key MUST NOT be used to
-    /// validate RRSIGs. keyTag() still includes the revoke bit per
-    /// RFC 4034 Appendix B, so do not change tag computation.
     pub fn isRevoked(self: DnskeyData) bool {
         return (self.flags & 0x80) != 0;
     }
@@ -477,7 +445,6 @@ pub const Nsec3Data = struct {
     type_bit_maps: []const u8,
 };
 
-/// A record's rdata in its parts, for building one.
 pub const RData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
@@ -493,7 +460,6 @@ pub const RData = union(enum) {
     ds: DsData,
     nsec: NsecData,
     nsec3: Nsec3Data,
-    /// Already wire.
     unknown: []const u8,
 
     pub const Error = Allocator.Error || error{InvalidRDataLength};
@@ -573,9 +539,6 @@ pub const RData = union(enum) {
     }
 };
 
-// Each type's layout, stated once: the parser checks records with these,
-// and the accessors read records the parser or `init` proved.
-
 fn nameLen(d: []const u8) Error!usize {
     var i: usize = 0;
     while (i < d.len) : (i += 1 + d[i]) if (d[i] == 0) return i + 1;
@@ -632,8 +595,8 @@ fn readDs(d: []const u8) Error!DsData {
 
 fn readNsec(d: []const u8, buf: *Name.Buf) Error!NsecData {
     const n = try nameLen(d);
-    // A length octet is at most 63, never a capital.
     const spelled = d[0..n];
+    // A length octet is at most 63, below 'A', so every byte can be tested.
     const folded = for (spelled) |c| {
         if (std.ascii.isUpper(c)) break std.ascii.lowerString(buf[0..n], spelled);
     } else spelled;
@@ -657,7 +620,6 @@ fn readNsec3(d: []const u8) Error!Nsec3Data {
     };
 }
 
-/// Names were checked as they were read; these are the rest.
 fn checkRdata(rtype: RType, d: []const u8) Error!void {
     switch (rtype) {
         .a => if (d.len != 4) return error.InvalidRDataLength,
@@ -670,8 +632,6 @@ fn checkRdata(rtype: RType, d: []const u8) Error!void {
     }
 }
 
-/// Check if an RType is present in a type bitmap (RFC 4034 §4.1.2).
-/// Used by NSEC and NSEC3 records.
 pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
     const type_num = @backingInt(rtype);
     const window = type_num >> 8;
@@ -694,18 +654,12 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
     return false;
 }
 
-// ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
-
-/// RFC 7828.
 pub const edns_opt_tcp_keepalive: u16 = 11;
 
-/// RFC 7830.
 const edns_opt_padding: u16 = 12;
 
-/// RFC 8914.
 pub const edns_opt_ede: u16 = 15;
 
-/// RFC 8914 Extended DNS Error.
 pub const Ede = struct {
     code: Code,
     text: []const u8 = "",
@@ -721,7 +675,6 @@ pub const Ede = struct {
         no_reachable_authority = 22,
         unsupported_nsec3_iterations = 27,
         synthesized = 29,
-        /// draft-muks-dns-ede-rate-limited.
         over_quota = 32,
     };
 
@@ -756,8 +709,8 @@ pub const Question = struct {
     name: Name,
     qtype: RType,
     qclass: RClass,
-    /// The name as its asker wrote it, for the echo and the 0x20 check.
-    /// Null when that is `name`.
+    /// The name's wire bytes in the case its asker wrote, for the echo and the
+    /// 0x20 check. Null when that is `name`.
     spelled: ?[]const u8 = null,
 };
 
@@ -768,8 +721,8 @@ pub const ResourceRecord = struct {
     rtype: RType,
     rclass: RClass,
     ttl: u32,
-    /// Canonical wire (RFC 4034 §6.2): names uncompressed and lowercase,
-    /// but an NSEC's next name, kept as signed (RFC 6840 §5.1).
+    /// Canonical wire (RFC 4034 §6.2): names uncompressed and lowercase, except
+    /// an NSEC's next name, kept as signed (RFC 6840 §5.1).
     rdata: []const u8,
 
     pub const Parts = struct {
@@ -784,7 +737,6 @@ pub const ResourceRecord = struct {
         return .{ .name = p.name, .rtype = p.rtype, .rclass = p.rclass, .ttl = p.ttl, .rdata = try p.rdata.encode(gpa) };
     }
 
-    /// For tests: memory the test binary never frees.
     pub fn fixture(p: Parts) ResourceRecord {
         return init(fixtures.allocator(), p) catch @panic("bad fixture");
     }
@@ -844,7 +796,6 @@ pub const ResourceRecord = struct {
         return readDs(rr.rdata) catch unreachable;
     }
 
-    /// The next name folded, into `buf` when it was signed with capitals.
     pub fn nsec(rr: ResourceRecord, buf: *Name.Buf) NsecData {
         std.debug.assert(rr.rtype == .nsec);
         return readNsec(rr.rdata, buf) catch unreachable;
@@ -855,7 +806,6 @@ pub const ResourceRecord = struct {
         return readNsec3(rr.rdata) catch unreachable;
     }
 
-    /// TYPE, CLASS, TTL and RDLENGTH as on the wire.
     pub fn fixed(rr: ResourceRecord) error{InvalidRDataLength}![10]u8 {
         var f: [10]u8 = undefined;
         mem.writeInt(u16, f[0..2], @backingInt(rr.rtype), .big);
@@ -876,7 +826,8 @@ pub fn wireNameLen(wire: []const u8) usize {
     return i + 1;
 }
 
-/// Where an rdata's names lie. `tail` is the octets after them, null for any.
+/// Where the names in a type's rdata lie: after `skip` octets and `strings`
+/// character-strings. `tail` is the octet count after them; null allows any.
 const Embedded = struct {
     skip: u8 = 0,
     strings: u8 = 0,
@@ -885,13 +836,14 @@ const Embedded = struct {
     tail: ?u8 = 0,
 
     const Spelling = enum {
-        /// Compressed both ways (RFC 3597 §4).
+        /// Compressed on read and on write (RFC 3597 §4).
         rfc1035,
-        /// Read through pointers, written flat (RFC 3597 §4).
+        /// Pointers accepted on read, never written (RFC 3597 §4).
         read_compressed,
         /// Never a pointer (RFC 4034 §3.1.7).
         flat,
-        /// Never a pointer nor folded (RFC 4034 §4.1.1, RFC 6840 §5.1).
+        /// Never a pointer, and kept in the case it was signed in (RFC 4034
+        /// §4.1.1, RFC 6840 §5.1).
         signed,
     };
 };
@@ -922,9 +874,6 @@ pub const Message = struct {
     opt: ?OptRecord = null,
 };
 
-/// Index of the first label-separating `.` at or after `start`, skipping
-/// escaped bytes. Works on any well-formed presentation string; `\DDD`
-/// digits can never be `.` so skipping one byte after `\` suffices.
 fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
     var i = start;
     while (i < s.len) : (i += 1) switch (s[i]) {
@@ -947,8 +896,6 @@ pub fn stripTrailingDot(s: []const u8) []const u8 {
     return s;
 }
 
-/// Decode one presentation-format label (`\.`, `\\`, `\DDD`, `\X` literal)
-/// into `out`. Returns the decoded length.
 fn unescapeLabel(label: []const u8, out: *[max_label_len]u8) Error!usize {
     var len: usize = 0;
     var i: usize = 0;
@@ -1002,8 +949,7 @@ fn wireOfDotted(buf: *Name.Buf, dotted: []const u8, comptime lower: bool) Error!
     return buf[0 .. n + 1];
 }
 
-/// Length octets sit below 'A', so only label bytes flip. RFC draft
-/// Vixie/Dagon.
+/// Length octets sit below 'A', so only label bytes flip.
 fn applyCase0x20(rng: std.Random, wire: []u8) void {
     var pool: u64 = 0;
     var bits_left: u8 = 0;
@@ -1019,9 +965,6 @@ fn applyCase0x20(rng: std.Random, wire: []u8) void {
     }
 }
 
-/// A question for an authority: RD clear, EDNS on. Borrows `qname`; its
-/// spelling is `allocator`'s, its letter case drawn from `case_rng` if given
-/// (draft-vixie-dnsext-dns0x20), for the caller to match in the reply.
 pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, do_bit: bool, case_rng: ?std.Random) Allocator.Error!Message {
     const spelled = try allocator.dupe(u8, qname.wire);
     if (case_rng) |rng| applyCase0x20(rng, spelled);
@@ -1073,8 +1016,6 @@ const Parser = struct {
 
     const Form = enum { compressed, uncompressed };
 
-    /// Read in place when it lies whole in the message, lowercase; else one
-    /// lowercase copy, 255 octets at most however few the message spent.
     fn parseName(self: *Parser, allocator: Allocator, comptime form: Form) Error!Name {
         var buf: Name.Buf = undefined;
         const name = try self.readName(&buf, form);
@@ -1082,7 +1023,6 @@ const Parser = struct {
     }
 
     fn readName(self: *Parser, buf: *Name.Buf, comptime form: Form) Error!Name {
-        // Where the name lies whole: no label before a pointer.
         var whole: ?usize = self.pos;
         var upper = false;
         var len: usize = 0;
@@ -1115,7 +1055,7 @@ const Parser = struct {
                     if (jumps > max_jumps) return error.CompressionPointerLoop;
                     if (resume_at == null) resume_at = cursor + 2;
                     const offset = (@as(u16, len_byte & 0x3F) << 8) | @as(u16, self.msg[cursor + 1]);
-                    // RFC 1035 §4.1.4: pointers must reference prior occurrences
+                    // RFC 1035 §4.1.4: a pointer refers to a prior occurrence.
                     if (offset >= cursor) return error.FormatError;
                     whole = if (len == 0) offset else null;
                     cursor = offset;
@@ -1145,7 +1085,6 @@ const Parser = struct {
         }
     }
 
-    /// An RRSIG keeps the week: binding levels it to its set (`dnssec.bindSets`).
     fn ttlCeiling(rtype: RType) u32 {
         return switch (rtype) {
             .nsec, .nsec3 => max_negative_ttl,
@@ -1153,7 +1092,7 @@ const Parser = struct {
         };
     }
 
-    /// The first name in a message has no earlier name to point at.
+    /// Uncompressed: the first name in a message has nothing earlier to point at.
     fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
         const start = self.pos;
         const name = try self.parseName(allocator, .uncompressed);
@@ -1167,7 +1106,8 @@ const Parser = struct {
         const name = try self.parseName(allocator, .compressed);
         const rtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const rclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
-        // RFC 2181 §8: top bit set is zero. OPT's field is not a TTL (RFC 6891 §6.1.3).
+        // RFC 2181 §8: a TTL with the top bit set is zero. OPT's field is flags,
+        // not a TTL (RFC 6891 §6.1.3).
         const raw_ttl = try self.readU32();
         const ttl = if (rtype == .opt) raw_ttl else if (raw_ttl > std.math.maxInt(i32)) 0 else @min(raw_ttl, ttlCeiling(rtype));
         const rdlength: usize = try self.readU16();
@@ -1241,17 +1181,12 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
     return try options.toOwnedSlice(allocator);
 }
 
-/// `opt_out` non-null marks the additional section: OPT records are
-/// extracted into it (RFC 6891) instead of appended. Null (answer /
-/// authority) keeps any OPT as an ordinary record.
 fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: usize, opt_out: ?*?OptRecord) Error![]ResourceRecord {
     var list: ArrayList(ResourceRecord) = try .initCapacity(allocator, @min(count, max_rrs));
     for (0..count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
         if (opt_out) |opt| if (rr.rtype == .opt) {
-            // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
             if (opt.* != null) return error.MultipleOptRecords;
-            // RFC 6891 §6.1.2: OPT owner name MUST be root.
             if (!rr.name.isRoot()) return error.FormatError;
             const options = try parseEdnsOptions(allocator, rr.rdata);
             opt.* = .{
@@ -1272,8 +1207,6 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     return (try parse(allocator, bytes)).message();
 }
 
-/// A message as parsed: its sections are fresh arrays, the caller's to
-/// trim or reorder before reading them as a `Message`.
 const Parsed = struct {
     header: Header,
     question: ?Question,
@@ -1287,17 +1220,14 @@ const Parsed = struct {
     }
 };
 
-/// Parse a DNS wire message. Names and rdata alias `bytes`, which must
-/// outlive what is parsed.
-///
-/// `allocator` must be an arena: nothing parsed can be freed piece by
-/// piece, on success or on error.
+/// Names and rdata alias `bytes`, which must outlive the result.
+/// `allocator` must be an arena: nothing here is freed piece by piece, on
+/// success or on error.
 pub fn parse(allocator: Allocator, bytes: []const u8) Error!Parsed {
     const hdr, var parser, const question = try readHead(allocator, bytes);
 
-    // Cap pre-allocation against what the wire can physically contain.
-    // Prevents a small packet with inflated header counts from triggering
-    // a large allocation (counts are attacker-controlled u16, max 65535).
+    // Header counts are attacker-chosen: preallocate no more records than the
+    // bytes could hold.
     const max_rrs = (bytes.len - header_len) / min_rr_len;
     const answers = try parseRRSection(allocator, &parser, hdr.an_count, max_rrs, null);
     const authorities = try parseRRSection(allocator, &parser, hdr.ns_count, max_rrs, null);
@@ -1314,12 +1244,11 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!Parsed {
     };
 }
 
-/// RFC 9619 §4: a second question is malformed, so none is read. Every
-/// pointer question would decompress into a name of its own.
 fn readHead(allocator: Allocator, bytes: []const u8) Error!struct { Header, Parser, ?Question } {
     if (bytes.len < header_len) return error.EndOfData;
     const hdr = Header.parse(bytes[0..12]);
     var parser = Parser{ .msg = bytes, .pos = 12 };
+    // RFC 9619 §4: more than one question is malformed.
     if (hdr.qd_count > 1) return error.FormatError;
     const question = if (hdr.qd_count == 1) try parser.parseQuestion(allocator) else null;
     return .{ hdr, parser, question };
@@ -1331,9 +1260,8 @@ pub const Query = struct {
     edns: ?Edns,
 };
 
-/// The question may alias `bytes`. Records are framed, not read, but
-/// for the additional section's OPT: a pointer or rdata nothing reads
-/// is no error.
+/// The question may alias `bytes`. Records are only framed, except the
+/// additional section's OPT: a bad pointer or rdata nothing reads is no error.
 pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
     const hdr, var parser, const question = try readHead(allocator, bytes);
 
@@ -1348,11 +1276,9 @@ pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
         const ttl = try parser.readU32();
         const rdata = try parser.readSlice(try parser.readU16());
         if (rtype != .opt) continue;
-        // RFC 6891 §6.1.1: one OPT per message, whichever section holds it.
         opts += 1;
         if (opts > 1) return error.MultipleOptRecords;
         if (i < before_additional) continue;
-        // §6.1.2: owned by the root.
         var at = Parser{ .msg = bytes, .pos = owner };
         if (!(try at.parseName(allocator, .compressed)).isRoot()) return error.FormatError;
         try frameEdnsOptions(rdata);
@@ -1386,7 +1312,6 @@ fn findOpt(msg: []const u8) Error!?struct { rdlength_at: usize, end: usize } {
     return null;
 }
 
-/// The Padding option goes last in the OPT, as RFC 8467 §4 has it.
 pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
     const opt = try findOpt(msg) orelse return error.FormatError;
     const end = opt.end;
@@ -1414,19 +1339,16 @@ pub fn hasOption(msg: []const u8, code: u16) Error!bool {
     return false;
 }
 
-/// RFC 1035 §4.1.4 targets. Byte-exact: a pointer must not change a name's case.
-/// A candidate entry spends its label count from `work`; once gone, names go
-/// out whole (Unbound CVE-2024-8508: labels² × entries per name).
+/// Compression targets. Matching is byte-exact, so a pointer never changes a
+/// name's case. Each candidate compared spends its label count from `work`;
+/// once that is gone, names go out whole (cf. Unbound CVE-2024-8508).
 const NameTable = struct {
     entries: [64]Entry = undefined,
     len: usize = 0,
     work: u32 = 1 << 16,
 
-    /// A name written at `offset`, `labels` long.
     const Entry = struct { offset: u16, labels: u8 };
 
-    /// `suffix` is an uncompressed wire name `labels` long; `out` holds
-    /// every entry's name.
     fn find(self: *NameTable, out: []const u8, suffix: []const u8, labels: u8) ?u16 {
         for (self.entries[0..self.len]) |e| {
             if (e.labels != labels) continue;
@@ -1444,8 +1366,6 @@ const NameTable = struct {
     }
 };
 
-/// The name at `out[at..]`, its pointers followed, is `wire` to the byte.
-/// Pointers the serializer wrote only reach back, so the walk ends.
 fn sameWireName(out: []const u8, at: u16, wire: []const u8) bool {
     var p: usize = at;
     var q: usize = 0;
@@ -1496,13 +1416,11 @@ pub const Serializer = struct {
         self.pos += data.len;
     }
 
-    /// An owner name, compressed when the message keeps a name table.
     fn writeName(self: *Serializer, wire: []const u8) Error!void {
         if (self.names != null) return self.writeWireName(wire);
         try self.writeSlice(wire);
     }
 
-    /// An uncompressed wire name, compressed against what is written.
     fn writeWireName(self: *Serializer, wire: []const u8) Error!void {
         const t = self.names.?;
         var labels: u8 = 0;
@@ -1548,8 +1466,6 @@ pub const Serializer = struct {
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
         try self.writeSlice(Name.root.wire);
         try self.writeU16(@backingInt(RType.opt));
-        // CLASS carries the payload size (RFC 6891 §6.1.2), and TTL the
-        // extended rcode (8), version (8), DO (1) and Z (15) (§6.1.3).
         try self.writeU16(opt.udp_payload_size);
         const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
             (@as(u32, opt.version) << 16) |
@@ -1567,9 +1483,8 @@ pub const Serializer = struct {
     }
 };
 
-/// Where each section ended, filled progressively by `serializeEnds`
-/// so a caller can rewind to a completed boundary after an overflow.
-/// 0 = never reached.
+/// Filled as `serializeEnds` goes, so they are valid after an overflow too.
+/// 0: never reached.
 pub const SectionEnds = struct { question: usize = 0, answers: usize = 0, authorities: usize = 0 };
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
@@ -1593,8 +1508,6 @@ pub const Sections = struct {
     }
 };
 
-/// The header goes last and counts only records that fit in one message,
-/// so each count fits a u16.
 pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, sections: Sections, opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
     var ser: Serializer = .{ .buf = buf[0..@min(buf.len, max_message_len)], .names = &names };
@@ -1615,8 +1528,6 @@ pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, sections: Sect
 }
 
 test "header parse known bytes" {
-    // Hand-crafted: id=0x1234, QR=1, opcode=0, AA=0, TC=0, RD=1, RA=1, rcode=0
-    // flags = 1_0000_0_0_1_1_000_0000 = 0x8180
     const bytes = [12]u8{
         0x12, 0x34, // id
         0x81, 0x80, // flags: QR=1, RD=1, RA=1
@@ -1638,10 +1549,6 @@ test "header parse known bytes" {
 }
 
 test "name parsing - compressed" {
-    // Build a message where offset 0 has "example.com" and then a pointer back
-    // Offset 0: \x07example\x03com\x00  (13 bytes)
-    // Offset 13: \x03foo\xC0\x00       (pointer to offset 0 = "example.com")
-    // So "foo.example.com"
     const data = "\x07example\x03com\x00\x03foo\xC0\x00";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1649,19 +1556,16 @@ test "name parsing - compressed" {
     const name = try parser.parseName(arena.allocator(), .compressed);
 
     try testing.expect(name.eql(.lit("foo.example.com")));
-    // pos should advance past the pointer (13 + 3+1 + 2 = 19)
     try testing.expectEqual(@as(usize, 19), parser.pos);
 }
 
 test "name parsing - forward pointer rejection" {
-    // Forward pointer at position 0 pointing to offset 2 — rejected per RFC 1035 §4.1.4
     const data = [_]u8{ 0xC0, 0x02, 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
     try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
 }
 
 test "name parsing - self pointer rejection" {
-    // Self-pointer: offset == cursor, rejected as non-backward
     const data = [_]u8{ 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
     try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
@@ -1730,7 +1634,6 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
 
     var buf: [512]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
-    // Question 21 + A(2+10+4) + RRSIG(2+10+18+13+3) + NS(2+10+4+2).
     try testing.expectEqual(@as(usize, 12 + 21 + 16 + 46 + 18), wire.len);
     try testing.expectEqualSlices(u8, "\x07example\x03com\x00", wire[12 + 21 + 16 + 30 ..][0..13]);
 
@@ -1749,7 +1652,6 @@ test "name compression follows a pointer inside an earlier name" {
     const rr: ResourceRecord = .fixture(.{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
     var buf: [512]u8 = undefined;
     const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = .{ .name = www, .qtype = .a, .qclass = .in }, .answers = &.{ rr, rr } });
-    // The second owner is one pointer to "mail" + a pointer, itself.
     try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
     const back = try parseMessage(a, wire);
     for (back.answers) |got| try testing.expect(got.name.eql(mail));
@@ -1761,7 +1663,6 @@ test "edge case: empty message (too short)" {
 }
 
 test "edge case: truncated question" {
-    // A three-byte label with one byte left.
     const pkt = "\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03a";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1776,9 +1677,7 @@ test "RFC 9619 §4: two questions are malformed before either is read" {
 
 test "RFC 1035 §4.1.4: a question's name holds no pointer, even one that would decode" {
     const header = "\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00";
-    // A label of bytes 01 62 00, then a pointer into it: "\001b\000.b."
     const into_label = header ++ "\x03\x01b\x00\xc0\x0d\x00\x01\x00\x01";
-    // Offset 4 is QDCOUNT's high byte, 00: the root.
     const into_header = header ++ "\xc0\x04\x00\x01\x00\x01";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1795,7 +1694,6 @@ test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
     const msg = try parseMessage(arena.allocator(), max);
     try testing.expectEqual(@as(usize, 63), msg.question.?.name.leaf().len);
 
-    // 64 is 0x40: top bits 01, a label type RFC 1035 never defined.
     const over = header ++ "\x40" ++ @as([64]u8, @splat('a'));
     try testing.expectError(error.InvalidLabelType, parseMessage(arena.allocator(), over));
 }
@@ -1821,15 +1719,12 @@ test "EDNS0: serialized OPT has correct wire format" {
     const wire = try serializeMessage(&buf, msg);
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, wire[10..12], .big));
-    // After the 11-byte question: root owner, type 41, class 1232, a TTL
-    // holding only DO, no rdata.
     try testing.expectEqualSlices(u8, "\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);
 }
 
 test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    // example.com A, then an OPT owned by "x.".
     const wire = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\x00\x01\x00\x01" ++
         "\x01x\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00";
     try testing.expectError(error.FormatError, parseMessage(arena.allocator(), wire));
@@ -1867,7 +1762,6 @@ test "padding ends the OPT's options, whatever it holds and whatever follows it"
 test "names are read lowercase, and the question as it was spelled" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    // A reply to WwW.eXaMpLe whose answer's owner points at the question.
     const wire = "\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" ++
         "\x03WwW\x07eXaMpLe\x00\x00\x01\x00\x01" ++
         "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
@@ -1899,8 +1793,6 @@ test "a name lying whole in the message, lowercase, is read in place" {
 }
 
 test "a pointer flood costs each name its 255 octets, no more" {
-    // A 126-label question, then answers whose owner and rdata are each a
-    // label and a pointer to it: 18 wire octets for two names of 255.
     var buf: [max_message_len]u8 = undefined;
     var n: usize = 12;
     for (0..max_label_count - 1) |_| {
@@ -1952,7 +1844,6 @@ test "an NSEC's next name goes back out as signed (RFC 6840 §5.1)" {
 }
 
 test "a query's other records are stepped, never built" {
-    // A 127-label question, then answers whose owner and rdata both point at it.
     var buf: [max_message_len]u8 = undefined;
     var n: usize = 12;
     for (0..max_label_count) |_| {
@@ -1974,8 +1865,6 @@ test "a query's other records are stepped, never built" {
     try testing.expectEqual(max_label_count, query.question.?.name.depth());
 }
 
-/// RFC 6672 §2.2: `owner` with its `suffix` replaced by `target`. Null
-/// past 255 octets, where no name from the wire could match it.
 pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target: Name) Allocator.Error!?Name {
     std.debug.assert(owner.isSubdomainOf(suffix));
     const prefix = owner.wire[0 .. owner.wire.len - suffix.wire.len];
@@ -1986,15 +1875,11 @@ pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target:
     return .of(wire);
 }
 
-/// RFC 5452 §9.1: the one question sent, at any rcode, its spelling byte
-/// for byte when `cased`. RFC 9619 lets a message carry none, but then
-/// nothing matches.
 pub fn validateResponse(response: Message, sent: []const u8, qtype: RType, cased: bool) error{Mismatch}!void {
     const f = response.header.flags;
     if (!f.qr or f.opcode != .query) return error.Mismatch;
     const q = response.question orelse return error.Mismatch;
     const got = q.spelled orelse return error.Mismatch;
-    // Length octets sit below 'A', so only label bytes fold.
     const same = if (cased) mem.eql(u8, got, sent) else std.ascii.eqlIgnoreCase(got, sent);
     if (!same or q.qtype != qtype or q.qclass != .in) return error.Mismatch;
 }
@@ -2024,9 +1909,7 @@ test "validateResponse: only the one question sent, at any rcode" {
 
 test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a week, NSEC and NSEC3 at three hours" {
     const a = [_]u8{ 192, 0, 2, 1 };
-    // Next name the root; window 0 holds A.
     const nsec = [_]u8{ 0, 0, 1, 0x40 };
-    // SHA-1, no salt, a one-byte hash, no types.
     const nsec3 = [_]u8{ 1, 0, 0, 0, 0, 1, 0xab };
     const Row = struct { rtype: RType, rdata: []const u8, ttl: u32, want: u32 };
     const rows = [_]Row{
@@ -2059,7 +1942,6 @@ test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a wee
 }
 
 test "compression past its work budget writes names whole, and they read back" {
-    // 126-label names differing only nearest the root: a compare per suffix per entry.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2102,7 +1984,6 @@ test "substituteSuffix declines a substitution that overflows a legal name" {
     const a = arena.allocator();
 
     const long_label = @as([63]u8, @splat('x')) ++ ".";
-    // Four 63-octet labels is 257 wire octets — past the 255 limit.
     const owner: Name = .lit(long_label ++ long_label ++ "short");
     const suffix: Name = .lit("short");
     const target: Name = .lit(long_label ++ long_label);
@@ -2163,7 +2044,6 @@ test "isSubdomainOf: self, descendants and the root; never a sibling, nor a labe
     const name = Name.lit("example.com");
     try testing.expect(name.isSubdomainOf(name));
     try testing.expect((Name.lit("www.example.com")).isSubdomainOf(name));
-    // Bytes `\x07example\x03com\x00` end this name inside its first label.
     try testing.expect(!(Name.lit("a\\007example.com")).isSubdomainOf(name));
     try testing.expect(name.isSubdomainOf(.root));
     try testing.expect(!(Name.lit("a.example.com")).isSubdomainOf(.lit("b.example.com")));
@@ -2186,8 +2066,6 @@ const TestRdata = struct {
     }
 };
 
-/// A response holding one answer, example.com IN 300, whose RDLENGTH
-/// says `rdlength` whatever `rdata` holds.
 fn testAnswer(pkt: *[max_udp_payload]u8, rtype: RType, rdata: []const u8, rdlength: u16) []const u8 {
     const head = "\x00\x01\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00\x07example\x03com\x00";
     @memcpy(pkt[0..head.len], head);
@@ -2201,7 +2079,6 @@ fn testAnswer(pkt: *[max_udp_payload]u8, rtype: RType, rdata: []const u8, rdleng
 }
 
 test "DNSKEY record parsing" {
-    // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
     const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
     var rd = TestRdata{};
     rd.put(u16, 257);
@@ -2224,7 +2101,6 @@ test "DNSKEY record parsing" {
 }
 
 test "DS record parsing" {
-    // RDATA: key_tag=20326, alg=8, digest_type=2 (SHA-256), digest=32 bytes
     const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
     var rd = TestRdata{};
     rd.put(u16, 20326);
@@ -2248,13 +2124,13 @@ test "RRSIG record parsing" {
     const signer_wire = "\x07example\x03com\x00";
     const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
     var rd = TestRdata{};
-    rd.put(u16, 1); // type_covered = A
-    rd.put(u8, 13); // algorithm = ECDSAP256SHA256
-    rd.put(u8, 2); // labels
-    rd.put(u32, 300); // original_ttl
-    rd.put(u32, 1700000000); // sig_expiration
-    rd.put(u32, 1699000000); // sig_inception
-    rd.put(u16, 12345); // key_tag
+    rd.put(u16, 1);
+    rd.put(u8, 13);
+    rd.put(u8, 2);
+    rd.put(u32, 300);
+    rd.put(u32, 1700000000);
+    rd.put(u32, 1699000000);
+    rd.put(u16, 12345);
     rd.putBytes(signer_wire);
     rd.putBytes(&fake_sig);
 
@@ -2296,11 +2172,11 @@ test "NSEC record parsing" {
 test "NSEC3 record parsing" {
     const salt = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
-    const bitmap = [_]u8{ 0x00, 0x01, 0x40 }; // window 0, len 1, A bit set
+    const bitmap = [_]u8{ 0x00, 0x01, 0x40 };
     var rd = TestRdata{};
-    rd.put(u8, 1); // hash_algorithm (SHA-1)
-    rd.put(u8, 0); // flags
-    rd.put(u16, 10); // iterations
+    rd.put(u8, 1);
+    rd.put(u8, 0);
+    rd.put(u16, 10);
     rd.put(u8, @intCast(salt.len));
     rd.putBytes(&salt);
     rd.put(u8, @intCast(next_hash.len));
@@ -2324,12 +2200,9 @@ test "NSEC3 record parsing" {
 test "typeBitmapContains" {
     const bitmap = [_]u8{
         0x00, 0x07, // window 0, length 7
-        0x62, // byte 0: A(1), NS(2), SOA(6)
-        0x00, // byte 1: empty
-        0x00, // byte 2: empty
-        0x00, // byte 3: empty
-        0x00, // byte 4: empty
-        0x03, // byte 5: RRSIG(46), NSEC(47)
+        0x62, 0x00,
+        0x00, 0x00,
+        0x00, 0x03,
         0x80, // byte 6: DNSKEY(48)
     };
 
@@ -2356,16 +2229,15 @@ test "an unnamed wire value prints as its number" {
 
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     var rd = TestRdata{};
-    rd.put(u16, 1); // type covered
-    rd.put(u8, 13); // algorithm
-    rd.put(u8, 2); // labels
+    rd.put(u16, 1);
+    rd.put(u8, 13);
+    rd.put(u8, 2);
     for ([_]u32{ 300, 1700000000, 1699000000 }) |v| rd.put(u32, v);
-    rd.put(u16, 12345); // key tag
+    rd.put(u16, 12345);
     rd.putBytes("\x07example\x03com\x00");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pkt: [max_udp_payload]u8 = undefined;
-    // 18 fixed bytes and a 13-byte signer: 20 ends inside the signer.
     try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), 20)));
 }
 
@@ -2379,12 +2251,12 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
 
 test "RFC 4034 §3.1.7, §4.1.1: an RRSIG's signer and an NSEC's next name hold no pointer" {
     var rd = TestRdata{};
-    rd.put(u16, 1); // type covered
-    rd.put(u8, 13); // algorithm
-    rd.put(u8, 2); // labels
+    rd.put(u16, 1);
+    rd.put(u8, 13);
+    rd.put(u8, 2);
     for ([_]u32{ 300, 1700000000, 1699000000 }) |v| rd.put(u32, v);
-    rd.put(u16, 12345); // key tag
-    rd.putBytes("\xc0\x0csig"); // the owner, example.com, by pointer
+    rd.put(u16, 12345);
+    rd.putBytes("\xc0\x0csig");
     const nsec = "\xc0\x0c\x00\x01\x40";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2431,12 +2303,9 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
 test "formatInto is injective over hostile labels" {
     var buf: [max_dotted_len + 1]u8 = undefined;
 
-    // The two wire names that motivated RFC 4343 §2.1 escaping: a literal
-    // 0x2e inside a label must not render like the separator.
     try testing.expectEqualStrings("e\\.d.com", (Name.lit("e\\.d.com")).formatInto(&buf));
     try testing.expectEqualStrings("e.d.com", (Name.lit("e.d.com")).formatInto(&buf));
 
-    // Non-printables render as \DDD, so 0x07 no longer collides with '?'.
     try testing.expectEqualStrings("\\007foo.com", (Name.lit("\\007foo.com")).formatInto(&buf));
     try testing.expectEqualStrings("?foo.com", (Name.lit("?foo.com")).formatInto(&buf));
 
@@ -2459,8 +2328,6 @@ test "formatInto/parseDottedName round-trip every label byte" {
         try testing.expect(original.eql(parsed));
     }
 
-    // Worst case: a wire-maximal name of pure \DDD content (253 bytes over
-    // four labels) renders to 4·250+3 = 1003 chars and still round-trips.
     const wide = [_]u8{max_label_len} ++ @as([max_label_len]u8, @splat(0));
     const last = [_]u8{61} ++ @as([61]u8, @splat(0));
     const original: Name = .of(&(wide ++ wide ++ wide ++ last ++ [_]u8{0}));
@@ -2477,8 +2344,6 @@ test "parseDottedName decodes presentation escapes" {
     const escaped_dot = try parseDottedName(alloc, "e\\.d.com");
     try testing.expect(escaped_dot.eql(.lit("e\\.d.com")));
 
-    // \DDD is a decimal byte, \X a literal, and a trailing escaped dot is
-    // content rather than a stripped separator.
     try testing.expect((try parseDottedName(alloc, "\\068")).eql(.lit("d")));
     try testing.expect((try parseDottedName(alloc, "ex\\ample.com")).eql(.lit("example.com")));
     try testing.expect((try parseDottedName(alloc, "a\\.")).eql(.lit("a\\.")));

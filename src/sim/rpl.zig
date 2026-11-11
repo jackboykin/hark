@@ -12,11 +12,8 @@ const dns64 = @import("../dns64.zig");
 const proof = @import("../proof.zig");
 const stub = @import("../stub.zig");
 
-/// testbound's default; hark refuses to cache TTL 0.
 const default_ttl: u32 = 3600;
 
-/// MATCH flags from every context; which ones a context honours is the
-/// runner's business. An unknown flag is a parse error.
 pub const Match = packed struct {
     opcode: bool = false,
     qname: bool = false,
@@ -46,27 +43,18 @@ pub const QueryLogRow = struct {
     dest: ?na.Address,
 };
 
-/// `DS PLACEHOLDER [<zone>]`: the digest of a key minted at run time;
-/// `zone` plants another zone's digest at this owner.
+/// `DS PLACEHOLDER [<zone>]`: parsed with key tag 0, which the signer swaps
+/// for the digest of `zone`'s minted key (default: the owner's).
 pub const DsFrom = struct { owner: dns.Name, zone: dns.Name };
 
 pub const Entry = struct {
     match: Match = .{},
-    /// REPLY flags and rcode; the responder forces QR regardless.
     flags: dns.Header.Flags = .{},
-    /// REPLY DO on a STEP QUERY; no-op on responder entries.
     do_bit: bool = false,
-    /// REPLY EDNS: send an OPT without DO.
     edns: bool = false,
-    /// MATCH ede=<code> on CHECK_ANSWER.
     ede: ?u16 = null,
-    /// ADJUST drop: a blackholed authority.
     drop: bool = false,
-    /// ADJUST force_upper_qname / drop_question: how the responder echoes
-    /// the question.
     echo: enum { copy, upper, none } = .copy,
-    /// ADJUST unsigned: the signer leaves the entry alone (an unsigned zone
-    /// served from a signed zone's address).
     unsigned: bool = false,
     sign_as: ?dns.Name = null,
     wildcard: ?dns.Name = null,
@@ -89,9 +77,7 @@ pub const Step = struct {
     n: u32,
     kind: Kind,
     entry: ?Entry = null,
-    /// TIME_PASSES: seconds to advance.
     seconds: u32 = 0,
-    /// CHECK_MAX_QUERIES, CHECK_MAX_VERIFIES, CHECK_MAX_RUNS: the bound so far.
     bound: u32 = 0,
 
     pub const Kind = enum {
@@ -100,10 +86,8 @@ pub const Step = struct {
         check_query_log,
         check_out_query,
         check_max_queries,
-        /// Signatures whose math ran, memo hits excluded.
         check_max_verifies,
         check_max_runs,
-        /// Refuse the next upstream query at the host, as if out of sockets.
         unsent,
         time_passes,
     };
@@ -114,7 +98,6 @@ pub const Scenario = struct {
     stub_zones: []const stub.Zone = &.{},
     ranges: []const Range = &.{},
     steps: []const Step = &.{},
-    /// `; hark:` directives; null is the harness default.
     qmin: ?bool = null,
     rebinding_enabled: ?bool = null,
     rebinding_allow_zones: []const []const u8 = &.{},
@@ -127,11 +110,8 @@ pub const Scenario = struct {
     min_ttl: ?u32 = null,
     prefetch: ?bool = null,
     client_timeout_ms: ?u32 = null,
-    /// Zones the harness signs; the first must be the root.
     dnssec_zones: []const []const u8 = &.{},
-    /// Seconds the harness's signatures stay valid; null, a year.
     sig_validity: ?u32 = null,
-    /// Caps the original TTL the harness's signatures carry; null, none.
     sig_original_ttl: ?u32 = null,
 };
 
@@ -142,7 +122,6 @@ pub const Diag = struct {
 
 pub const Error = error{ Parse, OutOfMemory };
 
-/// No address remapping: nothing here binds a socket.
 pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) Error!Scenario {
     var p: Parser = .{ .arena = arena, .diag = diag, .lines = mem.splitScalar(u8, text, '\n') };
     return p.parse();
@@ -153,7 +132,6 @@ const Parser = struct {
     diag: *Diag,
     lines: mem.SplitIterator(u8, .scalar),
     lineno: usize = 0,
-    /// The current significant line, held until `advance`.
     cur: ?[]const u8 = null,
     scenario: Scenario = .{},
 
@@ -162,8 +140,7 @@ const Parser = struct {
         return error.Parse;
     }
 
-    /// The next significant line, unconsumed. Applies `; hark:` directives
-    /// from the comments it skips.
+    /// Applies the `; hark: key = value` directives in the comments it skips.
     fn peek(p: *Parser) Error!?[]const u8 {
         if (p.cur) |c| return c;
         while (p.lines.next()) |raw| {
@@ -322,8 +299,6 @@ const Parser = struct {
         const kind = enumIgnoreCase(Step.Kind, kind_str) orelse return p.fail("unknown STEP kind");
         switch (kind) {
             .time_passes => {
-                // A bare TIME_PASSES would advance by 0 and launder every
-                // check.
                 const elapse = toks.next() orelse "";
                 const seconds = toks.next() orelse "";
                 if (!mem.eql(u8, elapse, "ELAPSE") or toks.next() != null) return p.fail("TIME_PASSES needs `ELAPSE <n>`");
@@ -396,7 +371,6 @@ const Parser = struct {
                 section = enumIgnoreCase(Section, s) orelse return p.fail("bad SECTION");
             } else switch (section orelse return p.fail("RR outside SECTION")) {
                 .question => {
-                    // RFC 9619 §4: one question a message.
                     if (e.question != null) return p.fail("a second QUESTION");
                     e.question = try p.question(line);
                 },
@@ -479,9 +453,7 @@ const Parser = struct {
         };
     }
 
-    /// `name [ttl] [class] type rdata…` in any of testbound's orders.
     fn parseRr(p: *Parser, raw: []const u8, ds_from: *std.ArrayList(DsFrom)) Error!dns.ResourceRecord {
-        // `;` ends the record unless quoted (`;{id = 2854}`).
         var line = raw;
         var quoted = false;
         for (raw, 0..) |c, i| {
@@ -550,7 +522,6 @@ const Parser = struct {
             .ds => {
                 const first = try p.word(toks);
                 if (eqlIgnoreCase(first, "placeholder")) {
-                    // Key tag 0 marks it; the signer fills in the digest.
                     const zone = if (toks.next()) |z| try p.name(z) else owner;
                     try ds_from.append(arena, .{ .owner = owner, .zone = zone });
                     return .{ .ds = .{
@@ -607,7 +578,7 @@ const Parser = struct {
             },
             else => {
                 if (rtype != .hinfo) return p.fail("unsupported RR type");
-                // Wire form, as the resolver synthesises it (RFC 8482).
+                // HINFO in wire form, as the resolver synthesises it (RFC 8482).
                 var wire: std.ArrayList(u8) = .empty;
                 for (try p.charStrings(toks)) |str| {
                     if (str.len > 255) return p.fail("character-string too long");
@@ -619,7 +590,6 @@ const Parser = struct {
         }
     }
 
-    /// Quoted strings may span tokens; bare tokens are one each.
     fn charStrings(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const []const u8 {
         var strings: std.ArrayList([]const u8) = .empty;
         while (toks.next()) |t| {
@@ -648,7 +618,6 @@ const Parser = struct {
         return out;
     }
 
-    /// A number, or an IANA mnemonic.
     fn algorithm(p: *Parser, text: []const u8) Error!dns.DnssecAlgorithm {
         if (isDigits(text)) return @fromBackingInt(try p.int(u8, text));
         const table = .{
@@ -660,7 +629,6 @@ const Parser = struct {
         return p.fail("unknown DNSSEC algorithm");
     }
 
-    /// Base64 that may span tokens, padded or not.
     fn base64(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
         var text: std.ArrayList(u8) = .empty;
         while (toks.next()) |t| try text.appendSlice(p.arena, t);
@@ -671,14 +639,13 @@ const Parser = struct {
         return out;
     }
 
-    /// RFC 4034 §3.2: YYYYMMDDHHmmSS, or seconds since the epoch.
     fn sigTime(p: *Parser, text: []const u8) Error!u32 {
         if (text.len != 14) return p.int(u32, text);
         const y = try p.int(i64, text[0..4]);
         const m = try p.int(i64, text[4..6]);
         const d = try p.int(i64, text[6..8]);
         const secs = try p.int(i64, text[8..10]) * 3600 + try p.int(i64, text[10..12]) * 60 + try p.int(i64, text[12..14]);
-        // Hinnant's days-from-civil: era-based, no month table.
+        // Hinnant's days-from-civil.
         const yy = y - @intFromBool(m <= 2);
         const era = @divFloor(yy, 400);
         const yoe = yy - era * 400;
@@ -688,7 +655,6 @@ const Parser = struct {
         return std.math.cast(u32, days * 86400 + secs) orelse p.fail("signature time out of range");
     }
 
-    /// RFC 4034 §4.1.2 type bitmap from the remaining type mnemonics.
     fn typeBitmap(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         var window: [256]u8 = undefined;
@@ -780,8 +746,6 @@ fn rtypeFromText(t: []const u8) ?dns.RType {
     inline for (table) |row| if (mem.eql(u8, u, row[0])) return row[1];
     return null;
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────
 
 fn parseTest(arena: Allocator, text: []const u8) !Scenario {
     var diag: Diag = .{};

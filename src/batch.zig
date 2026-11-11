@@ -19,20 +19,16 @@ const Allocator = std.mem.Allocator;
 const na = @import("net_address.zig");
 const sys = @import("sys_union.zig");
 
-/// A syscall a datagram pays the kernel's entry and exit each time; eight
-/// to a call takes most of the saving.
 pub const max = 8;
 
-/// The address a datagram was sent to, in its sender's family: an IPv4 one
-/// fills the first four bytes.
 pub const Local = [16]u8;
 
 const PktInfo = extern struct {
     hdr: linux.cmsghdr,
     info: extern union { v4: linux.in_pktinfo, v6: linux.in6_pktinfo },
 
-    /// Interface 0: routing picks the way out. Unpadded: past 36 bytes the
-    /// kernel allocates to copy it in.
+    /// Interface 0 lets routing pick the way out. The returned length is
+    /// unpadded on purpose: past 36 bytes the kernel allocates to copy it in.
     fn set(p: *PktInfo, to: na.Address, source: Local) usize {
         p.* = switch (to) {
             .ip4 => .{
@@ -52,9 +48,6 @@ comptime {
     assert(@offsetOf(PktInfo, "info") == mem.alignForward(usize, @sizeOf(linux.cmsghdr), linux.cmsg_align));
 }
 
-/// For a wildcard socket, whose reply would otherwise leave from whichever
-/// address routing picks, and a client that asked another drops it
-/// (RFC 1123 §2.3).
 pub fn tellLocal(fd: posix.fd_t, af: u32) !void {
     const one: c_int = 1;
     if (af == posix.AF.INET)
@@ -63,7 +56,8 @@ pub fn tellLocal(fd: posix.fd_t, af: u32) !void {
         try posix.setsockopt(fd, posix.SOL.IPV6, linux.IPV6.RECVPKTINFO, &mem.toBytes(one));
 }
 
-/// Its headers point into it, so a batch lives on the heap and never moves.
+/// The headers point into the batch itself, so it lives on the heap and
+/// must never move.
 pub fn create(gpa: Allocator, size: usize) !*Batch {
     const b = try gpa.create(Batch);
     errdefer gpa.destroy(b);
@@ -82,7 +76,7 @@ pub fn destroy(b: *Batch, gpa: Allocator) void {
 }
 
 pub fn recv(b: *Batch, fd: posix.fd_t, want: usize) usize {
-    // The kernel writes the lengths it used over the room it was given.
+    // Reset each time: the kernel overwrites the room given with the lengths used.
     for (b.hdrs[0..want]) |*h| {
         h.hdr.namelen = @sizeOf(na.PosixAddress);
         h.hdr.controllen = @sizeOf(PktInfo);
@@ -140,7 +134,6 @@ pub fn flush(b: *Batch) void {
         at += switch (linux.errno(rc)) {
             .SUCCESS => rc,
             .INTR => 0,
-            // Refused: dropped as if lost on the way, and the rest still go.
             else => 1,
         };
     }

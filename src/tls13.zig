@@ -10,7 +10,6 @@ const X25519 = crypto.dh.X25519;
 const P256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const MlKem = crypto.kem.ml_kem.MLKem768;
 
-// The one suite RFC 8446 §9.1 makes mandatory, so one hash and one cipher.
 const Sha256 = crypto.hash.sha2.Sha256;
 const Hkdf = crypto.kdf.hkdf.HkdfSha256;
 const Hmac = crypto.auth.hmac.sha2.HmacSha256;
@@ -54,7 +53,6 @@ pub fn alert(err: Error) tls.Alert.Description {
 pub const Offer = struct {
     alpn: ?[]const u8,
     answerable: []const tls.ExtensionType = &.{},
-    /// Transport parameters, which make this QUIC's handshake (RFC 9001 §8).
     quic: ?[]const u8 = null,
 };
 
@@ -66,8 +64,6 @@ const max_peer_params = 512;
 const finished_len = 4 + Hmac.mac_length;
 const empty_certificate = [_]u8{@backingInt(tls.HandshakeType.certificate)} ++ tls.int(u24, 4) ++ [_]u8{ 0, 0, 0, 0 };
 
-/// Past this, the two messages read whole fail: ServerHello with the hybrid
-/// share needs ~1.2 KiB, EncryptedExtensions what few extensions it may hold.
 const max_held = 1536;
 
 const Shares = struct {
@@ -79,8 +75,6 @@ const Shares = struct {
 pub const Step = union(enum) {
     more,
     handshake: Secrets,
-    /// The server's Finished proved: send `flight` under the client's
-    /// handshake secret, and everything after under these.
     done: Done,
 
     pub const Done = struct {
@@ -115,8 +109,9 @@ const Stage = enum {
         };
     }
 
-    /// RFC 9539 §4.6.3.4: any certificate is accepted, so proof of holding
-    /// its key proves nothing. Both go through the transcript and no further.
+    /// Certificate and CertificateVerify are hashed into the transcript and
+    /// never examined. RFC 9539 §4.6.3.4: any certificate is accepted, so
+    /// proof of holding its key would prove nothing.
     fn held(s: Stage) bool {
         return switch (s) {
             .server_hello, .encrypted_extensions, .certificate_request, .finished => true,
@@ -183,7 +178,6 @@ pub const Handshake = struct {
 
         const fixed = tls.extension(.supported_versions, tls.array(u8, tls.ProtocolVersion, .{.tls_1_3})) ++
             tls.extension(.supported_groups, tls.array(u16, tls.NamedGroup, .{ .x25519_ml_kem768, .x25519, .secp256r1 })) ++
-            // Nothing is checked against these, so the list turns no server away.
             tls.extension(.signature_algorithms, tls.array(u16, tls.SignatureScheme, .{
                 .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp521r1_sha512,
                 .ed25519,                .ed448,                  .rsa_pss_rsae_sha256,
@@ -196,7 +190,6 @@ pub const Handshake = struct {
                 tls.int(u16, @backingInt(tls.NamedGroup.x25519)) ++ tls.array(u16, u8, x25519) ++
                 tls.int(u16, @backingInt(tls.NamedGroup.secp256r1)) ++ tls.array(u16, u8, p256.public_key.toUncompressedSec1())));
 
-        // An empty legacy_session_id, so no middlebox compatibility mode (§D.4).
         const before = .{@backingInt(tls.HandshakeType.client_hello)} ++ [3]u8{ 0, 0, 0 } ++
             tls.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++ random.* ++ [1]u8{0} ++
             tls.int(u16, 2) ++ tls.int(u16, suite) ++ [2]u8{ 1, 0 };
@@ -357,8 +350,6 @@ pub const Handshake = struct {
     fn agree(h: *const Handshake, body: []const u8) Error!Shared {
         var r: Reader = .{ .rest = body };
         if (try r.int(u16) != @backingInt(tls.ProtocolVersion.tls_1_2)) return error.ProtocolVersion;
-        // We offered a share for every group we named, so a retry could only
-        // be for a cookie; that server stays on Do53.
         if (mem.eql(u8, try r.bytes(32), &tls.hello_retry_request_sequence)) return error.HandshakeFailure;
         if (try r.int(u8) != 0) return error.IllegalParameter;
         if (try r.int(u16) != suite) return error.IllegalParameter;
@@ -441,7 +432,6 @@ pub const Handshake = struct {
                 try one.end();
                 if (!mem.eql(u8, chosen, offered)) return error.IllegalParameter;
             },
-            // §4.2.7: a server may tell its groups, for later hellos.
             .supported_groups => {},
             else => if (mem.findScalar(tls.ExtensionType, h.offer.answerable, e.kind) == null) return error.UnsupportedExtension,
         };
@@ -559,7 +549,6 @@ pub fn hex(comptime s: []const u8) [s.len / 2]u8 {
     return out;
 }
 
-/// RFC 8448 §3, the simple 1-RTT handshake.
 const trace = struct {
     const client_private = hex("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005");
     const client_hello = hex("010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece70000" ++

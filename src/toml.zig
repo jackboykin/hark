@@ -17,7 +17,6 @@ pub const Value = union(enum) {
 pub const Table = struct {
     map: std.StringHashMapUnmanaged(Value),
 
-    /// The value at `key` if it is a `kind`.
     pub fn get(t: Table, key: []const u8, comptime kind: std.meta.Tag(Value)) ?@FieldType(Value, @tagName(kind)) {
         const v = t.map.get(key) orelse return null;
         return if (v == kind) @field(v, @tagName(kind)) else null;
@@ -35,7 +34,7 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-/// Allocated from `arena` and freed with it; keys point into `input`.
+/// Keys point into `input`; everything else lives in `arena`.
 pub fn parse(arena: Allocator, input: []const u8) ParseError!Table {
     var root = Table{ .map = .empty };
     var section = &root.map;
@@ -67,7 +66,6 @@ pub fn parse(arena: Allocator, input: []const u8) ParseError!Table {
             if (!isValidBareKey(key)) return error.InvalidBareKey;
             if (raw_val.len == 0) return error.InvalidSyntax;
 
-            // An array may span lines, with comments between its elements.
             if (raw_val[0] == '[' and unquoted(raw_val, ']') == null) {
                 var joined: std.ArrayList(u8) = .empty;
                 try joined.appendSlice(arena, raw_val);
@@ -93,7 +91,6 @@ fn stripComment(line: []const u8) []const u8 {
     return mem.trim(u8, line[0..at], &std.ascii.whitespace);
 }
 
-/// Where `target` first appears outside a string.
 fn unquoted(text: []const u8, target: u8) ?usize {
     var in_string = false;
     var escaped = false;
@@ -153,10 +150,8 @@ fn parseString(arena: Allocator, raw: []const u8) ParseError![]const u8 {
     return error.UnterminatedString;
 }
 
-/// Only arrays of strings.
 fn parseArray(arena: Allocator, raw: []const u8) ParseError![]const []const u8 {
     const close = mem.findScalarLast(u8, raw, ']') orelse return error.InvalidSyntax;
-    // Trailing garbage, as in `key = ["x"] junk`, is a typo, not a comment.
     for (raw[close + 1 ..]) |c| if (!std.ascii.isWhitespace(c)) return error.InvalidSyntax;
     const inner = raw[1..close];
 

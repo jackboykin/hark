@@ -10,8 +10,8 @@ const Allocator = mem.Allocator;
 const Alignment = mem.Alignment;
 const testing = std.testing;
 
-/// Each chunk ends in its foot, and the arena points at the newest, so an
-/// allocation that fits touches the arena alone.
+/// Sits at the end of its chunk, so the newest foot's address is also where
+/// the room to allocate from ends.
 const Foot = struct {
     older: ?*Foot,
     base: [*]u8,
@@ -21,8 +21,7 @@ const Foot = struct {
     }
 };
 
-/// std.heap.ArenaAllocator's node header: chunks are sized as std sized
-/// its nodes, so a cell lands in the slab it was measured in.
+/// std.heap.ArenaAllocator's node header: chunks are sized as std sizes its nodes.
 const unheld = 24;
 
 pub fn init(child: Allocator) Arena {
@@ -41,8 +40,6 @@ pub fn allocator(a: *Arena) Allocator {
     return .{ .ptr = a, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
 
-/// Rewinds, keeping one chunk the size of all it held. What it gives back
-/// is undefined, so a safe build fills it with 0xaa.
 pub fn reset(a: *Arena) void {
     const newest = a.foot orelse return;
     if (newest.older == null) {
@@ -68,8 +65,6 @@ fn open(a: *Arena, size: usize, ra: usize) ?usize {
     return a.at;
 }
 
-/// No atomics: each of hark's arenas belongs to one thread, where
-/// std.heap.ArenaAllocator, lock-free, pays them on every allocation.
 fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     const a: *Arena = @ptrCast(@alignCast(ctx));
     const p = alignment.forward(a.at);
@@ -88,7 +83,7 @@ fn more(a: *Arena, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
         const p = alignment.forward(a.at);
         const size = mem.alignForward(usize, p + n + @sizeOf(Foot) - @intFromPtr(chunk.ptr), @alignOf(Foot));
         if (a.child.rawResize(chunk, .of(Foot), size, ra)) {
-            // The new room may lie over the old foot.
+            // Copied out first: the grown room may lie over the old foot.
             const foot = f.*;
             const moved: *Foot = @ptrCast(@alignCast(chunk.ptr + size - @sizeOf(Foot)));
             moved.* = foot;

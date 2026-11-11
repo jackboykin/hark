@@ -28,7 +28,6 @@ const Key = struct {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         h.update(zone.formatInto(&buf));
         const pair = try Ecdsa.KeyPair.generateDeterministic(h.finalResult());
-        // RFC 6605 §4: the uncompressed point without its 0x04 prefix.
         const sec1 = pair.public_key.toUncompressedSec1();
         const dnskey: dns.DnskeyData = .{ .flags = dns.DnskeyData.zone_flag, .protocol = 3, .algorithm = .ecdsap256sha256, .public_key = try arena.dupe(u8, sec1[1..]) };
         const tag = rrsig.keyTag(dnskey);
@@ -42,8 +41,6 @@ const Key = struct {
     }
 };
 
-/// A scenario's keys and every signature made with them, kept across its
-/// runs: signing is deterministic, so a set signed again is the same bytes.
 pub const Mint = struct {
     arena: Allocator,
     keys: []Key,
@@ -59,12 +56,9 @@ pub const Mint = struct {
 pub const Signer = struct {
     arena: Allocator,
     mint: *Mint,
-    /// Wall seconds at minting.
     now: i64,
     validity: i64,
     original_ttl: ?u32,
-    /// Where each zone signed something: the addresses answering its
-    /// DNSKEY. A forced signer (SIGN_AS) registers nothing.
     served: std.ArrayList(Served) = .empty,
 
     const Served = struct { address: na.Address, key: *const Key };
@@ -73,12 +67,11 @@ pub const Signer = struct {
         return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400, .original_ttl = scenario.sig_original_ttl };
     }
 
-    /// The first declared zone's DS: the root, by the loader's rule.
+    /// The parser makes the first declared zone the root.
     pub fn anchor(self: *const Signer) ?[]const dns.DsData {
         return if (self.mint.keys.len > 0) (&self.mint.keys[0].ds)[0..1] else null;
     }
 
-    /// The ranges with placeholder DS records filled in and RRSIGs appended.
     pub fn bake(self: *Signer, ranges: []const rpl.Range) ![]const rpl.Range {
         if (self.mint.keys.len == 0) return ranges;
         const out = try self.arena.dupe(rpl.Range, ranges);
@@ -108,7 +101,6 @@ pub const Signer = struct {
     fn bakeSection(self: *Signer, rrs: []const RR, ds_from: []const rpl.DsFrom, cuts: []const dns.Name, forced: ?*const Key, address: na.Address, wildcard: ?dns.Name) ![]const RR {
         var out: std.ArrayList(RR) = .empty;
         try out.appendSlice(self.arena, rrs);
-        // Key tag 0: a placeholder DS.
         for (out.items) |*rr| if (rr.rtype == .ds and rr.ds().key_tag == 0) {
             var zone = rr.name;
             for (ds_from) |d| if (d.owner.eql(rr.name)) {
@@ -124,8 +116,7 @@ pub const Signer = struct {
             var first = true;
             for (originals[0..i]) |prev| first = first and !(prev.rclass == .in and prev.rtype == head.rtype and prev.name.eql(head.name));
             if (!first) continue;
-            // RFC 6672 §5.3.1: a CNAME synthesised under a DNAME travels
-            // unsigned.
+            // RFC 6672 §5.3.1: a CNAME synthesised under a DNAME travels unsigned.
             var synthesised = false;
             if (head.rtype == .cname) for (originals) |o| {
                 synthesised = synthesised or (o.rclass == .in and o.rtype == .dname and !head.name.eql(o.name) and head.name.isSubdomainOf(o.name));
@@ -133,9 +124,8 @@ pub const Signer = struct {
             if (synthesised) continue;
             const key = forced orelse self.keyFor(head.name, head.rtype, cuts) orelse continue;
             if (forced == null) try self.register(address, key);
-            // A signature by another zone, or of a reserved algorithm
-            // (123-251, RFC 6014 §4), is stuffing, not the set's: the set
-            // is still signed.
+            // A scenario's own RRSIG stands in for ours, unless it is by another zone or
+            // of a reserved algorithm (123-251, RFC 6014 §4): that is stuffing.
             var covered = false;
             for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rrsig().type_covered == head.rtype and o.rrsig().signer_name.eql(key.zone) and !reservedAlgorithm(@backingInt(o.rrsig().algorithm)));
             if (covered) continue;
@@ -146,9 +136,8 @@ pub const Signer = struct {
         return out.items;
     }
 
-    /// The deepest signed zone enclosing the owner; a DS, or an NSEC exactly
-    /// at a cut, is the parent's; anything else at or below a cut is nobody's
-    /// here.
+    /// A DS, or an NSEC exactly at a cut, is the parent's to sign; anything
+    /// else at or below a cut is the child's or glue, and unsigned here.
     fn keyFor(self: *const Signer, owner: dns.Name, rtype: dns.RType, cuts: []const dns.Name) ?*const Key {
         if (rtype == .ds) return self.deepest(owner, true);
         for (cuts) |c| if (c.eql(owner) and rtype == .nsec) return self.deepest(owner, true);
@@ -156,8 +145,6 @@ pub const Signer = struct {
         return self.deepest(owner, false);
     }
 
-    /// WILDCARD relabels only what the wildcard's zone could have
-    /// synthesised from it: a set it signs below the wildcard's parent.
     fn expands(self: *const Signer, wildcard: ?dns.Name, owner: dns.Name, key: *const Key, forced: ?*const Key) bool {
         const w = wildcard orelse return false;
         const parent = w.parent().?;
@@ -187,8 +174,6 @@ pub const Signer = struct {
         try self.served.append(self.arena, .{ .address = address, .key = key });
     }
 
-    /// One RRSIG over `set` (one owner and type); with `wildcard`, as
-    /// an expansion of that owner.
     pub fn sign(self: *Signer, key: *const Key, set: rrsig.Canonical, wildcard: ?dns.Name) !RR {
         const head = set.records[0];
         var sig: dns.RrsigData = .{
@@ -215,8 +200,6 @@ pub const Signer = struct {
         return .init(self.arena, .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } });
     }
 
-    /// An unmatched DNSKEY question: the zone's key, self-signed, from an
-    /// address that signs as it.
     pub fn dnskeyAnswer(self: *Signer, address: na.Address, q: dns.Question) !?[]const RR {
         if (q.qtype != .dnskey) return null;
         for (self.served.items) |s| {

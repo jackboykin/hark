@@ -21,10 +21,8 @@ pub const Own = struct {
         nodata,
         answer: []const dns.RData,
     },
-    /// Only home.arpa and service.arpa are specified as zones. The rest
-    /// are hark's own synthesis, AA clear and SOA-less: their RFCs want
-    /// answers (RFC 6761 §6.3, RFC 7686 §2, RFC 8880 §7.2) no SOA could
-    /// agree with.
+    /// Only home.arpa and service.arpa are zones, answered with AA and an SOA.
+    /// The rest get neither: their RFCs fix answers no SOA could agree with.
     zone: ?*const Zone = null,
 };
 
@@ -48,13 +46,8 @@ const own_zones = [_]Zone{ .of("home.arpa"), .of("service.arpa") };
 
 const loopback4: []const dns.RData = &.{.{ .a = .{ 127, 0, 0, 1 } }};
 const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1} }};
-/// RFC 7050 §8.
 const ipv4only: []const dns.RData = &.{ .{ .a = .{ 192, 0, 0, 170 } }, .{ .a = .{ 192, 0, 0, 171 } } };
 
-/// hark's own answer to the question, or null: ask the DNS. Names the spec
-/// reserves from the DNS would leak queries, and their metadata, to the
-/// root. example. and example.{com,net,org} are not among them: IANA serves
-/// them correctly, and intercepting them breaks documentation tests.
 pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     const n = name.depth();
     if (n == 0) return null;
@@ -72,14 +65,12 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
         return switch (qtype) {
             .soa => .{ .is = .{ .answer = z.soa }, .zone = z },
             .ns => .{ .is = .{ .answer = z.ns }, .zone = z },
-            // arpa delegates the apex, and its DS is asked there, with DO
-            // and only then.
+            // The DS question is arpa's, which delegates the apex: with DO it is
+            // asked there, for a denial a validator can check.
             .ds => if (do_bit) null else .{ .is = .nodata, .zone = z },
             else => .{ .is = .nodata, .zone = z },
         };
     };
-    // Only forwarders must pass ipv4only.arpa to an upstream DNS64; hark
-    // never forwards, and NODATA for AAAA tells a stub there is no NAT64.
     if (is(second, "ipv4only")) {
         if (n > 2) return .{ .is = .nxdomain };
         return switch (qtype) {
@@ -91,11 +82,9 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     return null;
 }
 
-/// At or below a name whose answer its RFC fixes, which no operator may
-/// send elsewhere: localhost (RFC 6761 §6.3), invalid (§6.4), onion (RFC
-/// 7686 §2), ipv4only.arpa (RFC 8880 §7.1). test is the operator's "by
-/// default" only (RFC 6761 §6.2); home.arpa and service.arpa may be
-/// served (RFC 8375 §4.4.B, RFC 6303 §3).
+/// Names whose answer an RFC fixes, which no operator may send elsewhere.
+/// `test` is absent on purpose (RFC 6761 §6.2 is only a default), as are
+/// home.arpa and service.arpa, which an operator may serve (RFC 8375 §4.4.B).
 pub fn fixed(name: dns.Name) bool {
     const n = name.depth();
     if (n == 0) return false;
@@ -108,7 +97,6 @@ fn is(label: []const u8, word: []const u8) bool {
     return std.mem.eql(u8, label, word);
 }
 
-/// hark's own reply to a special-use name.
 pub const Synthesized = struct {
     rcode: dns.RCode = .no_error,
     aa: bool = false,
@@ -135,7 +123,6 @@ fn records(allocator: mem.Allocator, owner: dns.Name, rtype: dns.RType, rdatas: 
     return rrs;
 }
 
-/// RFC 6303 §3's TTL, for every answer hark makes itself.
 const ttl: u32 = 10800;
 
 const testing = std.testing;
@@ -174,11 +161,8 @@ test "classify no match falls through" {
     try expectOwn(null, "notlocalhost.", .a);
     try expectOwn(null, "testing.com", .a);
     try expectOwn(null, "arpa", .a);
-    // A literal dot inside a label is not a subdomain boundary: `foo\.invalid`
-    // is one label and must resolve, not synthesize NXDOMAIN.
     try expectOwn(null, "foo\\.invalid", .a);
     try expectOwn(null, "bar\\.test.example.com", .a);
-    // ...but an escaped backslash before the dot leaves it a real boundary.
     try expectOwn(.{ .is = .nxdomain }, "x\\\\.invalid", .a);
 }
 
