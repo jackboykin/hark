@@ -20,6 +20,7 @@ const mem = std.mem;
 const na = @import("net_address.zig");
 const sys = @import("sys_union.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const dot = @import("dot.zig");
 const tls13 = @import("tls13.zig");
@@ -28,7 +29,7 @@ const carrier = @import("carrier.zig");
 
 const Carrier = carrier.Carrier;
 const Kind = carrier.Kind;
-const CellId = graph.CellId;
+const CellId = model.CellId;
 const Exchange = graph.Exchange;
 const Event = Edge.Event;
 

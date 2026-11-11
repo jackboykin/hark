@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const walk = @import("walk.zig");
 const store = @import("store.zig");
 const rand = @import("rand.zig");
@@ -125,7 +126,7 @@ pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
     return .{ .rcode = .server_failure, .question = q, .cacheable = false, .ede = ede };
 }
 
-fn servfailOf(q: dns.Question, why: graph.Failure) Served {
+fn servfailOf(q: dns.Question, why: model.Failure) Served {
     var s = servfail(q, .{ .code = why.code, .text = why.text });
     s.theirs = why.cause != .zone;
     return s;
@@ -236,7 +237,7 @@ pub const Desk = struct {
         return if (Dns64.on(d.dns64, c)) |x| try x.asked(arena, q) else q;
     }
 
-    pub fn built(d: *Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
+    pub fn built(d: *Desk, arena: Allocator, root: model.CellId, q: dns.Question, c: Client) !Served {
         return build(d, arena, root, try d.asked(arena, q, c), c);
     }
 
@@ -248,7 +249,7 @@ pub const Desk = struct {
         return .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
     }
 
-    pub fn finish(d: *Desk, arena: Allocator, q: dns.Question, c: Client, served: Served, a: ?graph.CellId) !Served {
+    pub fn finish(d: *Desk, arena: Allocator, q: dns.Question, c: Client, served: Served, a: ?model.CellId) !Served {
         const x = Dns64.on(d.dns64, c) orelse return served;
         const from = if (a) |id| try build(d, arena, id, aOf(q), c) else null;
         return try x.shape(arena, q, served, from);
@@ -296,7 +297,7 @@ fn hopOf(d: *const Desk, b: *store.Blob, r: store.Rrset) Hop {
     return .{ .blob = b, .rrset = r, .floor = floor };
 }
 
-fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
+fn build(d: *const Desk, arena: Allocator, root: model.CellId, q: dns.Question, c: Client) !Served {
     const g = d.g;
     if (failureOf(g, root, c.cd)) |why| return try stale(d, arena, q, c) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
@@ -323,7 +324,7 @@ fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, 
     return shape(d, arena, q, c, hops, secure, g.cell(root).expires() > g.now());
 }
 
-pub fn failureOf(g: *graph.Graph, root: graph.CellId, cd: bool) ?graph.Failure {
+pub fn failureOf(g: *graph.Graph, root: model.CellId, cd: bool) ?model.Failure {
     if (g.cell(root).failure()) |why| return why;
     if (cd) return null;
     for (g.cell(root).state.fact.answer.hops) |h| {
@@ -454,7 +455,7 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
         .ad = secure and (c.do_bit or c.ad),
         // A stub zone may rightly give private addresses, and a chain's addresses
         // are all in its last hop.
-        .local = @as(graph.Kind, @fromBackingInt(last.blob.kind)) == .stub,
+        .local = @as(model.Kind, @fromBackingInt(last.blob.kind)) == .stub,
         .question = q,
         .answers = answers.items,
         .authorities = authorities.items,

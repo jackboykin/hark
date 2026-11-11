@@ -7,24 +7,18 @@ const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const denial = @import("denial.zig");
 const walk = @import("walk.zig");
 
 const Graph = graph.Graph;
-const CellId = graph.CellId;
-const OptionalCellId = graph.OptionalCellId;
-const Failure = graph.Failure;
+const CellId = model.CellId;
+const OptionalCellId = model.OptionalCellId;
+const Failure = model.Failure;
 const RR = dns.ResourceRecord;
 
-/// `absent`, for `ds` and `dnskey` only: the parent's signed denial shows no
-/// delegation, so the name is no zone. Bogus is not a value: it fails.
-const Proof = enum(u8) { secure, insecure, absent };
-
-pub const Chain = struct {
-    status: Proof,
-    records: []const RR = &.{},
-    proven_until_ns: i64 = std.math.maxInt(i64),
-};
+const Proof = model.Proof;
+const Chain = model.Chain;
 
 pub const DsScratch = struct {
     parent: OptionalCellId = .none,
@@ -122,7 +116,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .failed => |why| return g.fail(id, why),
         .cut => |cid| g.cell(cid).state.fact.cut.zone,
     };
-    if (s.keys == .none) s.keys = .wrap(try g.demand(id, graph.Key.of(.dnskey, parent_zone, .a), parent_zone) orelse
+    if (s.keys == .none) s.keys = .wrap(try g.demand(id, model.Key.of(.dnskey, parent_zone, .a), parent_zone) orelse
         return g.fail(id, .unreachable_authority));
     const parent_keys = g.cell(s.keys.unwrap().?);
     if (!parent_keys.settled()) return;
@@ -133,7 +127,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .secure, .absent => {},
         .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires()),
     }
-    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .ds), zone) orelse
+    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, model.Key.of(.rrset, zone, .ds), zone) orelse
         return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
@@ -175,7 +169,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             .yxdomain => null,
         } orelse return .bogus;
         if (!proof.isProperAncestor(signer, zone)) return .bogus;
-        s.signer = .wrap(try g.demand(id, graph.Key.of(.dnskey, signer, .a), signer) orelse
+        s.signer = .wrap(try g.demand(id, model.Key.of(.dnskey, signer, .a), signer) orelse
             return .unreachable_authority);
     };
     const signer = keys.name;
@@ -222,8 +216,8 @@ pub fn runAhead(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.ahead;
     const name = g.cell(id).name;
     if (s.judge == .none) s.judge = .wrap(switch (g.cell(id).key.rtype) {
-        .dnskey => try g.demand(id, graph.Key.of(.dnskey, name, .a), name),
-        .ds => try g.demand(id, graph.Key.of(.ds, name, .a), name),
+        .dnskey => try g.demand(id, model.Key.of(.dnskey, name, .a), name),
+        .ds => try g.demand(id, model.Key.of(.ds, name, .a), name),
         else => try demandSecure(g, id, s.rrset.unwrap() orelse return g.settle(id, .ahead, g.now())),
     } orelse return g.settle(id, .ahead, g.now()));
     if (g.cell(s.judge.unwrap().?).settled()) try g.settle(id, .ahead, g.now());
@@ -232,9 +226,9 @@ pub fn runAhead(g: *Graph, id: CellId) !void {
 pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
     var z = zone;
     while (true) {
-        if (try g.peek(graph.Key.of(.ds, z, .a))) |f| return f.value.ds.status == .secure;
+        if (try g.peek(model.Key.of(.ds, z, .a))) |f| return f.value.ds.status == .secure;
         if (z.isRoot()) return true;
-        const ds = try g.peek(graph.Key.of(.rrset, z, .ds)) orelse return false;
+        const ds = try g.peek(model.Key.of(.rrset, z, .ds)) orelse return false;
         if (ds.value.rrset.kind != .answer or !dnssec.anySupportedDs(ds.value.rrset.answers)) return false;
         const above = ds.value.rrset.zone;
         if (!proof.isProperAncestor(above, z)) return false;
@@ -245,17 +239,17 @@ pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
-    if (s.ds == .none) s.ds = .wrap(try g.demand(id, graph.Key.of(.ds, zone, .a), zone) orelse
+    if (s.ds == .none) s.ds = .wrap(try g.demand(id, model.Key.of(.ds, zone, .a), zone) orelse
         return g.fail(id, .unreachable_authority));
     // Looks redundant with the demand below, but this one runs before the
     // DS settles: a zone likely to be signed gets its keys fetched alongside.
     if (s.rrset == .none and try signedDown(g, zone))
-        s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .dnskey), zone));
+        s.rrset = .wrap(try g.demand(id, model.Key.of(.rrset, zone, .dnskey), zone));
     const ds = g.cell(s.ds.unwrap().?);
     if (!ds.settled()) return;
     if (ds.failure()) |why| return g.fail(id, why);
     if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires());
-    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(.rrset, zone, .dnskey), zone) orelse
+    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, model.Key.of(.rrset, zone, .dnskey), zone) orelse
         return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
@@ -277,7 +271,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     const t = g.cell(rid);
     std.debug.assert(t.state == .fact);
-    const key = graph.Key.of(.secure, t.name, t.key.rtype);
+    const key = model.Key.of(.secure, t.name, t.key.rtype);
     if (g.indexed(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == g.gen(rid);
@@ -299,7 +293,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
     const zone = t.state.fact.rrset.zone;
-    if (s.zone_ds == .none) s.zone_ds = .wrap(try g.demand(id, graph.Key.of(.ds, zone, .a), zone) orelse
+    if (s.zone_ds == .none) s.zone_ds = .wrap(try g.demand(id, model.Key.of(.ds, zone, .a), zone) orelse
         return g.fail(id, .unreachable_authority));
     const zd = g.cell(s.zone_ds.unwrap().?);
     if (!zd.settled()) return;
@@ -349,7 +343,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         var it: Claims = .{ .r = r, .qtype = qtype };
         while (it.next()) |c| {
             const signer = signerOf(r, c, within, no_bound) orelse continue;
-            const key = graph.Key.of(.dnskey, signer, .a);
+            const key = model.Key.of(.dnskey, signer, .a);
             if (!g.holds(key) and g.indexed(key) == null) try g.fetchKeys(signer);
         }
     }
@@ -365,7 +359,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
             },
             .rrset, .proof, .denial => {
                 const signer = signerOf(r, c, within, s.below) orelse break :f .bogus;
-                if (!keysOf(g, s.key, signer)) s.key = .wrap(try g.demand(id, graph.Key.of(.dnskey, signer, .a), signer));
+                if (!keysOf(g, s.key, signer)) s.key = .wrap(try g.demand(id, model.Key.of(.dnskey, signer, .a), signer));
                 const kid = s.key.unwrap() orelse break :f .unreachable_authority;
                 const kc = g.cell(kid);
                 if (!kc.settled()) {
@@ -446,12 +440,12 @@ fn keysOf(g: *Graph, key: OptionalCellId, signer: dns.Name) bool {
     return g.cell(kid).name.eql(signer);
 }
 
-const max_claims = 2 * graph.max_links + 2 + max_proof_claims;
+const max_claims = 2 * model.max_links + 2 + max_proof_claims;
 /// `Claims` yields proof claims first, so their slots stay below this and
 /// may index `proved`.
 const max_proof_claims = proof.max_proof_records + 1;
 
-fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
+fn flooded(r: *const model.Reply, qtype: dns.RType) bool {
     if (proof.proofFlood(r.authorities)) return true;
     var it: Claims = .{ .r = r, .qtype = qtype };
     var n: usize = 0;
@@ -465,7 +459,7 @@ fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
 }
 
 const Claims = struct {
-    r: *const graph.Reply,
+    r: *const model.Reply,
     qtype: dns.RType,
     p: usize = 0,
     i: usize = 0,
@@ -523,14 +517,14 @@ const Claims = struct {
         return .{ .slot = it.slot, .owner = owner, .rtype = rtype, .head = head, .is = is };
     }
 
-    fn at(r: *const graph.Reply, qtype: dns.RType, slot: u8) Claim {
+    fn at(r: *const model.Reply, qtype: dns.RType, slot: u8) Claim {
         var it: Claims = .{ .r = r, .qtype = qtype };
         while (it.next()) |c| if (c.slot == slot) return c;
         unreachable;
     }
 };
 
-fn signerOf(r: *const graph.Reply, c: Claims.Claim, within: dns.Name, below: u8) ?dns.Name {
+fn signerOf(r: *const model.Reply, c: Claims.Claim, within: dns.Name, below: u8) ?dns.Name {
     const signer = switch (c.is) {
         .rrset => dnssec.signerBelow(r.answers, c.owner, c.rtype, below),
         .proof => dnssec.signerBelow(r.authorities, c.owner, c.rtype, below),
@@ -559,12 +553,12 @@ const Probe = struct {
             p.depth = @max(p.depth, above.depth()) + 1;
             if (p.depth > deepest.depth()) return .none;
             const candidate = deepest.ancestor(p.depth);
-            p.cell = .wrap(try g.demand(id, graph.Key.of(.ds, candidate, .a), candidate) orelse return .{ .stopped = .unreachable_authority });
+            p.cell = .wrap(try g.demand(id, model.Key.of(.ds, candidate, .a), candidate) orelse return .{ .stopped = .unreachable_authority });
         }
     }
 };
 
-fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !struct { rrs: []const RR, until: []const i64 } {
+fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !struct { rrs: []const RR, until: []const i64 } {
     const a = g.scratch.allocator();
     var keep: std.ArrayList(RR) = .empty;
     var until: std.ArrayList(i64) = .empty;
@@ -584,7 +578,7 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const 
 
 /// Drops the signatures the verifier did not weigh before a verdict is
 /// stamped on the bytes. Only signatures go, so claim slots do not move.
-fn keepWeighed(g: *Graph, target: CellId, r: *const graph.Reply, c: *const Claims.Claim, zone: dns.Name, now: u32) !void {
+fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, zone: dns.Name, now: u32) !void {
     const section = if (c.is == .proof) r.authorities else r.answers;
     const set = dnssec.setFrom(section, c.head);
     var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), section.len);
@@ -609,10 +603,10 @@ fn firstOfRrset(rrs: []const RR, i: usize) bool {
 
 /// On a denial only the NSEC or NSEC3 proof is kept: the child's NS in a
 /// denial's authority would read as a referral.
-pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !?graph.Reply {
+pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !?model.Reply {
     const ds = dnssec.setAt(msg.authorities, child, .ds);
     if (ds.len > 0) {
-        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = ds, .zone = zone, .stored_ns = g.now() };
+        var reply: model.Reply = .{ .kind = .answer, .aa = true, .answers = ds, .zone = zone, .stored_ns = g.now() };
         reply.ttl = walk.replyTtl(reply);
         return reply;
     }

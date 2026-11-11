@@ -10,6 +10,7 @@ const dnssec = @import("dnssec.zig");
 const rrsig = @import("rrsig.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const trust = @import("trust.zig");
 const proof = @import("proof.zig");
 const denial = @import("denial.zig");
@@ -18,14 +19,14 @@ const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
 
 const Graph = graph.Graph;
-const CellId = graph.CellId;
-const OptionalCellId = graph.OptionalCellId;
-const Key = graph.Key;
+const CellId = model.CellId;
+const OptionalCellId = model.OptionalCellId;
+const Key = model.Key;
 const Need = graph.Need;
-const Reply = graph.Reply;
-const Failure = graph.Failure;
+const Reply = model.Reply;
+const Failure = model.Failure;
 
-const max_links = graph.max_links;
+const max_links = model.max_links;
 
 const max_servers = delegation.max_servers_per_level;
 
@@ -174,12 +175,12 @@ pub const Ask = struct {
         return true;
     }
 
-    fn seed(a: *Ask, g: *Graph, cut: graph.Cut) void {
+    fn seed(a: *Ask, g: *Graph, cut: model.Cut) void {
         var found = a.gather(g);
         a.more = reach(g, a, &found, a.take(cut));
     }
 
-    fn take(a: *Ask, cut: graph.Cut) []const graph.Server {
+    fn take(a: *Ask, cut: model.Cut) []const model.Server {
         a.placed_until_ns = @min(a.placed_until_ns, cut.placed_until_ns);
         return cut.servers;
     }
@@ -231,7 +232,7 @@ pub const AddrScratch = struct {
 
 pub const AnswerScratch = struct {
     budget: *graph.Budget = undefined,
-    hops: [max_links + 1]graph.Answer.Hop = undefined,
+    hops: [max_links + 1]model.Answer.Hop = undefined,
     n: u8 = 0,
     judged: u8 = 0,
 };
@@ -301,7 +302,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 .broken => |why| return failAnswer(g, id, why),
             }
         }
-        const from: ?graph.Kind = if (s.n == 0) null else g.cell(s.hops[s.n - 1].set).key.kind;
+        const from: ?model.Kind = if (s.n == 0) null else g.cell(s.hops[s.n - 1].set).key.kind;
         const hop_kind = g.hopKind(from, next, qtype) orelse return failAnswer(g, id, into_stub);
         const own = if (s.n == 0) g.cell(id).key.at(hop_kind, qtype) else Key.of(hop_kind, next, qtype);
         s.hops[s.n] = .{ .set = try g.demandHop(id, own, next) orelse
@@ -324,7 +325,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
 }
 
 /// Where the settled hops lead: on to another name, to the end, or nowhere.
-fn follow(g: *Graph, hops: []const graph.Answer.Hop, qtype: dns.RType) Links.Step {
+fn follow(g: *Graph, hops: []const model.Answer.Hop, qtype: dns.RType) Links.Step {
     var links: Links = .{};
     var step: Links.Step = .done;
     for (hops) |h| {
@@ -337,10 +338,10 @@ fn follow(g: *Graph, hops: []const graph.Answer.Hop, qtype: dns.RType) Links.Ste
     return step;
 }
 
-fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
+fn settleAnswer(g: *Graph, id: CellId, a: model.Answer, expires: i64) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
-    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(graph.Answer.Hop, a.hops) } }, expires);
+    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(model.Answer.Hop, a.hops) } }, expires);
 }
 
 fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
@@ -348,7 +349,7 @@ fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
     try g.fail(id, why);
 }
 
-fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
+fn lapsing(g: *Graph, hops: []const model.Answer.Hop) ?i64 {
     var first: ?store.Life = null;
     for (hops) |h| {
         const c = g.cell(h.set);
@@ -712,7 +713,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     const placed = @min(zone_placed_until_ns, now + @as(i64, ns_ttl) * std.time.ns_per_s);
     var expires = placed;
     const sa = g.scratch.allocator();
-    const servers = try sa.alloc(graph.Server, ref.ns_count);
+    const servers = try sa.alloc(model.Server, ref.ns_count);
     for (servers, ref.ns_names[0..ref.ns_count]) |*server, host| {
         const key = Key.of(.addr, try host.clone(sa), .a);
         var glue: std.ArrayList(na.AddressKey) = .empty;
@@ -725,7 +726,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         };
         server.* = .{ .key = key, .glue = glue.items };
     }
-    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
+    const cut: model.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
     try g.publish(Key.of(.cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
     if (g.cfg.trust_anchors != null) {
         if (try trust.referralDs(g, msg, zone, ref.zone_cut)) |ds| try g.publish(Key.of(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
@@ -1101,7 +1102,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
                 return gatherServers(g, id, a);
             },
         };
-        const servers: []const graph.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
+        const servers: []const model.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
         const partial = reach(g, a, &found, servers);
         if (found.new == 0 or a.fetched_unglued) try learn(g, id, a, &found, servers, &left);
         a.more = if (a.fetched_unglued) left.awaited else partial;
@@ -1167,7 +1168,7 @@ const Left = struct {
 
 /// A glued server is reached at its glue alone: what its own zone says of it
 /// never changes how it is reached.
-fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const graph.Server) bool {
+fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const model.Server) bool {
     var partial = false;
     for (servers) |server| {
         if (server.glue.len > 0) {
@@ -1186,7 +1187,7 @@ fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const graph.Server) b
     return partial;
 }
 
-fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const graph.Server, left: *Left) !void {
+fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const model.Server, left: *Left) !void {
     for (servers) |server| {
         if (server.glue.len > 0) continue;
         var unknown: [families.len]bool = @splat(false);

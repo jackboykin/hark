@@ -9,6 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sign = @import("sign.zig");
 const graph = @import("../graph.zig");
+const model = @import("../model.zig");
 const chaos = @import("../chaos.zig");
 
 const Need = graph.Need;
@@ -116,7 +117,7 @@ pub const Sim = struct {
             return s.schedule(ex.id, s.now_ns, 0, .unsent);
         }
         if (s.chaos) |ch| if (ch.live(.carrier)) {
-            const key = graph.Key.of(.rrset, q.name, q.qtype);
+            const key = model.Key.of(.rrset, q.name, q.qtype);
             const event = ch.peek(.carrier, key);
             try ch.spend(.carrier, key);
             if (try ch.choose(.carrier, event, 4, .{ .key = key }) != 0) return s.schedule(ex.id, s.now_ns, 0, .moved);

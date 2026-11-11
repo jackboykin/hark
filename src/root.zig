@@ -23,6 +23,7 @@ test {
     _ = @import("dns64.zig");
     _ = @import("dnssec.zig");
     _ = @import("edge.zig");
+    _ = @import("model.zig");
     _ = @import("fuzz_nsec.zig");
     _ = @import("fuzz_wire.zig");
     _ = @import("graph.zig");

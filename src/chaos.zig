@@ -2,7 +2,7 @@
 //! make, at each `Site`, and the events that drew, for shrinking a failure.
 const std = @import("std");
 const dns = @import("dns.zig");
-const graph = @import("graph.zig");
+const model = @import("model.zig");
 const na = @import("net_address.zig");
 
 pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier };
@@ -10,7 +10,7 @@ pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch
 pub const Events = std.array_hash_map.Auto(u64, void);
 
 const About = union(enum) {
-    key: graph.Key,
+    key: model.Key,
     server: na.AddressKey,
     none,
 };
@@ -38,12 +38,12 @@ pub const Chaos = struct {
         return std.hash.Wyhash.hash(c.seed, std.mem.asBytes(&site)) & 1 == 1;
     }
 
-    pub fn peek(c: *const Chaos, site: Site, key: graph.Key) u64 {
+    pub fn peek(c: *const Chaos, site: Site, key: model.Key) u64 {
         const of = c.keyed(site, key);
         return c.named(site, of ^ @as(u64, c.decided.get(of) orelse 0));
     }
 
-    pub fn spend(c: *Chaos, site: Site, key: graph.Key) !void {
+    pub fn spend(c: *Chaos, site: Site, key: model.Key) !void {
         const n = try c.decided.getOrPut(c.gpa, c.keyed(site, key));
         n.value_ptr.* = if (n.found_existing) n.value_ptr.* + 1 else 1;
     }
@@ -55,7 +55,7 @@ pub const Chaos = struct {
         return h.final();
     }
 
-    fn keyed(c: *const Chaos, site: Site, key: graph.Key) u64 {
+    fn keyed(c: *const Chaos, site: Site, key: model.Key) u64 {
         var h = std.hash.Wyhash.init(c.seed);
         h.update(std.mem.asBytes(&site));
         h.update(std.mem.asBytes(&key.kind));

@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const answer = @import("answer.zig");
 const Arena = @import("arena.zig");
 const slab = @import("slab.zig");
@@ -79,8 +80,8 @@ const slot_mask = (1 << slot_bits) - 1;
 const max_conns = 1 << (slot_bits - 1);
 
 const Pending = struct {
-    root: graph.CellId,
-    a: ?graph.CellId = null,
+    root: model.CellId,
+    a: ?model.CellId = null,
     query: dns.Query,
     question_bytes: []u8 = &.{},
     owes: Owes,
@@ -559,7 +560,7 @@ const Server = struct {
         s.vacate(i);
     }
 
-    fn reach(s: *Server, id: graph.CellId) !void {
+    fn reach(s: *Server, id: model.CellId) !void {
         if (id >= s.heads.items.len) try s.heads.appendNTimes(s.gpa, Pending.none, id + 1 - s.heads.items.len);
     }
 

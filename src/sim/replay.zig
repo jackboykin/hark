@@ -10,6 +10,7 @@ const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
 const sign = @import("sign.zig");
 const graph = @import("../graph.zig");
+const model = @import("../model.zig");
 const answer = @import("../answer.zig");
 const response = @import("../response.zig");
 const rebinding = @import("../rebinding.zig");
@@ -249,8 +250,8 @@ const Run = struct {
 };
 
 const Held = struct {
-    roots: [2]?graph.CellId = .{ null, null },
-    kept: std.ArrayList(graph.CellId) = .empty,
+    roots: [2]?model.CellId = .{ null, null },
+    kept: std.ArrayList(model.CellId) = .empty,
 };
 
 fn unholdAll(g: *graph.Graph, held: *Held) void {
@@ -453,7 +454,7 @@ fn leave(g: *graph.Graph, held: *Held) !?answer.Served {
     return null;
 }
 
-fn settleBy(g: *graph.Graph, s: *sim.Sim, root: graph.CellId, until: i64) !bool {
+fn settleBy(g: *graph.Graph, s: *sim.Sim, root: model.CellId, until: i64) !bool {
     while (!g.cell(root).settled()) {
         const ev = s.next(until) orelse return false;
         try g.complete(ev.id, ev.completion);

@@ -5,12 +5,13 @@ const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const special_use = @import("special_use.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const walk = @import("walk.zig");
 const delegation = @import("delegation.zig");
 
 const Graph = graph.Graph;
-const CellId = graph.CellId;
-const Failure = graph.Failure;
+const CellId = model.CellId;
+const Failure = model.Failure;
 
 pub const Zone = struct {
     apex: dns.Name,

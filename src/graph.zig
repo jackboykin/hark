@@ -28,27 +28,15 @@ const store = @import("store.zig");
 const walk = @import("walk.zig");
 const stub = @import("stub.zig");
 const chaos = @import("chaos.zig");
-
-/// A DNAME and its synthesised CNAME count once. Chains in the wild run to
-/// 12; resolvers stop at 10 to 19.
-pub const max_links = 14;
-
-pub const CellId = u32;
-
-pub const OptionalCellId = enum(CellId) {
-    none = std.math.maxInt(CellId),
-    _,
-
-    pub fn wrap(id: ?CellId) OptionalCellId {
-        const i = id orelse return .none;
-        std.debug.assert(i != @backingInt(OptionalCellId.none));
-        return @fromBackingInt(i);
-    }
-
-    pub fn unwrap(o: OptionalCellId) ?CellId {
-        return if (o == .none) null else @backingInt(o);
-    }
-};
+const model = @import("model.zig");
+const CellId = model.CellId;
+const OptionalCellId = model.OptionalCellId;
+const Kind = model.Kind;
+const Key = model.Key;
+const Reply = model.Reply;
+const Outcome = model.Outcome;
+const Failure = model.Failure;
+const Value = model.Value;
 
 pub const Need = enum {
     datagram,
@@ -126,57 +114,6 @@ pub const Edge = struct {
     }
 };
 
-/// `parental` is held for the denial index alone and is never a cell.
-pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
-
-pub const Key = struct {
-    kind: Kind,
-    rtype: dns.RType,
-    name: []const u8,
-    name_hash: u32,
-
-    /// Borrows `name`: whatever keeps a key dupes it.
-    pub fn of(kind: Kind, name: dns.Name, rtype: dns.RType) Key {
-        return .init(kind, name.wire, rtype);
-    }
-
-    pub fn shown(k: Key, buf: *[dns.max_dotted_len + 1]u8) []const u8 {
-        return if (k.name.len == 0) "" else dns.Name.of(k.name).formatInto(buf);
-    }
-
-    pub fn init(kind: Kind, name: []const u8, rtype: dns.RType) Key {
-        return .{ .kind = kind, .rtype = rtype, .name = name, .name_hash = hashName(name) };
-    }
-
-    pub fn at(k: Key, kind: Kind, rtype: dns.RType) Key {
-        return .{ .kind = kind, .rtype = rtype, .name = k.name, .name_hash = k.name_hash };
-    }
-
-    fn hashName(name: []const u8) u32 {
-        return @truncate(std.hash.Wyhash.hash(rand.hash_seed, name));
-    }
-
-    pub fn hash(k: Key) u64 {
-        if (builtin.mode == .debug) std.debug.assert(k.name_hash == hashName(k.name));
-        const x = @as(u64, k.name_hash) << 32 | @as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype);
-        const p = @as(u128, x) * 0x9e3779b97f4a7c15;
-        return @truncate(p ^ p >> 64);
-    }
-
-    pub fn eql(a: Key, b: Key) bool {
-        return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
-    }
-
-    const Context = struct {
-        pub fn hash(_: Context, k: Key) u32 {
-            return @truncate(k.hash());
-        }
-        pub fn eql(_: Context, a: Key, b: Key, _: usize) bool {
-            return a.eql(b);
-        }
-    };
-};
-
 const Asked = struct {
     key: Key,
     as_of: i64,
@@ -204,99 +141,8 @@ pub const Config = struct {
     trace: bool = false,
 };
 
-pub const Cut = struct {
-    zone: dns.Name,
-    servers: []const Server = &.{},
-    placed_until_ns: i64 = std.math.maxInt(i64),
-};
-
-pub const Server = struct {
-    key: Key,
-    glue: []const na.AddressKey = &.{},
-};
-
-pub const Reply = struct {
-    kind: Of,
-    aa: bool,
-    answers: []const dns.ResourceRecord = &.{},
-    authorities: []const dns.ResourceRecord = &.{},
-    additionals: []const dns.ResourceRecord = &.{},
-    target: dns.Name = .root,
-    zone: dns.Name = .root,
-    ede: ?dns.Ede.Code = null,
-    stored_ns: i64 = 0,
-    ttl: u32 = 0,
-
-    pub const Of = enum {
-        answer,
-        alias,
-        nodata,
-        nxdomain,
-        yxdomain,
-
-        pub fn rcode(k: Of) dns.RCode {
-            return switch (k) {
-                .answer, .alias, .nodata => .no_error,
-                .nxdomain => .name_error,
-                .yxdomain => .yx_domain,
-            };
-        }
-    };
-};
-
-pub const Answer = struct {
-    hops: []const Hop,
-
-    pub const Hop = struct {
-        set: CellId,
-        judge: OptionalCellId = .none,
-    };
-};
-
-const Outcome = union(enum) {
-    reply: struct { msg: dns.Message, rtt_ns: i64, stream: bool },
-    timeout,
-    unsent,
-    moved,
-    mismatch,
-    malformed,
-    oversized,
-};
-
 /// Plain goes only by stream, where a forger cannot follow.
 pub const Case = enum { random, plain };
-
-pub const Failure = struct {
-    code: dns.Ede.Code,
-    text: []const u8 = "",
-    cause: enum { zone, host, asker } = .zone,
-    remembered: bool = false,
-    unplaced: bool = false,
-
-    pub const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
-};
-
-pub const Value = union(Kind) {
-    cut: Cut,
-    addr: []const na.AddressKey,
-    rrset: Reply,
-    stub: Reply,
-    answer: Answer,
-    ds: trust.Chain,
-    dnskey: trust.Chain,
-    secure: trust.Chain,
-    exchange: Outcome,
-    refresh: void,
-    ahead: void,
-    parental: void,
-
-    pub fn reply(v: Value) Reply {
-        return switch (v) {
-            .rrset, .stub => |r| r,
-            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
-        };
-    }
-};
 
 const Work = struct {
     child: Allocator,
@@ -1194,7 +1040,7 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?trust.Chain };
+    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?model.Chain };
 
     /// The blobs are the store's; the caller refs what it keeps.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: Age) !?[]const Recalled {
@@ -1205,7 +1051,7 @@ pub const Graph = struct {
         while (true) {
             kind = g.hopKind(kind, next, qtype) orelse return null;
             const e = g.storedHop(kind.?, next, qtype, age) orelse return null;
-            var standing: ?trust.Chain = null;
+            var standing: ?model.Chain = null;
             if (g.awaitsVerdict(kind.?)) {
                 standing = e.verdict.standing(g.now());
                 if (if (age == .fresh) standing == null else !e.verdict.judged()) return null;
@@ -1690,13 +1536,4 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.payer = &g.unpaid;
     g.unhold(first);
     g.unhold(second);
-}
-
-test "a key's name hash follows the process seed" {
-    const saved = rand.hash_seed;
-    defer rand.hash_seed = saved;
-    const a: Key = .of(.rrset, .lit("www.example"), .a);
-    rand.hash_seed = 0xdeadbeefcafef00d;
-    const b: Key = .of(.rrset, .lit("www.example"), .a);
-    try std.testing.expect(a.name_hash != b.name_hash);
 }

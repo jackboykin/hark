@@ -6,12 +6,11 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
-const graph = @import("graph.zig");
-const trust = @import("trust.zig");
+const model = @import("model.zig");
 
-const Kind = graph.Kind;
-const Key = graph.Key;
-const Value = graph.Value;
+const Kind = model.Kind;
+const Key = model.Key;
+const Value = model.Value;
 const RR = dns.ResourceRecord;
 
 pub const Verdict = extern struct {
@@ -23,7 +22,7 @@ pub const Verdict = extern struct {
     proven_until_ns: i64 = 0,
     until_ns: i64 = 0,
 
-    pub fn stamp(v: *Verdict, c: trust.Chain, until_ns: i64, now_ns: i64) void {
+    pub fn stamp(v: *Verdict, c: model.Chain, until_ns: i64, now_ns: i64) void {
         const judged_s = if (v.until_ns == until_ns) v.judged_s else @as(u32, @intCast(@divFloor(now_ns, std.time.ns_per_s)));
         v.* = .{ .status = @backingInt(c.status), .judged_s = judged_s, .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
     }
@@ -36,7 +35,7 @@ pub const Verdict = extern struct {
         return if (v.judged()) @min(expires_ns, v.until_ns) else expires_ns;
     }
 
-    pub fn standing(v: Verdict, instant_ns: i64) ?trust.Chain {
+    pub fn standing(v: Verdict, instant_ns: i64) ?model.Chain {
         if (!v.judged() or v.until_ns <= instant_ns) return null;
         return .{ .status = @fromBackingInt(v.status), .proven_until_ns = v.proven_until_ns };
     }
@@ -330,7 +329,7 @@ pub const Store = struct {
             .cut => blk: {
                 const zone = try r.name();
                 const placed_until_ns = try r.int(i64);
-                const servers = try arena.alloc(graph.Server, try r.int(u16));
+                const servers = try arena.alloc(model.Server, try r.int(u16));
                 const glue = try arena.alloc(na.AddressKey, try r.int(u16));
                 var at: usize = 0;
                 for (servers) |*server| {
@@ -344,7 +343,7 @@ pub const Store = struct {
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
             .rrset, .stub, .parental => |kind| blk: {
-                var reply: graph.Reply = .{
+                var reply: model.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
                     .aa = undefined,
                 };
@@ -365,7 +364,7 @@ pub const Store = struct {
                 break :blk if (kind == .stub) .{ .stub = reply } else .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
-                var c: trust.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
+                var c: model.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
                 c.proven_until_ns = try r.int(i64);
                 c.records = try r.records(arena, try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
@@ -376,7 +375,7 @@ pub const Store = struct {
 };
 
 pub const Rrset = struct {
-    kind: graph.Reply.Of,
+    kind: model.Reply.Of,
     aa: bool,
     ede: ?dns.Ede.Code,
     ttl: u32,
@@ -393,7 +392,7 @@ pub const Rrset = struct {
     pub fn answered(b: *Blob) ?Answered {
         std.debug.assert(isReply(b));
         const p = b.payload();
-        if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[b.name_len])))) != .answer) return null;
+        if (@as(model.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[b.name_len])))) != .answer) return null;
         var at: usize = b.name_len + 1 + 1 + 2 + 4 + 8;
         at += stored(p, at).len;
         at += stored(p, at).len;
@@ -617,7 +616,7 @@ test "a fact survives the blob byte for byte" {
         .expire = 4,
         .minimum = 5,
     } } })};
-    const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
+    const reply: model.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
     const key: Key = .of(.rrset, .lit("www.example.com"), .a);
 
     const blob = try s.build(key, .{ .rrset = reply }, 1000);

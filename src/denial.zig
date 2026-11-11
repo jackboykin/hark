@@ -9,12 +9,13 @@ const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const walk = @import("walk.zig");
 
 const store = @import("store.zig");
 
 const Graph = graph.Graph;
-const CellId = graph.CellId;
+const CellId = model.CellId;
 const RR = dns.ResourceRecord;
 
 const Span = struct {
@@ -160,7 +161,7 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
     return gop.value_ptr;
 }
 
-pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const i64, keys_until: i64) !void {
+pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const i64, keys_until: i64) !void {
     std.debug.assert(!proof.proofFlood(r.authorities));
     const zkey = signer.wire;
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
@@ -171,10 +172,10 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         if (rr.rtype == .nsec and minimal(rr)) continue;
         const rrs = dnssec.setFrom(r.authorities, i);
         const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
-        const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        const kind: graph.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
+        const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
+        const kind: model.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up only after.
-        const judged = (try g.fact(graph.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
+        const judged = (try g.fact(model.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {
             g.store.unref(judged);
             return e;
@@ -268,7 +269,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     const budget = &g.payer.validation;
     if (proof.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, budget) != .secure) return false;
 
-    var reply: graph.Reply = .{
+    var reply: model.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,
         .aa = true,
         .authorities = authorities.items,
@@ -318,7 +319,7 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
 
     const zone: dns.Name = .lit("example");
     const soa: RR = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
-    const reply: graph.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
+    const reply: model.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
     try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());

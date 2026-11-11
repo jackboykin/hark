@@ -27,9 +27,10 @@ const sys = @import("sys_union.zig");
 const monotonic = @import("monotonic.zig");
 const rand = @import("rand.zig");
 const graph = @import("graph.zig");
+const model = @import("model.zig");
 const Sessions = @import("sessions.zig");
 
-const CellId = graph.CellId;
+const CellId = model.CellId;
 const Completion = graph.Completion;
 const Exchange = graph.Exchange;
 

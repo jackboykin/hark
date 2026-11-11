@@ -8,7 +8,7 @@ const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
-const graph = @import("graph.zig");
+const model = @import("model.zig");
 const store = @import("store.zig");
 const config = @import("config.zig");
 
@@ -303,8 +303,8 @@ test "fuzz: store round trip" {
             if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
             const st = &shared_store.?;
             const owner = if (msg.question) |q| q.name else dns.Name.root;
-            const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
-            const key: graph.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
+            const reply: model.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
+            const key: model.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
             const blob = st.build(key, .{ .rrset = reply }, 10) catch return;
             st.put(blob) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;
