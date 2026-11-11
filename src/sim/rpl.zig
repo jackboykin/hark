@@ -110,7 +110,6 @@ pub const Step = struct {
 };
 
 pub const Scenario = struct {
-    name: []const u8 = "",
     root_hints: []const na.Address = &.{},
     stub_zones: []const stub.Zone = &.{},
     ranges: []const Range = &.{},
@@ -226,9 +225,9 @@ const Parser = struct {
         } else if (mem.eql(u8, key, "rebinding-enabled")) {
             s.rebinding_enabled = yes(val);
         } else if (mem.eql(u8, key, "rebinding-allow-zone")) {
-            s.rebinding_allow_zones = try appendStr(p.arena, s.rebinding_allow_zones, val);
+            s.rebinding_allow_zones = try mem.concat(p.arena, []const u8, &.{ s.rebinding_allow_zones, &.{val} });
         } else if (mem.eql(u8, key, "rebinding-extra-allow")) {
-            s.rebinding_extra_allow = try appendStr(p.arena, s.rebinding_extra_allow, val);
+            s.rebinding_extra_allow = try mem.concat(p.arena, []const u8, &.{ s.rebinding_extra_allow, &.{val} });
         } else if (mem.eql(u8, key, "stagger-ms")) {
             s.stagger_ms = try p.int(u32, val);
         } else if (mem.eql(u8, key, "max-queries")) {
@@ -256,14 +255,13 @@ const Parser = struct {
             if (s.dnssec_zones.len == 0 and !mem.eql(u8, canon, "."))
                 return p.fail("first dnssec-zone must be `.`");
             for (s.dnssec_zones) |z| if (mem.eql(u8, z, canon)) return;
-            s.dnssec_zones = try appendStr(p.arena, s.dnssec_zones, canon);
+            s.dnssec_zones = try mem.concat(p.arena, []const u8, &.{ s.dnssec_zones, &.{canon} });
         } else return p.fail("unknown hark directive");
     }
 
     fn parse(p: *Parser) Error!Scenario {
         const head = try p.next();
         if (!mem.startsWith(u8, head, "SCENARIO_BEGIN")) return p.fail("expected SCENARIO_BEGIN");
-        p.scenario.name = mem.trim(u8, head["SCENARIO_BEGIN".len..], " \t");
 
         var ranges: std.ArrayList(Range) = .empty;
         var steps: std.ArrayList(Step) = .empty;
@@ -371,15 +369,15 @@ const Parser = struct {
                 while (toks.next()) |t| try p.matchFlag(&e, t);
             } else if (mem.eql(u8, head, "ADJUST")) {
                 while (toks.next()) |t| {
-                    if (eqlLower(t, "drop")) {
+                    if (eqlIgnoreCase(t, "drop")) {
                         e.drop = true;
-                    } else if (eqlLower(t, "force_upper_qname")) {
+                    } else if (eqlIgnoreCase(t, "force_upper_qname")) {
                         e.echo = .upper;
-                    } else if (eqlLower(t, "drop_question")) {
+                    } else if (eqlIgnoreCase(t, "drop_question")) {
                         e.echo = .none;
-                    } else if (eqlLower(t, "unsigned")) {
+                    } else if (eqlIgnoreCase(t, "unsigned")) {
                         e.unsigned = true;
-                    } else if (!eqlLower(t, "copy_id") and !eqlLower(t, "copy_query")) {
+                    } else if (!eqlIgnoreCase(t, "copy_id") and !eqlIgnoreCase(t, "copy_query")) {
                         return p.fail("unknown ADJUST flag");
                     }
                 }
@@ -460,7 +458,7 @@ const Parser = struct {
         const b = toks.next();
         if (toks.next() != null) return p.fail("bad QUESTION line");
         const type_tok = b orelse a;
-        if (b != null and !eqlLower(a, "in")) return p.fail("only class IN is supported");
+        if (b != null and !eqlIgnoreCase(a, "in")) return p.fail("only class IN is supported");
         return .{
             .name = try p.name(owner),
             .qtype = rtypeFromText(type_tok) orelse return p.fail("bad QUESTION type"),
@@ -502,7 +500,7 @@ const Parser = struct {
             t = toks.next() orelse return p.fail("RR needs a type");
         }
         var class: dns.RClass = .in;
-        inline for (.{ "in", "ch", "hs" }, .{ 1, 3, 4 }) |text, code| if (eqlLower(t, text)) {
+        inline for (.{ "in", "ch", "hs" }, .{ 1, 3, 4 }) |text, code| if (eqlIgnoreCase(t, text)) {
             class = @fromBackingInt(code);
             t = toks.next() orelse return p.fail("RR needs a type");
             break;
@@ -551,7 +549,7 @@ const Parser = struct {
             .txt => return .{ .txt = .{ .strings = try p.charStrings(toks) } },
             .ds => {
                 const first = try p.word(toks);
-                if (eqlLower(first, "placeholder")) {
+                if (eqlIgnoreCase(first, "placeholder")) {
                     // Key tag 0 marks it; the signer fills in the digest.
                     const zone = if (toks.next()) |z| try p.name(z) else owner;
                     try ds_from.append(arena, .{ .owner = owner, .zone = zone });
@@ -741,24 +739,15 @@ fn enumIgnoreCase(comptime E: type, s: []const u8) ?E {
 }
 
 fn yes(val: []const u8) bool {
-    return eqlLower(val, "yes") or eqlLower(val, "true") or eqlLower(val, "on") or mem.eql(u8, val, "1");
+    return eqlIgnoreCase(val, "yes") or eqlIgnoreCase(val, "true") or eqlIgnoreCase(val, "on") or mem.eql(u8, val, "1");
 }
 
-fn eqlLower(a: []const u8, comptime lower: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, lower);
-}
+const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
 
 fn isDigits(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
-}
-
-fn appendStr(arena: Allocator, list: []const []const u8, s: []const u8) Allocator.Error![]const []const u8 {
-    const out = try arena.alloc([]const u8, list.len + 1);
-    @memcpy(out[0..list.len], list);
-    out[list.len] = s;
-    return out;
 }
 
 fn rcodeFromText(t: []const u8) ?dns.RCode {
