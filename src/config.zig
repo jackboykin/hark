@@ -50,21 +50,21 @@ const root_hints_default: [2 * root_servers.len]Address = hints: {
     var hints: [2 * root_servers.len]Address = undefined;
     for (root_servers, hints[0..root_servers.len], hints[root_servers.len..]) |r, *v4, *v6| {
         v4.* = net_addr.initIp4((std.Io.net.Ip4Address.parse(r.ip4, 53) catch unreachable).bytes, 53);
-        v6.* = net_addr.initIp6((std.Io.net.Ip6Address.parse(r.ip6, 53) catch unreachable).bytes, 53, 0, 0);
+        v6.* = net_addr.initIp6((std.Io.net.Ip6Address.parse(r.ip6, 53) catch unreachable).bytes, 53);
     }
     break :hints hints;
 };
 
 const loopback_cidrs = [_]acl.Cidr{
     .{ .address = net_addr.initIp4(.{ 127, 0, 0, 0 }, 0), .prefix = 8 },
-    .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0, 0, 0), .prefix = 128 },
+    .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0), .prefix = 128 },
 };
 
 /// Each default is the value `hark.toml.example` shows.
 pub const EncryptedTransport = enum { off, opportunistic };
 
 pub const ServerConfig = struct {
-    listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0) },
+    listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53) },
     /// Empty: the IANA roots.
     root_hints: []const Address = &.{},
     /// Where glue points. Test-only: production always asks port 53.
@@ -503,7 +503,7 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
         else
             default_port;
         const ip6 = std.Io.net.Ip6Address.parse(ip6_str, port) catch return null;
-        return net_addr.initIp6(ip6.bytes, port, 0, 0);
+        return net_addr.initIp6(ip6.bytes, port);
     }
 
     // First vs last colon distinguish the three remaining shapes:
@@ -520,7 +520,7 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
             return .{ .ip4 = ip4 };
         }
         const ip6 = std.Io.net.Ip6Address.parse(s, default_port) catch return null;
-        return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
+        return net_addr.initIp6(ip6.bytes, default_port);
     }
 
     // Same strict dotted-quad grammar as acl.zig's CIDR parsing —

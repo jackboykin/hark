@@ -150,8 +150,8 @@ pub fn flush(b: *Batch) void {
 test "datagrams come in and go out by the batch, each to its sender" {
     const any4 = na.initIp4(@splat(0), 0);
     const lo4 = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const any6 = na.initIp6(@splat(0), 0, 0, 0);
-    const lo6 = na.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0, 0, 0);
+    const any6 = na.initIp6(@splat(0), 0);
+    const lo6 = na.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0);
     for ([_][2]na.Address{ .{ lo4, lo4 }, .{ any4, lo4 }, .{ lo6, lo6 }, .{ any6, lo6 } }) |pair| try roundTrip(pair[0], pair[1]);
 }
 

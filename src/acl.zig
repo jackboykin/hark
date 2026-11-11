@@ -34,7 +34,7 @@ pub fn parse(s: []const u8) ?Cidr {
     const slash = mem.findScalar(u8, s, '/');
     const addr_str = s[0 .. slash orelse s.len];
     var address: na.Address = if (mem.findScalar(u8, addr_str, ':') != null)
-        na.initIp6((std.Io.net.Ip6Address.parse(addr_str, 0) catch return null).bytes, 0, 0, 0)
+        na.initIp6((std.Io.net.Ip6Address.parse(addr_str, 0) catch return null).bytes, 0)
     else
         na.initIp4((std.Io.net.Ip4Address.parse(addr_str, 0) catch return null).bytes, 0);
     const bytes: []u8 = switch (address) {
@@ -129,13 +129,13 @@ test "matches /32 single host" {
 
 test "matches v6 single host" {
     const c = parse("::1/128") orelse return error.ParseFailed;
-    try testing.expect(c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 0, 0, 0)));
-    try testing.expect(!c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, 0, 0, 0)));
+    try testing.expect(c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 0)));
+    try testing.expect(!c.matches(na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, 0)));
 }
 
 test "matches family mismatch fails" {
     const v4 = parse("0.0.0.0/0") orelse return error.ParseFailed;
-    try testing.expect(!v4.matches(na.initIp6(@splat(0), 0, 0, 0)));
+    try testing.expect(!v4.matches(na.initIp6(@splat(0), 0)));
 }
 
 test "matchesBytes accepts bare rdata bytes" {

@@ -13,8 +13,8 @@ pub fn initIp4(bytes: [4]u8, port: u16) Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
 }
 
-pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
-    return .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope } } };
+pub fn initIp6(bytes: [16]u8, port: u16) Address {
+    return .{ .ip6 = .{ .bytes = bytes, .port = port } };
 }
 
 /// Canonical Murmur3 fmix64. FNV-1a's multiply only propagates leftward, so
@@ -63,7 +63,7 @@ pub const AddressKey = struct {
     }
 
     pub fn toAddress(k: AddressKey) Address {
-        return if (k.family == posix.AF.INET) initIp4(k.addr[0..4].*, k.port) else initIp6(k.addr, k.port, 0, 0);
+        return if (k.family == posix.AF.INET) initIp4(k.addr[0..4].*, k.port) else initIp6(k.addr, k.port);
     }
 
     /// Hash context tuned for AddressKey: reads the 16-byte addr as two u64s
@@ -320,7 +320,7 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     const b = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
     const c = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 5353));
     const d = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 5 }, 53));
-    const e = AddressKey.fromAddress(initIp6([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0)), 53, 0, 0));
+    const e = AddressKey.fromAddress(initIp6([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0)), 53));
 
     try testing.expect(ctx.eql(a, b));
     try testing.expectEqual(ctx.hash(a), ctx.hash(b));
