@@ -754,7 +754,7 @@ fn validateNsec3NegativeProof(
 /// Zone argument for tests of pure range geometry: under the root, every
 /// name is in the signer's zone.
 const test_root = dns.Name.root;
-pub const test_com = dns.Name.lit("com");
+const test_com = dns.Name.lit("com");
 
 test "classifyDelegation with DS present" {
     const child_zone = dns.Name.lit("example.com");

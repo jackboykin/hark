@@ -192,12 +192,6 @@ pub const SignedData = struct {
     original_ttl: u32 = 0,
     set: Canonical = .{ .records = &.{} },
 
-    fn raw(bytes: []const u8) SignedData {
-        var d: SignedData = .{ .header_len = bytes.len };
-        @memcpy(d.header[0..bytes.len], bytes);
-        return d;
-    }
-
     pub fn feed(self: *const SignedData, hasher: anytype) void {
         hasher.update(self.header[0..self.header_len]);
         for (self.set.records) |rr| {
@@ -232,23 +226,6 @@ pub fn buildSignedData(rrsig: dns.RrsigData, set: Canonical) SignedData {
 // replay value). Expiration grace would widen an attacker's replay window for
 // a captured RRSIG, so it stays zero.
 const inception_skew_tolerance: u32 = 60;
-
-/// Verify an RRSIG, returning true on success, false on non-budget failure.
-/// Propagates ValidationBudgetExhausted so callers can bail out of loops.
-pub fn tryVerifyRrsig(
-    rrsig: dns.RrsigData,
-    dnskey: dns.DnskeyData,
-    set: Canonical,
-    now_u32: u32,
-    budget: *ValidationBudget,
-    memo: *VerifyMemo,
-) error{ValidationBudgetExhausted}!bool {
-    verifyRrsig(rrsig, dnskey, set, now_u32, budget, memo) catch |e| switch (e) {
-        error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
-        else => return false,
-    };
-    return true;
-}
 
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
@@ -710,6 +687,7 @@ test "VerifyMemo: a set holds its two newest tags" {
 
 test "invalid key sizes are rejected" {
     const msg = "test";
+    const signed = buildSignedData(test_window_rrsig, test_window_empty_set);
     const sig64: [64]u8 = @splat(0);
     const sig96: [96]u8 = @splat(0);
 
@@ -718,11 +696,11 @@ test "invalid key sizes are rejected" {
     // ECDSA P-384: key must be 96 bytes
     try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, &sig96, &testDigest(EcdsaP384.Hash, msg), &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
-    try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &signed, &.{ 0x01, 0x02 }));
     // ML-DSA-44: key 1312 bytes, signature 2420 bytes
     const pq_sig: [MlDsa44.Signature.encoded_length]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, verifyMlDsa(&pq_sig, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
-    try testing.expectError(error.InvalidSignature, verifyMlDsa(&sig64, &SignedData.raw(msg), &@as([MlDsa44.PublicKey.encoded_length]u8, @splat(0))));
+    try testing.expectError(error.InvalidKey, verifyMlDsa(&pq_sig, &signed, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidSignature, verifyMlDsa(&sig64, &signed, &@as([MlDsa44.PublicKey.encoded_length]u8, @splat(0))));
 }
 
 test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
@@ -987,7 +965,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
 }
 
 /// Remembers nothing; unit tests exercise the math alone.
-var test_memo: VerifyMemo = .{};
+pub var test_memo: VerifyMemo = .{};
 
 fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
     var d: [Hash.digest_length]u8 = undefined;

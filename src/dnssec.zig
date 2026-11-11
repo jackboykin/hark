@@ -59,8 +59,7 @@ fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
     return true;
 }
 
-/// Remembers nothing; unit tests exercise the math alone.
-var test_memo: rrsig.VerifyMemo = .{};
+const test_memo = &rrsig.test_memo;
 var test_scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 
 test "dsEligible: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not to an unusable one" {
@@ -242,7 +241,11 @@ fn rrsetVerifiesWithAnyKey(
 ) error{ValidationBudgetExhausted}!bool {
     for (keyset.keys, keyset.tags) |dk, tag| {
         if (tag != sig.key_tag) continue;
-        if (try rrsig.tryVerifyRrsig(sig, dk, set, now_u32, budget, memo)) return true;
+        rrsig.verifyRrsig(sig, dk, set, now_u32, budget, memo) catch |e| switch (e) {
+            error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
+            else => continue,
+        };
+        return true;
     }
     return false;
 }
@@ -599,12 +602,12 @@ test "validateDnskeyRrset: 65 keys verify whole, and a signature over 64 launder
     @memcpy(set[0..65], &recs);
     set[65] = rrsigRr(rrsig.test_owner, whole.rrsig);
     var budget: rrsig.ValidationBudget = .{};
-    _ = (try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget, &test_memo)).?;
+    _ = (try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget, test_memo)).?;
 
     // The 65th key must not ride in on a signature over the other 64.
     set[65] = rrsigRr(rrsig.test_owner, part.rrsig);
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget2, &test_memo) == null);
+    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget2, test_memo) == null);
 }
 
 test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the budget" {
@@ -644,7 +647,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
 
     const cap: u32 = 8;
     var budget: rrsig.ValidationBudget = .{ .max_sig_verify = cap };
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &records, &.{ds}, rrsig.test_owner, 1700000000, &budget, &test_memo) == null);
+    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &records, &.{ds}, rrsig.test_owner, 1700000000, &budget, test_memo) == null);
     try testing.expectEqual(cap, budget.sig_verify_spent);
     try testing.expect(budget.stopped != null);
 }
@@ -753,13 +756,13 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .signature = &signature,
     };
     var budget: rrsig.ValidationBudget = .{};
-    try rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo);
+    try rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, test_memo);
 
     signature[100] ^= 1;
-    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo));
+    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, test_memo));
     signature[100] ^= 1;
-    sig.signer_name = proof.test_com;
-    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, &test_memo));
+    sig.signer_name = .lit("com");
+    try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), 1439000000, &budget, test_memo));
 }
 
 test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
@@ -786,10 +789,10 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
         } } });
     }
     var at_cap: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), rrs[0 .. 2 * proof.max_proof_records], &.{key}, 1700000000, &at_cap, &test_memo) == null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), rrs[0 .. 2 * proof.max_proof_records], &.{key}, 1700000000, &at_cap, test_memo) == null);
     try testing.expect(at_cap.sig_verify_spent > 0);
     var past: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &rrs, &.{key}, 1700000000, &past, &test_memo) == null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &rrs, &.{key}, 1700000000, &past, test_memo) == null);
     try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
@@ -815,8 +818,8 @@ test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" 
     const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, a.dnskey), dnskeyRr(rrsig.test_owner, g.dnskey) };
     const signed = [_]dns.ResourceRecord{ nsecs[0], rrsigRr(alpha, a.rrsig), nsecs[1], rrsigRr(gamma, g.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &signed, &dnskeys, 1_700_000_000, &budget, &test_memo) != null);
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), signed[0..3], &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &signed, &dnskeys, 1_700_000_000, &budget, test_memo) != null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), signed[0..3], &dnskeys, 1_700_000_000, &budget, test_memo) == null);
 }
 
 test "verifyAuthorityProofSigs: a signature over part of a set verifies none of it" {
@@ -838,8 +841,8 @@ test "verifyAuthorityProofSigs: a signature over part of a set verifies none of 
     const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, n.dnskey), dnskeyRr(rrsig.test_owner, s.dnskey) };
     const sigs = [_]dns.ResourceRecord{ nsec[0], rrsigRr(rrsig.test_owner, n.rrsig), rrsigRr(rrsig.test_owner, s.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas[0..16].*), &dnskeys, 1_700_000_000, &budget, &test_memo) != null);
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas), &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas[0..16].*), &dnskeys, 1_700_000_000, &budget, test_memo) != null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas), &dnskeys, 1_700_000_000, &budget, test_memo) == null);
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
@@ -861,9 +864,9 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
 
     var budget: rrsig.ValidationBudget = .{};
     const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.lit("other.com"), signed.rrsig) };
-    try testing.expect(try validateRrset(test_scratch.allocator(), &moved, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) == null);
+    try testing.expect(try validateRrset(test_scratch.allocator(), &moved, rrsig.test_owner, .a, false, &dnskeys, now, &budget, test_memo) == null);
     const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
-    try testing.expect(try validateRrset(test_scratch.allocator(), &home, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) != null);
+    try testing.expect(try validateRrset(test_scratch.allocator(), &home, rrsig.test_owner, .a, false, &dnskeys, now, &budget, test_memo) != null);
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
@@ -882,12 +885,12 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const sig_rr = dns.ResourceRecord.fixture(.{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const replayed = [_]dns.ResourceRecord{ proof.nsecRr(v, a), sig_rr };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &replayed, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &replayed, &dnskeys, 1_700_000_000, &budget, test_memo) == null);
 
     const own_sig = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &genuine, &dnskeys, 1_700_000_000, &budget2, test_memo) != null);
 
     // A stray naming fewer labels is no signature over the set, and the
     // one that is still proves it (RFC 6840 §5.4).
@@ -896,7 +899,7 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const stray = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = fewer } });
     const strayed = [_]dns.ResourceRecord{ real[0], stray, own_sig };
     var budget3: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &strayed, &dnskeys, 1_700_000_000, &budget3, &test_memo) != null);
+    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &strayed, &dnskeys, 1_700_000_000, &budget3, test_memo) != null);
 }
 
 fn testSignMlDsa(
@@ -956,23 +959,23 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     // Downgrade: ML-DSA-44 signature stripped, classical one intact. Bogus.
     const stripped = keys ++ [_]dns.ResourceRecord{key.sig(ed.rrsig)};
     var b1: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b1, &test_memo) == null);
+    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b1, test_memo) == null);
 
     // Both present, either order: the ML-DSA-44 one is what verifies.
     const dual = keys ++ [_]dns.ResourceRecord{ key.sig(ed.rrsig), key.sig(pq) };
     var b2: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b2, &test_memo)).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual, &.{ ed_ds, pq_ds }, rrsig.test_owner, 1_700_000_000, &b2, test_memo)).?.algorithm);
     const dual_rev = keys ++ [_]dns.ResourceRecord{ key.sig(pq), key.sig(ed.rrsig) };
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual_rev, &.{ pq_ds, ed_ds }, rrsig.test_owner, 1_700_000_000, &b2, &test_memo)).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual_rev, &.{ pq_ds, ed_ds }, rrsig.test_owner, 1_700_000_000, &b2, test_memo)).?.algorithm);
 
     // An ML-DSA-44 DS that anchors nothing demands nothing: unknown digest,
     // or SHA-1 beside a usable SHA-256 DS (RFC 4509 §3).
     const odd_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
     var b4: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, 1_700_000_000, &b4, &test_memo)).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, 1_700_000_000, &b4, test_memo)).?.algorithm);
     var pq_sha1 = dsDigest(Sha1, rrsig.test_owner, pq_key);
     const sha1_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, 1_700_000_000, &b4, &test_memo)).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, 1_700_000_000, &b4, test_memo)).?.algorithm);
 
     // Only the ML-DSA-44 key survives into the keyset used below the apex;
     // without an ML-DSA-44 DS the keyset stays whole.
@@ -986,7 +989,7 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     // No ML-DSA-44 DS: the key's presence in the DNSKEY RRset alone demands
     // nothing (RFC 6840 §5.11 MUST NOT; RFC 6781 §4.1.4 liberal rollover).
     var b3: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ed_ds}, rrsig.test_owner, 1_700_000_000, &b3, &test_memo)).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ed_ds}, rrsig.test_owner, 1_700_000_000, &b3, test_memo)).?.algorithm);
 }
 
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
@@ -1008,7 +1011,7 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
         .digest = &digest,
     };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &recs, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget, &test_memo) == null);
+    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &recs, &.{ds}, rrsig.test_owner, 1_700_000_000, &budget, test_memo) == null);
 }
 
 test "validateRrset: the TTL cap comes from the signature that verified" {
@@ -1040,7 +1043,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } }),
     };
     var budget: rrsig.ValidationBudget = .{};
-    const sig = (try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo)).?.sig;
+    const sig = (try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, test_memo)).?.sig;
     // The verifying signature's original TTL, never the junk record's 1.
     try testing.expectEqual(@as(u32, 300), rrsig.Cap.of(sig, now).original_ttl);
 }
@@ -1068,9 +1071,9 @@ test "validateRrset: 70 records verify whole, and a signature over 64 launders n
     @memcpy(answers[0..70], &recs);
     answers[70] = rrsigRr(rrsig.test_owner, whole.rrsig);
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget, &test_memo) != null);
+    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget, test_memo) != null);
 
     answers[70] = rrsigRr(rrsig.test_owner, part.rrsig);
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget2, &test_memo) == null);
+    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget2, test_memo) == null);
 }
