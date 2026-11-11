@@ -511,7 +511,7 @@ pub fn proveNoCloserMatch(
     };
 }
 
-const NoCloserMatch = union(enum) {
+pub const NoCloserMatch = union(enum) {
     nsec: dns.Name,
     nsec3: [Sha1.digest_length]u8,
     verdict: SecurityStatus,

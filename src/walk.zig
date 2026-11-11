@@ -295,16 +295,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                     return failAnswer(g, id, .unreachable_authority));
                 s.judged += 1;
             }
-            var links: Links = .{};
-            var step: Links.Step = .done;
-            for (s.hops[0..s.n]) |h| {
-                const r = g.cell(h.set).state.fact.reply();
-                step = for (r.answers) |rr| {
-                    if (rr.rtype == .cname) if (links.pass(rr.name)) |why| break .{ .broken = why };
-                } else links.end(r.kind, r.target, qtype);
-                if (step != .next) break;
-            }
-            switch (step) {
+            switch (follow(g, s.hops[0..s.n], qtype)) {
                 .done => break,
                 .next => |n| next = n,
                 .broken => |why| return failAnswer(g, id, why),
@@ -330,6 +321,20 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     try settleAnswer(g, id, .{ .hops = s.hops[0..s.n] }, expires);
     if (kind == .answer and g.cfg.prefetch) if (lapsing(g, s.hops[0..s.n])) |end|
         g.refresh(g.cell(id).key, g.cell(id).name, end) catch {};
+}
+
+/// Where the settled hops lead: on to another name, to the end, or nowhere.
+fn follow(g: *Graph, hops: []const graph.Answer.Hop, qtype: dns.RType) Links.Step {
+    var links: Links = .{};
+    var step: Links.Step = .done;
+    for (hops) |h| {
+        const r = g.cell(h.set).state.fact.reply();
+        step = for (r.answers) |rr| {
+            if (rr.rtype == .cname) if (links.pass(rr.name)) |why| break .{ .broken = why };
+        } else links.end(r.kind, r.target, qtype);
+        if (step != .next) break;
+    }
+    return step;
 }
 
 fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
@@ -600,11 +605,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         const p = proof.noCloserMatch(reply.authorities, name, sig.rrsig().labels, zone, &g.payer.validation);
         // The budget refused a hash, so no proof was chosen: an alias without its own is no fact.
         if (p == .verdict and g.payer.validation.stopped != null) return;
-        for (reply.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and p.restsOn(rr, zone)) {
-            for (reply.authorities, kept) |of, *k| if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) {
-                k.* = true;
-            };
-        };
+        keepProof(reply.authorities, kept, p, zone);
     };
     var proofs: std.ArrayList(dns.ResourceRecord) = .empty;
     for (reply.authorities, kept) |rr, k| if (k) try proofs.append(a, rr);
@@ -619,6 +620,16 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     };
     hop.ttl = replyTtl(hop);
     try g.publish(Key.of(.rrset, name, .cname), name, by, .{ .rrset = hop }, replyExpiry(hop));
+}
+
+/// Marks each NSEC or NSEC3 set `p` rests on, with its signatures.
+fn keepProof(authorities: []const dns.ResourceRecord, kept: []bool, p: proof.NoCloserMatch, zone: dns.Name) void {
+    for (authorities) |rr| {
+        if ((rr.rtype != .nsec and rr.rtype != .nsec3) or !p.restsOn(rr, zone)) continue;
+        for (authorities, kept) |of, *k| {
+            if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) k.* = true;
+        }
+    }
 }
 
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
@@ -849,16 +860,18 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: 
             levelled.ttl = @min(rr.ttl, life);
             keep.appendAssumeCapacity(levelled);
         },
-        .nsec, .nsec3 => if (flood) keep.appendAssumeCapacity(rr) else for (signers.items) |sn| {
-            const signed = if (rr.rtype == .rrsig) rr.rrsig().signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
-            if (signed) {
-                keep.appendAssumeCapacity(rr);
-                break;
-            }
-        },
+        .nsec, .nsec3 => if (flood or signedByAny(rrs, rr, signers.items)) keep.appendAssumeCapacity(rr),
         else => if (rest) keep.appendAssumeCapacity(rr),
     };
     return keep.items;
+}
+
+fn signedByAny(rrs: []const dns.ResourceRecord, rr: dns.ResourceRecord, signers: []const dns.Name) bool {
+    for (signers) |sn| {
+        if (rr.rtype == .rrsig and rr.rrsig().signer_name.eql(sn)) return true;
+        if (rr.rtype != .rrsig and dnssec.signedBy(rrs, rr.name, rr.rtype, sn)) return true;
+    }
+    return false;
 }
 
 fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {
@@ -954,48 +967,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
     }
     var refused = false;
     while (true) {
-        var i: u8 = 0;
-        while (i < a.nattempts) {
-            const ex = g.cell(a.attempts[i].exchange);
-            if (!ex.settled()) {
-                i += 1;
-                continue;
-            }
-            const at = a.end(i);
-            switch (ex.state.fact.exchange) {
-                // The deadline cut the wait before the server was due: it was asked
-                // nothing, and may be tried again.
-                .timeout => if (ex.scratch.exchange.cut_short) {
-                    a.tried &= ~Ask.bit(at.server);
-                },
-                .unsent => a.local = true,
-                .moved => if (try sendTo(g, id, a, at.server, a.noneLive(g), at.need, at.case, qname, qtype) == null) {
-                    refused = true;
-                },
-                // The server's breach: no stream retry, only a sibling.
-                .oversized => {},
-                // Once more over a stream with plain case: a forger cannot follow there,
-                // and a server that normalises 0x20 case answers.
-                .mismatch, .malformed => if (at.case == .random) {
-                    if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .plain, qname, qtype) == null) refused = true;
-                },
-                .reply => |r| {
-                    if (r.msg.header.flags.tc) {
-                        // TC over a stream is a broken server, as good as a timeout.
-                        if (!r.stream) {
-                            if (try sendTo(g, id, a, at.server, a.noneLive(g), .stream, .random, qname, qtype) == null) refused = true;
-                        }
-                    } else {
-                        const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
-                        if (kept) |k| {
-                            a.nattempts = 0;
-                            return .{ .reply = k };
-                        }
-                        if (a.held == .none) a.held = .wrap(at.exchange);
-                    }
-                },
-            }
-        }
+        if (try reap(g, id, a, qname, qtype, &refused)) |kept| return .{ .reply = kept };
         if (refused) return if (a.nattempts > 0) .pending else a.giveUp(g);
         if (a.nattempts > 0 and (g.cfg.stagger_ms == 0 or a.nattempts == max_hedge)) return .pending;
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
@@ -1018,7 +990,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         if (!due and !p.track.mayAnswer()) return .pending;
         if (p.track == .dead and waited != .dead) return .pending;
         const last = p.last and !a.more;
-        const sent = try sendTo(g, id, a, p.server, last, need, .random, qname, qtype) orelse {
+        const sent = try sendTo(g, id, a, p.server, last, .{ .name = qname, .qtype = qtype, .need = need, .case = .random }) orelse {
             refused = true;
             continue;
         };
@@ -1028,6 +1000,53 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
         if (p.track.mayAnswer()) return .pending;
     }
+}
+
+/// Reads every settled attempt and resends what its outcome asks for, setting
+/// `refused` when a resend could not go. Returns the reply that answers.
+fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refused: *bool) !?Kept {
+    const Way = struct { need: Need, case: graph.Case };
+    var i: u8 = 0;
+    while (i < a.nattempts) {
+        const ex = g.cell(a.attempts[i].exchange);
+        if (!ex.settled()) {
+            i += 1;
+            continue;
+        }
+        const at = a.end(i);
+        const again: ?Way = switch (ex.state.fact.exchange) {
+            // The deadline cut the wait before the server was due: it was asked
+            // nothing, and may be tried again.
+            .timeout => way: {
+                if (ex.scratch.exchange.cut_short) a.tried &= ~Ask.bit(at.server);
+                break :way null;
+            },
+            .unsent => way: {
+                a.local = true;
+                break :way null;
+            },
+            .moved => .{ .need = at.need, .case = at.case },
+            // The server's breach: no stream retry, only a sibling.
+            .oversized => null,
+            // Once more over a stream with plain case: a forger cannot follow there,
+            // and a server that normalises 0x20 case answers.
+            .mismatch, .malformed => if (at.case == .random) .{ .need = .stream, .case = .plain } else null,
+            // TC over a stream is a broken server, as good as a timeout.
+            .reply => |r| if (r.msg.header.flags.tc) (if (r.stream) null else Way{ .need = .stream, .case = .random }) else way: {
+                const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
+                if (kept) |k| {
+                    a.nattempts = 0;
+                    return k;
+                }
+                if (a.held == .none) a.held = .wrap(at.exchange);
+                break :way null;
+            },
+        };
+        const way = again orelse continue;
+        const q: Graph.Query = .{ .name = qname, .qtype = qtype, .need = way.need, .case = way.case };
+        if (try sendTo(g, id, a, at.server, a.noneLive(g), q) == null) refused.* = true;
+    }
+    return null;
 }
 
 fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
@@ -1051,11 +1070,11 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, need: Need, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?Graph.Sent {
-    const ex = try g.exchange(id, a.servers[server], need, case, qname, qtype, a.nattempts == 0 and last) orelse return null;
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, q: Graph.Query) !?Graph.Sent {
+    const ex = try g.exchange(id, a.servers[server], q, a.nattempts == 0 and last) orelse return null;
     a.tried |= Ask.bit(server);
     a.shown = a.shown.max(ex.exposure);
-    a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .need = need, .case = case };
+    a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .need = q.need, .case = q.case };
     a.nattempts += 1;
     return ex;
 }
@@ -1087,10 +1106,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
         if (found.new == 0 or a.fetched_unglued) try learn(g, id, a, &found, servers, &left);
         a.more = if (a.fetched_unglued) left.awaited else partial;
         if (found.new == 0) {
-            var pending = false;
-            for (left.busy.items) |key| {
-                if (try g.demand(id, key, .of(key.name)) != null) pending = true;
-            }
+            const pending = try demandAll(g, id, left.busy.items);
             a.more = a.more or pending;
             if (pending) return .pending;
         }
@@ -1103,15 +1119,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
                 else => 1,
             };
             try g.shuffle(.gather, g.cell(id).key, Left.Unknown, unknown);
-            var demanded = false;
-            for (unknown[0..@min(limit, unknown.len)]) |u| {
-                const host: dns.Name = .of(u.host.name);
-                for (families, u.families) |family, wanted| {
-                    if (!wanted) continue;
-                    const aid = try g.demand(id, u.host.at(.addr, family), host) orelse continue;
-                    if (!g.cell(aid).settled()) demanded = true;
-                }
-            }
+            const demanded = try lookUp(g, id, unknown[0..@min(limit, unknown.len)]);
             a.more = demanded;
             if (demanded) return .pending;
             return gatherServers(g, id, a);
@@ -1124,6 +1132,26 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
         std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     }
     return if (left.stopped) .stopped else .none;
+}
+
+/// Waits on each address lookup already in flight; true if any could be.
+fn demandAll(g: *Graph, id: CellId, busy: []const Key) !bool {
+    var pending = false;
+    for (busy) |key| {
+        if (try g.demand(id, key, .of(key.name)) != null) pending = true;
+    }
+    return pending;
+}
+
+/// Starts the wanted address lookups of each host; true if any is still out.
+fn lookUp(g: *Graph, id: CellId, hosts: []const Left.Unknown) !bool {
+    var demanded = false;
+    for (hosts) |u| for (families, u.families) |family, wanted| {
+        if (!wanted) continue;
+        const aid = try g.demand(id, u.host.at(.addr, family), .of(u.host.name)) orelse continue;
+        if (!g.cell(aid).settled()) demanded = true;
+    };
+    return demanded;
 }
 
 const families = [_]dns.RType{ .a, .aaaa };
@@ -1159,40 +1187,40 @@ fn reach(g: *Graph, a: *Ask, found: *Ask.Found, servers: []const graph.Server) b
 }
 
 fn learn(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, servers: []const graph.Server, left: *Left) !void {
-    const sa = g.scratch.allocator();
     for (servers) |server| {
         if (server.glue.len > 0) continue;
         var unknown: [families.len]bool = @splat(false);
-        for (families, &unknown) |family, *u| {
-            if (g.proven(server.key.at(.rrset, family)) != null) continue;
-            const key = server.key.at(.addr, family);
-            if (g.indexed(key)) |aid| {
-                const c = g.cell(aid);
-                if (!c.settled()) {
-                    left.awaited = left.awaited or g.holdsInput(id, aid);
-                    try left.busy.append(sa, key);
-                    continue;
-                }
-                if (g.holdsInput(id, aid)) {
-                    const why = c.failure() orelse {
-                        for (c.state.fact.addr) |x| a.offer(g, found, x);
-                        continue;
-                    };
-                    switch (why.cause) {
-                        .zone => {},
-                        .host => a.local = true,
-                        .asker => if (g.spent(g.payer)) {
-                            left.stopped = true;
-                        } else {
-                            left.awaited = true;
-                            try left.busy.append(sa, key);
-                        },
-                    }
-                    continue;
-                }
-            }
-            u.* = true;
-        }
-        if (mem.findScalar(bool, &unknown, true) != null) try left.unknown.append(sa, .{ .host = server.key, .families = unknown });
+        for (families, &unknown) |family, *u| u.* = try unlearned(g, id, a, found, left, server.key, family);
+        if (mem.findScalar(bool, &unknown, true) != null) try left.unknown.append(g.scratch.allocator(), .{ .host = server.key, .families = unknown });
     }
+}
+
+/// True when one family of a server's addresses is neither proven, in flight
+/// nor already an input of this cell: it is still to be looked up.
+fn unlearned(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, left: *Left, host: Key, family: dns.RType) !bool {
+    if (g.proven(host.at(.rrset, family)) != null) return false;
+    const key = host.at(.addr, family);
+    const aid = g.indexed(key) orelse return true;
+    const c = g.cell(aid);
+    if (!c.settled()) {
+        left.awaited = left.awaited or g.holdsInput(id, aid);
+        try left.busy.append(g.scratch.allocator(), key);
+        return false;
+    }
+    if (!g.holdsInput(id, aid)) return true;
+    const why = c.failure() orelse {
+        for (c.state.fact.addr) |x| a.offer(g, found, x);
+        return false;
+    };
+    switch (why.cause) {
+        .zone => {},
+        .host => a.local = true,
+        .asker => if (g.spent(g.payer)) {
+            left.stopped = true;
+        } else {
+            left.awaited = true;
+            try left.busy.append(g.scratch.allocator(), key);
+        },
+    }
+    return false;
 }

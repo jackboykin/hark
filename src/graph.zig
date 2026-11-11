@@ -1497,7 +1497,14 @@ pub const Graph = struct {
 
     pub const Sent = struct { id: CellId, est: ns_rtt.RttState, rounds: u32, exposure: Exposure };
 
-    pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, need: Need, case: Case, qname: dns.Name, qtype: dns.RType, uncapped: bool) !?Sent {
+    /// One question as it goes to a server.
+    pub const Query = struct { name: dns.Name, qtype: dns.RType, need: Need, case: Case };
+
+    pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, q: Query, uncapped: bool) !?Sent {
+        const qname = q.name;
+        const qtype = q.qtype;
+        const need = q.need;
+        const case = q.case;
         std.debug.assert(case == .random or need == .stream);
         // The run's payer may spend itself mid-run while another waiter still has
         // room: the shared work goes on at that one's cost.
@@ -1675,10 +1682,10 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .datagram, .random, host, .a, true));
+    try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .{ .name = host, .qtype = .a, .need = .datagram, .case = .random }, true));
     g.cell(second).scratch.answer.budget.queries = 0;
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expect(try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .datagram, .random, host, .a, true) != null);
+    try testing.expect(try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .{ .name = host, .qtype = .a, .need = .datagram, .case = .random }, true) != null);
     try testing.expectEqual(1, g.cell(second).scratch.answer.budget.queries);
     g.payer = &g.unpaid;
     g.unhold(first);
