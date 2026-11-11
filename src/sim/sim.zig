@@ -115,7 +115,7 @@ pub const Sim = struct {
 
     /// One upstream query. Its reply or absence is scheduled now; nothing
     /// depends on later steps.
-    pub fn send(s: *Sim, ex: Exchange) !void {
+    fn send(s: *Sim, ex: Exchange) !void {
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         const q = query.question orelse return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         if (s.pending_unsent > 0) {

@@ -26,7 +26,7 @@ pub const Client = struct {
 
 /// RFC 6147 at the client's edge, off under CD (§5.5); the cells stay
 /// what the authorities said.
-pub const Dns64 = struct {
+const Dns64 = struct {
     prefix: dns64.Prefix,
 
     pub fn on(prefix: ?dns64.Prefix, c: Client) ?Dns64 {
@@ -111,7 +111,7 @@ fn synthesized(q: dns.Question, s: special_use.Synthesized) Served {
     return .{ .rcode = s.rcode, .aa = s.aa, .question = q, .answers = s.answers, .authorities = s.authorities, .cacheable = false, .local = true };
 }
 
-pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
+fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
     const served = synthesized(q, try special_use.synthesize(arena, q, o));
     // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
@@ -126,7 +126,7 @@ pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dn
 }
 
 /// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
-pub fn hinfo(arena: Allocator, q: dns.Question) !Served {
+fn hinfo(arena: Allocator, q: dns.Question) !Served {
     const rr: dns.ResourceRecord = try .init(arena, .{ .name = q.name, .rtype = .hinfo, .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } });
     return .{ .rcode = .no_error, .question = q, .answers = try arena.dupe(dns.ResourceRecord, &.{rr}), .cacheable = false };
 }
@@ -145,7 +145,7 @@ fn servfailOf(q: dns.Question, why: graph.Failure) Served {
 
 /// Serve's policy over what the store still holds past a fact's TTL; the
 /// graph knows nothing of it.
-pub const Retention = struct {
+const Retention = struct {
     /// Answer from memory, asking nobody, until a reply is this old.
     min_ttl: u32 = 0,
     /// RFC 8767: serve an answer this long past its retention when it
@@ -169,7 +169,7 @@ pub const Desk = struct {
 
     /// `recalled` and `floored` come noted; `replayed` and `held` never are,
     /// or a hold would extend itself.
-    pub const Early = union(enum) {
+    const Early = union(enum) {
         synthesized: Served,
         replayed: Served,
         held: Served,
@@ -619,7 +619,7 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 /// asking nobody, for a window that doubles while it keeps failing, to the
 /// RFC's 5 minutes; an answer forgets it. Keyed (qname, qtype, CD), since a
 /// CD client is owed bogus data. Policy over no fact, so it is the server's.
-pub const Failures = struct {
+const Failures = struct {
     /// Array-backed: every answer removes, and a tombstoning map's misses
     /// would probe ever longer.
     map: std.array_hash_map.Custom([]const u8, Entry, Seeded, true) = .empty,

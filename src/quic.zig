@@ -16,7 +16,7 @@ const Aead = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes = crypto.core.aes.Aes128;
 const Secret = tls13.Secret;
 
-pub const version: u32 = 1;
+const version: u32 = 1;
 const initial_salt = hex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
 const retry_key = hex("be0c690b9f66575a1d766b54e368c84e");
 const retry_nonce = hex("461599d35d632bf2239825bb");
@@ -26,7 +26,7 @@ pub const max_datagram = 1200;
 /// Hark's max_udp_payload_size: what IPv4 over Ethernet carries in one
 /// datagram. A server may send no larger (RFC 9000 §18.2).
 pub const max_received = 1472;
-pub const alpn = "doq";
+const alpn = "doq";
 
 // RFC 9001 §6.6: AES-GCM's limits.
 const packets_per_key = 1 << 23;
@@ -55,9 +55,9 @@ const doq_no_error: u64 = 0x0;
 const doq_protocol_error: u64 = 0x2;
 const doq_request_cancelled: u64 = 0x3;
 
-pub const max_varint: u64 = (1 << 62) - 1;
+const max_varint: u64 = (1 << 62) - 1;
 
-pub fn varintLen(v: u64) usize {
+fn varintLen(v: u64) usize {
     std.debug.assert(v <= max_varint);
     if (v < 1 << 6) return 1;
     if (v < 1 << 14) return 2;
@@ -65,7 +65,7 @@ pub fn varintLen(v: u64) usize {
     return 8;
 }
 
-pub fn putVarint(out: []u8, v: u64) usize {
+fn putVarint(out: []u8, v: u64) usize {
     const n = varintLen(v);
     switch (n) {
         1 => out[0] = @intCast(v),
@@ -133,7 +133,7 @@ const Writer = struct {
     }
 };
 
-pub const Cid = struct {
+const Cid = struct {
     len: u8 = 0,
     bytes: [20]u8 = undefined,
 
@@ -153,7 +153,7 @@ pub const Cid = struct {
     }
 };
 
-pub const Keys = struct {
+const Keys = struct {
     secret: Secret,
     key: [Aead.key_length]u8,
     iv: [Aead.nonce_length]u8,
@@ -220,7 +220,7 @@ pub const Keys = struct {
     }
 };
 
-pub fn initialKeys(dcid: []const u8) struct { client: Keys, server: Keys } {
+fn initialKeys(dcid: []const u8) struct { client: Keys, server: Keys } {
     const initial = Hkdf.extract(&initial_salt, dcid);
     return .{
         .client = .of(&tls.hkdfExpandLabel(Hkdf, initial, "client in", "", Hkdf.prk_length)),
@@ -229,7 +229,7 @@ pub fn initialKeys(dcid: []const u8) struct { client: Keys, server: Keys } {
 }
 
 /// RFC 9001 §5.8.
-pub fn retryValid(retry: []const u8, odcid: []const u8) bool {
+fn retryValid(retry: []const u8, odcid: []const u8) bool {
     if (retry.len < Aead.tag_length) return false;
     var pseudo: [1 + 20 + 1500]u8 = undefined;
     const body = retry[0 .. retry.len - Aead.tag_length];
@@ -285,7 +285,7 @@ const Param = enum(u64) {
 
 /// No stream the server may open, and an empty source connection id: a
 /// connected socket says whose a datagram is (RFC 9000 §5.1).
-pub fn ourParams(out: *[tls13.max_quic_params]u8) []const u8 {
+fn ourParams(out: *[tls13.max_quic_params]u8) []const u8 {
     var w: Writer = .{ .buf = out };
     inline for (.{
         .{ Param.max_idle_timeout, idle_ms },
@@ -563,7 +563,7 @@ const CryptoIn = struct {
     };
 };
 
-pub const Level = enum { initial, handshake, application };
+const Level = enum { initial, handshake, application };
 
 pub const End = enum { failed, closed };
 
@@ -620,7 +620,7 @@ const Stream = struct {
 
 const Close = struct { app: bool, code: u64, frame: u64 = 0 };
 
-pub const Error = error{
+const Error = error{
     InternalError,
     FlowControlError,
     StreamLimitError,

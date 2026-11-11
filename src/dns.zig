@@ -27,11 +27,11 @@ fn Tag(comptime E: type) type {
 }
 
 pub const max_label_len = 63;
-pub const max_name_len = 253;
+const max_name_len = 253;
 /// RFC 1035 §3.1, the root's length octet included.
 pub const max_name_wire_len = 255;
 /// Every label one octet long, beside the root's zero.
-pub const max_label_count = (max_name_wire_len - 1) / 2;
+const max_label_count = (max_name_wire_len - 1) / 2;
 /// Presentation-format ceiling: every content byte can escape to `\DDD`
 /// (4 chars), separators are free relative to the wire length budget.
 pub const max_dotted_len = 4 * max_name_len;
@@ -700,7 +700,7 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
 pub const edns_opt_tcp_keepalive: u16 = 11;
 
 /// RFC 7830.
-pub const edns_opt_padding: u16 = 12;
+const edns_opt_padding: u16 = 12;
 
 /// RFC 8914.
 pub const edns_opt_ede: u16 = 15;
@@ -1274,7 +1274,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
 
 /// A message as parsed: its sections are fresh arrays, the caller's to
 /// trim or reorder before reading them as a `Message`.
-pub const Parsed = struct {
+const Parsed = struct {
     header: Header,
     question: ?Question,
     answers: []ResourceRecord,
@@ -1417,7 +1417,7 @@ pub fn hasOption(msg: []const u8, code: u16) Error!bool {
 /// RFC 1035 §4.1.4 targets. Byte-exact: a pointer must not change a name's case.
 /// A candidate entry spends its label count from `work`; once gone, names go
 /// out whole (Unbound CVE-2024-8508: labels² × entries per name).
-pub const NameTable = struct {
+const NameTable = struct {
     entries: [64]Entry = undefined,
     len: usize = 0,
     work: u32 = 1 << 16,

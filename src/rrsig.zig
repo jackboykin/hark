@@ -975,7 +975,7 @@ fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
 
 /// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
 /// that verifies it. Buffers are caller-owned so the slices outlive the call.
-pub const TestSigned = struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData };
+const TestSigned = struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData };
 
 pub fn testSignRrset(
     rrset: []const dns.ResourceRecord,

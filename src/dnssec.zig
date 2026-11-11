@@ -272,7 +272,7 @@ pub fn signedBy(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RTy
 
 /// The signatures over one set worth a verify: room for a rollover's;
 /// more is stuffing.
-pub const max_sigs_per_set = 8;
+const max_sigs_per_set = 8;
 
 fn usable(sig: dns.RrsigData, now: u32) bool {
     return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, now);
@@ -316,7 +316,7 @@ pub const Weighed = struct {
     }
 };
 
-pub const Verified = struct { sig: dns.RrsigData, unweighed: bool };
+const Verified = struct { sig: dns.RrsigData, unweighed: bool };
 
 /// A section read as sets (RFC 2181 §5), in place: each set where it first
 /// appears, then the signatures bound to it, all at their lowest TTL (RFC

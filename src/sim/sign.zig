@@ -16,7 +16,7 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const RR = dns.ResourceRecord;
 
-pub const Key = struct {
+const Key = struct {
     zone: dns.Name,
     pair: Ecdsa.KeyPair,
     dnskey: dns.DnskeyData,

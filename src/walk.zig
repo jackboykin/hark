@@ -31,7 +31,7 @@ const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
 
-pub const Attempt = struct { exchange: CellId, server: u8, need: Need, case: graph.Case };
+const Attempt = struct { exchange: CellId, server: u8, need: Need, case: graph.Case };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
@@ -244,7 +244,7 @@ pub const Ask = struct {
 pub const Kept = struct { msg: dns.Message, verdict: Verdict };
 
 /// `none`: an rcode that answers nothing.
-pub const Verdict = union(enum) { reply: Reply, loop, none };
+const Verdict = union(enum) { reply: Reply, loop, none };
 
 /// A held fact above a name that speaks for every name below it, and its judge.
 const Above = struct { fact: OptionalCellId = .none, judge: OptionalCellId = .none };
@@ -510,7 +510,7 @@ fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
     return n;
 }
 
-pub const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
+const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
 
 /// Waits on `startAt`'s cut, or on the deepest one known if no probe
 /// could place it.

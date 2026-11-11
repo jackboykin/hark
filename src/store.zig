@@ -107,7 +107,7 @@ pub const Life = struct {
 
 /// Handed the store itself, so whatever embeds one finds itself by the
 /// field (`@fieldParentPtr`) and never pins its address.
-pub const OnEvict = *const fn (*Store, *Blob) void;
+const OnEvict = *const fn (*Store, *Blob) void;
 
 pub const Store = struct {
     gpa: Allocator,

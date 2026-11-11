@@ -18,12 +18,12 @@ const ns_rtt = @import("../ns_rtt.zig");
 const chaos = @import("../chaos.zig");
 const slab = @import("../slab.zig");
 
-pub const Phase = enum { steps, warm };
+const Phase = enum { steps, warm };
 
 /// How many decisions each chaos site took other than hark's own.
 const Fired = std.EnumArray(chaos.Site, u32);
 
-pub const Report = struct {
+const Report = struct {
     /// The failing step and why.
     step: u32 = 0,
     msg: []const u8 = "",
@@ -58,14 +58,14 @@ pub const Report = struct {
     }
 };
 
-pub const Answered = struct {
+const Answered = struct {
     phase: Phase,
     step: u32,
     wire: []const u8,
     limited: bool,
 };
 
-pub const Options = struct {
+const Options = struct {
     seed: u64 = 1,
     trace: bool = false,
     chaos: u64 = 0,

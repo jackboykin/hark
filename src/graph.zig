@@ -883,7 +883,7 @@ pub const Graph = struct {
         return if (v == 0) ms else @intCast(v);
     }
 
-    pub fn skips(g: *Graph, site: chaos.Site, key: Key) !bool {
+    fn skips(g: *Graph, site: chaos.Site, key: Key) !bool {
         return try g.decide(site, key, 2) == 1;
     }
 
@@ -1695,11 +1695,11 @@ pub const Graph = struct {
         }
     }
 
-    pub fn observe(g: *Graph, server: na.Address, rtt_ns: i64) void {
+    fn observe(g: *Graph, server: na.Address, rtt_ns: i64) void {
         g.rtt.write(.fromAddress(server), g.nowMs()).observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
     }
 
-    pub fn observeTimeout(g: *Graph, server: na.Address) void {
+    fn observeTimeout(g: *Graph, server: na.Address) void {
         g.rtt.write(.fromAddress(server), g.nowMs()).observeTimeout(g.nowMs());
     }
 
@@ -1711,7 +1711,7 @@ pub const Graph = struct {
         return g.estimate(server).track;
     }
 
-    pub const Estimate = struct { track: ns_rtt.Track, est: ?*const ns_rtt.RttState };
+    const Estimate = struct { track: ns_rtt.Track, est: ?*const ns_rtt.RttState };
 
     pub fn estimate(g: *Graph, server: na.AddressKey) Estimate {
         if (g.chaosAt(.dead)) |ch| {

@@ -10,7 +10,7 @@ pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch
 pub const Events = std.array_hash_map.Auto(u64, void);
 
 /// What an event decided about, for a shrunk failure's report.
-pub const About = union(enum) {
+const About = union(enum) {
     key: graph.Key,
     server: na.AddressKey,
     none,
@@ -83,7 +83,7 @@ pub const Chaos = struct {
     /// One of `n` for `event`, unnoted; the bias, n / 2^64, never shows. A
     /// draw of 0 is what hark does without chaos, or, where hark draws too,
     /// the first.
-    pub fn draw(c: *const Chaos, event: u64, n: u64) u64 {
+    fn draw(c: *const Chaos, event: u64, n: u64) u64 {
         if (c.only) |only| if (!only.contains(event)) return 0;
         return @intCast(std.math.mulWide(u64, std.hash.Wyhash.hash(event, "draw"), n) >> 64);
     }
