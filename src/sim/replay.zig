@@ -120,6 +120,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         .dns64 = scenario.dns64_prefix,
     };
     defer desk.deinit();
+    const run: Run = .{ .arena = arena, .g = &g, .s = &s, .scenario = scenario, .held = &held, .desk = &desk, .rb = &rb };
     var last: ?dns.Message = null;
     var cursor: usize = 0;
     for (scenario.steps) |st| {
@@ -129,63 +130,10 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
             .check_answer, .check_query_log, .check_out_query, .check_max_queries, .check_max_verifies, .check_max_runs => continue,
             .query, .unsent, .time_passes => {},
         };
-        switch (st.kind) {
-            .query => {
-                const sent = try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb);
-                try answered(gpa, report, opts, &s, .steps, st.n, sent);
-                last = if (sent) |x| x.msg else null;
-                if (sent == null and opts.chaos == 0 and scenario.client_timeout_ms == null) {
-                    report.msg = "client timed out";
-                    return error.ScenarioFailed;
-                }
-            },
-            .check_answer => {
-                const actual = last orelse {
-                    report.msg = "no answer to check";
-                    return error.ScenarioFailed;
-                };
-                if (answerMismatch(actual, st.entry.?, .cold)) |why| {
-                    if (opts.trace) printSections(actual);
-                    report.msg = why;
-                    return error.ScenarioFailed;
-                }
-            },
-            .check_query_log => if (queryLogMismatch(s.log.items, st.entry.?)) |why| {
-                report.msg = why;
-                return error.ScenarioFailed;
-            },
-            .check_out_query => {
-                if (cursor >= s.log.items.len) {
-                    report.msg = "CHECK_OUT_QUERY past the end of the log";
-                    return error.ScenarioFailed;
-                }
-                if (outQueryMismatch(s.log.items[cursor], st.entry.?)) |why| {
-                    report.msg = why;
-                    return error.ScenarioFailed;
-                }
-                cursor += 1;
-            },
-            .check_max_queries => if (s.log.items.len > st.bound) {
-                report.msg = "CHECK_MAX_QUERIES exceeded";
-                return error.ScenarioFailed;
-            },
-            .check_max_verifies => if (g.verify_memo.misses > st.bound) {
-                report.msg = "CHECK_MAX_VERIFIES exceeded";
-                return error.ScenarioFailed;
-            },
-            .check_max_runs => if (g.runs > st.bound) {
-                report.msg = "CHECK_MAX_RUNS exceeded";
-                return error.ScenarioFailed;
-            },
-            .unsent => s.pending_unsent += 1,
-            .time_passes => {
-                const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
-                while (s.next(until)) |ev| try g.complete(ev.id, ev.completion);
-            },
-        }
+        try runStep(gpa, run, st, opts, report, &last, &cursor);
     }
     report.phase = .warm;
-    try requery(gpa, arena, &g, &s, scenario, opts, report, &held, &desk, &rb);
+    try requery(gpa, run, opts, report);
     letGoAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
@@ -194,11 +142,72 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     }
 }
 
+/// One scenario step: a question asked, a check made, or time moved.
+fn runStep(gpa: Allocator, r: Run, st: rpl.Step, opts: Options, report: *Report, last: *?dns.Message, cursor: *usize) !void {
+    const g = r.g;
+    const s = r.s;
+    switch (st.kind) {
+        .query => {
+            const sent = try resolveClient(r, st.entry.?);
+            try answered(gpa, report, opts, s, .steps, st.n, sent);
+            last.* = if (sent) |x| x.msg else null;
+            if (sent == null and opts.chaos == 0 and r.scenario.client_timeout_ms == null) {
+                report.msg = "client timed out";
+                return error.ScenarioFailed;
+            }
+        },
+        .check_answer => {
+            const actual = last.* orelse {
+                report.msg = "no answer to check";
+                return error.ScenarioFailed;
+            };
+            if (answerMismatch(actual, st.entry.?, .cold)) |why| {
+                if (opts.trace) printSections(actual);
+                report.msg = why;
+                return error.ScenarioFailed;
+            }
+        },
+        .check_query_log => if (queryLogMismatch(s.log.items, st.entry.?)) |why| {
+            report.msg = why;
+            return error.ScenarioFailed;
+        },
+        .check_out_query => {
+            if (cursor.* >= s.log.items.len) {
+                report.msg = "CHECK_OUT_QUERY past the end of the log";
+                return error.ScenarioFailed;
+            }
+            if (outQueryMismatch(s.log.items[cursor.*], st.entry.?)) |why| {
+                report.msg = why;
+                return error.ScenarioFailed;
+            }
+            cursor.* += 1;
+        },
+        .check_max_queries => if (s.log.items.len > st.bound) {
+            report.msg = "CHECK_MAX_QUERIES exceeded";
+            return error.ScenarioFailed;
+        },
+        .check_max_verifies => if (g.verify_memo.misses > st.bound) {
+            report.msg = "CHECK_MAX_VERIFIES exceeded";
+            return error.ScenarioFailed;
+        },
+        .check_max_runs => if (g.runs > st.bound) {
+            report.msg = "CHECK_MAX_RUNS exceeded";
+            return error.ScenarioFailed;
+        },
+        .unsent => s.pending_unsent += 1,
+        .time_passes => {
+            const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
+            while (s.next(until)) |ev| try g.complete(ev.id, ev.completion);
+        },
+    }
+}
+
 /// Every checked question, asked again of the settled graph, must answer the
 /// same from memory alone, unless the answer was never a fact (TTL 0). Only a
 /// question's last check counts; TTLs have aged and are not compared.
-fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, opts: Options, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
-    const steps = scenario.steps;
+fn requery(gpa: Allocator, r: Run, opts: Options, report: *Report) !void {
+    const s = r.s;
+    const steps = r.scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
         const q = query.entry.?.question.?;
@@ -210,7 +219,7 @@ fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scena
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const sent = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk, rb);
+        const sent = try resolveClient(r, query.entry.?);
         try answered(gpa, report, opts, s, .warm, query.n, sent);
         const actual = sent orelse {
             if (opts.chaos != 0) continue;
@@ -227,6 +236,17 @@ fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scena
         }
     }
 }
+
+/// What one scenario's replay works on.
+const Run = struct {
+    arena: Allocator,
+    g: *graph.Graph,
+    s: *sim.Sim,
+    scenario: *const rpl.Scenario,
+    held: *Held,
+    desk: *answer.Desk,
+    rb: *const rebinding.Config,
+};
 
 const Held = struct {
     roots: [2]?graph.CellId = .{ null, null },
@@ -328,7 +348,10 @@ fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
 }
 
 /// The roots stay in `held` until the next question: the answer reads their hops.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !?Sent {
+fn resolveClient(r: Run, entry: rpl.Entry) !?Sent {
+    const arena = r.arena;
+    const g = r.g;
+    const desk = r.desk;
     const q = entry.question.?;
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     var limited = false;
@@ -340,19 +363,19 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         },
         .recalled => |served| blk: {
             errdefer served.release(&g.store);
-            try agrees(arena, g, s, scenario, q, client, held, desk, rb, served);
+            try agrees(r, q, client, served);
             break :blk served;
         },
         .graph => blk: {
-            const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null;
-            for (held.roots) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
+            const built = try shapeClient(r, q, client) orelse return null;
+            for (r.held.roots) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
                 limited = limited or why.cause == .asker or why.remembered;
             };
             break :blk try desk.derived(q, client, built);
         },
     };
     defer served.release(&g.store);
-    const wire = try wireOf(arena, q, client, entry.do_bit or entry.edns, rb, served);
+    const wire = try wireOf(arena, q, client, entry.do_bit or entry.edns, r.rb, served);
     return .{ .msg = try dns.parseMessage(arena, wire), .wire = wire, .cacheable = served.cacheable, .limited = limited };
 }
 
@@ -372,9 +395,13 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
 }
 
 /// What recall serves from the store, the graph must build too, to the byte, asking nobody.
-fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config, recalled: answer.Served) !void {
+fn agrees(r: Run, q: dns.Question, client: answer.Client, recalled: answer.Served) !void {
+    const arena = r.arena;
+    const g = r.g;
+    const s = r.s;
+    const rb = r.rb;
     const before = s.log.items.len;
-    const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
+    const built = try shapeClient(r, q, client) orelse return error.RecallDisagrees;
     defer built.release(&g.store);
     if (s.log.items.len != before) return error.RecallDisagrees;
     const a = try wireOf(arena, q, client, false, rb, recalled);
@@ -383,7 +410,13 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
 
-fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk) !?answer.Served {
+fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
+    const arena = r.arena;
+    const g = r.g;
+    const s = r.s;
+    const held = r.held;
+    const desk = r.desk;
+    const scenario = r.scenario;
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms orelse 5000) * std.time.ns_per_ms;
     const asked = try desk.asked(arena, q, client);
