@@ -1,47 +1,9 @@
 //! The hark module: every source file, for main, the fuzzers and the tests.
 
-pub const acl = @import("acl.zig");
-pub const answer = @import("answer.zig");
-pub const arena = @import("arena.zig");
-pub const batch = @import("batch.zig");
 pub const config = @import("config.zig");
-pub const delegation = @import("delegation.zig");
-pub const denial = @import("denial.zig");
-pub const dns = @import("dns.zig");
-pub const dot = @import("dot.zig");
-pub const carrier = @import("carrier.zig");
-pub const dot_socket = @import("dot_socket.zig");
-pub const doq_socket = @import("doq_socket.zig");
-pub const quic = @import("quic.zig");
-pub const dns64 = @import("dns64.zig");
-pub const dnssec = @import("dnssec.zig");
-pub const edge = @import("edge.zig");
-pub const graph = @import("graph.zig");
-pub const slab = @import("slab.zig");
 pub const monotonic = @import("monotonic.zig");
-pub const net_address = @import("net_address.zig");
-pub const ns_rtt = @import("ns_rtt.zig");
-pub const proof = @import("proof.zig");
-pub const rand = @import("rand.zig");
-pub const rebinding = @import("rebinding.zig");
-pub const response = @import("response.zig");
-pub const rrsig = @import("rrsig.zig");
 pub const serve = @import("serve.zig");
-pub const sessions = @import("sessions.zig");
-pub const special_use = @import("special_use.zig");
-pub const store = @import("store.zig");
-pub const stub = @import("stub.zig");
-pub const sys = @import("sys_union.zig");
-pub const tls13 = @import("tls13.zig");
-pub const toml = @import("toml.zig");
-pub const trust = @import("trust.zig");
-pub const walk = @import("walk.zig");
-pub const sim = struct {
-    pub const rpl = @import("sim/rpl.zig");
-    pub const sign = @import("sim/sign.zig");
-    pub const sim = @import("sim/sim.zig");
-    pub const replay = @import("sim/replay.zig");
-};
+pub const slab = @import("slab.zig");
 
 // Explicit per-file imports drive test discovery by reachability, so tests run
 // regardless of pub-ness — unlike refAllDecls, which sees only pub decls (a
