@@ -10,6 +10,7 @@
 //!
 //! The rules live beside it: the delegation walk in walk.zig, the chain of
 //! trust in trust.zig, aggressive denial in denial.zig; one core.
+//! What a cell is keyed by and holds is model.zig, which the store reads too.
 const std = @import("std");
 const builtin = @import("builtin");
 const rand = @import("rand.zig");
