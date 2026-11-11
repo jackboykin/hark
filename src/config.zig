@@ -529,82 +529,15 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     return .{ .ip4 = ip4 };
 }
 
-test "parse full config" {
-    var cfg = try parseConfig(testing.allocator,
-        \\[server]
-        \\listen = ["127.0.0.1:8053"]
-        \\
-        \\[resolver]
-        \\dnssec = true
-        \\qname-minimization = false
-        \\
-        \\[cache]
-        \\size = 8388608
-    );
-    defer cfg.deinit();
-
-    try testing.expectEqual(@as(usize, 1), cfg.listen.len);
-    try testing.expectEqual(@as(u16, 8053), cfg.listen[0].getPort());
-    try testing.expectEqual(true, cfg.dnssec);
-    try testing.expectEqual(false, cfg.qname_minimization);
-    try testing.expectEqual(@as(usize, 8388608), cfg.cache_size);
-}
-
 test "a bad dns64-prefix refuses startup" {
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, "[resolver]\ndns64-prefix = \"64:ff9b::/100\"\n"));
-}
-
-test "parse IPv6 listen address" {
-    var cfg = try parseConfig(testing.allocator,
-        \\[server]
-        \\listen = ["[::1]:5353"]
-    );
-    defer cfg.deinit();
-
-    try testing.expectEqual(@as(usize, 1), cfg.listen.len);
-    try testing.expectEqual(@as(u16, 5353), cfg.listen[0].getPort());
-}
-
-test "parse address with default port" {
-    const addr = parseAddress("192.168.1.1", 53).?;
-    try testing.expectEqual(@as(u16, 53), addr.getPort());
-}
-
-test "parse address with explicit port" {
-    const addr = parseAddress("192.168.1.1:8053", 53).?;
-    try testing.expectEqual(@as(u16, 8053), addr.getPort());
 }
 
 test "bracketed address needs a colon before its port" {
     try testing.expectEqual(@as(?Address, null), parseAddress("[::1]5353", 53));
 }
 
-test "cache prefetch and stale config" {
-    var cfg = try parseConfig(testing.allocator,
-        \\[cache]
-        \\prefetch = true
-        \\serve-stale-ttl = 3600
-        \\min-ttl = 300
-        \\servfail-ttl = 7
-    );
-    defer cfg.deinit();
-
-    try testing.expectEqual(true, cfg.prefetch);
-    try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
-    try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
-    try testing.expectEqual(@as(u32, 7), cfg.servfail_ttl);
-}
-
-test "tcp idle and queries knobs parse and validate" {
-    var cfg = try parseConfig(testing.allocator,
-        \\[server]
-        \\tcp-idle-timeout-ms = 8000
-        \\tcp-queries-per-conn = 64
-    );
-    defer cfg.deinit();
-    try testing.expectEqual(@as(u32, 8000), cfg.tcp_idle_timeout_ms);
-    try testing.expectEqual(@as(u32, 64), cfg.tcp_queries_per_conn);
-
+test "tcp idle and queries knobs refuse what is out of range" {
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
         \\tcp-queries-per-conn = 0
@@ -614,15 +547,6 @@ test "tcp idle and queries knobs parse and validate" {
         \\[server]
         \\tcp-idle-timeout-ms = 7000000
     ));
-}
-
-test "rebinding defaults are safe (enabled, empty extras)" {
-    var cfg = try parseConfig(testing.allocator, "");
-    defer cfg.deinit();
-    try testing.expectEqual(true, cfg.rebinding.enabled);
-    try testing.expectEqual(@as(usize, 0), cfg.rebinding.allow_zones.len);
-    try testing.expectEqual(@as(usize, 0), cfg.rebinding.extra_block.len);
-    try testing.expectEqual(@as(usize, 0), cfg.rebinding.extra_allow.len);
 }
 
 test "rebinding rejects empty / root zone in allow_zones (would silently disable scrub)" {

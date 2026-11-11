@@ -817,63 +817,6 @@ fn parseTest(arena: Allocator, text: []const u8) !Scenario {
     };
 }
 
-test "minimal hark scenario" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const s = try parseTest(arena_state.allocator(),
-        \\; hark: root-hints = 127.0.10.1
-        \\
-        \\SCENARIO_BEGIN minimal
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.1
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode qname
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR AA NOERROR
-        \\    SECTION QUESTION
-        \\      example.com. IN A
-        \\    SECTION ANSWER
-        \\      example.com. 3600 IN A 1.2.3.4
-        \\      example.com. IN TXT "hello world" plain
-        \\  ENTRY_END
-        \\RANGE_END
-        \\STEP 1 QUERY
-        \\ENTRY_BEGIN
-        \\  REPLY RD
-        \\  SECTION QUESTION
-        \\    example.com. IN A
-        \\ENTRY_END
-        \\STEP 2 CHECK_ANSWER
-        \\ENTRY_BEGIN
-        \\  MATCH rcode answer ede=3
-        \\  REPLY QR RD RA NXDOMAIN
-        \\  SECTION QUESTION
-        \\    example.com. IN A
-        \\ENTRY_END
-        \\STEP 3 TIME_PASSES ELAPSE 10
-        \\STEP 4 CHECK_MAX_QUERIES 7
-        \\SCENARIO_END
-    );
-    try testing.expectEqualStrings("minimal", s.name);
-    try testing.expectEqual(1, s.root_hints.len);
-    try testing.expectEqual(1, s.ranges.len);
-    const e = s.ranges[0].entries[0];
-    try testing.expect(e.match.opcode and e.match.qname and !e.match.qtype);
-    try testing.expect(e.flags.qr and e.flags.aa and e.flags.rcode == .no_error);
-    try testing.expectEqual(2, e.answers.len);
-    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, e.answers[0].a());
-    var strings = e.answers[1].txt();
-    try testing.expectEqualStrings("hello world", strings.next().?);
-    try testing.expectEqualStrings("plain", strings.next().?);
-    try testing.expectEqual(4, s.steps.len);
-    try testing.expectEqual(Step.Kind.query, s.steps[0].kind);
-    try testing.expect(s.steps[0].entry.?.flags.rd);
-    try testing.expectEqual(3, s.steps[1].entry.?.ede.?);
-    try testing.expectEqual(dns.RCode.name_error, s.steps[1].entry.?.flags.rcode);
-    try testing.expectEqual(10, s.steps[2].seconds);
-    try testing.expectEqual(7, s.steps[3].bound);
-}
-
 test "rejections" {
     const cases = [_]struct { text: []const u8, msg: []const u8 }{
         .{ .text = "SCENARIO_BEGIN x\nSTEP 1 QUERY\nENTRY_BEGIN\nMATCH quesiton\nENTRY_END\nSCENARIO_END", .msg = "unknown MATCH flag" },

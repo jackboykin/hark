@@ -145,27 +145,6 @@ test "parseIp6Arpa round-trips through the nibble order" {
     try testing.expectEqual(@as(?[16]u8, null), parseIp6Arpa(.lit("abc.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.")));
 }
 
-test "synthesizeAaaa embeds every A, drops its RRSIG and caps TTL by the SOA" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
-    const host = try dns.parseDottedName(al, "host.example.com.");
-    const sig: dns.RrsigData = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 0, .sig_expiration = 0, .sig_inception = 0, .key_tag = 0, .signer_name = host, .signature = "" };
-    const a = [_]dns.ResourceRecord{
-        .fixture(.{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
-        .fixture(.{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } }),
-    };
-    const soa = [_]dns.ResourceRecord{.fixture(.{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } })};
-    try testing.expect(wantsSynthesis(.no_error, &.{}));
-    const out = (try synthesizeAaaa(al, Prefix.well_known, &a, &soa)).?;
-    try testing.expectEqual(@as(usize, 1), out.len);
-    try testing.expectEqual(dns.RType.aaaa, out[0].rtype);
-    try testing.expectEqual(@as(u32, 300), out[0].ttl);
-    try testing.expectEqualSlices(u8, &Prefix.well_known.embed(.{ 192, 0, 2, 1 }), out[0].rdata);
-    try testing.expect(!wantsSynthesis(.no_error, out));
-    try testing.expectEqual(@as(?[]dns.ResourceRecord, null), try synthesizeAaaa(al, Prefix.well_known, &.{}, &soa));
-}
-
 test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME hop" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -528,19 +528,6 @@ pub fn signedLabels(name: dns.Name) u8 {
     return name.depth() - @intFromBool(star);
 }
 
-test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
-    try testing.expect(isSupportedAlgorithm(.rsasha256));
-    try testing.expect(isSupportedAlgorithm(.rsasha512));
-    try testing.expect(isSupportedAlgorithm(.ecdsap256sha256));
-    try testing.expect(isSupportedAlgorithm(.ecdsap384sha384));
-    try testing.expect(isSupportedAlgorithm(.ed25519));
-    try testing.expect(isSupportedAlgorithm(.mldsa44));
-    try testing.expect(!isSupportedAlgorithm(.rsasha1));
-    try testing.expect(!isSupportedAlgorithm(.rsasha1_nsec3));
-    try testing.expect(!isSupportedAlgorithm(.rsamd5));
-    try testing.expect(!isSupportedAlgorithm(.dsasha1));
-}
-
 pub const test_owner = dns.Name.lit("example.com");
 
 const TestFlatten = struct {

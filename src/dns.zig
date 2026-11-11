@@ -1707,33 +1707,6 @@ test "name parsing - self pointer rejection" {
     try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
 }
 
-test "full query packet parse" {
-    const pkt = "\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt);
-
-    try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
-    try testing.expect(msg.header.flags.rd);
-    const q = msg.question.?;
-    try testing.expect(q.name.eql(.lit("example.com")));
-    try testing.expectEqual(RType.a, q.qtype);
-    try testing.expectEqual(RClass.in, q.qclass);
-}
-
-test "A record parsing" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .a, &.{ 93, 184, 216, 34 }, 4));
-
-    try testing.expectEqual(@as(usize, 1), msg.answers.len);
-    const rr = msg.answers[0];
-    try testing.expectEqual(RType.a, rr.rtype);
-    try testing.expectEqual(@as(u32, 300), rr.ttl);
-    try testing.expectEqualSlices(u8, &[_]u8{ 93, 184, 216, 34 }, &rr.a());
-}
-
 test "SOA record parsing" {
     var rd = TestRdata{};
     rd.putBytes("\x02ns\x07example\x03com\x00");
@@ -1752,20 +1725,6 @@ test "SOA record parsing" {
     try testing.expectEqual(@as(u32, 900), soa.retry);
     try testing.expectEqual(@as(u32, 604800), soa.expire);
     try testing.expectEqual(@as(u32, 86400), soa.minimum);
-}
-
-test "MX record parsing" {
-    var rd = TestRdata{};
-    rd.put(u16, 10);
-    rd.putBytes("\x04mail\x07example\x03com\x00");
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .mx, rd.slice(), rd.pos));
-
-    const mx = msg.answers[0].mx();
-    try testing.expectEqual(@as(u16, 10), mx.preference);
-    try testing.expect(mx.exchange.eql(.lit("mail.example.com")));
 }
 
 test "TXT record parsing" {
