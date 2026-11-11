@@ -206,17 +206,18 @@ pub fn buildSignedData(rrsig: dns.RrsigData, set: Canonical) SignedData {
 /// widen the replay window of a captured signature.
 const inception_skew_tolerance: u32 = 60;
 
+/// When a signature is checked, at whose cost, and what is known to verify.
+pub const Verifier = struct { now: u32, budget: *ValidationBudget, memo: *VerifyMemo };
+
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
     set: Canonical,
-    now_u32: u32,
-    budget: *ValidationBudget,
-    memo: *VerifyMemo,
+    at: Verifier,
 ) VerifyError!void {
     // Charged before any check, so attempts the cheap checks reject count
     // too (KeyTrap).
-    try budget.consumeVerify();
+    try at.budget.consumeVerify();
 
     // Else an RRSIG naming a weaker algorithm hands the key to that verifier.
     if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
@@ -237,7 +238,7 @@ pub fn verifyRrsig(
         }
     }
 
-    if (!inWindow(rrsig, now_u32)) return error.SignatureExpired;
+    if (!inWindow(rrsig, at.now)) return error.SignatureExpired;
 
     const data = buildSignedData(rrsig, set);
 
@@ -248,12 +249,12 @@ pub fn verifyRrsig(
             data.feed(&hash);
             hash.final(&digest);
             const t = VerifyMemo.tag(alg, dnskey.public_key, rrsig.signature, &digest);
-            if (memo.recall(&t)) {
+            if (at.memo.recall(&t)) {
                 if (builtin.mode == .debug) proveMath(alg, rrsig.signature, &data, &digest, dnskey.public_key) catch unreachable;
                 return;
             }
             try proveMath(alg, rrsig.signature, &data, &digest, dnskey.public_key);
-            memo.remember(&t);
+            at.memo.remember(&t);
         },
         else => return error.UnsupportedAlgorithm,
     }
@@ -571,7 +572,7 @@ test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
     const dnskey: dns.DnskeyData = .{ .flags = 257, .protocol = 3, .algorithm = .ed25519, .public_key = &key };
     var budget: ValidationBudget = .{};
     var memo: VerifyMemo = .{};
-    try verifyRrsig(rrsig, dnskey, .sort(answers), 1_800_000_000, &budget, &memo);
+    try verifyRrsig(rrsig, dnskey, .sort(answers), .{ .now = 1_800_000_000, .budget = &budget, .memo = &memo });
 }
 
 test "ECDSA P-384 signature verification" {
@@ -600,11 +601,11 @@ test "VerifyMemo: a remembered signature binds its key and still expires" {
     var budget: ValidationBudget = .{};
     const now: u32 = 1_700_000_000;
 
-    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
-    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), now, &budget, &memo);
+    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), .{ .now = now, .budget = &budget, .memo = &memo });
+    try verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), .{ .now = now, .budget = &budget, .memo = &memo });
     try testing.expectEqual(1, memo.hits);
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, .sort(&recs), now, &budget, &memo));
-    try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), signed.rrsig.sig_expiration + 1, &budget, &memo));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, .sort(&recs), .{ .now = now, .budget = &budget, .memo = &memo }));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), .{ .now = signed.rrsig.sig_expiration + 1, .budget = &budget, .memo = &memo }));
     try testing.expectEqual(1, memo.hits);
 }
 
@@ -728,12 +729,12 @@ const test_window_empty_set: Canonical = .{ .records = &.{} };
 
 test "verifyRrsig rejects expired signature" {
     var budget: ValidationBudget = .{};
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, 1700000000 + 1, &budget, &test_memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, .{ .now = 1700000000 + 1, .budget = &budget, .memo = &test_memo }));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
     var budget: ValidationBudget = .{};
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, 1699000000 - inception_skew_tolerance - 1, &budget, &test_memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, .{ .now = 1699000000 - inception_skew_tolerance - 1, .budget = &budget, .memo = &test_memo }));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
@@ -742,7 +743,7 @@ test "verifyRrsig tolerates clock skew within window" {
         1700000000, // at expiration boundary
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
-        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, now, &budget, &test_memo));
+        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, .{ .now = now, .budget = &budget, .memo = &test_memo }));
     }
 }
 
@@ -765,7 +766,7 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        verifyRrsig(rrsig, test_window_dnskey, .sort(&rrset), 1699500000, &budget, &test_memo),
+        verifyRrsig(rrsig, test_window_dnskey, .sort(&rrset), .{ .now = 1699500000, .budget = &budget, .memo = &test_memo }),
     );
 }
 
@@ -776,9 +777,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
             test_window_rrsig,
             test_window_dnskey,
             test_window_empty_set,
-            1699500000,
-            &budget,
-            &test_memo,
+            .{ .now = 1699500000, .budget = &budget, .memo = &test_memo },
         ));
     }
     try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent);
@@ -787,9 +786,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
         test_window_rrsig,
         test_window_dnskey,
         test_window_empty_set,
-        1699500000,
-        &budget,
-        &test_memo,
+        .{ .now = 1699500000, .budget = &budget, .memo = &test_memo },
     ));
     try testing.expect(budget.stopped == .verify);
 }
@@ -822,7 +819,7 @@ test "verifyRrsig takes an expansion only from a wildcard inside the signer's zo
         data.feed(&sig);
         sig_buf = sig.finalize().toBytes();
         var budget: ValidationBudget = .{};
-        const got = verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), 1_700_000_000, &budget, &test_memo);
+        const got = verifyRrsig(signed.rrsig, signed.dnskey, .sort(&recs), .{ .now = 1_700_000_000, .budget = &budget, .memo = &test_memo });
         if (c.ok) try got else try testing.expectError(error.InvalidSignature, got);
     }
 }
@@ -855,7 +852,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         const signed = try testSignRrset(&below, rtype, parent, .ed25519, &sig_buf, &pub_buf);
         try testing.expectError(
             error.InvalidSignature,
-            verifyRrsig(signed.rrsig, signed.dnskey, .sort(&below), 1_700_000_000, &budget, &test_memo),
+            verifyRrsig(signed.rrsig, signed.dnskey, .sort(&below), .{ .now = 1_700_000_000, .budget = &budget, .memo = &test_memo }),
         );
 
         var apex_sig_buf: [64]u8 = undefined;
@@ -864,7 +861,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
             .fixture(.{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata }),
         };
         const apex = try testSignRrset(&at_apex, rtype, parent, .ed25519, &apex_sig_buf, &apex_pub_buf);
-        try verifyRrsig(apex.rrsig, apex.dnskey, .sort(&at_apex), 1_700_000_000, &budget, &test_memo);
+        try verifyRrsig(apex.rrsig, apex.dnskey, .sort(&at_apex), .{ .now = 1_700_000_000, .budget = &budget, .memo = &test_memo });
     }
 }
 
