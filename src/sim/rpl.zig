@@ -103,8 +103,6 @@ pub const Step = struct {
         /// Signatures whose math ran, memo hits excluded.
         check_max_verifies,
         check_max_runs,
-        /// Drop the next upstream query as if the authority timed out.
-        timeout,
         /// Refuse the next upstream query at the host, as if out of sockets.
         unsent,
         time_passes,
@@ -346,7 +344,7 @@ const Parser = struct {
                 if (!mem.eql(u8, elapse, "ELAPSE") or toks.next() != null) return p.fail("TIME_PASSES needs `ELAPSE <n>`");
                 return .{ .n = n, .kind = kind, .seconds = try p.int(u32, seconds) };
             },
-            .timeout, .unsent => return .{ .n = n, .kind = kind },
+            .unsent => return .{ .n = n, .kind = kind },
             .check_max_queries, .check_max_verifies, .check_max_runs => {
                 const bound = try p.int(u32, toks.next() orelse return p.fail("CHECK_MAX_* takes one integer"));
                 if (toks.next() != null) return p.fail("CHECK_MAX_* takes one integer");

@@ -123,9 +123,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         .extra_allow = try config.parseCidrList(arena, scenario.rebinding_extra_allow),
         .nat64 = scenario.dns64_prefix,
     };
-    var drops: u32 = 0;
-    for (scenario.steps) |st| drops += @intFromBool(st.kind == .timeout);
-    s.pending_drops = drops;
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
     // CHECK_ANSWER reads the held roots' hops.
@@ -145,7 +142,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         report.step = st.n;
         if (opts.chaos != 0) switch (st.kind) {
             .check_answer, .check_query_log, .check_out_query, .check_max_queries, .check_max_verifies, .check_max_runs => continue,
-            .query, .timeout, .unsent, .time_passes => {},
+            .query, .unsent, .time_passes => {},
         };
         switch (st.kind) {
             .query => {
@@ -195,7 +192,6 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
                 report.msg = "CHECK_MAX_RUNS exceeded";
                 return error.ScenarioFailed;
             },
-            .timeout => cursor += 1,
             .unsent => s.pending_unsent += 1,
             // What was due arrives on the way.
             .time_passes => {
@@ -620,7 +616,6 @@ const Job = struct {
     path: []const u8,
     scenario: rpl.Scenario,
     seeds: u64,
-    expect_fail: bool,
     failed: bool = false,
     tally: graph.Tally = .{},
     cells: usize = 0,
@@ -632,7 +627,7 @@ const Job = struct {
 /// Replay every scenario under `root` across `seeds`, checking
 /// that one seed replays to one upstream query log. Scenarios share
 /// nothing, so debug spreads them over every core.
-fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
+fn replayDir(root: []const u8, seeds: u64) !Replayed {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -652,10 +647,8 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
             return err;
         };
         r.parsed += 1;
-        var expect_fail = false;
-        for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
         const path = try arena.dupe(u8, ent.path);
-        try jobs.append(arena, .{ .path = path, .scenario = scenario, .seeds = seeds, .expect_fail = expect_fail });
+        try jobs.append(arena, .{ .path = path, .scenario = scenario, .seeds = seeds });
     }
     var next: std.atomic.Value(usize) = .init(0);
     var leaked: std.atomic.Value(bool) = .init(false);
@@ -741,13 +734,6 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     const result = runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &first);
     inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(j.tally, f) += @field(first.tally, f);
     j.cells += first.cells;
-    if (j.expect_fail) {
-        if (result) |_| {
-            j.failed = true;
-            std.debug.print("{s} (seed {d}): passed but is marked xfail\n", .{ j.path, seed });
-        } else |_| {}
-        return;
-    }
     result catch |err| {
         j.failed = true;
         std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
@@ -870,7 +856,7 @@ test "trace one scenario" {
 }
 
 test "hark walk scenarios settle to today's answers" {
-    const r = try replayDir("test/scenarios/hark", 8, &.{});
+    const r = try replayDir("test/scenarios/hark", 8);
     try testing.expectEqual(223, r.parsed);
     try testing.expectEqual(0, r.failed);
     // A site that never leaves hark's own choice tests nothing.

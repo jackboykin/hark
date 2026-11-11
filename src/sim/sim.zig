@@ -59,8 +59,6 @@ pub const Sim = struct {
     wall_sec: i64 = wall0_sec,
     /// The scenario step in effect, for RANGE windows.
     step: u32 = 0,
-    /// `STEP n TIMEOUT`: drop this many of the next upstream queries.
-    pending_drops: u32 = 0,
     /// `STEP n UNSENT`: refuse this many of the next upstream queries at the host.
     pending_unsent: u32 = 0,
     events: std.PriorityQueue(Event, void, Event.before) = .empty,
@@ -134,11 +132,6 @@ pub const Sim = struct {
         // RFC 8109 root priming is not logged.
         if (!(q.name.isRoot() and q.qtype == .ns))
             try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .need = ex.need });
-        if (s.pending_drops > 0) {
-            s.pending_drops -= 1;
-            try s.hear(q, silence);
-            return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
-        }
         var asked = try s.ask(ex.server, q, ex.need);
         const tie = try s.tieOf(asked.final());
         const delay = s.latency(ex.server, asked);
