@@ -168,6 +168,21 @@ pub fn validateQuery(query: dns.Query) ?struct { rcode: dns.RCode, extended_rcod
     return null;
 }
 
+fn testCtx(question: dns.Question, over: anytype) ResponseContext {
+    var ctx: ResponseContext = .{
+        .query_id = 0,
+        .opcode = .query,
+        .rd = true,
+        .cd = false,
+        .question = question,
+        .client_edns = false,
+        .client_do = false,
+        .max_udp_payload = dns.max_udp_payload,
+    };
+    inline for (@typeInfo(@TypeOf(over)).@"struct".field_names) |f| @field(ctx, f) = @field(over, f);
+    return ctx;
+}
+
 test "buildResponseWire carries EDE only to an EDNS client" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -175,16 +190,7 @@ test "buildResponseWire carries EDE only to an EDNS client" {
 
     const question: dns.Question = .{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in };
     const servfail: Reply = .{ .rcode = .server_failure, .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" } };
-    var ctx: ResponseContext = .{
-        .query_id = 1,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .question = question,
-        .client_edns = true,
-        .client_do = false,
-        .max_udp_payload = dns.max_udp_payload,
-    };
+    var ctx = testCtx(question, .{ .client_edns = true });
 
     var buf: [dns.max_udp_payload]u8 = undefined;
     const opt = (try dns.parseMessage(a, buildResponseWire(&buf, ctx, servfail, a).?)).opt.?;
@@ -211,17 +217,7 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const result = buildResponseWire(&buf, .{
-        .query_id = 0x1234,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .question = question,
-        .client_edns = false,
-        .client_do = false,
-        .max_udp_payload = dns.max_udp_payload,
-        .rebinding = &scrub_on,
-    }, .{ .rcode = .no_error, .answers = &answers }, failing.allocator());
+    const result = buildResponseWire(&buf, testCtx(question, .{ .rebinding = &scrub_on }), .{ .rcode = .no_error, .answers = &answers }, failing.allocator());
 
     try testing.expect(result == null);
 }
@@ -320,16 +316,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
     };
     var buf: [1024]u8 = undefined;
     for ([_]usize{ 300, 1024 }) |cap| for (rows) |row| {
-        const wire = buildResponseWire(buf[0..cap], .{
-            .query_id = 0x4242,
-            .opcode = .query,
-            .rd = false,
-            .cd = false,
-            .question = question,
-            .client_edns = true,
-            .client_do = false,
-            .max_udp_payload = row.max,
-        }, reply, a).?;
+        const wire = buildResponseWire(buf[0..cap], testCtx(question, .{ .rd = false, .client_edns = true, .max_udp_payload = row.max }), reply, a).?;
         try testing.expect(wire.len <= row.max);
         const parsed = try dns.parseMessage(a, wire);
         try testing.expectEqual(row.tc, parsed.header.flags.tc);
@@ -352,16 +339,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
     @memset(authorities, nsec);
 
     var buf: [dns.max_message_len]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 1,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .question = .{ .name = name, .qtype = .a, .qclass = .in },
-        .client_edns = false,
-        .client_do = true,
-        .max_udp_payload = dns.max_message_len,
-    }, .{ .rcode = .name_error, .authorities = authorities }, a).?;
+    const wire = buildResponseWire(&buf, testCtx(.{ .name = name, .qtype = .a, .qclass = .in }, .{ .client_do = true, .max_udp_payload = dns.max_message_len }), .{ .rcode = .name_error, .authorities = authorities }, a).?;
     const parsed = try dns.parseMessage(a, wire);
     try testing.expect(parsed.header.flags.tc);
     try testing.expectEqual(@as(u16, 0), parsed.header.ns_count);
@@ -397,17 +375,7 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
     const scrub_on = rebinding.Config{ .enabled = true };
     for ([_]*const rebinding.Config{ &rebinding.Config.off, &scrub_on }, [_]u16{ 1, 0 }) |rb, kept| {
         var buf: [dns.max_udp_payload]u8 = undefined;
-        const wire = buildResponseWire(&buf, .{
-            .query_id = 0,
-            .opcode = .query,
-            .rd = true,
-            .cd = false,
-            .question = .{ .name = zone, .qtype = .a, .qclass = .in },
-            .client_edns = false,
-            .client_do = false,
-            .max_udp_payload = dns.max_udp_payload,
-            .rebinding = rb,
-        }, reply, a).?;
+        const wire = buildResponseWire(&buf, testCtx(.{ .name = zone, .qtype = .a, .qclass = .in }, .{ .rebinding = rb }), reply, a).?;
         try testing.expectEqual(kept, (try dns.parseMessage(a, wire)).header.ar_count);
     }
 }
@@ -422,17 +390,7 @@ test "buildResponseWire: a local answer bypasses the rebinding scrub; any other 
     const loopback: dns.ResourceRecord = .fixture(.{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } });
     for ([_]bool{ true, false }) |local| {
         var buf: [dns.max_udp_payload]u8 = undefined;
-        const wire = buildResponseWire(&buf, .{
-            .query_id = 0,
-            .opcode = .query,
-            .rd = true,
-            .cd = false,
-            .question = .{ .name = localhost, .qtype = .a, .qclass = .in },
-            .client_edns = false,
-            .client_do = false,
-            .max_udp_payload = dns.max_udp_payload,
-            .rebinding = &scrub_on,
-        }, .{ .rcode = .no_error, .local = local, .answers = &.{loopback} }, a).?;
+        const wire = buildResponseWire(&buf, testCtx(.{ .name = localhost, .qtype = .a, .qclass = .in }, .{ .rebinding = &scrub_on }), .{ .rcode = .no_error, .local = local, .answers = &.{loopback} }, a).?;
         try testing.expectEqual(@intFromBool(local), (try dns.parseMessage(a, wire)).header.an_count);
     }
 }
@@ -447,17 +405,7 @@ test "buildResponseWire: a rebinding scrub clears AD" {
     for ([_][4]u8{ .{ 93, 184, 216, 34 }, .{ 192, 168, 1, 1 } }, [_]bool{ true, false }) |ip, ad| {
         const answers = [_]dns.ResourceRecord{.fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } })};
         var buf: [dns.max_udp_payload]u8 = undefined;
-        const wire = buildResponseWire(&buf, .{
-            .query_id = 0,
-            .opcode = .query,
-            .rd = true,
-            .cd = false,
-            .question = .{ .name = name, .qtype = .a, .qclass = .in },
-            .client_edns = true,
-            .client_do = true,
-            .max_udp_payload = dns.max_udp_payload,
-            .rebinding = &scrub_on,
-        }, .{ .rcode = .no_error, .ad = true, .answers = &answers }, a).?;
+        const wire = buildResponseWire(&buf, testCtx(.{ .name = name, .qtype = .a, .qclass = .in }, .{ .client_edns = true, .client_do = true, .rebinding = &scrub_on }), .{ .rcode = .no_error, .ad = true, .answers = &answers }, a).?;
         try testing.expectEqual(ad, (try dns.parseMessage(a, wire)).header.flags.ad);
     }
 }
