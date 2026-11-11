@@ -552,7 +552,7 @@ pub fn recordLen(bytes: []const u8) Error!?usize {
     return header_len + @as(usize, n);
 }
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
+pub fn hex(comptime s: []const u8) [s.len / 2]u8 {
     @setEvalBranchQuota(4 * s.len);
     var out: [s.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;

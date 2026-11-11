@@ -35,7 +35,6 @@ pub const Shared = struct {
     out_len: usize = 0,
 };
 
-const End = carrier.End;
 const News = carrier.News;
 const Event = carrier.Event;
 

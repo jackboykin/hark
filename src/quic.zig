@@ -310,7 +310,6 @@ const Params = struct {
     max_streams: u64 = 0,
     ack_delay_exponent: u6 = 3,
     max_ack_delay_ns: i64 = 25 * std.time.ns_per_ms,
-    cid_limit: u64 = 2,
     original_dcid: ?Cid = null,
     initial_scid: ?Cid = null,
     retry_scid: ?Cid = null,
@@ -365,8 +364,7 @@ const Params = struct {
                 },
                 .disable_active_migration => if (value.len != 0) return error.TransportParameterError,
                 .active_connection_id_limit => {
-                    p.cid_limit = try number(&v);
-                    if (p.cid_limit < 2) return error.TransportParameterError;
+                    if (try number(&v) < 2) return error.TransportParameterError;
                 },
                 // Hark never migrates, but this id is the server's second (RFC 9000 §5.1.1).
                 .preferred_address => {
@@ -1441,7 +1439,7 @@ pub const Conn = struct {
         var last_loss_ns: ?i64 = null;
         var run_from: ?i64 = null;
         var persistent = false;
-        const span = (c.smoothed_rtt + @max(4 * c.rttvar, granularity_ns) + c.peer.max_ack_delay_ns) * persistent_threshold;
+        const span = c.pto(.application) * persistent_threshold;
         for (0..s.sent_len) |i| {
             const p = s.sentAt(i);
             if (p.pn > largest) break;
@@ -1898,10 +1896,6 @@ pub const Conn = struct {
         return if (at == 0) null else buf[0..at];
     }
 
-    pub fn rounds(c: *const Conn) u32 {
-        return if (c.established()) 1 else 2;
-    }
-
     pub fn spent(c: *const Conn, now: i64) bool {
         if (c.sealed >= packets_per_key) return true;
         // RFC 9250 §4.4: a question that might cross the idle close goes on a
@@ -1910,11 +1904,7 @@ pub const Conn = struct {
     }
 };
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const hex = tls13.hex;
 
 const testing = std.testing;
 

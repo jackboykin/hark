@@ -75,7 +75,7 @@ pub fn established(sock: *const Socket) bool {
 }
 
 pub fn rounds(sock: *const Socket) u32 {
-    return sock.conn.rounds();
+    return if (sock.conn.established()) 1 else dial_rounds;
 }
 
 pub fn spent(sock: *const Socket) bool {

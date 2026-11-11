@@ -1,7 +1,6 @@
 //! What carries a server's exchanges over an encrypted session: the one
 //! interface `Sessions` drives, whichever transport is underneath.
 
-const std = @import("std");
 const na = @import("net_address.zig");
 const Edge = @import("edge.zig");
 const DotSocket = @import("dot_socket.zig");
