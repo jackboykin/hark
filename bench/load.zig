@@ -111,29 +111,120 @@ const Shared = struct {
     end: i64,
 };
 
+/// One thread's send scratch and its place in the schedule and the queries.
+const Sender = struct {
+    buf: [batch][max_query]u8 = undefined,
+    iov: [batch]std.posix.iovec_const = undefined,
+    hdr: [batch]linux.mmsghdr = undefined,
+    due: [batch]i64 = undefined,
+    id: [batch]u16 = undefined,
+    /// Nanoseconds between sends in open loop; 0 is closed loop.
+    gap: i64,
+    window: u32,
+    next_due: i64,
+    qi: usize,
+
+    /// Queues up to `cap` queries on `s` and sends them; returns how many left.
+    fn send(o: *Sender, sh: *const Shared, s: *Sock, cap: usize, t: i64) usize {
+        var n: usize = 0;
+        while (n < cap) : (n += 1) {
+            if (s.len + n == s.ring.len) break;
+            var due = t;
+            if (o.gap > 0) {
+                if (o.next_due > t) break;
+                due = o.next_due;
+                o.next_due += o.gap;
+            } else if (s.out + n >= o.window) break;
+            while (s.due[s.next_id] != 0) s.next_id +%= 1;
+            const id = s.next_id;
+            s.next_id +%= 1;
+            const q = sh.queries.get(o.qi);
+            o.qi = (o.qi + 1) % sh.queries.ends.len;
+            @memcpy(o.buf[n][0..q.len], q);
+            std.mem.writeInt(u16, o.buf[n][0..2], id, .big);
+            o.iov[n] = .{ .base = &o.buf[n], .len = q.len };
+            o.hdr[n] = .{ .hdr = .{ .name = null, .namelen = 0, .iov = @ptrCast(&o.iov[n]), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
+            o.due[n] = due;
+            o.id[n] = id;
+            s.due[id] = due;
+        }
+        if (n == 0) return 0;
+        const rc = linux.sendmmsg(s.fd, &o.hdr, @intCast(n), linux.MSG.DONTWAIT);
+        const sent: usize = if (linux.errno(rc) == .SUCCESS) rc else 0;
+        for (sent..n) |k| s.due[o.id[k]] = 0;
+        for (0..sent) |k| {
+            s.ring[(s.head + s.len) % s.ring.len] = .{ .id = o.id[k], .due = o.due[k] };
+            s.len += 1;
+        }
+        s.out += @intCast(sent);
+        return sent;
+    }
+};
+
+const Receiver = struct {
+    buf: [batch][max_query]u8 = undefined,
+    iov: [batch]std.posix.iovec = undefined,
+    hdr: [batch]linux.mmsghdr = undefined,
+
+    fn init(r: *Receiver) void {
+        for (&r.iov, &r.hdr, &r.buf) |*v, *h, *b| {
+            v.* = .{ .base = b, .len = b.len };
+            h.* = .{ .hdr = .{ .name = null, .namelen = 0, .iov = @ptrCast(v), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
+        }
+    }
+
+    /// Takes what has arrived on `s`; true if anything did.
+    fn receive(r: *Receiver, s: *Sock, stats: *Stats) bool {
+        const rc = linux.recvmmsg(s.fd, &r.hdr, batch, linux.MSG.DONTWAIT, null);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return false;
+        const at = now();
+        for (r.hdr[0..rc], r.buf[0..rc]) |h, b| {
+            if (h.len < 12) continue;
+            const id = std.mem.readInt(u16, b[0..2], .big);
+            if (s.due[id] == 0) continue;
+            stats.hist.add(@intCast(at - s.due[id]));
+            stats.rcodes[b[3] & 0xf] += 1;
+            stats.completed += 1;
+            s.due[id] = 0;
+            s.out -= 1;
+        }
+        stats.last_ns = at;
+        return true;
+    }
+};
+
+/// Drops answered entries from the head of the ring, and lost ones once
+/// `patient` no longer holds for them.
+fn expire(s: *Sock, t: i64, timeout: i64, patient: bool, stats: *Stats) void {
+    while (s.len > 0) {
+        const p = s.ring[s.head];
+        if (s.due[p.id] == p.due) {
+            if (t - p.due < timeout and patient) break;
+            s.due[p.id] = 0;
+            s.out -= 1;
+            stats.lost += 1;
+        }
+        s.head = @intCast((s.head + 1) % s.ring.len);
+        s.len -= 1;
+    }
+}
+
 fn run(sh: *const Shared, socks: []Sock, first: usize, stats: *Stats) void {
     const o = sh.opts;
     const timeout: i64 = @as(i64, o.timeout_s) * std.time.ns_per_s;
-    const window = @max(1, o.inflight / o.sockets);
     const rate = o.qps / o.threads;
-    const gap: i64 = if (rate > 0) @intCast(std.time.ns_per_s / rate) else 0;
-    var next_due = sh.start;
-    var qi = first;
-
-    var sbuf: [batch][max_query]u8 = undefined;
-    var siov: [batch]std.posix.iovec_const = undefined;
-    var shdr: [batch]linux.mmsghdr = undefined;
-    var sdue: [batch]i64 = undefined;
-    var sid: [batch]u16 = undefined;
-    var rbuf: [batch][max_query]u8 = undefined;
-    var riov: [batch]std.posix.iovec = undefined;
-    var rhdr: [batch]linux.mmsghdr = undefined;
-    for (&riov, &rhdr, &rbuf) |*v, *h, *b| {
-        v.* = .{ .base = b, .len = b.len };
-        h.* = .{ .hdr = .{ .name = null, .namelen = 0, .iov = @ptrCast(v), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
-    }
+    var sender: Sender = .{
+        .gap = if (rate > 0) @intCast(std.time.ns_per_s / rate) else 0,
+        .window = @max(1, o.inflight / o.sockets),
+        .next_due = sh.start,
+        .qi = first,
+    };
+    var receiver: Receiver = .{};
+    receiver.init();
     var pfds: [256]linux.pollfd = undefined;
     for (socks, 0..) |s, i| pfds[i] = .{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 };
+    // Open loop spreads what is due over the flows.
+    const cap = if (sender.gap > 0) @max(1, batch / socks.len) else batch;
 
     while (true) {
         var progress = false;
@@ -141,70 +232,12 @@ fn run(sh: *const Shared, socks: []Sock, first: usize, stats: *Stats) void {
         const sending = t < sh.end;
         for (socks) |*s| {
             if (sending) {
-                var n: usize = 0;
-                // Open loop spreads what is due over the flows.
-                const cap = if (gap > 0) @max(1, batch / socks.len) else batch;
-                while (n < cap) : (n += 1) {
-                    if (s.len + n == s.ring.len) break;
-                    var due = t;
-                    if (gap > 0) {
-                        if (next_due > t) break;
-                        due = next_due;
-                        next_due += gap;
-                    } else if (s.out + n >= window) break;
-                    while (s.due[s.next_id] != 0) s.next_id +%= 1;
-                    const id = s.next_id;
-                    s.next_id +%= 1;
-                    const q = sh.queries.get(qi);
-                    qi = (qi + 1) % sh.queries.ends.len;
-                    @memcpy(sbuf[n][0..q.len], q);
-                    std.mem.writeInt(u16, sbuf[n][0..2], id, .big);
-                    siov[n] = .{ .base = &sbuf[n], .len = q.len };
-                    shdr[n] = .{ .hdr = .{ .name = null, .namelen = 0, .iov = @ptrCast(&siov[n]), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
-                    sdue[n] = due;
-                    sid[n] = id;
-                    s.due[id] = due;
-                }
-                if (n > 0) {
-                    const rc = linux.sendmmsg(s.fd, &shdr, @intCast(n), linux.MSG.DONTWAIT);
-                    const sent: usize = if (linux.errno(rc) == .SUCCESS) rc else 0;
-                    for (sent..n) |k| s.due[sid[k]] = 0;
-                    for (0..sent) |k| {
-                        s.ring[(s.head + s.len) % s.ring.len] = .{ .id = sid[k], .due = sdue[k] };
-                        s.len += 1;
-                    }
-                    s.out += @intCast(sent);
-                    stats.sent += sent;
-                    progress = progress or sent > 0;
-                }
+                const sent = sender.send(sh, s, cap, t);
+                stats.sent += sent;
+                progress = progress or sent > 0;
             }
-            const rc = linux.recvmmsg(s.fd, &rhdr, batch, linux.MSG.DONTWAIT, null);
-            if (linux.errno(rc) == .SUCCESS and rc > 0) {
-                const at = now();
-                for (rhdr[0..rc], rbuf[0..rc]) |h, b| {
-                    if (h.len < 12) continue;
-                    const id = std.mem.readInt(u16, b[0..2], .big);
-                    if (s.due[id] == 0) continue;
-                    stats.hist.add(@intCast(at - s.due[id]));
-                    stats.rcodes[b[3] & 0xf] += 1;
-                    stats.completed += 1;
-                    s.due[id] = 0;
-                    s.out -= 1;
-                }
-                stats.last_ns = at;
-                progress = true;
-            }
-            while (s.len > 0) {
-                const p = s.ring[s.head];
-                if (s.due[p.id] == p.due) {
-                    if (t - p.due < timeout and (sending or t < sh.end + timeout)) break;
-                    s.due[p.id] = 0;
-                    s.out -= 1;
-                    stats.lost += 1;
-                }
-                s.head = @intCast((s.head + 1) % s.ring.len);
-                s.len -= 1;
-            }
+            if (receiver.receive(s, stats)) progress = true;
+            expire(s, t, timeout, sending or t < sh.end + timeout, stats);
         }
         if (!sending) {
             var out: u32 = 0;
@@ -215,7 +248,7 @@ fn run(sh: *const Shared, socks: []Sock, first: usize, stats: *Stats) void {
             }
         }
         if (!progress) {
-            const wait: i32 = if (gap > 0 and sending) 0 else 1;
+            const wait: i32 = if (sender.gap > 0 and sending) 0 else 1;
             _ = linux.poll(&pfds, @intCast(socks.len), wait);
         }
     }
