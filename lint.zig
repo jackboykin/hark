@@ -6,6 +6,10 @@
 //! - A switch over a closed enum or union of hark's own names every tag.
 //! - Nothing std marks deprecated is used.
 //! - No `@constCast`.
+//! - A function or test is at most 100 lines of code, nests control flow at
+//!   most 4 deep, and takes at most 7 parameters.
+//! - A `pub` declaration is named by another file.
+//! - No import cycle outside the named knots.
 
 const std = @import("std");
 const mem = std.mem;
@@ -37,7 +41,10 @@ pub fn main(init: std.process.Init) !void {
         try switches(arena, f, enums);
         try deprecated(arena, f, &lib);
         constCast(f);
+        try shape(arena, f);
     }
+    try needlessPub(arena, files);
+    try cycles(arena, files);
     if (problems > 0) {
         std.debug.print("lint: {d} problem{s}\n", .{ problems, if (problems == 1) "" else "s" });
         std.process.exit(1);
@@ -288,6 +295,155 @@ fn constCast(f: File) void {
         if (f.tree.tokenTag(token) == .builtin and mem.eql(u8, f.tree.tokenSlice(token), "@constCast"))
             report(f, token, "@constCast: what is typed const stays const", .{});
     }
+}
+
+const max_lines = 100;
+const max_depth = 4;
+const max_params = 7;
+
+/// Length finds the outlier; depth finds the stacked cases a count of lines
+/// cannot see.
+fn shape(arena: Allocator, f: File) !void {
+    const t = f.tree;
+    const line_of = try arena.alloc(u32, t.tokens.len);
+    var line: u32 = 0;
+    var at: usize = 0;
+    for (line_of, t.tokens.items(.start)) |*l, start| {
+        line += @intCast(mem.countScalar(u8, t.source[at..start], '\n'));
+        at = start;
+        l.* = line;
+    }
+    for (0..t.nodes.len) |n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const body = switch (t.nodeTag(node)) {
+            .fn_decl => t.nodeData(node).node_and_node[1],
+            .test_decl => t.nodeData(node).opt_token_and_node[1],
+            else => continue,
+        };
+        const name = t.nodeMainToken(node);
+        const first = t.firstToken(body) + 1;
+        const last = t.lastToken(body);
+        var lines: u32 = 0;
+        var seen: ?u32 = null;
+        for (line_of[first..last]) |l| if (seen != l) {
+            seen = l;
+            lines += 1;
+        };
+        if (lines > max_lines) report(f, name, "{d} lines of code, over {d}", .{ lines, max_lines });
+        const depth = try nesting(arena, t, first, last);
+        if (depth > max_depth) report(f, name, "control flow nests {d} deep, over {d}", .{ depth, max_depth });
+        if (t.nodeTag(node) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const params = t.fullFnProto(&buf, t.nodeData(node).node_and_node[0]).?.ast.params.len;
+        if (params > max_params) report(f, name, "{d} parameters, over {d}", .{ params, max_params });
+    }
+}
+
+/// The deepest stack of if, while, for and switch between two tokens. An
+/// `else if` continues its chain, it does not nest.
+fn nesting(arena: Allocator, t: Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) !u32 {
+    var spans: std.ArrayList([2]Ast.TokenIndex) = .empty;
+    for (0..t.nodes.len) |n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        var end = t.lastToken(node);
+        if (t.fullIf(node)) |full| {
+            if (full.ast.else_expr.unwrap()) |e| if (t.fullIf(e) != null) {
+                end = t.lastToken(full.ast.then_expr);
+            };
+        } else if (t.fullWhile(node) == null and t.fullFor(node) == null and t.fullSwitch(node) == null) continue;
+        const start = t.firstToken(node);
+        if (start >= first and end <= last) try spans.append(arena, .{ start, end });
+    }
+    var deepest: u32 = 0;
+    for (spans.items) |inner| {
+        var depth: u32 = 0;
+        for (spans.items) |outer| depth += @intFromBool(outer[0] <= inner[0] and inner[1] <= outer[1]);
+        deepest = @max(deepest, depth);
+    }
+    return deepest;
+}
+
+/// Names std calls by convention, which no file of hark's needs to name.
+const called_by_std = [_][]const u8{ "main", "std_options", "panic", "format" };
+
+/// A name another file never says is a private name.
+fn needlessPub(arena: Allocator, files: []const File) !void {
+    const said = try arena.alloc(std.StringHashMapUnmanaged(void), files.len);
+    for (said, files) |*names, f| {
+        names.* = .empty;
+        for (0..f.tree.tokens.len) |i| {
+            const token: Ast.TokenIndex = @intCast(i);
+            if (f.tree.tokenTag(token) == .identifier) try names.put(arena, f.tree.tokenSlice(token), {});
+        }
+    }
+    for (files, 0..) |f, own| {
+        const t = f.tree;
+        tokens: for (0..t.tokens.len) |i| {
+            if (t.tokenTag(@intCast(i)) != .keyword_pub) continue;
+            var token: Ast.TokenIndex = @intCast(i + 1);
+            while (t.tokenTag(token) != .identifier) token += 1;
+            const name = t.tokenSlice(token);
+            for (called_by_std) |known| if (mem.eql(u8, name, known)) continue :tokens;
+            for (said, 0..) |names, other| if (other != own and names.contains(name)) continue :tokens;
+            report(f, token, "pub {s} is named by no other file", .{name});
+        }
+    }
+}
+
+/// Files that are one module by design: each imports the others freely.
+const knots = [_][]const []const u8{
+    &.{ "src/chaos.zig", "src/denial.zig", "src/graph.zig", "src/store.zig", "src/stub.zig", "src/trust.zig", "src/walk.zig" },
+    &.{ "src/carrier.zig", "src/doq_socket.zig", "src/dot_socket.zig", "src/edge.zig", "src/sessions.zig" },
+};
+
+/// A cycle makes its files one unit; outside a named knot that is an accident.
+fn cycles(arena: Allocator, files: []const File) !void {
+    const reach = try reaches(arena, try imports(arena, files));
+    for (files, 0..) |f, i| for (files[i + 1 ..], i + 1..) |g, j| {
+        if (!reach[i].isSet(j) or !reach[j].isSet(i)) continue;
+        if (!knotted(f.path, g.path)) report(f, 0, "in an import cycle with {s}, outside a named knot", .{g.path});
+    };
+}
+
+fn knotted(a: []const u8, b: []const u8) bool {
+    for (knots) |knot| if (holds(knot, a) and holds(knot, b)) return true;
+    return false;
+}
+
+fn holds(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |p| if (mem.eql(u8, p, path)) return true;
+    return false;
+}
+
+/// Per file, the files of hark's it imports.
+fn imports(arena: Allocator, files: []const File) ![]const []const usize {
+    const edges = try arena.alloc([]const usize, files.len);
+    for (edges, files) |*out, f| {
+        var to: std.ArrayList(usize) = .empty;
+        for (0..f.tree.nodes.len) |n| {
+            const target = importTarget(f.tree, @fromBackingInt(@intCast(n))) orelse continue;
+            const path = try Io.Dir.path.resolveAlloc(arena, &.{ Io.Dir.path.dirname(f.path) orelse ".", target });
+            for (files, 0..) |g, i| if (mem.eql(u8, g.path, path)) try to.append(arena, i);
+        }
+        out.* = to.items;
+    }
+    return edges;
+}
+
+/// Per file, every file its imports lead to.
+fn reaches(arena: Allocator, edges: []const []const usize) ![]const std.bit_set.Dynamic {
+    const reach = try arena.alloc(std.bit_set.Dynamic, edges.len);
+    for (reach, 0..) |*r, from| {
+        r.* = try .initEmpty(arena, edges.len);
+        var stack: std.ArrayList(usize) = .empty;
+        try stack.append(arena, from);
+        while (stack.pop()) |at| for (edges[at]) |to| {
+            if (r.isSet(to)) continue;
+            r.set(to);
+            try stack.append(arena, to);
+        };
+    }
+    return reach;
 }
 
 fn collect(arena: Allocator, io: Io, root: []const u8, paths: *std.ArrayList([]const u8)) !void {
