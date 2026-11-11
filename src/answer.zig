@@ -421,7 +421,7 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
             age = 0;
             life = stale_hold_s;
         }
-        try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
+        try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, .{ .age = age, .life = life, .floor = hop.floor, .stale = hop.stale });
     }
     const r = last.rrset;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -433,14 +433,14 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
         const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
-        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
+        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, .{ .age = hop_age, .life = hop.life, .floor = hop.floor, .stale = hop.stale });
     }
-    try appendAged(arena, &authorities, &seen, r.sections[1], keep, age, life, last.floor, last.stale);
+    try appendAged(arena, &authorities, &seen, r.sections[1], keep, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
     // Nothing judges additional, so a reply with AD carries none.
     if (!secure) {
         var add = keep;
         add.section = .additional;
-        try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
+        try appendAged(arena, &additionals, null, r.sections[2], add, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
     }
     const ede: ?dns.Ede = if (stale_any)
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
@@ -501,7 +501,9 @@ const Keep = struct {
     }
 };
 
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
+const Aging = struct { age: u32, life: u32, floor: u32, stale: bool };
+
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?*Seen, records: store.Records, keep: Keep, t: Aging) !void {
     try out.ensureUnusedCapacity(arena, records.len);
     var it = records.iterator();
     while (it.next()) |rr| {
@@ -510,7 +512,7 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), seen: ?
         var aged = rr;
         // Floored, then aged, then capped by the proof's life. A record past its
         // TTL in a stale reply gets the hold instead of 0 (RFC 8767 §4).
-        aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
+        aged.ttl = if (t.stale and rr.ttl <= t.age) stale_hold_s else @min(@max(rr.ttl, t.floor) -| t.age, t.life);
         out.appendAssumeCapacity(aged);
     }
 }
@@ -694,7 +696,7 @@ test "a proof two hops share goes out once" {
     };
     var out: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = 4 };
-    for (hops) |hop| try appendAged(a, &out, &seen, hop, .{ .section = .authority, .qtype = .a, .do_bit = true }, 0, std.math.maxInt(u32), 0, false);
+    for (hops) |hop| try appendAged(a, &out, &seen, hop, .{ .section = .authority, .qtype = .a, .do_bit = true }, .{ .age = 0, .life = std.math.maxInt(u32), .floor = 0, .stale = false });
     try std.testing.expectEqual(3, out.items.len);
 }
 
