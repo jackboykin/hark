@@ -21,7 +21,6 @@ const na = @import("net_address.zig");
 const delegation = @import("delegation.zig");
 const rrsig = @import("rrsig.zig");
 const dnssec = @import("dnssec.zig");
-const monotonic = @import("monotonic.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
 const denial = @import("denial.zig");
@@ -373,35 +372,6 @@ const Refusal = struct { until_ns: i64, why: Failure };
 
 const refresh_jitter_ns = std.time.ns_per_s;
 
-pub const Tally = struct {
-    runs: u64 = 0,
-    settles: u64 = 0,
-    parses: u64 = 0,
-    rule_ns: u64 = 0,
-    send_ns: u64 = 0,
-    verify_ns: u64 = 0,
-    parse_ns: u64 = 0,
-    store_ns: u64 = 0,
-    reruns: u64 = 0,
-    rerun_ns: u64 = 0,
-    reaches: u64 = 0,
-    reaches_visits: u64 = 0,
-
-    pub const timed = builtin.is_test;
-
-    pub const Clock = struct {
-        t0: i64,
-        into: *u64,
-        pub fn stop(c: Clock) void {
-            if (timed) c.into.* += @intCast(monotonic.nowNs() - c.t0);
-        }
-    };
-
-    pub fn clock(into: *u64) Clock {
-        return .{ .t0 = if (timed) monotonic.nowNs() else 0, .into = into };
-    }
-};
-
 const ExchangeScratch = struct {
     id: u16,
     sent: []const u8,
@@ -561,13 +531,12 @@ pub const Graph = struct {
     flights: u32 = 0,
     failed: std.array_hash_map.Custom(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
-    created: u64 = 0,
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
     ready: std.ArrayList(Queued) = .empty,
     answered: std.ArrayList(CellId) = .empty,
     rtt: *ns_rtt.Table,
-    tally: Tally = .{},
     schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    runs: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     denial: denial.Index = .{},
     verify_memo: rrsig.VerifyMemo = .{},
     store: store.Store,
@@ -790,9 +759,6 @@ pub const Graph = struct {
             .unsent => .unsent,
             .moved => .moved,
             .reply => |heard| blk: {
-                const clock = Tally.clock(&g.tally.parse_ns);
-                defer clock.stop();
-                g.tally.parses += 1;
                 const bytes = try arena.dupe(u8, heard.bytes);
                 var p = dns.parse(arena, bytes) catch break :blk .malformed;
                 if (p.header.id != sc.id) break :blk .mismatch;
@@ -887,7 +853,6 @@ pub const Graph = struct {
             .scratch = scratch,
         };
         g.live += 1;
-        g.created += 1;
         return id;
     }
 
@@ -970,7 +935,6 @@ pub const Graph = struct {
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
-        g.tally.settles += 1;
         if (g.cfg.trace) switch (value) {
             .ds, .dnskey, .secure => |chain| {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -980,8 +944,6 @@ pub const Graph = struct {
         };
         switch (value) {
             .cut, .rrset, .stub, .ds, .dnskey => {
-                const clock = Tally.clock(&g.tally.store_ns);
-                defer clock.stop();
                 const blob = try g.store.build(c.key, value, expires_ns);
                 const owned = owned: {
                     errdefer g.store.unref(blob);
@@ -1013,7 +975,6 @@ pub const Graph = struct {
         const c = g.cell(id);
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
         std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.verdict.judged());
-        g.tally.settles += 1;
         const value = try store.Store.parse(c.arena.allocator(), v);
         const blob = try g.store.build(c.key, value, v.end());
         blob.verdict = v.verdict;
@@ -1058,7 +1019,6 @@ pub const Graph = struct {
     pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
-        g.tally.settles += 1;
         if (g.cfg.trace) {
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
@@ -1410,7 +1370,6 @@ pub const Graph = struct {
 
     fn reaches(g: *Graph, from: CellId, target: CellId) bool {
         g.checks += 1;
-        g.tally.reaches += 1;
         var stack: std.ArrayList(CellId) = .empty;
         stack.append(g.scratch.allocator(), from) catch return true;
         while (stack.pop()) |id| {
@@ -1418,7 +1377,6 @@ pub const Graph = struct {
             const c = g.cell(id);
             if (c.seen == g.checks) continue;
             c.seen = g.checks;
-            g.tally.reaches_visits += 1;
             var it = c.waiterIds();
             while (it.next()) |w| stack.append(g.scratch.allocator(), w) catch return true;
         }
@@ -1471,15 +1429,10 @@ pub const Graph = struct {
         defer g.payer = &g.unpaid;
         g.as_of = c.as_of;
         defer g.as_of = 0;
-        g.tally.runs += 1;
-        if (builtin.is_test) g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
-        const clock = Tally.clock(&g.tally.rule_ns);
-        defer clock.stop();
-        const created_before = g.created;
-        defer if (!c.settled() and g.created == created_before) {
-            g.tally.reruns += 1;
-            if (Tally.timed) g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
-        };
+        if (builtin.is_test) {
+            g.runs += 1;
+            g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
+        }
         switch (g.cell(id).key.kind) {
             .cut => try walk.runCut(g, id),
             .rrset => try walk.runRrset(g, id),
@@ -1562,8 +1515,6 @@ pub const Graph = struct {
         try g.pin(id, by);
         budget.queries += 1;
         g.cell(id).holds += 1;
-        const clock = Tally.clock(&g.tally.send_ns);
-        defer clock.stop();
         const rng = g.edge.rng;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();

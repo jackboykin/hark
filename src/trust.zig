@@ -180,8 +180,6 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     };
     const signer = keys.name;
     const budget = &g.payer.validation;
-    const clock = graph.Tally.clock(&g.tally.verify_ns);
-    defer clock.stop();
     const now = g.wallNow();
     switch (r.kind) {
         .answer => {
@@ -267,8 +265,6 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.ds());
     const budget = &g.payer.validation;
-    const clock = graph.Tally.clock(&g.tally.verify_ns);
-    defer clock.stop();
     const now = g.wallNow();
     const sig = try dnssec.validateDnskeyRrset(g.scratch.allocator(), r.answers, ds_data.items, zone, now, budget, &g.verify_memo) orelse
         return failChain(g, id, s.rrset.unwrap().?);
@@ -358,8 +354,6 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         }
     }
     const budget = &g.payer.validation;
-    const clock = graph.Tally.clock(&g.tally.verify_ns);
-    defer clock.stop();
     const now = g.wallNow();
     var it: Claims = .{ .r = r, .qtype = qtype };
     while (it.next()) |c| {

@@ -36,8 +36,6 @@ const Report = struct {
     fired: Fired = .initFill(0),
     left: chaos.Events = .empty,
     told: std.ArrayList([]const u8) = .empty,
-    tally: graph.Tally = .{},
-    cells: usize = 0,
 
     fn deinit(r: *Report, gpa: Allocator) void {
         gpa.free(r.log);
@@ -102,9 +100,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     }, edge);
     defer g.deinit();
     defer {
-        report.tally = g.tally;
         report.schedule = g.schedule;
-        report.cells = g.cells.items.len;
     }
 
     const rb: rebinding.Config = .{
@@ -177,7 +173,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
                 report.msg = "CHECK_MAX_VERIFIES exceeded";
                 return error.ScenarioFailed;
             },
-            .check_max_runs => if (g.tally.runs > st.bound) {
+            .check_max_runs => if (g.runs > st.bound) {
                 report.msg = "CHECK_MAX_RUNS exceeded";
                 return error.ScenarioFailed;
             },
@@ -573,15 +569,13 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
     return null;
 }
 
-const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0, compared: usize = 0, departed: usize = 0, fired: Fired = .initFill(0) };
+const Replayed = struct { parsed: usize, failed: usize, compared: usize = 0, departed: usize = 0, fired: Fired = .initFill(0) };
 
 const Job = struct {
     path: []const u8,
     scenario: rpl.Scenario,
     seeds: u64,
     failed: bool = false,
-    tally: graph.Tally = .{},
-    cells: usize = 0,
     compared: u32 = 0,
     departed: u32 = 0,
     fired: Fired = .initFill(0),
@@ -619,9 +613,6 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
     replayJobs(jobs.items, &next, &leaked);
     for (threads) |t| t.join();
     for (jobs.items) |j| {
-        inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(r.tally, f) += @field(j.tally, f);
-        r.cells += j.cells;
-        r.scenarios += j.seeds;
         r.failed += @intFromBool(j.failed);
         r.compared += j.compared;
         r.departed += j.departed;
@@ -629,28 +620,12 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
     }
     if (leaked.load(.monotonic)) r.failed += 1;
     if (@import("builtin").mode == .debug) return r;
-    const t = r.tally;
     std.debug.print("  chaos compared {d} answers; {d} more were past the reference's world\n", .{ r.compared, r.departed });
     std.debug.print("  chaos fired", .{});
     var fired = r.fired;
     var it = fired.iterator();
     while (it.next()) |e| std.debug.print(" {t} {d}", .{ e.key, e.value.* });
     std.debug.print("\n", .{});
-    std.debug.print("  {d} cycle checks walked {d} cells ({d:.1} each) over {d} cell slots\n", .{ t.reaches, t.reaches_visits, @as(f64, @floatFromInt(t.reaches_visits)) / @as(f64, @floatFromInt(@max(t.reaches, 1))), r.cells });
-    std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
-    std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries, {d} verifying and {d} in the store) vs {d} ns per parse; {d:.0} cells per run\n", .{
-        root,
-        t.runs,
-        t.settles,
-        @as(f64, @floatFromInt(t.runs)) / @as(f64, @floatFromInt(@max(t.settles, 1))),
-        (t.rule_ns -| t.send_ns -| t.verify_ns -| t.store_ns) / @max(t.settles, 1),
-        t.rule_ns / @max(t.settles, 1),
-        t.send_ns / @max(t.settles, 1),
-        t.verify_ns / @max(t.settles, 1),
-        t.store_ns / @max(t.settles, 1),
-        t.parse_ns / @max(t.parses, 1),
-        @as(f64, @floatFromInt(r.cells)) / @as(f64, @floatFromInt(@max(r.scenarios, 1))),
-    });
     return r;
 }
 
@@ -689,8 +664,6 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     var first: Report = .{};
     defer first.deinit(gpa);
     const result = runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &first);
-    inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(j.tally, f) += @field(first.tally, f);
-    j.cells += first.cells;
     result catch |err| {
         j.failed = true;
         std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
