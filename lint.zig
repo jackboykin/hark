@@ -10,6 +10,7 @@
 //!   most 4 deep, and takes at most 7 parameters.
 //! - A `pub` declaration is named by another file.
 //! - No import cycle outside the named knots, and no import left unused.
+//! - Every file under src/ is listed in root.zig, or its tests never run.
 
 const std = @import("std");
 const mem = std.mem;
@@ -46,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try needlessPub(arena, files);
     try cycles(arena, files);
+    try listed(arena, files);
     if (problems > 0) {
         std.debug.print("lint: {d} problem{s}\n", .{ problems, if (problems == 1) "" else "s" });
         std.process.exit(1);
@@ -429,6 +431,18 @@ fn knotted(a: []const u8, b: []const u8) bool {
 fn holds(paths: []const []const u8, path: []const u8) bool {
     for (paths) |p| if (mem.eql(u8, p, path)) return true;
     return false;
+}
+
+/// Tests are found by reachability from root.zig alone.
+fn listed(arena: Allocator, files: []const File) !void {
+    const edges = try imports(arena, files);
+    const root = for (files, 0..) |f, i| {
+        if (mem.eql(u8, f.path, "src/root.zig")) break i;
+    } else return;
+    for (files, 0..) |f, i| {
+        if (i == root or !mem.startsWith(u8, f.path, "src/") or mem.eql(u8, f.path, "src/main.zig")) continue;
+        if (mem.findScalar(usize, edges[root], i) == null) report(f, 0, "not listed in src/root.zig: its tests never run", .{});
+    }
 }
 
 /// Per file, the files of hark's it imports.

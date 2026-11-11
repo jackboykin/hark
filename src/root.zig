@@ -12,6 +12,7 @@ test {
     _ = @import("arena.zig");
     _ = @import("batch.zig");
     _ = @import("carrier.zig");
+    _ = @import("chaos.zig");
     _ = @import("config.zig");
     _ = @import("delegation.zig");
     _ = @import("denial.zig");
