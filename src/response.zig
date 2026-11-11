@@ -122,35 +122,37 @@ pub fn buildResponseWire(
     return null;
 }
 
-pub fn serializeErrorResponse(
-    wire_buf: *[dns.max_udp_payload]u8,
-    query_id: u16,
-    opcode: dns.OpCode,
+/// A reply that carries only an rcode, to a query that may not have parsed.
+pub const Refusal = struct {
+    id: u16,
+    opcode: dns.OpCode = .query,
     rcode: dns.RCode,
-    extended_rcode: u8,
+    extended_rcode: u8 = 0,
     rd: bool,
-    question: ?dns.Question,
-    client: ?dns.Edns,
-) []const u8 {
-    const opt: ?dns.OptRecord = if (client) |o| .{
+    question: ?dns.Question = null,
+    client: ?dns.Edns = null,
+};
+
+pub fn serializeErrorResponse(wire_buf: *[dns.max_udp_payload]u8, e: Refusal) []const u8 {
+    const opt: ?dns.OptRecord = if (e.client) |o| .{
         .udp_payload_size = dns.edns_udp_payload,
-        .extended_rcode = extended_rcode,
+        .extended_rcode = e.extended_rcode,
         .version = 0,
         .do_bit = o.do_bit,
         .options = &.{},
     } else null;
     const msg = dns.Message{
         .header = .{
-            .id = query_id,
+            .id = e.id,
             .flags = .{
                 .qr = true,
-                .opcode = opcode,
-                .rd = rd,
+                .opcode = e.opcode,
+                .rd = e.rd,
                 .ra = true,
-                .rcode = rcode,
+                .rcode = e.rcode,
             },
         },
-        .question = question,
+        .question = e.question,
         .opt = opt,
     };
     // At most one question, so 12 + 259 + 11 octets: it fits.
@@ -229,7 +231,7 @@ test "serializeErrorResponse produces valid DNS message" {
 
     const name = try dns.parseDottedName(a, "example.com");
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .query, .refused, 0, true, .{ .name = name, .qtype = .a, .qclass = .in }, null);
+    const wire = serializeErrorResponse(&buf, .{ .id = 0xABCD, .rcode = .refused, .rd = true, .question = .{ .name = name, .qtype = .a, .qclass = .in } });
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
@@ -265,7 +267,7 @@ test "validateQuery returns BADVERS for unsupported EDNS version" {
 test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
     const opcode_update: dns.OpCode = @fromBackingInt(@intCast(5));
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, null, null);
+    const wire = serializeErrorResponse(&buf, .{ .id = 0x9999, .opcode = opcode_update, .rcode = .not_implemented, .rd = false });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -347,7 +349,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
 
 test "serializeErrorResponse answers an EDNS query with OPT (RFC 6891 §6.1.1)" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, null, .{ .udp_payload_size = 512, .version = 1, .do_bit = true });
+    const wire = serializeErrorResponse(&buf, .{ .id = 0x1234, .rcode = .no_error, .extended_rcode = 1, .rd = false, .client = .{ .udp_payload_size = 512, .version = 1, .do_bit = true } });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

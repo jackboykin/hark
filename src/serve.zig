@@ -404,9 +404,9 @@ const Server = struct {
         const arena = s.scratch.allocator();
         const query = dns.readQuery(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
-            return s.sendError(reply, id, .query, .format_error, 0, wire[2] & 1 != 0, null, null);
+            return s.sendError(reply, .{ .id = id, .rcode = .format_error, .rd = wire[2] & 1 != 0 });
         };
-        if (response.validateQuery(query)) |v| return s.sendError(reply, query.header.id, query.header.flags.opcode, v.rcode, v.extended_rcode, query.header.flags.rd, query.question, query.edns);
+        if (response.validateQuery(query)) |v| return s.sendError(reply, .{ .id = query.header.id, .opcode = query.header.flags.opcode, .rcode = v.rcode, .extended_rcode = v.extended_rcode, .rd = query.header.flags.rd, .question = query.question, .client = query.edns });
         const q = query.question.?;
         const client = answer.Client.fromQuery(query);
         if (build_options.testing_enabled) if (advanceClockSeconds(q.name)) |secs| {
@@ -752,7 +752,7 @@ const Server = struct {
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
         const wire = response.buildResponseWire(s.room(reply), ctx, served.reply(), arena) orelse
-            return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.question, query.edns);
+            return s.sendError(reply, .{ .id = query.header.id, .opcode = query.header.flags.opcode, .rcode = .server_failure, .rd = query.header.flags.rd, .question = query.question, .client = query.edns });
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -770,9 +770,9 @@ const Server = struct {
         s.write(reply, wire.len);
     }
 
-    fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, question: ?dns.Question, edns: ?dns.Edns) void {
-        const wire = response.serializeErrorResponse(s.room(reply)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, edns);
-        s.count(rcode, null);
+    fn sendError(s: *Server, reply: Reply, e: response.Refusal) void {
+        const wire = response.serializeErrorResponse(s.room(reply)[0..dns.max_udp_payload], e);
+        s.count(e.rcode, null);
         s.write(reply, wire.len);
     }
 
