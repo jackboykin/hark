@@ -1,6 +1,5 @@
 //! The delegation walk's pure decisions: QNAME minimisation, zone cuts, and
 //! which sibling failure a stub sees.
-const std = @import("std");
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 

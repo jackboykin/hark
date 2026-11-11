@@ -9,7 +9,7 @@
 //! - A function or test is at most 100 lines of code, nests control flow at
 //!   most 4 deep, and takes at most 7 parameters.
 //! - A `pub` declaration is named by another file.
-//! - No import cycle outside the named knots.
+//! - No import cycle outside the named knots, and no import left unused.
 
 const std = @import("std");
 const mem = std.mem;
@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
         try deprecated(arena, f, &lib);
         constCast(f);
         try shape(arena, f);
+        unusedImports(f);
     }
     try needlessPub(arena, files);
     try cycles(arena, files);
@@ -390,9 +391,24 @@ fn needlessPub(arena: Allocator, files: []const File) !void {
     }
 }
 
+/// An import nothing reads claims a dependency the file does not have.
+fn unusedImports(f: File) void {
+    const t = f.tree;
+    decls: for (t.rootDecls()) |d| {
+        const v = t.fullVarDecl(d) orelse continue;
+        if (v.visib_token != null or importTarget(t, v.ast.init_node.unwrap() orelse continue) == null) continue;
+        const name = v.ast.mut_token + 1;
+        for (0..t.tokens.len) |i| {
+            const token: Ast.TokenIndex = @intCast(i);
+            if (token != name and t.tokenTag(token) == .identifier and mem.eql(u8, t.tokenSlice(token), t.tokenSlice(name))) continue :decls;
+        }
+        report(f, name, "{s} is imported and never used", .{t.tokenSlice(name)});
+    }
+}
+
 /// Files that are one module by design: each imports the others freely.
 const knots = [_][]const []const u8{
-    &.{ "src/chaos.zig", "src/denial.zig", "src/graph.zig", "src/store.zig", "src/stub.zig", "src/trust.zig", "src/walk.zig" },
+    &.{ "src/denial.zig", "src/graph.zig", "src/stub.zig", "src/trust.zig", "src/walk.zig" },
     &.{ "src/carrier.zig", "src/doq_socket.zig", "src/dot_socket.zig", "src/edge.zig", "src/sessions.zig" },
 };
 
