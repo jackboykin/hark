@@ -870,13 +870,23 @@ pub const Conn = struct {
             rest = rest[used..];
         }
         if (!any) {
-            if (datagram.len >= 21) for (c.cids) |o| if (o) |id| if (id.token) |t| {
-                if (crypto.timing_safe.eql([16]u8, t, datagram[datagram.len - 16 ..][0..16].*)) return c.end(.closed, "stateless reset");
-            };
+            if (c.isReset(datagram)) return c.end(.closed, "stateless reset");
             return;
         }
         c.idle_from_ns = now;
         c.eliciting_since_heard = false;
+    }
+
+    /// RFC 9000 §10.3: a datagram no key opens, ending in a token the server
+    /// gave with one of its connection ids.
+    fn isReset(c: *const Conn, datagram: []const u8) bool {
+        if (datagram.len < 21) return false;
+        const tail = datagram[datagram.len - 16 ..][0..16].*;
+        for (c.cids) |o| {
+            const token = (o orelse continue).token orelse continue;
+            if (crypto.timing_safe.eql([16]u8, token, tail)) return true;
+        }
+        return false;
     }
 
     fn packet(c: *Conn, rest: []u8, now: i64, delivered: *std.ArrayList([]u8), any: *bool) Error!?usize {
@@ -1413,24 +1423,23 @@ pub const Conn = struct {
                 continue;
             }
             if (p.state == .lost) continue;
-            if (p.sent_ns <= lost_before or largest >= p.pn + packet_threshold) {
-                s.land(p, .lost);
-                if (p.in_flight) {
-                    c.in_flight -= p.bytes;
-                    last_loss_ns = @max(last_loss_ns orelse p.sent_ns, p.sent_ns);
-                }
-                c.settle(level, p.pn, p.streams, false);
-                if (p.ack_eliciting) {
-                    if (c.first_rtt_ns != null and p.sent_ns > c.first_rtt_ns.?) {
-                        if (run_from) |from| {
-                            if (p.sent_ns - from > span) persistent = true;
-                        } else run_from = p.sent_ns;
-                    }
-                }
-            } else {
+            if (p.sent_ns > lost_before and largest < p.pn + packet_threshold) {
                 const at = p.sent_ns + delay;
                 s.loss_ns = @min(s.loss_ns orelse at, at);
+                continue;
             }
+            s.land(p, .lost);
+            if (p.in_flight) {
+                c.in_flight -= p.bytes;
+                last_loss_ns = @max(last_loss_ns orelse p.sent_ns, p.sent_ns);
+            }
+            c.settle(level, p.pn, p.streams, false);
+            if (!p.ack_eliciting or c.first_rtt_ns == null or p.sent_ns <= c.first_rtt_ns.?) continue;
+            const from = run_from orelse {
+                run_from = p.sent_ns;
+                continue;
+            };
+            if (p.sent_ns - from > span) persistent = true;
         }
         if (last_loss_ns) |sent| c.congested(sent, now);
         if (persistent) {
