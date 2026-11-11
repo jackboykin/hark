@@ -60,9 +60,9 @@ pub const Key = struct {
 
     pub fn hash(k: Key) u64 {
         if (builtin.mode == .debug) std.debug.assert(k.name_hash == hashName(k.name));
-        const x = @as(u64, k.name_hash) << 32 | @as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype);
+        const x = (@as(u64, k.name_hash) << 32) | (@as(u64, @backingInt(k.kind)) << 16) | @backingInt(k.rtype);
         const p = @as(u128, x) * 0x9e3779b97f4a7c15;
-        return @truncate(p ^ p >> 64);
+        return @truncate(p ^ (p >> 64));
     }
 
     pub fn eql(a: Key, b: Key) bool {

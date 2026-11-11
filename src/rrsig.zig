@@ -144,7 +144,7 @@ pub const VerifyMemo = struct {
 
 pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     var ac: u32 = dnskey.flags;
-    ac += @as(u32, dnskey.protocol) << 8 | @backingInt(dnskey.algorithm);
+    ac += (@as(u32, dnskey.protocol) << 8) | @backingInt(dnskey.algorithm);
     for (dnskey.public_key, 0..) |b, i| ac += if (i & 1 == 0) @as(u32, b) << 8 else b;
     ac += (ac >> 16) & 0xFFFF;
     return @truncate(ac);
@@ -331,7 +331,7 @@ fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.di
     var exp_len: usize = key_data[0];
     var offset: usize = 1;
     if (exp_len == 0) {
-        exp_len = @as(usize, key_data[1]) << 8 | key_data[2];
+        exp_len = (@as(usize, key_data[1]) << 8) | key_data[2];
         offset = 3;
     }
 

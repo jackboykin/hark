@@ -160,12 +160,12 @@ fn connected(sock: *Socket) !News {
 pub fn next(sock: *Socket, sh: *Shared) !?Event {
     std.debug.assert(sh.out_len == 0);
     while (true) {
-        const ev = sock.session.next(&sh.read, &sh.out) catch |err| {
+        const ev = (sock.session.next(&sh.read, &sh.out) catch |err| {
             sock.why = @errorName(err);
             sock.state = .alerted;
             if (err != error.AlertHeard) _ = sock.put(sock.session.alert(&sh.out, tls13.alert(@errorCast(err)))) catch {};
             return .{ .ended = .failed };
-        } orelse {
+        }) orelse {
             const left = sock.session.leftover(&sh.read);
             if (left.plain.len + left.sealed.len != 0) {
                 sock.held = try sock.edge.work.alloc(u8, left.plain.len + left.sealed.len);

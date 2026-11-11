@@ -93,7 +93,7 @@ fn ReaderOf(comptime Bytes: type) type {
             const n = @as(usize, 1) << @intCast(r.rest[0] >> 6);
             const b = try r.bytes(n);
             var v: u64 = b[0] & 0x3f;
-            for (b[1..]) |x| v = v << 8 | x;
+            for (b[1..]) |x| v = (v << 8) | x;
             return .{ .value = v, .len = n };
         }
     };
@@ -198,7 +198,7 @@ const Keys = struct {
         var t: u32 = 0;
         for (packet[pn_at..][0..len], m[1..][0..len]) |*b, x| {
             b.* ^= x;
-            t = t << 8 | b.*;
+            t = (t << 8) | b.*;
         }
         return .{ .first = packet[0], .truncated = t, .len = len };
     }
@@ -862,10 +862,10 @@ pub const Conn = struct {
         var rest = datagram;
         var any = false;
         while (rest.len > 0) {
-            const used = c.packet(rest, now, delivered, &any) catch |err| {
+            const used = (c.packet(rest, now, delivered, &any) catch |err| {
                 try c.caught(err);
                 return;
-            } orelse break;
+            }) orelse break;
             if (c.ended != null) return;
             rest = rest[used..];
         }
@@ -1776,11 +1776,11 @@ pub const Conn = struct {
         var w: Writer = .{ .buf = out };
         const pn_bits: u8 = @intCast(p.pn_len - 1);
         if (p.level == .application) {
-            w.byte(0x40 | @as(u8, c.key_phase) << 2 | pn_bits);
+            w.byte(0x40 | (@as(u8, c.key_phase) << 2) | pn_bits);
             w.put(c.dcid.slice());
         } else {
             const kind: u8 = if (p.level == .initial) 0 else 2;
-            w.byte(0xc0 | kind << 4 | pn_bits);
+            w.byte(0xc0 | (kind << 4) | pn_bits);
             w.put(&std.mem.toBytes(mem.nativeToBig(u32, version)));
             w.byte(c.dcid.len);
             w.put(c.dcid.slice());

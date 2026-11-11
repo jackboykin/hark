@@ -64,7 +64,7 @@ pub const Signer = struct {
     const Served = struct { address: na.Address, key: *const Key };
 
     pub fn init(arena: Allocator, scenario: *const rpl.Scenario, mint: *Mint, wall_sec: i64) !Signer {
-        return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400, .original_ttl = scenario.sig_original_ttl };
+        return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse (365 * 86400), .original_ttl = scenario.sig_original_ttl };
     }
 
     /// The parser makes the first declared zone the root.

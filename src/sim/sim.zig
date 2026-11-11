@@ -105,7 +105,7 @@ pub const Sim = struct {
 
     fn wakeErased(ctx: *anyopaque, id: u32, gen: u32, at_ns: i64) anyerror!void {
         const s: *Sim = @ptrCast(@alignCast(ctx));
-        return s.schedule(id, at_ns, try s.tieOf(@as(u64, id) << 32 | gen), .{ .wake = gen });
+        return s.schedule(id, at_ns, try s.tieOf((@as(u64, id) << 32) | gen), .{ .wake = gen });
     }
 
     fn send(s: *Sim, ex: Exchange) !void {

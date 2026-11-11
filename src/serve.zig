@@ -975,8 +975,8 @@ const Span = struct {
     pub fn format(s: Span, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const t: u64 = @intCast(@divTrunc(@max(s.ns, 0), std.time.ns_per_s));
         const days = t / 86400;
-        const h = t % 86400 / 3600;
-        const m = t % 3600 / 60;
+        const h = (t % 86400) / 3600;
+        const m = (t % 3600) / 60;
         const sec = t % 60;
         if (days > 0) return w.print("{d}d {d}h", .{ days, h });
         if (h > 0) return w.print("{d}h {d}m", .{ h, m });

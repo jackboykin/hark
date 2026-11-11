@@ -39,7 +39,7 @@ const slot_sizes: [class_count]u32 = blk: {
 fn classOf(len: usize) u8 {
     const n = len -| 1;
     const k: usize = std.math.log2_int(usize, n | fine_max);
-    return @intCast((k - std.math.log2(fine_max) << std.math.log2(steps)) + (n >> @intCast(k - std.math.log2(steps))));
+    return @intCast(((k - std.math.log2(fine_max)) << std.math.log2(steps)) + (n >> @intCast(k - std.math.log2(steps))));
 }
 
 /// Slots sit at multiples of their size from the slab's start, and every

@@ -120,7 +120,7 @@ const Asked = struct {
     as_of: i64,
 
     fn hash(a: Asked) u32 {
-        return @truncate(a.key.hash() ^ @as(u64, @bitCast(a.as_of)) *% 0x9e3779b97f4a7c15);
+        return @truncate(a.key.hash() ^ (@as(u64, @bitCast(a.as_of)) *% 0x9e3779b97f4a7c15));
     }
 };
 

@@ -1282,7 +1282,7 @@ pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
         var at = Parser{ .msg = bytes, .pos = owner };
         if (!(try at.parseName(allocator, .compressed)).isRoot()) return error.FormatError;
         try frameEdnsOptions(rdata);
-        edns = .{ .udp_payload_size = class, .version = @intCast(ttl >> 16 & 0xFF), .do_bit = ttl & 0x8000 != 0 };
+        edns = .{ .udp_payload_size = class, .version = @intCast((ttl >> 16) & 0xFF), .do_bit = ttl & 0x8000 != 0 };
     }
     return .{ .header = hdr, .question = question, .edns = edns };
 }
@@ -1372,7 +1372,7 @@ fn sameWireName(out: []const u8, at: u16, wire: []const u8) bool {
     while (true) {
         const len = out[p];
         if (len & 0xC0 == 0xC0) {
-            p = @as(usize, len & 0x3F) << 8 | out[p + 1];
+            p = (@as(usize, len & 0x3F) << 8) | out[p + 1];
             continue;
         }
         if (len != wire[q]) return false;

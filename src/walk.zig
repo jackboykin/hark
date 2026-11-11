@@ -157,7 +157,7 @@ pub const Ask = struct {
             .silent => 1,
             .dead => 2,
         };
-        return class << 62 | @as(u64, @backingInt(shows)) << 60 | @min(soon, unheard);
+        return (class << 62) | (@as(u64, @backingInt(shows)) << 60) | @min(soon, unheard);
     }
 
     fn flying(a: *const Ask, g: *Graph) ns_rtt.Track {

@@ -41,7 +41,7 @@ const loss_one: u16 = 1 << 15;
 
 pub fn normal(bits: u64) f64 {
     var sum: u64 = 0;
-    inline for (0..4) |k| sum += bits >> (16 * k) & 0xffff;
+    inline for (0..4) |k| sum += (bits >> (16 * k)) & 0xffff;
     return (@as(f64, @floatFromInt(sum)) - 2 * 65535.0) * (@sqrt(3.0) / 65536.0);
 }
 
@@ -188,7 +188,7 @@ pub fn ServerTable(comptime State: type) type {
 
         fn slot(key: AddressKey) struct { set: usize, tag: u32 } {
             const h = AddressKey.HashCtx.hash(.{}, key);
-            return .{ .set = @as(usize, @intCast(h % sets)) * ways, .tag = @as(u32, @truncate(h >> 32)) | 1 << 31 };
+            return .{ .set = @as(usize, @intCast(h % sets)) * ways, .tag = @as(u32, @truncate(h >> 32)) | (1 << 31) };
         }
 
         fn find(t: *const Self, set: usize, tag: u32, key: AddressKey) ?usize {

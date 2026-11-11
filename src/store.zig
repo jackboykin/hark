@@ -294,7 +294,7 @@ pub const Store = struct {
             .rrset, .stub => |r| {
                 // `Rrset.read` and `Rrset.answered` read this layout in place.
                 try w.int(u8, @backingInt(r.kind));
-                try w.int(u8, @intFromBool(r.aa) | @as(u8, @intFromBool(r.ede != null)) << 1);
+                try w.int(u8, @intFromBool(r.aa) | (@as(u8, @intFromBool(r.ede != null)) << 1));
                 try w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
                 try w.int(u32, r.ttl);
                 try w.int(i64, r.stored_ns);
@@ -484,7 +484,7 @@ fn stored(payload: []const u8, at: usize) struct { name: []const u8, len: usize 
         const n = dns.wireNameLen(payload[at..]);
         return .{ .name = payload[at..][0..n], .len = n };
     }
-    const to = @as(usize, payload[at] & 0x3f) << 8 | payload[at + 1];
+    const to = (@as(usize, payload[at] & 0x3f) << 8) | payload[at + 1];
     return .{ .name = payload[to..][0..dns.wireNameLen(payload[to..])], .len = 2 };
 }
 
