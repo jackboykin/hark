@@ -183,6 +183,7 @@ pub const Desk = struct {
 
     fn hold(d: *Desk, q: dns.Question, c: Client) !?Failures.Held {
         const held = d.failures.get(q, c.cd, d.g.now()) orelse return null;
+        // Only a test's chaos may forget a held failure.
         if (!builtin.is_test) return held;
         return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else held;
     }
