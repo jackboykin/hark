@@ -35,10 +35,6 @@ pub const Referral = struct {
     zone_cut: dns.Name,
     ns_names: [max_servers_per_level]dns.Name,
     ns_count: usize,
-
-    pub fn nsNames(r: *const Referral) []const dns.Name {
-        return r.ns_names[0..r.ns_count];
-    }
 };
 
 /// Which addresses a walk may send to.

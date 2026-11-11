@@ -1378,13 +1378,8 @@ pub const Graph = struct {
         std.debug.assert(key.kind == .rrset);
         return switch (g.served(key, g.indexed(key)) orelse return null) {
             .stored => |e| e,
-            .live => |id| if (g.cell(id).state == .fact) g.version(id) else null,
+            .live => |id| if (g.cell(id).state == .fact) g.cell(id).blob.? else null,
         };
-    }
-
-    /// A settled rrset as the store keeps it.
-    pub fn version(g: *Graph, id: CellId) *store.Blob {
-        return g.cell(id).blob.?;
     }
 
     /// A stored fact, read from its live version when there is one.

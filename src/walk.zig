@@ -635,7 +635,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         if (s.denial.fact == .none and try belowDenial(g, id, s, cut.state.fact.cut.zone)) return;
         switch (aboveSays(g, &s.denial)) {
             .waits => return,
-            .answers => return g.settleAs(id, g.version(s.denial.fact.unwrap().?)),
+            .answers => return g.settleAs(id, g.cell(s.denial.fact.unwrap().?).blob.?),
             .silent => {},
         }
         s.ask = .{ .zone = cut.state.fact.cut.zone };
@@ -819,7 +819,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     var expires = placed;
     const sa = g.scratch.allocator();
     const servers = try sa.alloc(graph.Server, ref.ns_count);
-    for (servers, ref.nsNames()) |*server, host| {
+    for (servers, ref.ns_names[0..ref.ns_count]) |*server, host| {
         const key = Key.of(.addr, try host.clone(sa), .a);
         var glue: std.ArrayList(na.AddressKey) = .empty;
         // Glue is the parent's word only inside its own zone.
