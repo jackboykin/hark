@@ -46,7 +46,7 @@ test {
     _ = @import("store.zig");
     _ = @import("stub.zig");
     _ = @import("sys_linux.zig");
-    _ = @import("sys_union.zig");
+    _ = @import("sys.zig");
     _ = @import("tls13.zig");
     _ = @import("toml.zig");
     _ = @import("trust.zig");

@@ -17,7 +17,7 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const na = @import("net_address.zig");
-const sys = @import("sys_union.zig");
+const sys = @import("sys.zig");
 
 pub const max = 8;
 

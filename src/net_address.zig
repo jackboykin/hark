@@ -3,7 +3,7 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
-const sys = @import("sys_union.zig");
+const sys = @import("sys.zig");
 const rand = @import("rand.zig");
 const acl = @import("acl.zig");
 

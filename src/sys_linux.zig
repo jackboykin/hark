@@ -1,5 +1,5 @@
 //! Linux syscall wrappers with error unions. Reach them through
-//! sys_union.zig; import this file directly only for what has no meaning
+//! sys.zig; import this file directly only for what has no meaning
 //! off Linux (signalfd).
 const std = @import("std");
 const linux = std.os.linux;
