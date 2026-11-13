@@ -1,9 +1,10 @@
 //! bench <experiment> ...: hark's benchmarks, one program.
 //!
-//!   tp <rounds> <workload> side...      throughput (tp.zig)
-//!   prof <rounds> hit|miss side...      where a query's time goes (prof.zig)
-//!   report tp|prof [session] [side...]  a session's report again, the latest if none is named
-//!   load ...                            the load generator by hand (load.zig)
+//!   tp <rounds> <workload> side...               throughput (tp.zig)
+//!   prof <rounds> hit|miss side...               where a query's time goes (prof.zig)
+//!   overload <hark binary>                       what load beyond the ceiling costs (overload.zig)
+//!   report tp|prof|overload [session] [side...]  a session's report again, the latest if none is named
+//!   load ...                                     the load generator by hand (load.zig)
 //!
 //! Run as bench/run, which builds it first, in `nix develop .#bench` on an
 //! idle machine. What to run is said in arguments, how in the environment:
@@ -15,9 +16,10 @@ const os = @import("os.zig");
 const load = @import("load.zig");
 const tp = @import("tp.zig");
 const prof = @import("prof.zig");
+const overload = @import("overload.zig");
 const Ledger = @import("ledger.zig");
 
-const usage = "usage: bench tp|prof <rounds> <workload> side... | report tp|prof [session] [side...] | load ...\n";
+const usage = "usage: bench tp|prof <rounds> <workload> side... | overload <binary> | report tp|prof|overload [session] [side...] | load ...\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -41,6 +43,8 @@ pub fn main(init: std.process.Init) !void {
         tp.main(arena, config, &ledger, args)
     else if (std.mem.eql(u8, verb, "prof"))
         prof.main(arena, config, &ledger, args)
+    else if (std.mem.eql(u8, verb, "overload"))
+        overload.main(arena, config, &ledger, args)
     else if (std.mem.eql(u8, verb, "report"))
         report(arena, &ledger, args)
     else
@@ -60,5 +64,6 @@ fn report(arena: std.mem.Allocator, ledger: *const Ledger, args: []const []const
     const runs = try ledger.read(args[0], if (named) args[1] else null);
     if (std.mem.eql(u8, args[0], "tp")) return tp.report(arena, runs, args[1 + @as(usize, @intFromBool(named)) ..]);
     if (std.mem.eql(u8, args[0], "prof")) return prof.report(arena, runs);
+    if (std.mem.eql(u8, args[0], "overload")) return overload.report(arena, runs);
     return error.Usage;
 }

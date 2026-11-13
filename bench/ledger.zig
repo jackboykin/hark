@@ -41,6 +41,17 @@ pub const Run = struct {
     profile: ?Profile = null,
     syscalls: ?Counts = null,
     failed: ?Counts = null,
+    overload: ?Overload = null,
+};
+
+const Overload = struct {
+    level: f64,
+    ceiling: f64,
+    probe_sent: u64,
+    probe_completed: u64,
+    rxq_max: u64,
+    kernel_drops: u64,
+    unanswered: u64,
 };
 
 pub const Profile = struct {
