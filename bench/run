@@ -1,0 +1,4 @@
+#!/bin/sh -e
+d=$(dirname "$0")
+(cd "$d" && zig build)
+exec "$d/zig-out/bin/bench" "$@"
