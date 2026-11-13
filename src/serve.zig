@@ -54,11 +54,18 @@ const Reply = union(enum) {
     udp: struct { fd: posix.fd_t, addr: na.Address },
     wildcard: struct { fd: posix.fd_t, addr: na.Address, local: Batch.Local },
     tcp: *Conn,
+
+    fn peer(r: Reply) na.Address {
+        return switch (r) {
+            inline .udp, .wildcard => |u| u.addr,
+            .tcp => |c| c.addr,
+        };
+    }
 };
 
 const Owes = union(enum) {
     reply: Reply,
-    left,
+    left: na.Address,
     nothing,
 };
 
@@ -133,15 +140,19 @@ const Timer = struct {
 
 const Tenant = struct { slot: u32, gen: u32 };
 
+const Unanswered = struct {
+    dropped: u64 = 0,
+    shed: u64 = 0,
+    late: u64 = 0,
+    reaped: u64 = 0,
+
+    const Fate = std.meta.FieldEnum(Unanswered);
+};
+
 const Clients = struct {
     queries: struct { udp: u64 = 0, tcp: u64 = 0 } = .{},
     replies: struct { noerror: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, other: u64 = 0 } = .{},
-    unanswered: struct {
-        dropped: u64 = 0,
-        shed: u64 = 0,
-        late: u64 = 0,
-        reaped: u64 = 0,
-    } = .{},
+    unanswered: Unanswered = .{},
     cache: struct {
         hit: u64 = 0,
         miss: u64 = 0,
@@ -367,7 +378,7 @@ const Server = struct {
 
     fn drop(s: *Server, c: *Conn) void {
         if (c.owed > 0) for (s.pending.items, 0..) |*p, i| if (p.phase != .vacant and p.tcpOn(c)) {
-            p.owes = .left;
+            p.owes = .{ .left = c.addr };
             if (p.at_ns != Pending.never) continue;
             p.at_ns = @max(p.timeout(), s.e.now_ns);
             s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
@@ -432,14 +443,13 @@ const Server = struct {
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
         const admit: graph.Graph.Admit = if (crowded and !s.known(asked)) .join else .new;
         const root = s.g.demandRoot(asked.name, asked.qtype, admit) catch |err| {
-            const fate = switch (err) {
-                error.Full => &c.unanswered.dropped,
-                error.Novel => &c.unanswered.shed,
+            const fate: Unanswered.Fate = switch (err) {
+                error.Full => .dropped,
+                error.Novel => .shed,
                 else => return err,
             };
             if (reply == .tcp) return s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
-            fate.* += 1;
-            return;
+            return s.forsake(fate, .{ .reply = reply }, query, s.e.now_ns);
         };
         try s.g.drain();
         var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns };
@@ -528,7 +538,7 @@ const Server = struct {
         const reply = switch (p.owes) {
             .reply => |r| r,
             .left => {
-                s.clients.unanswered.late += 1;
+                s.forsake(.late, p.owes, p.query, p.asked_ns);
                 return s.vacate(i);
             },
             .nothing => return s.vacate(i),
@@ -611,7 +621,7 @@ const Server = struct {
             s.pending.items[i].phase = .late;
             return false;
         }
-        if (p.owes != .nothing) s.clients.unanswered.late += 1;
+        s.forsake(.late, p.owes, p.query, p.asked_ns);
         return true;
     }
 
@@ -619,7 +629,8 @@ const Server = struct {
         while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
             const l = s.late.popFront() orelse return;
             const i = s.parkedAs(l) orelse continue;
-            if (s.pending.items[i].owes != .nothing) s.clients.unanswered.reaped += 1;
+            const p = s.pending.items[i];
+            s.forsake(.reaped, p.owes, p.query, p.asked_ns);
             s.unpark(i);
             s.vacate(i);
         }
@@ -694,7 +705,7 @@ const Server = struct {
             return err;
         };
         if (reply != .tcp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
-            s.clients.unanswered.late += 1;
+            s.forsake(.late, .{ .reply = reply }, query, asked_ns);
             return served.release(&s.g.store);
         }
         s.send(reply, query, served, asked_ns);
@@ -755,20 +766,33 @@ const Server = struct {
         const wire = response.buildResponseWire(s.room(reply), ctx, served.reply(), arena) orelse
             return s.sendError(reply, .{ .id = query.header.id, .opcode = query.header.flags.opcode, .rcode = .server_failure, .rd = query.header.flags.rd, .question = query.question, .client = query.edns });
         if (s.cfg.log_queries) {
-            var ab: [64]u8 = undefined;
-            var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            const q = query.question.?;
-            const peer = switch (reply) {
-                inline .udp, .wildcard => |u| u.addr,
-                .tcp => |c| c.addr,
-            };
-            const rcode = served.rcode;
             var rb: [24]u8 = undefined;
-            const outcome = if (rcode == .no_error) "" else std.mem.print(&rb, " {f}", .{dns.tag(rcode)}) catch "";
-            log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
+            const outcome = if (served.rcode == .no_error) "" else std.mem.print(&rb, " {f}", .{dns.tag(served.rcode)}) catch "";
+            s.logQuery(reply.peer(), query, outcome, asked_ns);
         }
         s.count(served.rcode, served.ede);
         s.write(reply, wire.len);
+    }
+
+    fn forsake(s: *Server, fate: Unanswered.Fate, owes: Owes, query: dns.Query, asked_ns: i64) void {
+        const peer = switch (owes) {
+            .reply => |r| r.peer(),
+            .left => |a| a,
+            .nothing => return,
+        };
+        switch (fate) {
+            inline else => |f| @field(s.clients.unanswered, @tagName(f)) += 1,
+        }
+        if (s.cfg.log_queries) s.logQuery(peer, query, switch (fate) {
+            inline else => |f| " " ++ @tagName(f),
+        }, asked_ns);
+    }
+
+    fn logQuery(s: *Server, peer: na.Address, query: dns.Query, outcome: []const u8, asked_ns: i64) void {
+        var ab: [64]u8 = undefined;
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        const q = query.question.?;
+        log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
     }
 
     fn sendError(s: *Server, reply: Reply, e: response.Refusal) void {
