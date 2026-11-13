@@ -265,33 +265,21 @@ pub const Name = struct {
     }
 
     pub fn formatInto(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
-        var pos: usize = 0;
+        var w: std.Io.Writer = .fixed(buf);
+        self.format(&w) catch unreachable;
+        return w.buffered();
+    }
+
+    pub fn format(self: Name, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var i: usize = 0;
         while (self.wire[i] != 0) : (i += 1 + self.wire[i]) {
-            if (pos > 0) {
-                buf[pos] = '.';
-                pos += 1;
-            }
+            if (i > 0) try w.writeByte('.');
             for (self.wire[i + 1 ..][0..self.wire[i]]) |byte| switch (byte) {
-                '.', '\\' => {
-                    buf[pos] = '\\';
-                    buf[pos + 1] = byte;
-                    pos += 2;
-                },
-                0x21...0x2d, 0x2f...0x5b, 0x5d...0x7e => {
-                    buf[pos] = byte;
-                    pos += 1;
-                },
-                else => {
-                    buf[pos] = '\\';
-                    buf[pos + 1] = '0' + byte / 100;
-                    buf[pos + 2] = '0' + (byte / 10) % 10;
-                    buf[pos + 3] = '0' + byte % 10;
-                    pos += 4;
-                },
+                '.', '\\' => try w.writeAll(&.{ '\\', byte }),
+                0x21...0x2d, 0x2f...0x5b, 0x5d...0x7e => try w.writeByte(byte),
+                else => try w.writeAll(&.{ '\\', '0' + byte / 100, '0' + (byte / 10) % 10, '0' + byte % 10 }),
             };
         }
-        return buf[0..pos];
     }
 
     pub fn eql(a: Name, b: Name) bool {
