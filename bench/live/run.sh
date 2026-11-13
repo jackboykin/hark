@@ -40,4 +40,4 @@ for r in $(seq "$ROUNDS"); do
   wait "${PIDS[@]}" 2>/dev/null
   echo "round $r done"
 done
-bench compare "$OUT" "${A%%=*}" "${B%%=*}" | tee "$OUT/compare.txt"
+"$D/../run" compare "$OUT" "${A%%=*}" "${B%%=*}" 2>&1 | tee "$OUT/compare.txt"

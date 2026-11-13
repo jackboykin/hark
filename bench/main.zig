@@ -4,6 +4,7 @@
 //!   prof <rounds> hit|miss side...               where a query's time goes (prof.zig)
 //!   overload <hark binary>                       what load beyond the ceiling costs (overload.zig)
 //!   report tp|prof|overload [session] [side...]  a session's report again, the latest if none is named
+//!   compare <dir> <A> <B>                        the live bench's two sides (compare.zig)
 //!   load ...                                     the load generator by hand (load.zig)
 //!
 //! Run as bench/run, which builds it first, in `nix develop .#bench` on an
@@ -17,9 +18,10 @@ const load = @import("load.zig");
 const tp = @import("tp.zig");
 const prof = @import("prof.zig");
 const overload = @import("overload.zig");
+const compare = @import("compare.zig");
 const Ledger = @import("ledger.zig");
 
-const usage = "usage: bench tp|prof <rounds> <workload> side... | overload <binary> | report tp|prof|overload [session] [side...] | load ...\n";
+const usage = "usage: bench tp|prof <rounds> <workload> side... | overload <binary> | report tp|prof|overload [session] [side...] | compare <dir> <A> <B> | load ...\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -39,7 +41,9 @@ pub fn main(init: std.process.Init) !void {
     const config = try arena.print("{s}/config", .{dir});
     if (std.mem.eql(u8, verb, "load")) return load.main(arena, args);
     const ledger: Ledger = try .open(arena, dir);
-    const result = if (std.mem.eql(u8, verb, "tp"))
+    const result = if (std.mem.eql(u8, verb, "compare"))
+        compare.main(arena, args)
+    else if (std.mem.eql(u8, verb, "tp"))
         tp.main(arena, config, &ledger, args)
     else if (std.mem.eql(u8, verb, "prof"))
         prof.main(arena, config, &ledger, args)
