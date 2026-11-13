@@ -38,6 +38,17 @@ pub const Run = struct {
     /// p50, p99 and p99.9 in ns, from open-loop runs.
     latency: ?[3]u64 = null,
     counters: Counts = .{},
+    profile: ?Profile = null,
+    syscalls: ?Counts = null,
+    failed: ?Counts = null,
+};
+
+pub const Profile = struct {
+    seconds: f64,
+    parts: Counts = .{},
+    top: std.json.ArrayHashMap(Counts) = .{},
+    cycles: Counts = .{},
+    instructions: Counts = .{},
 };
 
 fn clock(buf: []u8) []const u8 {
