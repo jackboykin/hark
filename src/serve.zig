@@ -24,6 +24,7 @@ const response = @import("response.zig");
 const sys_linux = @import("sys_linux.zig");
 const Edge = @import("edge.zig");
 const log = std.log.scoped(.serve);
+const query_log = std.log.scoped(.query);
 
 const max_frame = 4096;
 const udp_recv_max = 4096;
@@ -147,6 +148,18 @@ const Unanswered = struct {
     reaped: u64 = 0,
 
     const Fate = std.meta.FieldEnum(Unanswered);
+};
+
+const Outcome = union(enum) {
+    rcode: dns.RCode,
+    fate: Unanswered.Fate,
+
+    pub fn format(o: Outcome, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (o) {
+            .rcode => |r| if (r != .no_error) try w.print(" {f}", .{dns.tag(r)}),
+            .fate => |f| try w.print(" {t}", .{f}),
+        }
+    }
 };
 
 const Clients = struct {
@@ -765,11 +778,7 @@ const Server = struct {
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
         const wire = response.buildResponseWire(s.room(reply), ctx, served.reply(), arena) orelse
             return s.sendError(reply, .{ .id = query.header.id, .opcode = query.header.flags.opcode, .rcode = .server_failure, .rd = query.header.flags.rd, .question = query.question, .client = query.edns });
-        if (s.cfg.log_queries) {
-            var rb: [24]u8 = undefined;
-            const outcome = if (served.rcode == .no_error) "" else std.mem.print(&rb, " {f}", .{dns.tag(served.rcode)}) catch "";
-            s.logQuery(reply.peer(), query, outcome, asked_ns);
-        }
+        if (s.cfg.log_queries) s.logQuery(reply.peer(), query, .{ .rcode = served.rcode }, asked_ns);
         s.count(served.rcode, served.ede);
         s.write(reply, wire.len);
     }
@@ -783,16 +792,12 @@ const Server = struct {
         switch (fate) {
             inline else => |f| @field(s.clients.unanswered, @tagName(f)) += 1,
         }
-        if (s.cfg.log_queries) s.logQuery(peer, query, switch (fate) {
-            inline else => |f| " " ++ @tagName(f),
-        }, asked_ns);
+        if (s.cfg.log_queries) s.logQuery(peer, query, .{ .fate = fate }, asked_ns);
     }
 
-    fn logQuery(s: *Server, peer: na.Address, query: dns.Query, outcome: []const u8, asked_ns: i64) void {
-        var ab: [64]u8 = undefined;
-        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+    fn logQuery(s: *Server, peer: na.Address, query: dns.Query, outcome: Outcome, asked_ns: i64) void {
         const q = query.question.?;
-        log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
+        query_log.info("client={f} id=0x{x:0>4} {f} {f}{f} {d}ms", .{ peer, query.header.id, q.name, dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
     }
 
     fn sendError(s: *Server, reply: Reply, e: response.Refusal) void {

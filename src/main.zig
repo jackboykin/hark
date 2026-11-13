@@ -7,8 +7,6 @@ const build_options = @import("build_options");
 const hark = @import("hark");
 const Io = std.Io;
 
-var log_verbose = false;
-
 pub const std_options: std.Options = .{
     .logFn = logFn,
     .log_level = .debug,
@@ -20,8 +18,6 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (level == .debug and !log_verbose) return;
-
     const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
 
     const secs: u64 = @intCast(hark.monotonic.wallclockSec());
@@ -82,14 +78,14 @@ fn printUsage() void {
         \\
         \\Serve options:
         \\  --config <path>     Path to config file (default: /etc/hark/hark.toml)
-        \\  --verbose, -v       Enable debug logging (per-query log lines)
+        \\  --verbose, -v       Trace each resolution's steps
         \\
     , .{});
 }
 
 fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
     var config_path: ?[]const u8 = null;
-    var cli_verbose = false;
+    var trace = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse {
@@ -97,7 +93,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
-            cli_verbose = true;
+            trace = true;
         } else {
             log.err("unknown serve option: {s}", .{arg});
             std.process.exit(1);
@@ -112,7 +108,6 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
     else
         loadDefaultConfig(allocator, io) catch std.process.exit(1);
     defer cfg.deinit();
-    log_verbose = cli_verbose or cfg.log_queries;
 
     // A socket per exchange in flight can pass the usual 1024 soft limit.
     if (std.posix.getrlimit(.NOFILE)) |lim| {
@@ -120,7 +115,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    hark.serve.run(allocator, work_allocator, if (builtin.mode == .debug) null else &reserve, &cfg, cli_verbose) catch |err| {
+    hark.serve.run(allocator, work_allocator, if (builtin.mode == .debug) null else &reserve, &cfg, trace) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
