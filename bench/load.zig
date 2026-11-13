@@ -107,7 +107,10 @@ pub const Result = struct {
 };
 
 const Hist = struct {
-    n: [64 * 8]u64 = @splat(0),
+    n: [64 * steps]u64 = @splat(0),
+
+    const bits = 6;
+    const steps = 1 << bits;
 
     fn add(h: *Hist, ns: u64) void {
         h.n[index(@max(ns, 1))] += 1;
@@ -115,8 +118,8 @@ const Hist = struct {
 
     fn index(ns: u64) usize {
         const e: u6 = @intCast(63 - @clz(ns));
-        const frac = if (e >= 3) (ns >> (e - 3)) & 7 else (ns << (3 - e)) & 7;
-        return @as(usize, e) * 8 + @as(usize, @intCast(frac));
+        const frac = if (e >= bits) (ns >> (e - bits)) % steps else (ns << (bits - e)) % steps;
+        return @as(usize, e) * steps + @as(usize, @intCast(frac));
     }
 
     fn pct(h: *const Hist, p: f64) u64 {
@@ -128,9 +131,8 @@ const Hist = struct {
         for (h.n, 0..) |c, i| {
             seen += c;
             if (seen >= want) {
-                const e: u6 = @intCast(i / 8);
-                const base = @as(u64, 1) << e;
-                return base + (base * (i % 8 + 1)) / 8;
+                const base = @as(u64, 1) << @intCast(i / steps);
+                return base + (base * (i % steps + 1)) / steps;
             }
         }
         return 0;
