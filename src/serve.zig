@@ -23,6 +23,7 @@ const monotonic = @import("monotonic.zig");
 const response = @import("response.zig");
 const sys_linux = @import("sys_linux.zig");
 const Edge = @import("edge.zig");
+const sink = @import("log.zig");
 const log = std.log.scoped(.serve);
 const query_log = std.log.scoped(.query);
 
@@ -919,6 +920,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
             s.logSummary();
         }
         s.out.flush();
+        sink.flush();
         const ev = try e.next(@min(sweep_at, stats_at, s.nextTimer())) orelse {
             try s.settle();
             continue;

@@ -1,5 +1,5 @@
-//! The hark executable: its arguments, the config it loads and its log,
-//! then the server.
+//! The hark executable: its arguments and the config it loads, then the
+//! server.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,30 +8,15 @@ const hark = @import("hark");
 const Io = std.Io;
 
 pub const std_options: std.Options = .{
-    .logFn = logFn,
+    .logFn = hark.log.logFn,
     .log_level = .debug,
 };
 
-fn logFn(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+pub const panic = std.debug.FullPanic(panicked);
 
-    const secs: u64 = @intCast(hark.monotonic.wallclockSec());
-    const es = std.time.epoch.EpochSeconds{ .secs = secs };
-    const ds = es.getDaySeconds();
-    const yd = es.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-
-    var buf: [4096]u8 = undefined;
-    const line = std.mem.print(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z " ++ level.asText() ++ scope_prefix ++ format ++ "\n", .{
-        yd.year,              md.month.numeric(),      @as(u9, md.day_index) + 1,
-        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
-    } ++ args) catch return;
-    std.debug.print("{s}", .{line});
+fn panicked(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    hark.log.drain();
+    std.debug.defaultPanic(msg, first_trace_addr);
 }
 
 const log = std.log;
@@ -40,31 +25,37 @@ var reserve: hark.slab.Reserve = .{};
 var lasting: hark.slab.Tenant = .init(&reserve);
 var work: hark.slab.Tenant = .init(&reserve);
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    defer hark.log.drain();
+    command(init) catch return 1;
+    return 0;
+}
+
+fn command(init: std.process.Init) !void {
     const allocator = if (builtin.mode == .debug) init.gpa else lasting.allocator();
     const work_allocator = if (builtin.mode == .debug) init.gpa else work.allocator();
     const io = init.io;
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
-    const command = args.next() orelse {
+    const name = args.next() orelse {
         printUsage();
-        std.process.exit(1);
+        return error.Usage;
     };
 
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+    if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h") or std.mem.eql(u8, name, "help")) {
         printUsage();
-    } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-V")) {
+    } else if (std.mem.eql(u8, name, "version") or std.mem.eql(u8, name, "--version") or std.mem.eql(u8, name, "-V")) {
         var stdout_buf: [64]u8 = undefined;
         var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-        stdout_writer.interface.print("hark {s}\n", .{build_options.version}) catch std.process.exit(1);
-        stdout_writer.interface.flush() catch std.process.exit(1);
-    } else if (std.mem.eql(u8, command, "serve")) {
+        try stdout_writer.interface.print("hark {s}\n", .{build_options.version});
+        try stdout_writer.interface.flush();
+    } else if (std.mem.eql(u8, name, "serve")) {
         return runServe(allocator, work_allocator, &args, io);
     } else {
-        log.err("unknown command: {s}", .{command});
+        log.err("unknown command: {s}", .{name});
         printUsage();
-        std.process.exit(1);
+        return error.Usage;
     }
 }
 
@@ -90,23 +81,23 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
         if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse {
                 log.err("--config requires a path", .{});
-                std.process.exit(1);
+                return error.Usage;
             };
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             trace = true;
         } else {
             log.err("unknown serve option: {s}", .{arg});
-            std.process.exit(1);
+            return error.Usage;
         }
     }
 
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
-            std.process.exit(1);
+            return err;
         }
     else
-        loadDefaultConfig(allocator, io) catch std.process.exit(1);
+        try loadDefaultConfig(allocator, io);
     defer cfg.deinit();
 
     // A socket per exchange in flight can pass the usual 1024 soft limit.
@@ -117,7 +108,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
 
     hark.serve.run(allocator, work_allocator, if (builtin.mode == .debug) null else &reserve, &cfg, trace) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
-        std.process.exit(1);
+        return err;
     };
 }
 

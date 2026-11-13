@@ -100,6 +100,27 @@ pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     }
 }
 
+/// O_NONBLOCK would change the open file, which stderr shares with whoever
+/// else holds it.
+pub fn writeNoWait(fd: posix.fd_t, buf: []const u8) !usize {
+    const iov = [1]posix.iovec_const{.{ .base = buf.ptr, .len = buf.len }};
+    while (true) {
+        const rc = linux.pwritev2(fd, &iov, 1, -1, linux.RWF.NOWAIT);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            .INTR => continue,
+            .OPNOTSUPP, .NOSYS => error.Unsupported,
+            .BADF => unreachable,
+            .IO => error.InputOutput,
+            .NOSPC => error.NoSpaceLeft,
+            .PIPE => error.BrokenPipe,
+            .NOMEM => error.SystemResources,
+            else => |e| posix.unexpectedErrno(e),
+        };
+    }
+}
+
 /// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`: linking libc
 /// widens the posix one to glibc's 128 bytes, which is not the kernel ABI.
 pub fn signalfd(fd: posix.fd_t, mask: *const linux.sigset_t, flags: u32) !posix.fd_t {

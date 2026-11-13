@@ -1,6 +1,7 @@
 //! The hark module: every source file, for main, the fuzzers and the tests.
 
 pub const config = @import("config.zig");
+pub const log = @import("log.zig");
 pub const monotonic = @import("monotonic.zig");
 pub const serve = @import("serve.zig");
 pub const slab = @import("slab.zig");
@@ -26,6 +27,7 @@ test {
     _ = @import("fuzz_nsec.zig");
     _ = @import("fuzz_wire.zig");
     _ = @import("graph.zig");
+    _ = @import("log.zig");
     _ = @import("model.zig");
     _ = @import("monotonic.zig");
     _ = @import("net_address.zig");

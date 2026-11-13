@@ -15,3 +15,4 @@ pub const close = os.close;
 pub const listen = os.listen;
 pub const sendto = os.sendto;
 pub const write = os.write;
+pub const writeNoWait = os.writeNoWait;
