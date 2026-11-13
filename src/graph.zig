@@ -38,6 +38,7 @@ const Reply = model.Reply;
 const Outcome = model.Outcome;
 const Failure = model.Failure;
 const Value = model.Value;
+const log = std.log.scoped(.graph);
 
 pub const Need = enum {
     datagram,
@@ -488,8 +489,10 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.enqueue(id);
         g.stats.resolver.detail.ahead += 1;
-        var nb: [dns.max_dotted_len + 1]u8 = undefined;
-        if (g.cfg.trace) std.debug.print("  ahead {s} {f}\n", .{ key.shown(&nb), dns.tag(key.rtype) });
+        if (g.cfg.trace) {
+            var nb: [dns.max_dotted_len + 1]u8 = undefined;
+            log.debug("ahead {s} {f}", .{ key.shown(&nb), dns.tag(key.rtype) });
+        }
         return id;
     }
 
@@ -508,8 +511,10 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.wake(id, at);
         g.stats.resolver.early.refresh += 1;
-        var nb: [dns.max_dotted_len + 1]u8 = undefined;
-        if (g.cfg.trace) std.debug.print("  refresh {s} {f} in {d} ms\n", .{ key.shown(&nb), dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
+        if (g.cfg.trace) {
+            var nb: [dns.max_dotted_len + 1]u8 = undefined;
+            log.debug("refresh {s} {f} in {d} ms", .{ key.shown(&nb), dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
+        }
     }
 
     const Queued = struct { id: CellId, gen: u32 };
@@ -628,13 +633,11 @@ pub const Graph = struct {
             },
         };
         if (g.cfg.trace) {
-            var ab: [64]u8 = undefined;
-            var nb: [dns.max_dotted_len + 1]u8 = undefined;
             const over: []const u8 = if (completion == .reply and completion.reply.stream) " over a session" else "";
-            std.debug.print("  {s} {s} {f} {t}{s} -> {t}\n", .{ na.format(sc.server, &ab), c.name.formatInto(&nb), dns.tag(sc.qtype), sc.need, over, std.meta.activeTag(outcome) });
+            log.debug("{f} {f} {f} {t}{s} -> {t}", .{ sc.server, c.name, dns.tag(sc.qtype), sc.need, over, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
                 const m = outcome.reply.msg;
-                std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
+                log.debug("    aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
             }
         }
         switch (outcome) {
@@ -783,10 +786,7 @@ pub const Graph = struct {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
         if (g.cfg.trace) switch (value) {
-            .ds, .dnskey, .secure => |chain| {
-                var nb: [dns.max_dotted_len + 1]u8 = undefined;
-                std.debug.print("  {t}({s}) -> {t} for {d} s\n", .{ std.meta.activeTag(value), c.name.formatInto(&nb), chain.status, @divTrunc(expires_ns - g.now(), std.time.ns_per_s) });
-            },
+            .ds, .dnskey, .secure => |chain| log.debug("{t}({f}) -> {t} for {d} s", .{ std.meta.activeTag(value), c.name, chain.status, @divTrunc(expires_ns - g.now(), std.time.ns_per_s) }),
             .cut, .addr, .rrset, .stub, .answer, .exchange, .refresh, .ahead, .parental => {},
         };
         switch (value) {
@@ -866,10 +866,7 @@ pub const Graph = struct {
     pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
-        if (g.cfg.trace) {
-            var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
-        }
+        if (g.cfg.trace) log.debug("{t}({f}) failed: {t} {s}", .{ c.key.kind, c.name, why.code, why.text });
         if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
         const owned = try c.own(why);
         c.state = .{ .failure = owned };
@@ -1359,10 +1356,7 @@ pub const Graph = struct {
         const budget = g.payer;
         const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text else null;
         if (stop) |why| {
-            if (g.cfg.trace) {
-                var nb: [dns.max_dotted_len + 1]u8 = undefined;
-                std.debug.print("  {s} {f} refused: {s}\n", .{ qname.formatInto(&nb), dns.tag(qtype), why });
-            }
+            if (g.cfg.trace) log.debug("{f} {f} refused: {s}", .{ qname, dns.tag(qtype), why });
             return null;
         }
         const id = try g.newCell(.init(.exchange, "", .a), qname, g.as_of);

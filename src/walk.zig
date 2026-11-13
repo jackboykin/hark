@@ -17,6 +17,7 @@ const denial = @import("denial.zig");
 const store = @import("store.zig");
 const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
+const log = std.log.scoped(.graph);
 
 const Graph = graph.Graph;
 const CellId = model.CellId;
@@ -1127,11 +1128,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
         }
     }
     if (a.untried() != 0) return .ready;
-    if (g.cfg.trace) {
-        var nb: [dns.max_dotted_len + 1]u8 = undefined;
-        var zb: [dns.max_dotted_len + 1]u8 = undefined;
-        std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
-    }
+    if (g.cfg.trace) log.debug("{f} at {f}: {d} servers, none left, {s}", .{ g.cell(id).name, zone, a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     return if (left.stopped) .stopped else .none;
 }
 
