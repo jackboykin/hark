@@ -329,50 +329,50 @@ pub const Store = struct {
         return .{ .refs = 1, .len = @intCast(len), .name_hash = key.name_hash, .rtype = @backingInt(key.rtype), .kind = @backingInt(key.kind), .name_len = @intCast(key.name.len), .expires_ns = expires_ns };
     }
 
-    pub fn parse(arena: Allocator, b: *Blob) !Value {
+    pub fn parse(arena: Allocator, b: *Blob) Allocator.Error!Value {
         var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()), .pos = b.name_len };
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
-                const zone = try r.name();
-                const placed_until_ns = try r.int(i64);
-                const servers = try arena.alloc(model.Server, try r.int(u16));
-                const glue = try arena.alloc(na.AddressKey, try r.int(u16));
+                const zone = r.name();
+                const placed_until_ns = r.int(i64);
+                const servers = try arena.alloc(model.Server, r.int(u16));
+                const glue = try arena.alloc(na.AddressKey, r.int(u16));
                 var at: usize = 0;
                 for (servers) |*server| {
-                    const name = try r.slice(try r.int(u16));
-                    server.key = .{ .kind = .addr, .rtype = .a, .name = name, .name_hash = try r.int(u32) };
-                    const n = try r.int(u16);
+                    const name = r.slice(r.int(u16));
+                    server.key = .{ .kind = .addr, .rtype = .a, .name = name, .name_hash = r.int(u32) };
+                    const n = r.int(u16);
                     server.glue = glue[at..][0..n];
                     at += n;
                 }
-                for (glue) |*gl| gl.* = try r.addr();
+                for (glue) |*gl| gl.* = r.addr();
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
             .rrset, .stub, .parental => |kind| blk: {
                 var reply: model.Reply = .{
-                    .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
+                    .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
                     .aa = undefined,
                 };
-                const flags = try r.int(u8);
+                const flags = r.int(u8);
                 reply.aa = flags & 1 != 0;
-                const ede = try r.int(u16);
+                const ede = r.int(u16);
                 if (flags & 2 != 0) reply.ede = @fromBackingInt(ede);
-                reply.ttl = try r.int(u32);
-                reply.stored_ns = try r.int(i64);
-                reply.target = try r.name();
-                reply.zone = try r.name();
-                const an = try r.int(u16);
-                const ns = try r.int(u16);
-                const ar = try r.int(u16);
+                reply.ttl = r.int(u32);
+                reply.stored_ns = r.int(i64);
+                reply.target = r.name();
+                reply.zone = r.name();
+                const an = r.int(u16);
+                const ns = r.int(u16);
+                const ar = r.int(u16);
                 reply.answers = try r.records(arena, an);
                 reply.authorities = try r.records(arena, ns);
                 reply.additionals = try r.records(arena, ar);
                 break :blk if (kind == .stub) .{ .stub = reply } else .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
-                var c: model.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
-                c.proven_until_ns = try r.int(i64);
-                c.records = try r.records(arena, try r.int(u16));
+                var c: model.Chain = .{ .status = @fromBackingInt(r.int(u8)) };
+                c.proven_until_ns = r.int(i64);
+                c.records = try r.records(arena, r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
             .addr, .answer, .secure, .exchange, .refresh, .ahead => unreachable,
@@ -392,7 +392,7 @@ pub const Rrset = struct {
 
     pub fn of(b: *Blob) Rrset {
         std.debug.assert(isReply(b));
-        return read(.{ .buf = b.payload(), .pos = b.name_len }) catch unreachable;
+        return read(.{ .buf = b.payload(), .pos = b.name_len });
     }
 
     pub fn answered(b: *Blob) ?Answered {
@@ -416,10 +416,10 @@ pub const Rrset = struct {
         }
     };
 
-    fn read(r0: Reader) !Rrset {
+    fn read(r0: Reader) Rrset {
         var r = r0;
         var v: Rrset = .{
-            .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
+            .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
             .aa = undefined,
             .ede = null,
             .ttl = undefined,
@@ -428,22 +428,22 @@ pub const Rrset = struct {
             .zone = undefined,
             .sections = undefined,
         };
-        const flags = try r.int(u8);
+        const flags = r.int(u8);
         v.aa = flags & 1 != 0;
-        const ede = try r.int(u16);
+        const ede = r.int(u16);
         if (flags & 2 != 0) v.ede = @fromBackingInt(ede);
-        v.ttl = try r.int(u32);
-        v.stored_ns = try r.int(i64);
-        v.target = try r.wireName();
-        v.zone = try r.wireName();
+        v.ttl = r.int(u32);
+        v.stored_ns = r.int(i64);
+        v.target = r.wireName();
+        v.zone = r.wireName();
         var counts: [3]u16 = undefined;
-        for (&counts) |*n| n.* = try r.int(u16);
+        for (&counts) |*n| n.* = r.int(u16);
         for (&v.sections, counts) |*sec, n| {
             const start = r.pos;
             for (0..n) |_| {
-                _ = try r.wireName();
-                const fixed = try r.slice(10);
-                _ = try r.slice(mem.readInt(u16, fixed[8..10], .big));
+                _ = r.wireName();
+                const fixed = r.slice(10);
+                _ = r.slice(mem.readInt(u16, fixed[8..10], .big));
             }
             sec.* = .{ .payload = r.buf, .start = start, .end = r.pos, .len = n };
         }
@@ -551,42 +551,41 @@ fn Writer(comptime measuring: bool) type {
     };
 }
 
+/// Reads a payload only as `build` wrote it, so a read never runs short.
 const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    fn int(r: *Reader, comptime T: type) !T {
-        if (r.pos + @sizeOf(T) > r.buf.len) return error.EndOfData;
+    fn int(r: *Reader, comptime T: type) T {
         defer r.pos += @sizeOf(T);
         return mem.readInt(T, r.buf[r.pos..][0..@sizeOf(T)], .little);
     }
 
-    fn slice(r: *Reader, n: usize) ![]const u8 {
-        if (r.pos + n > r.buf.len) return error.EndOfData;
+    fn slice(r: *Reader, n: usize) []const u8 {
         defer r.pos += n;
         return r.buf[r.pos..][0..n];
     }
 
-    fn name(r: *Reader) !dns.Name {
-        return .of(try r.wireName());
+    fn name(r: *Reader) dns.Name {
+        return .of(r.wireName());
     }
 
-    fn wireName(r: *Reader) ![]const u8 {
+    fn wireName(r: *Reader) []const u8 {
         const n = stored(r.buf, r.pos);
         r.pos += n.len;
         return n.name;
     }
 
-    fn addr(r: *Reader) !na.AddressKey {
-        const family = try r.int(u8);
-        const port = try r.int(u16);
-        return .{ .family = family, .port = port, .addr = (try r.slice(16))[0..16].* };
+    fn addr(r: *Reader) na.AddressKey {
+        const family = r.int(u8);
+        const port = r.int(u16);
+        return .{ .family = family, .port = port, .addr = r.slice(16)[0..16].* };
     }
 
-    fn records(r: *Reader, arena: Allocator, n: u16) ![]RR {
+    fn records(r: *Reader, arena: Allocator, n: u16) Allocator.Error![]RR {
         const out = try arena.alloc(RR, n);
         var it: Records.Iterator = .{ .payload = r.buf, .pos = r.pos, .end = r.buf.len };
-        for (out) |*rr| rr.* = it.next() orelse return error.EndOfData;
+        for (out) |*rr| rr.* = it.next().?;
         r.pos = it.pos;
         return out;
     }
