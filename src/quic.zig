@@ -1339,8 +1339,8 @@ pub const Conn = struct {
         const newest = newest_acked orelse return;
         if (level == .handshake) c.handshake_acked = true;
         if (newest.pn == largest and any_eliciting) {
-            const delay: i64 = @intCast(@min(delay_raw << c.peer.ack_delay_exponent, std.math.maxInt(i32)) * std.time.ns_per_us);
-            c.sampleRtt(now - newest.sent_ns, if (level == .application) delay else 0, now);
+            const delay_us: i64 = if (level == .application) @min(delay_raw <<| c.peer.ack_delay_exponent, std.math.maxInt(i32)) else 0;
+            c.sampleRtt(now - newest.sent_ns, delay_us * std.time.ns_per_us, now);
         }
         try c.detectLoss(level, now);
         if (c.handshake_acked or c.phase == .confirmed) c.pto_count = 0;
