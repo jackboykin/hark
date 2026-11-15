@@ -1,0 +1,16 @@
+recursor:
+  socket_dir: __RUN__
+  daemon: false
+  setuid: ''
+  setgid: ''
+incoming:
+  listen: [127.0.0.1:__PORT__]
+  allow_from: [127.0.0.0/8]
+dnssec:
+  validation: validate
+recordcache:
+  max_entries: 4000000
+packetcache:
+  max_entries: 4000000
+logging:
+  loglevel: 3

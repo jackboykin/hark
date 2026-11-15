@@ -4,7 +4,7 @@
 //!   prof <rounds> hit|miss side...               where a query's time goes (prof.zig)
 //!   overload <hark binary>                       what load beyond the ceiling costs (overload.zig)
 //!   report tp|prof|overload [session] [side...]  a session's report again, the latest if none is named
-//!   compare <dir> <A> <B>                        the live bench's two sides (compare.zig)
+//!   compare <dir> <side>...                      the live bench's sides (compare.zig)
 //!   load ...                                     the load generator by hand (load.zig)
 //!
 //! Run as bench/run, which builds it first, in `nix develop .#bench` on an
@@ -21,7 +21,7 @@ const overload = @import("overload.zig");
 const compare = @import("compare.zig");
 const Ledger = @import("ledger.zig");
 
-const usage = "usage: bench tp|prof <rounds> <workload> side... | overload <binary> | report tp|prof|overload [session] [side...] | compare <dir> <A> <B> | load ...\n";
+const usage = "usage: bench tp|prof <rounds> <workload> side... | overload <binary> | report tp|prof|overload [session] [side...] | compare <dir> <side>... | load ...\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
