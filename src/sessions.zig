@@ -122,19 +122,15 @@ const Way = union(enum) {
     session: *Conn,
 };
 
-const Best = struct { way: Way, known: u32 };
-
-fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Best {
-    var b: Best = .{ .way = .plain, .known = std.math.maxInt(u32) };
+fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Way {
+    var b: Way = .plain;
     if (key.port != s.plain_port) return b;
     var fewest: u32 = std.math.maxInt(u32);
     for (std.enums.values(Kind)) |kind| {
         const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
         if (standing.status(s.edge.now_ns) != .capable) continue;
-        const dial_rounds = carrier.dialRounds(kind);
-        b.known = @min(b.known, dial_rounds);
         var way: Way = .{ .dial = kind };
-        var rounds = dial_rounds;
+        var rounds = carrier.dialRounds(kind);
         if (s.find(key, kind)) |c| if (!c.carrier.spent()) {
             if (c.overdue) continue;
             way = .{ .session = c };
@@ -142,14 +138,23 @@ fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Be
         };
         if (rounds < fewest) {
             fewest = rounds;
-            b.way = way;
+            b = way;
         }
     }
     return b;
 }
 
+fn knownRounds(s: *const Sessions, standings: ?*const Standings) u32 {
+    var known: u32 = std.math.maxInt(u32);
+    for (std.enums.values(Kind)) |kind| {
+        const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
+        if (standing.status(s.edge.now_ns) == .capable) known = @min(known, carrier.dialRounds(kind));
+    }
+    return known;
+}
+
 pub fn quote(s: *const Sessions, server: na.AddressKey, need: graph.Need) graph.Quote {
-    return switch (s.best(server, s.standing.get(server)).way) {
+    return switch (s.best(server, s.standing.get(server))) {
         .plain => .{ .rounds = need.plainRounds(), .exposure = .cleartext },
         .dial => |kind| .{ .rounds = carrier.dialRounds(kind), .exposure = .encrypted },
         .session => |c| .{ .rounds = c.carrier.rounds(), .exposure = .encrypted },
@@ -160,16 +165,17 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const key: na.AddressKey = .fromAddress(ex.server);
     if (key.port != s.plain_port) return false;
     const standings = s.standing.get(key);
-    const r = s.best(key, standings);
+    const known = s.knownRounds(standings);
     for (std.enums.values(Kind)) |kind| {
         const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
-        if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= r.known) continue;
+        if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= known) continue;
         // Damped for the dial's length, so no second probe starts while this one
         // is out, or for as long if it could not start.
         s.setStanding(key, kind, dial_timeout_ns, false);
         _ = s.dial(kind, ex.server, key) catch {};
     }
-    const c = switch (r.way) {
+    // A probe's dial may evict an idle session, so the way is chosen after.
+    const c = switch (s.best(key, standings)) {
         .plain => return false,
         .dial => |kind| blk: {
             if (s.find(key, kind)) |old| try s.drop(old, .closed);
