@@ -358,10 +358,10 @@ test "replay" {
     const Header = std.Build.abi.fuzz.MmapInputHeader;
     const len = std.mem.readInt(u32, data[@offsetOf(Header, "len")..][0..4], .little);
     var smith: Smith = .{ .in = data[@sizeOf(Header)..][0..len] };
-    try fuzzOne({}, &smith);
+    try fuzzOne(&smith);
 }
 
-fn fuzzOne(_: void, s: *Smith) anyerror!void {
+fn fuzzOne(s: *Smith) !void {
     var z: Zone = undefined;
     draw(&z, s);
     const zone: dns.Name = .lit(apex);
@@ -433,5 +433,9 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
 }
 
 test "fuzz: dnssec denial proofs against a model zone" {
-    try testing.fuzz({}, fuzzOne, .{});
+    try testing.fuzz({}, struct {
+        fn one(_: void, s: *Smith) anyerror!void {
+            return fuzzOne(s);
+        }
+    }.one, .{});
 }

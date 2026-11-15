@@ -6,6 +6,7 @@
 //! - A switch over a closed enum or union of hark's own names every tag.
 //! - Nothing std marks deprecated is used.
 //! - No `@constCast`.
+//! - No `anyerror` outside a test.
 //! - A function or test is at most 100 lines of code, nests control flow at
 //!   most 4 deep, and takes at most 7 parameters.
 //! - A `pub` declaration is named by another file.
@@ -42,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
         try switches(arena, f, enums);
         try deprecated(arena, f, &lib);
         constCast(f);
+        try anyError(arena, f);
         try shape(arena, f);
         unusedImports(f);
     }
@@ -297,6 +299,18 @@ fn constCast(f: File) void {
         const token: Ast.TokenIndex = @intCast(i);
         if (f.tree.tokenTag(token) == .builtin and mem.eql(u8, f.tree.tokenSlice(token), "@constCast"))
             report(f, token, "@constCast: what is typed const stays const", .{});
+    }
+}
+
+/// An error set the compiler can't list hides what escapes through it.
+fn anyError(arena: Allocator, f: File) !void {
+    const t = f.tree;
+    const tests = try testRanges(arena, t);
+    tokens: for (0..t.tokens.len) |i| {
+        for (tests) |r| if (i >= r[0] and i <= r[1]) continue :tokens;
+        const token: Ast.TokenIndex = @intCast(i);
+        if (t.tokenTag(token) == .identifier and mem.eql(u8, t.tokenSlice(token), "anyerror"))
+            report(f, token, "anyerror: name the errors that can escape", .{});
     }
 }
 
