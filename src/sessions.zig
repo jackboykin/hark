@@ -178,7 +178,7 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const c = switch (s.best(key, standings)) {
         .plain => return false,
         .dial => |kind| blk: {
-            if (s.find(key, kind)) |old| try s.drop(old, .closed);
+            if (s.find(key, kind)) |old| try s.retire(old);
             break :blk s.dial(kind, ex.server, key) catch return false;
         },
         .session => |c| c,
@@ -295,16 +295,35 @@ fn evictIdle(s: *Sessions) !bool {
     return true;
 }
 
+fn retire(s: *Sessions, c: *Conn) !void {
+    if (c.pending.count() == 0) return s.drop(c, .closed);
+    const e = s.edge;
+    try e.queue.ensureUnusedCapacity(e.gpa, c.queued.items.len);
+    s.unlist(c);
+    s.stats.getPtr(c.carrier).moved += c.queued.items.len;
+    for (c.queued.items) |at| e.queue.appendAssumeCapacity(s.completed(at, .moved));
+    c.queued.clearRetainingCapacity();
+}
+
+fn retired(s: *const Sessions, c: *const Conn) bool {
+    return c.pending.count() == 0 and s.find(c.key, c.carrier) != c;
+}
+
+fn unlist(s: *Sessions, c: *const Conn) void {
+    const of = s.by_server.getPtr(c.key) orelse return;
+    if (of.get(c.carrier) != c) return;
+    of.set(c.carrier, null);
+    for (of.values) |o| {
+        if (o != null) return;
+    }
+    _ = s.by_server.remove(c.key);
+}
+
 fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
     const e = s.edge;
     try e.queue.ensureUnusedCapacity(e.gpa, c.pending.count() + c.queued.items.len);
     _ = s.conns.swapRemove(mem.findScalar(*Conn, s.conns.items, c).?);
-    if (s.by_server.getPtr(c.key)) |of| if (of.get(c.carrier) == c) {
-        of.set(c.carrier, null);
-        for (of.values) |o| {
-            if (o != null) break;
-        } else _ = s.by_server.remove(c.key);
-    };
+    s.unlist(c);
     if (s.unflushed == c) {
         s.unflushed = null;
         c.carrier.unflush(&s.shared);
@@ -379,6 +398,7 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
             },
         },
     }
+    if (s.retired(c)) return s.drop(c, .closed);
     if (s.unflushed != c) try s.flush();
     s.unflushed = c;
     try s.rearm(c);
@@ -412,7 +432,7 @@ pub fn flightDue(s: *Sessions, id: CellId, seq: u32) !void {
     s.stats.getPtr(c.carrier).timed_out += 1;
     queue.appendAssumeCapacity(s.completed(at, .timeout));
     const heard = c.last_reply_ns orelse return s.drop(c, .failed);
-    if (heard < left_ns) return s.drop(c, .closed);
+    if (heard < left_ns or s.retired(c)) return s.drop(c, .closed);
     if (s.unflushed != c) try s.flush();
     s.unflushed = c;
 }
@@ -464,4 +484,53 @@ test "a write lost while queries leave the handshake moves each query once" {
     try s.drop(c, .closed);
     try testing.expectEqual(queries, e.queue.items.len);
     try testing.expectEqual(0, s.flights.count());
+}
+
+test "a spent session keeps its pending to the end while a successor takes the rest" {
+    const testing = std.testing;
+    var e = try Edge.init(testing.allocator);
+    defer e.deinit();
+    try e.enableSessions(53, 853);
+    const s = e.sessions.?;
+    var pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)) != .SUCCESS) return error.SocketPairFailed;
+    defer sys.close(pair[1]);
+    const secret: tls13.Secret = @splat(1);
+    const server = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+    const c = try testing.allocator.create(Conn);
+    c.* = .{
+        .key = .fromAddress(server),
+        .carrier = .{ .dot = .{
+            .edge = &e,
+            .token = 0,
+            .fd = pair[0],
+            .state = .established,
+            .session = .{ .gpa = testing.allocator, .handshake = null, .phase = .application, .read = .of(&secret), .write = .of(&secret) },
+        } },
+        .last_ns = 0,
+        .dial_by_ns = 0,
+    };
+    try s.conns.append(testing.allocator, c);
+    try s.by_server.put(testing.allocator, c.key, .init(.{ .dot = c, .doq = null }));
+    s.setStanding(c.key, .dot, persistence_ns, true);
+    s.setStanding(c.key, .doq, damping_ns, false);
+    const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
+    const deadline = e.now_ns + std.time.ns_per_s;
+    try testing.expect(try s.carry(.{ .id = 1, .server = server, .need = .datagram, .wire = &wire, .deadline_ns = deadline }));
+    try s.flush();
+    c.carrier.dot.session.write.seq = 1 << 24;
+    try testing.expect(try s.carry(.{ .id = 2, .server = server, .need = .datagram, .wire = &wire, .deadline_ns = deadline }));
+    try testing.expect(mem.findScalar(*Conn, s.conns.items, c) != null);
+    try testing.expect(s.find(c.key, .dot) != c);
+    try testing.expectEqual(1, c.pending.count());
+    try testing.expectEqual(0, e.queue.items.len);
+
+    var frame = [_]u8{ 0, 12 } ++ @as([12]u8, @splat(0));
+    var keys: tls13.Keys = .of(&secret);
+    var record: [64]u8 = undefined;
+    _ = try sys.write(pair[1], keys.seal(&record, .application_data, &frame));
+    try s.ready(0, linux.EPOLL.IN);
+    try testing.expect(mem.findScalar(*Conn, s.conns.items, c) == null);
+    try testing.expectEqual(1, e.queue.items.len);
+    try testing.expect(e.queue.items[0].exchange.completion == .reply);
 }
