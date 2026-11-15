@@ -40,7 +40,6 @@ pub const Session = struct {
     read: Keys = undefined,
     write: Keys = undefined,
     plain: u32 = 0,
-    next_id: u16 = 0,
     post: tls13.Framer = .{},
 
     pub fn begin(gpa: mem.Allocator, out: *[tls13.header_len + tls13.max_hello]u8, entropy: *const [tls13.entropy_len]u8) !struct { Session, []const u8 } {
@@ -65,17 +64,13 @@ pub const Session = struct {
         s.handshake = null;
     }
 
-    /// The message id is replaced by a session counter: no id is in use twice
-    /// on a session, and inside TLS its unpredictability guards nothing.
-    pub fn query(s: *Session, out: []u8, wire: []const u8) struct { id: u16, sealed: []u8 } {
+    pub fn query(s: *Session, out: []u8, wire: []const u8, id: u16) []u8 {
         var frame: [max_frame]u8 = undefined;
         std.debug.assert(wire.len >= 12 + 11 and wire.len <= 512);
-        const id = s.next_id;
-        s.next_id +%= 1;
         const padded = dns.pad(frame[2..], wire, pad_block) catch unreachable;
         mem.writeInt(u16, frame[0..2], @intCast(padded.len), .big);
         mem.writeInt(u16, frame[2..4], id, .big);
-        return .{ .id = id, .sealed = s.write.seal(out, .application_data, frame[0 .. 2 + padded.len]) };
+        return s.write.seal(out, .application_data, frame[0 .. 2 + padded.len]);
     }
 
     pub fn alert(s: *Session, out: []u8, what: tls.Alert.Description) []const u8 {
@@ -230,7 +225,7 @@ test "a server's key update turns both ways when it asks" {
     rx = .{ .buf = &buf, .end = server.seal(&buf, .application_data, &frame).len };
     try testing.expectEqualSlices(u8, frame[2..], (try s.next(&rx, &out)).?.reply);
     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
-    _ = try client.open(s.query(&out, &wire).sealed);
+    _ = try client.open(s.query(&out, &wire, 0));
 }
 
 const Fake = struct {
@@ -461,7 +456,7 @@ const Fake = struct {
                 4 => {
                     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
                     var out: [max_sealed]u8 = undefined;
-                    const opened = try f.client.open(f.s.query(&out, &wire).sealed);
+                    const opened = try f.client.open(f.s.query(&out, &wire, 0));
                     try testing.expectEqual(.application_data, opened.kind);
                     try testing.expectEqual(0, (opened.data.len - 2) % pad_block);
                 },

@@ -49,9 +49,9 @@ pub const Carrier = union(Kind) {
     }
 
     /// `wire` is borrowed and must outlive its query.
-    pub fn query(c: *Carrier, sh: *Shared, wire: []const u8) !Taken {
+    pub fn query(c: *Carrier, sh: *Shared, wire: []const u8, outstanding: anytype) !Taken {
         return switch (c.*) {
-            inline else => |*x, kind| try x.query(&@field(sh, @tagName(kind)), wire),
+            inline else => |*x, kind| try x.query(&@field(sh, @tagName(kind)), wire, outstanding),
         };
     }
 

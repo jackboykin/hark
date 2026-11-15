@@ -6,6 +6,7 @@ fd: posix.fd_t,
 state: enum { connecting, handshaking, established, alerted } = .connecting,
 session: dot.Session = undefined,
 held: []u8 = &.{},
+next_id: u16 = 0,
 unsent: std.ArrayList(u8) = .empty,
 why: []const u8 = "silence",
 
@@ -190,11 +191,15 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
     }
 }
 
-pub fn query(sock: *Socket, sh: *Shared, wire: []const u8) !carrier.Taken {
+/// Inside TLS an unpredictable message id guards nothing, so ids count up.
+pub fn query(sock: *Socket, sh: *Shared, wire: []const u8, outstanding: anytype) !carrier.Taken {
+    if (outstanding.count() > std.math.maxInt(u16)) return .later;
     if (sh.out_len + dot.max_sealed > sh.out.len and !try sock.flush(sh)) return .gone;
-    const q = sock.session.query(sh.out[sh.out_len..], wire);
-    sh.out_len += q.sealed.len;
-    return .{ .sent = q.id };
+    while (outstanding.contains(sock.next_id)) sock.next_id +%= 1;
+    const id = sock.next_id;
+    sock.next_id +%= 1;
+    sh.out_len += sock.session.query(sh.out[sh.out_len..], wire, id).len;
+    return .{ .sent = id };
 }
 
 pub fn flush(sock: *Socket, sh: *Shared) !bool {

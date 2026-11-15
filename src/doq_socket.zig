@@ -88,7 +88,7 @@ pub fn fault(sock: *const Socket) []const u8 {
     return sock.errno orelse sock.conn.fault;
 }
 
-pub fn query(sock: *Socket, _: *Shared, wire: []const u8) !carrier.Taken {
+pub fn query(sock: *Socket, _: *Shared, wire: []const u8, _: anytype) !carrier.Taken {
     return switch (try sock.conn.query(wire)) {
         .id => |id| .{ .sent = id },
         .later => .later,

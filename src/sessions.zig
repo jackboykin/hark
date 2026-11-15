@@ -209,7 +209,7 @@ pub fn flush(s: *Sessions) !void {
 }
 
 fn send(s: *Sessions, c: *Conn, at: *Carried) !carrier.Taken {
-    const taken = try c.carrier.query(&s.shared, at.wire);
+    const taken = try c.carrier.query(&s.shared, at.wire, &c.pending);
     if (taken != .sent) return taken;
     c.pending.putAssumeCapacity(taken.sent, at);
     at.wire_id = taken.sent;
