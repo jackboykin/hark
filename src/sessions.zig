@@ -188,16 +188,10 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     at.* = .{ .conn = c, .id = ex.id, .seq = seq, .wire = ex.wire, .asked_ns = e.now_ns };
     s.flights.putAssumeCapacity(ex.id, at);
     s.stats.getPtr(c.carrier).carried += 1;
-    if (!c.carrier.established() or c.queued.items.len > 0) {
-        c.queued.appendAssumeCapacity(at);
-        return true;
-    }
+    c.queued.appendAssumeCapacity(at);
+    if (!c.carrier.established() or c.queued.items.len > 1) return true;
     if (s.unflushed != c) try s.flush();
-    switch (try s.send(c, at)) {
-        .sent => s.unflushed = c,
-        .later => c.queued.appendAssumeCapacity(at),
-        .gone => try s.drop(c, .closed),
-    }
+    if (try s.drain(c)) s.unflushed = c else try s.drop(c, .closed);
     return true;
 }
 
