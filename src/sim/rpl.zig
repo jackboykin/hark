@@ -482,10 +482,7 @@ const Parser = struct {
             t = toks.next() orelse return p.fail("RR needs a type");
         }
         const rtype = rtypeFromText(t) orelse return p.fail("unknown RR type");
-        return dns.ResourceRecord.init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) }) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.InvalidRDataLength => p.fail("rdata field too long"),
-        };
+        return dns.ResourceRecord.init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) });
     }
 
     fn rdata(p: *Parser, rtype: dns.RType, owner: dns.Name, toks: *mem.TokenIterator(u8, .any), ds_from: *std.ArrayList(DsFrom)) Error!dns.RData {
@@ -571,8 +568,8 @@ const Parser = struct {
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
                     .iterations = iterations,
-                    .salt = if (mem.eql(u8, salt, "-")) "" else try p.unhex(salt),
-                    .next_hashed_owner = hashed[0..n],
+                    .salt = if (mem.eql(u8, salt, "-")) "" else try p.octets(try p.unhex(salt)),
+                    .next_hashed_owner = try p.octets(hashed[0..n]),
                     .type_bit_maps = try p.typeBitmap(toks),
                 } };
             },
@@ -581,7 +578,6 @@ const Parser = struct {
                 // HINFO in wire form, as the resolver synthesises it (RFC 8482).
                 var wire: std.ArrayList(u8) = .empty;
                 for (try p.charStrings(toks)) |str| {
-                    if (str.len > 255) return p.fail("character-string too long");
                     try wire.append(arena, @intCast(str.len));
                     try wire.appendSlice(arena, str);
                 }
@@ -602,7 +598,13 @@ const Parser = struct {
             try strings.append(p.arena, toks.buffer[start..close]);
             toks.index = close + 1;
         }
+        for (strings.items) |s| _ = try p.octets(s);
         return strings.items;
+    }
+
+    /// A field its length octet must count (RFC 1035 §3.3).
+    fn octets(p: *Parser, s: []const u8) Error![]const u8 {
+        return if (s.len > 255) p.fail("rdata field too long") else s;
     }
 
     fn hex(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {

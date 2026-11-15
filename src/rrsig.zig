@@ -181,7 +181,7 @@ const SignedData = struct {
             var signed = rr;
             signed.ttl = self.original_ttl;
             hasher.update(owner.wire);
-            hasher.update(&(signed.fixed() catch unreachable));
+            hasher.update(&signed.fixed());
             hasher.update(rr.rdata);
         }
     }

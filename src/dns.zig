@@ -450,9 +450,7 @@ pub const RData = union(enum) {
     nsec3: Nsec3Data,
     unknown: []const u8,
 
-    pub const Error = Allocator.Error || error{InvalidRDataLength};
-
-    fn encode(rdata: RData, gpa: Allocator) RData.Error![]const u8 {
+    fn encode(rdata: RData, gpa: Allocator) Allocator.Error![]const u8 {
         switch (rdata) {
             .ns, .cname, .dname, .ptr => |n| return n.wire,
             .unknown => |bytes| return bytes,
@@ -460,14 +458,13 @@ pub const RData = union(enum) {
         }
         var w: std.Io.Writer.Allocating = .init(gpa);
         errdefer w.deinit();
-        rdata.write(&w.writer) catch |err| return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => |e| e,
-        };
+        rdata.write(&w.writer) catch return error.OutOfMemory;
         return try w.toOwnedSlice();
     }
 
-    fn write(rdata: RData, w: *std.Io.Writer) (std.Io.Writer.Error || RData.Error)!void {
+    /// A character-string, salt or hash longer than 255 octets has no wire
+    /// form: whoever reads one from outside turns it away first.
+    fn write(rdata: RData, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (rdata) {
             .a => |addr| try w.writeAll(&addr),
             .aaaa => |addr| try w.writeAll(&addr),
@@ -482,7 +479,7 @@ pub const RData = union(enum) {
                 for ([_]u32{ soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum }) |v| try w.writeInt(u32, v, .big);
             },
             .txt => |txt| for (txt.strings) |str| {
-                try w.writeByte(std.math.cast(u8, str.len) orelse return error.InvalidRDataLength);
+                try w.writeByte(@intCast(str.len));
                 try w.writeAll(str);
             },
             .rrsig => |sig| {
@@ -516,9 +513,9 @@ pub const RData = union(enum) {
                 try w.writeByte(@backingInt(nsec3.hash_algorithm));
                 try w.writeByte(nsec3.flags);
                 try w.writeInt(u16, nsec3.iterations, .big);
-                try w.writeByte(std.math.cast(u8, nsec3.salt.len) orelse return error.InvalidRDataLength);
+                try w.writeByte(@intCast(nsec3.salt.len));
                 try w.writeAll(nsec3.salt);
-                try w.writeByte(std.math.cast(u8, nsec3.next_hashed_owner.len) orelse return error.InvalidRDataLength);
+                try w.writeByte(@intCast(nsec3.next_hashed_owner.len));
                 try w.writeAll(nsec3.next_hashed_owner);
                 try w.writeAll(nsec3.type_bit_maps);
             },
@@ -710,7 +707,8 @@ pub const ResourceRecord = struct {
     rclass: RClass,
     ttl: u32,
     /// Canonical wire (RFC 4034 §6.2): names uncompressed and lowercase, except
-    /// an NSEC's next name, kept as signed (RFC 6840 §5.1).
+    /// an NSEC's next name, kept as signed (RFC 6840 §5.1). At most 65535
+    /// octets: the parser expands compressed names only where the rest is short.
     rdata: []const u8,
 
     const Parts = struct {
@@ -721,7 +719,7 @@ pub const ResourceRecord = struct {
         rdata: RData,
     };
 
-    pub fn init(gpa: Allocator, p: Parts) RData.Error!ResourceRecord {
+    pub fn init(gpa: Allocator, p: Parts) Allocator.Error!ResourceRecord {
         return .{ .name = p.name, .rtype = p.rtype, .rclass = p.rclass, .ttl = p.ttl, .rdata = try p.rdata.encode(gpa) };
     }
 
@@ -794,12 +792,12 @@ pub const ResourceRecord = struct {
         return readNsec3(rr.rdata) catch unreachable;
     }
 
-    pub fn fixed(rr: ResourceRecord) error{InvalidRDataLength}![10]u8 {
+    pub fn fixed(rr: ResourceRecord) [10]u8 {
         var f: [10]u8 = undefined;
         mem.writeInt(u16, f[0..2], @backingInt(rr.rtype), .big);
         mem.writeInt(u16, f[2..4], @backingInt(rr.rclass), .big);
         mem.writeInt(u32, f[4..8], rr.ttl, .big);
-        mem.writeInt(u16, f[8..10], std.math.cast(u16, rr.rdata.len) orelse return error.InvalidRDataLength, .big);
+        mem.writeInt(u16, f[8..10], @intCast(rr.rdata.len), .big);
         return f;
     }
 
@@ -1437,7 +1435,7 @@ pub const Serializer = struct {
     fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name.wire);
         const at = self.pos;
-        try self.writeSlice(&try rr.fixed());
+        try self.writeSlice(&rr.fixed());
         const e = (if (self.names != null) embedded(rr.rtype) else null) orelse return self.writeSlice(rr.rdata);
         if (e.spelling != .rfc1035) return self.writeSlice(rr.rdata);
         try self.writeSlice(rr.rdata[0..e.skip]);

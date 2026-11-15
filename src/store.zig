@@ -270,13 +270,13 @@ pub const Store = struct {
 
     /// Rdata names arrive compressed and are stored whole, so no message size
     /// bounds a blob: it is measured, then written.
-    pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) !*Blob {
+    pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) Allocator.Error!*Blob {
         std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
         var measure: Writer(true) = .{ .buf = {} };
-        try encode(true, &measure, key, value);
+        encode(true, &measure, key, value);
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), measure.pos);
         var w: Writer(false) = .{ .buf = out };
-        try encode(false, &w, key, value);
+        encode(false, &w, key, value);
         std.debug.assert(w.pos == out.len);
         const b: *Blob = @ptrCast(out.ptr);
         b.* = header(key, out.len, expires_ns);
@@ -284,7 +284,7 @@ pub const Store = struct {
         return b;
     }
 
-    fn encode(comptime measuring: bool, w: *Writer(measuring), key: Key, value: Value) !void {
+    fn encode(comptime measuring: bool, w: *Writer(measuring), key: Key, value: Value) void {
         w.slice(key.name);
         w.anchors[0] = .{ .at = 0, .wire = key.name };
         switch (value) {
@@ -313,13 +313,13 @@ pub const Store = struct {
                 w.name(r.target);
                 w.name(r.zone);
                 for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| w.int(u16, @intCast(sec.len));
-                for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| try w.records(sec);
+                for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| w.records(sec);
             },
             .ds, .dnskey => |c| {
                 w.int(u8, @backingInt(c.status));
                 w.int(i64, c.proven_until_ns);
                 w.int(u16, @intCast(c.records.len));
-                try w.records(c.records);
+                w.records(c.records);
             },
             .addr, .answer, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
         }
@@ -541,10 +541,10 @@ fn Writer(comptime measuring: bool) type {
             w.slice(&k.addr);
         }
 
-        fn records(w: *W, rrs: []const RR) !void {
+        fn records(w: *W, rrs: []const RR) void {
             for (rrs) |rr| {
                 w.name(rr.name);
-                w.slice(&try rr.fixed());
+                w.slice(&rr.fixed());
                 w.slice(rr.rdata);
             }
         }
