@@ -935,10 +935,10 @@ test "a send that shows less goes first, however slower, until the ask has shown
         wall: i64 = 0,
         sealed: na.AddressKey,
 
-        fn send(_: *anyopaque, _: graph.Exchange) anyerror!graph.Exposure {
+        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
             return .none;
         }
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) graph.Error!void {}
         fn quote(ctx: *anyopaque, server: na.AddressKey, need: Need) graph.Quote {
             const w: *@This() = @ptrCast(@alignCast(ctx));
             if (!w.sealed.eql(server)) return .{ .rounds = need.plainRounds(), .exposure = .cleartext };

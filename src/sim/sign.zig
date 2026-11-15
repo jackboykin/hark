@@ -192,9 +192,10 @@ pub const Signer = struct {
         data.feed(&h);
         const minted = try self.mint.signatures.getOrPut(self.mint.arena, h.finalResult());
         if (!minted.found_existing) {
-            var s = try key.pair.signer(null);
+            // A minted P-256 pair always signs: std's errors guard a bad one.
+            var s = key.pair.signer(null) catch unreachable;
             data.feed(&s);
-            minted.value_ptr.* = (try s.finalize()).toBytes();
+            minted.value_ptr.* = (s.finalize() catch unreachable).toBytes();
         }
         sig.signature = try self.arena.dupe(u8, minted.value_ptr);
         return .init(self.arena, .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } });

@@ -92,21 +92,25 @@ pub const Completion = union(enum) {
     wake: u32,
 };
 
+/// All a rule or an edge may fail with. Anything else that goes wrong is
+/// one question's to answer, so it is settled where it happens.
+pub const Error = error{OutOfMemory};
+
 pub const Edge = struct {
     ctx: *anyopaque,
     now_ns: *const i64,
     wall_sec: *const i64,
     rng: std.Random,
-    sendFn: *const fn (*anyopaque, Exchange) anyerror!Exposure,
-    wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
+    sendFn: *const fn (*anyopaque, Exchange) Error!Exposure,
+    wakeFn: *const fn (*anyopaque, CellId, u32, i64) Error!void,
     quoteFn: ?*const fn (*anyopaque, na.AddressKey, Need) Quote = null,
     chaos: ?*chaos.Chaos = null,
 
-    pub fn send(e: Edge, ex: Exchange) !Exposure {
+    pub fn send(e: Edge, ex: Exchange) Error!Exposure {
         return e.sendFn(e.ctx, ex);
     }
 
-    pub fn wake(e: Edge, id: CellId, gen: u32, at_ns: i64) !void {
+    pub fn wake(e: Edge, id: CellId, gen: u32, at_ns: i64) Error!void {
         return e.wakeFn(e.ctx, id, gen, at_ns);
     }
 
@@ -520,7 +524,7 @@ pub const Graph = struct {
         try g.ready.append(g.gpa, .{ .id = id, .gen = g.gen(id) });
     }
 
-    pub fn drain(g: *Graph) !void {
+    pub fn drain(g: *Graph) Error!void {
         while (try g.nextReady()) |q| if (g.gen(q.id) == q.gen) try g.run(q.id);
     }
 
@@ -593,7 +597,7 @@ pub const Graph = struct {
         return g.edge.wake(id, g.gen(id), at_ns);
     }
 
-    pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
+    pub fn complete(g: *Graph, id: CellId, completion: Completion) Error!void {
         if (completion == .wake) {
             if (g.gen(id) == completion.wake) try g.enqueue(id);
             return g.drain();
@@ -1261,7 +1265,7 @@ pub const Graph = struct {
 
     /// Held for the run: what it publishes may settle and free its own readers
     /// while the rule still has the cell in hand.
-    fn run(g: *Graph, id: CellId) !void {
+    fn run(g: *Graph, id: CellId) Error!void {
         const c = g.cell(id);
         if (c.settled()) return;
         c.holds += 1;
@@ -1403,10 +1407,10 @@ const Quiet = struct {
         return .init(std.testing.allocator, std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
     }
 
-    fn send(_: *anyopaque, _: Exchange) anyerror!Exposure {
+    fn send(_: *anyopaque, _: Exchange) Error!Exposure {
         return .none;
     }
-    fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) Error!void {}
 };
 
 test "a cell replacing an expired one keeps the index entry when the old one goes" {

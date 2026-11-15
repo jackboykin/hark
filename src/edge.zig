@@ -106,11 +106,11 @@ fn quoteErased(ctx: *anyopaque, server: na.AddressKey, need: graph.Need) graph.Q
     return @as(*Edge, @ptrCast(@alignCast(ctx))).sessions.?.quote(server, need);
 }
 
-fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!graph.Exposure {
+fn sendErased(ctx: *anyopaque, ex: Exchange) graph.Error!graph.Exposure {
     return @as(*Edge, @ptrCast(@alignCast(ctx))).send(ex);
 }
 
-fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) anyerror!void {
+fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) graph.Error!void {
     try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, gen, .wake);
 }
 
