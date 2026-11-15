@@ -856,7 +856,10 @@ pub const Graph = struct {
         std.debug.assert(blob.key().eql(c.key));
         g.store.put(blob.ref()) catch |err| {
             g.store.unref(blob);
-            if (err != error.Refused) return err;
+            switch (err) {
+                error.Refused => {},
+                error.OutOfMemory => |e| return e,
+            }
         };
     }
 
@@ -1246,8 +1249,10 @@ pub const Graph = struct {
         const blob = try g.store.build(key, value, expires_ns);
         g.store.put(blob) catch |err| {
             g.store.unref(blob);
-            if (err != error.Refused) return err;
-            return null;
+            return switch (err) {
+                error.Refused => null,
+                error.OutOfMemory => |e| e,
+            };
         };
         // A put may evict what it lands as it lands.
         const e = g.store.any(key) orelse return null;

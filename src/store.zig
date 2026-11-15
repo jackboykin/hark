@@ -199,7 +199,7 @@ pub const Store = struct {
     }
 
     /// Takes the caller's reference on success; on any error it stays theirs.
-    pub fn put(s: *Store, blob: *Blob) !void {
+    pub fn put(s: *Store, blob: *Blob) error{ OutOfMemory, Refused }!void {
         const ref = Ref.of(blob);
         const gop = try s.map.getOrPut(s.gpa, ref);
         const old: ?*Blob = if (gop.found_existing) gop.key_ptr.blob() else null;
