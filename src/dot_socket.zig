@@ -152,8 +152,7 @@ fn connected(sock: *Socket) !News {
     var hello: [tls13.header_len + tls13.max_hello]u8 = undefined;
     sock.session, const bytes = dot.Session.begin(sock.edge.work, &hello, &entropy) catch return .{ .ended = .failed };
     sock.state = .handshaking;
-    try sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, linux.EPOLL.IN, Edge.session_tag | sock.token);
-    if (!try sock.put(bytes)) return .{ .ended = .failed };
+    if (!sock.rewatch(linux.EPOLL.IN) or !try sock.put(bytes)) return .{ .ended = .failed };
     return .nothing;
 }
 
@@ -217,7 +216,7 @@ fn put(sock: *Socket, bytes: []const u8) !bool {
             },
         }
         if (rest.len == 0) return true;
-        try sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, linux.EPOLL.IN | linux.EPOLL.OUT, Edge.session_tag | sock.token);
+        if (!sock.rewatch(linux.EPOLL.IN | linux.EPOLL.OUT)) return false;
     }
     try sock.unsent.appendSlice(sock.edge.gpa, rest);
     return true;
@@ -234,6 +233,15 @@ fn flushUnsent(sock: *Socket) !bool {
         },
     }
     sock.unsent.replaceRangeAssumeCapacity(0, rc, &.{});
-    if (sock.unsent.items.len == 0) try sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, linux.EPOLL.IN, Edge.session_tag | sock.token);
+    return sock.unsent.items.len > 0 or sock.rewatch(linux.EPOLL.IN);
+}
+
+/// A socket whose watch can't change would sleep through its replies or
+/// wake for nothing, so it ends.
+fn rewatch(sock: *Socket, events: u32) bool {
+    sock.edge.ctl(linux.EPOLL.CTL_MOD, sock.fd, events, Edge.session_tag | sock.token) catch {
+        sock.why = "epoll_ctl";
+        return false;
+    };
     return true;
 }
