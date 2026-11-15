@@ -146,9 +146,9 @@ const Compare = struct {
                 try c.note(t, side, "VmHWM KiB", try std.fmt.parseFloat(f64, f.next().?));
             }
             const log = try os.slurp(c.arena, try c.arena.print("{s}.log", .{mem[0 .. mem.len - 4]}));
-            if (counter(log, "resolver.exchanges.udp")) |udp| if (counter(log, "resolver.exchanges.tcp")) |tcp| {
-                try c.note(t, side, "exchanges", udp + tcp);
-                try c.note(t, side, "upstream tcp", tcp);
+            if (counter(log, "resolver.exchanges.datagram")) |datagram| if (counter(log, "resolver.exchanges.stream")) |stream| {
+                try c.note(t, side, "exchanges", datagram + stream);
+                try c.note(t, side, "upstream stream", stream);
             };
             if (counter(log, "resolver.faults.timeout")) |n| try c.note(t, side, "upstream timeouts", n);
             if (counter(log, "trust.bogus")) |n| try c.note(t, side, "bogus", n);
@@ -173,7 +173,7 @@ const Compare = struct {
             n = @splat(@splat(0));
         }
         for (0..2) |side| try c.footprint(&t, side);
-        for ([_][]const u8{ "cold ad", "cold servfail", "cold failed", "exchanges", "upstream tcp", "upstream timeouts", "bogus", "store KiB", "store facts", "VmHWM KiB" }) |key| {
+        for ([_][]const u8{ "cold ad", "cold servfail", "cold failed", "exchanges", "upstream stream", "upstream timeouts", "bogus", "store KiB", "store facts", "VmHWM KiB" }) |key| {
             std.debug.print("{s: <22}", .{key});
             for (t) |side| {
                 if (side.get(key)) |v| std.debug.print(" {d: >10.1}", .{try stats.median(gpa, v.items)}) else std.debug.print(" {s: >10}", .{"-"});
