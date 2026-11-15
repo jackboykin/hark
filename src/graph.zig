@@ -391,10 +391,7 @@ pub const Graph = struct {
 
     pub fn init(gpa: Allocator, work: Allocator, cfg: Config, edge: Edge) !Graph {
         const rtt = try ns_rtt.Table.create(gpa);
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = store.Store.init(gpa, cfg.store_bytes) catch |err| {
-            gpa.destroy(rtt);
-            return err;
-        } };
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = .init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
         g.store.on_evict = evicted;
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;

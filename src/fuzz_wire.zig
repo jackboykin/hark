@@ -300,12 +300,12 @@ test "fuzz: store round trip" {
             defer arena.deinit();
             const alloc = arena.allocator();
             const msg = dns.parseMessage(alloc, genMessage(s, &w)) catch return;
-            if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
+            if (shared_store == null) shared_store = store.Store.init(std.heap.smp_allocator, 64 * 1024);
             const st = &shared_store.?;
             const owner = if (msg.question) |q| q.name else dns.Name.root;
             const reply: model.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             const key: model.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
-            const blob = st.build(key, .{ .rrset = reply }, 10) catch return;
+            const blob = try st.build(key, .{ .rrset = reply }, 10);
             st.put(blob) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;
             const back = (try store.Store.parse(alloc, got)).rrset;

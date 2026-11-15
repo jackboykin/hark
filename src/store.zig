@@ -117,7 +117,6 @@ pub const Store = struct {
     evictions: u64 = 0,
     unadmitted: u64 = 0,
     on_evict: ?OnEvict = null,
-    stage: []u8,
 
     const door_bits = 1 << 16;
 
@@ -165,15 +164,14 @@ pub const Store = struct {
         return s.map.getIndexAdapted(Probe{ .key = key, .h = key.hash() }, ByKey{});
     }
 
-    pub fn init(gpa: Allocator, cap: usize) !Store {
-        return .{ .gpa = gpa, .cap = cap, .stage = try gpa.alloc(u8, 2 * @as(usize, dns.max_message_len)) };
+    pub fn init(gpa: Allocator, cap: usize) Store {
+        return .{ .gpa = gpa, .cap = cap };
     }
 
     pub fn deinit(s: *Store) void {
         for (s.map.keys()) |r| s.letGo(r.blob());
         s.map.deinit(s.gpa);
         s.visited.deinit(s.gpa);
-        s.gpa.free(s.stage);
     }
 
     pub fn unref(s: *Store, b: *Blob) void {
@@ -270,53 +268,61 @@ pub const Store = struct {
         return false;
     }
 
+    /// Rdata names arrive compressed and are stored whole, so no message size
+    /// bounds a blob: it is measured, then written.
     pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) !*Blob {
         std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
-        var w: Writer = .{ .buf = s.stage, .pos = @sizeOf(Blob) };
-        try w.slice(key.name);
-        w.anchors[0] = .{ .at = 0, .len = key.name.len };
+        var measure: Writer(true) = .{ .buf = {} };
+        try encode(true, &measure, key, value);
+        const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), measure.pos);
+        var w: Writer(false) = .{ .buf = out };
+        try encode(false, &w, key, value);
+        std.debug.assert(w.pos == out.len);
+        const b: *Blob = @ptrCast(out.ptr);
+        b.* = header(key, out.len, expires_ns);
+        s.bytes += out.len;
+        return b;
+    }
+
+    fn encode(comptime measuring: bool, w: *Writer(measuring), key: Key, value: Value) !void {
+        w.slice(key.name);
+        w.anchors[0] = .{ .at = 0, .wire = key.name };
         switch (value) {
             .cut => |c| {
-                try w.name(c.zone);
-                try w.int(i64, c.placed_until_ns);
-                try w.int(u16, @intCast(c.servers.len));
+                w.name(c.zone);
+                w.int(i64, c.placed_until_ns);
+                w.int(u16, @intCast(c.servers.len));
                 var glue: usize = 0;
                 for (c.servers) |server| glue += server.glue.len;
-                try w.int(u16, @intCast(glue));
+                w.int(u16, @intCast(glue));
                 for (c.servers) |server| {
-                    try w.int(u16, @intCast(server.key.name.len));
-                    try w.slice(server.key.name);
-                    try w.int(u32, server.key.name_hash);
-                    try w.int(u16, @intCast(server.glue.len));
+                    w.int(u16, @intCast(server.key.name.len));
+                    w.slice(server.key.name);
+                    w.int(u32, server.key.name_hash);
+                    w.int(u16, @intCast(server.glue.len));
                 }
-                for (c.servers) |server| for (server.glue) |gl| try w.addr(gl);
+                for (c.servers) |server| for (server.glue) |gl| w.addr(gl);
             },
             .rrset, .stub => |r| {
                 // `Rrset.read` and `Rrset.answered` read this layout in place.
-                try w.int(u8, @backingInt(r.kind));
-                try w.int(u8, @intFromBool(r.aa) | (@as(u8, @intFromBool(r.ede != null)) << 1));
-                try w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
-                try w.int(u32, r.ttl);
-                try w.int(i64, r.stored_ns);
-                try w.name(r.target);
-                try w.name(r.zone);
-                for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| try w.int(u16, @intCast(sec.len));
+                w.int(u8, @backingInt(r.kind));
+                w.int(u8, @intFromBool(r.aa) | (@as(u8, @intFromBool(r.ede != null)) << 1));
+                w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
+                w.int(u32, r.ttl);
+                w.int(i64, r.stored_ns);
+                w.name(r.target);
+                w.name(r.zone);
+                for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| w.int(u16, @intCast(sec.len));
                 for ([_][]const RR{ r.answers, r.authorities, r.additionals }) |sec| try w.records(sec);
             },
             .ds, .dnskey => |c| {
-                try w.int(u8, @backingInt(c.status));
-                try w.int(i64, c.proven_until_ns);
-                try w.int(u16, @intCast(c.records.len));
+                w.int(u8, @backingInt(c.status));
+                w.int(i64, c.proven_until_ns);
+                w.int(u16, @intCast(c.records.len));
                 try w.records(c.records);
             },
             .addr, .answer, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
         }
-        const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
-        @memcpy(out, s.stage[0..w.pos]);
-        const b: *Blob = @ptrCast(out.ptr);
-        b.* = header(key, w.pos, expires_ns);
-        s.bytes += w.pos;
-        return b;
     }
 
     fn header(key: Key, len: usize, expires_ns: i64) Blob {
@@ -488,59 +494,62 @@ fn stored(payload: []const u8, at: usize) struct { name: []const u8, len: usize 
     return .{ .name = payload[to..][0..dns.wireNameLen(payload[to..])], .len = 2 };
 }
 
-const Writer = struct {
-    buf: []u8,
-    pos: usize,
-    anchors: [3]?Anchor = @splat(null),
+/// Writes a payload after the blob's header, or only counts its length.
+fn Writer(comptime measuring: bool) type {
+    return struct {
+        buf: if (measuring) void else []u8,
+        pos: usize = payload_at,
+        anchors: [3]?Anchor = @splat(null),
 
-    const payload_at = @sizeOf(Blob);
-    const Anchor = struct { at: usize, len: usize };
+        const W = @This();
+        const payload_at = @sizeOf(Blob);
+        /// A name stored whole at `at` in the payload, as the value spells it.
+        const Anchor = struct { at: usize, wire: []const u8 };
 
-    fn int(w: *Writer, comptime T: type, v: T) !void {
-        if (w.pos + @sizeOf(T) > w.buf.len) return error.EndOfData;
-        mem.writeInt(T, w.buf[w.pos..][0..@sizeOf(T)], v, .little);
-        w.pos += @sizeOf(T);
-    }
-
-    fn slice(w: *Writer, s: []const u8) !void {
-        if (w.pos + s.len > w.buf.len) return error.EndOfData;
-        @memcpy(w.buf[w.pos..][0..s.len], s);
-        w.pos += s.len;
-    }
-
-    fn name(w: *Writer, n: dns.Name) !void {
-        if (n.wire.len > 2) for (w.anchors) |anchor| {
-            const a = anchor orelse continue;
-            const at = a.at + (suffixAt(w.buf[payload_at + a.at ..][0..a.len], n.wire) orelse continue);
-            if (at >= 1 << 14) continue;
-            return w.slice(&.{ 0xc0 | @as(u8, @intCast(at >> 8)), @truncate(at) });
-        };
-        const a: Anchor = .{ .at = w.pos - payload_at, .len = n.wire.len };
-        try w.slice(n.wire);
-        if (w.anchors[1] == null) w.anchors[1] = a;
-        w.anchors[2] = a;
-    }
-
-    fn suffixAt(whole: []const u8, n: []const u8) ?usize {
-        var at: usize = 0;
-        while (whole.len - at > n.len) at += @as(usize, whole[at]) + 1;
-        return if (mem.eql(u8, whole[at..], n)) at else null;
-    }
-
-    fn addr(w: *Writer, k: na.AddressKey) !void {
-        try w.int(u8, k.family);
-        try w.int(u16, k.port);
-        try w.slice(&k.addr);
-    }
-
-    fn records(w: *Writer, rrs: []const RR) !void {
-        for (rrs) |rr| {
-            try w.name(rr.name);
-            try w.slice(&try rr.fixed());
-            try w.slice(rr.rdata);
+        fn int(w: *W, comptime T: type, v: T) void {
+            if (!measuring) mem.writeInt(T, w.buf[w.pos..][0..@sizeOf(T)], v, .little);
+            w.pos += @sizeOf(T);
         }
-    }
-};
+
+        fn slice(w: *W, s: []const u8) void {
+            if (!measuring) @memcpy(w.buf[w.pos..][0..s.len], s);
+            w.pos += s.len;
+        }
+
+        fn name(w: *W, n: dns.Name) void {
+            if (n.wire.len > 2) for (w.anchors) |anchor| {
+                const a = anchor orelse continue;
+                const at = a.at + (suffixAt(a.wire, n.wire) orelse continue);
+                if (at >= 1 << 14) continue;
+                return w.slice(&.{ 0xc0 | @as(u8, @intCast(at >> 8)), @truncate(at) });
+            };
+            const a: Anchor = .{ .at = w.pos - payload_at, .wire = n.wire };
+            w.slice(n.wire);
+            if (w.anchors[1] == null) w.anchors[1] = a;
+            w.anchors[2] = a;
+        }
+
+        fn suffixAt(whole: []const u8, n: []const u8) ?usize {
+            var at: usize = 0;
+            while (whole.len - at > n.len) at += @as(usize, whole[at]) + 1;
+            return if (mem.eql(u8, whole[at..], n)) at else null;
+        }
+
+        fn addr(w: *W, k: na.AddressKey) void {
+            w.int(u8, k.family);
+            w.int(u16, k.port);
+            w.slice(&k.addr);
+        }
+
+        fn records(w: *W, rrs: []const RR) !void {
+            for (rrs) |rr| {
+                w.name(rr.name);
+                w.slice(&try rr.fixed());
+                w.slice(rr.rdata);
+            }
+        }
+    };
+}
 
 const Reader = struct {
     buf: []const u8,
@@ -588,7 +597,7 @@ test "a fact survives the blob byte for byte" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var s = try Store.init(testing.allocator, 1 << 20);
+    var s: Store = .init(testing.allocator, 1 << 20);
     defer s.deinit();
 
     const owner = try dns.parseDottedName(arena, "www.example.com.");
@@ -677,9 +686,37 @@ test "a fact survives the blob byte for byte" {
     try testing.expect(cut.servers[0].glue.len == 2 and cut.servers[0].glue[1].eql(glue[1]));
 }
 
+test "a blob holds an rrset larger than any message" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var s: Store = .init(testing.allocator, 1 << 20);
+    defer s.deinit();
+
+    // A reply spells each 255-octet target in two octets past the first.
+    const long = [_]u8{63} ++ @as([63]u8, @splat('z'));
+    const spelled = [_]u8{ 2, 'a', 'a' } ++ long ++ long ++ long ++ [_]u8{58} ++ @as([58]u8, @splat('y')) ++ [_]u8{0};
+    const zone: dns.Name = .lit("zone");
+    const rrs = try arena.alloc(RR, 600);
+    for (rrs, 0..) |*rr, i| {
+        const target = try arena.dupe(u8, &spelled);
+        target[1] = 'a' + @as(u8, @intCast(i / 26));
+        target[2] = 'a' + @as(u8, @intCast(i % 26));
+        rr.* = .{ .name = zone, .rtype = .ns, .rclass = .in, .ttl = 300, .rdata = target };
+    }
+    const reply: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .target = zone, .zone = zone, .ttl = 300 };
+    const blob = try s.build(.of(.rrset, zone, .ns), .{ .rrset = reply }, 10);
+    defer s.unref(blob);
+    try testing.expect(blob.len > 2 * @as(usize, dns.max_message_len));
+    const back = (try Store.parse(arena, blob)).rrset;
+    try testing.expectEqual(rrs.len, back.answers.len);
+    for (rrs, back.answers) |want, got| try testing.expectEqualSlices(u8, want.rdata, got.rdata);
+}
+
 test "the cap holds by eviction and admission" {
     const testing = std.testing;
-    var s = try Store.init(testing.allocator, 2048);
+    var s: Store = .init(testing.allocator, 2048);
     defer s.deinit();
     var names: [64][5]u8 = undefined;
     for (&names, 0..) |*buf, i| {
@@ -714,7 +751,7 @@ test "a replaced version leaves as one evicted" {
             w.last = b;
         }
     };
-    var w: Watched = .{ .store = try Store.init(testing.allocator, 1 << 16) };
+    var w: Watched = .{ .store = .init(testing.allocator, 1 << 16) };
     defer w.store.deinit();
     w.store.on_evict = Watched.evicted;
     const zone: dns.Name = .lit("x");
