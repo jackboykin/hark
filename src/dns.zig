@@ -682,7 +682,23 @@ pub const OptRecord = struct {
     version: u8,
     do_bit: bool,
     options: []const EdnsOption,
+
+    /// The record up to its options: root owner, type, then the payload size,
+    /// extended RCODE, version and flags where class and TTL would sit.
+    pub fn fixed(opt: OptRecord, rdlength: u16) [opt_fixed_len]u8 {
+        var f: [opt_fixed_len]u8 = undefined;
+        f[0] = 0;
+        mem.writeInt(u16, f[1..3], @backingInt(RType.opt), .big);
+        mem.writeInt(u16, f[3..5], opt.udp_payload_size, .big);
+        f[5] = opt.extended_rcode;
+        f[6] = opt.version;
+        mem.writeInt(u16, f[7..9], @as(u16, @intFromBool(opt.do_bit)) << 15, .big);
+        mem.writeInt(u16, f[9..11], rdlength, .big);
+        return f;
+    }
 };
+
+const opt_fixed_len = 11;
 
 pub const Edns = struct {
     udp_payload_size: u16,
@@ -951,21 +967,27 @@ fn applyCase0x20(rng: std.Random, wire: []u8) void {
     }
 }
 
-pub fn buildQuery(allocator: Allocator, id: u16, qname: Name, qtype: RType, do_bit: bool, case_rng: ?std.Random) Allocator.Error!Message {
-    const spelled = try allocator.dupe(u8, qname.wire);
-    if (case_rng) |rng| applyCase0x20(rng, spelled);
+const QueryWire = struct {
+    wire: []const u8,
+    /// The question's name as it went out, in its 0x20 case.
+    spelled: []const u8,
+};
 
-    return .{
-        .header = .{ .id = id, .flags = .{} },
-        .question = .{ .name = qname, .qtype = qtype, .qclass = .in, .spelled = spelled },
-        .opt = .{
-            .udp_payload_size = edns_udp_payload,
-            .extended_rcode = 0,
-            .version = 0,
-            .do_bit = do_bit,
-            .options = &.{},
-        },
-    };
+/// The question and an OPT record (RFC 6891 §6.1.2) with no options and DO
+/// its only flag, written into exactly its own length.
+pub fn buildQuery(gpa: Allocator, id: u16, qname: Name, qtype: RType, do_bit: bool, case_rng: ?std.Random) Allocator.Error!QueryWire {
+    const wire = try gpa.alloc(u8, header_len + qname.wire.len + 4 + opt_fixed_len);
+    const hdr: Header = .{ .id = id, .flags = .{}, .qd_count = 1, .ar_count = 1 };
+    hdr.serialize(wire[0..header_len]);
+    const spelled = wire[header_len..][0..qname.wire.len];
+    @memcpy(spelled, qname.wire);
+    if (case_rng) |rng| applyCase0x20(rng, spelled);
+    const tail = wire[header_len + spelled.len ..];
+    mem.writeInt(u16, tail[0..2], @backingInt(qtype), .big);
+    mem.writeInt(u16, tail[2..4], @backingInt(RClass.in), .big);
+    const opt: OptRecord = .{ .udp_payload_size = edns_udp_payload, .extended_rcode = 0, .version = 0, .do_bit = do_bit, .options = &.{} };
+    tail[4..][0..opt_fixed_len].* = opt.fixed(0);
+    return .{ .wire = wire, .spelled = spelled };
 }
 
 const Parser = struct {
@@ -1390,12 +1412,6 @@ pub const Serializer = struct {
         self.pos += 2;
     }
 
-    fn writeU32(self: *Serializer, val: u32) Error!void {
-        try self.ensureSpace(4);
-        mem.writeInt(u32, self.buf[self.pos..][0..4], val, .big);
-        self.pos += 4;
-    }
-
     fn writeSlice(self: *Serializer, data: []const u8) Error!void {
         try self.ensureSpace(data.len);
         @memcpy(self.buf[self.pos..][0..data.len], data);
@@ -1450,17 +1466,9 @@ pub const Serializer = struct {
     }
 
     pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
-        try self.writeSlice(Name.root.wire);
-        try self.writeU16(@backingInt(RType.opt));
-        try self.writeU16(opt.udp_payload_size);
-        const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
-            (@as(u32, opt.version) << 16) |
-            (@as(u32, @intFromBool(opt.do_bit)) << 15);
-        try self.writeU32(ttl);
-
         var rdlength: u16 = 0;
         for (opt.options) |o| rdlength += 4 + (std.math.cast(u16, o.data.len) orelse return error.InvalidRDataLength);
-        try self.writeU16(rdlength);
+        try self.writeSlice(&opt.fixed(rdlength));
         for (opt.options) |o| {
             try self.writeU16(o.code);
             try self.writeU16(@intCast(o.data.len));
@@ -1699,10 +1707,7 @@ test "EDNS0: serialized OPT has correct wire format" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, true, null);
-
-    var buf: [max_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
+    const wire = (try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, true, null)).wire;
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, wire[10..12], .big));
     try testing.expectEqualSlices(u8, "\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);

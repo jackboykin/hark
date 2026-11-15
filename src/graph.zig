@@ -1368,9 +1368,7 @@ pub const Graph = struct {
         const rng = g.edge.rng;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();
-        const msg = try dns.buildQuery(arena, qid, qname, qtype, g.cfg.trust_anchors != null, if (case == .random) rng else null);
-        var wire_buf: [512]u8 = undefined;
-        const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
+        const query = try dns.buildQuery(arena, qid, qname, qtype, g.cfg.trust_anchors != null, if (case == .random) rng else null);
         const sc = try arena.create(ExchangeScratch);
         const est = g.rtt.get(server);
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
@@ -1382,13 +1380,13 @@ pub const Graph = struct {
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
-        sc.* = .{ .id = qid, .sent = msg.question.?.spelled.?, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
+        sc.* = .{ .id = qid, .sent = query.spelled, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         const exposure = try g.edge.send(.{
             .id = id,
             .server = addr,
             .need = need,
-            .wire = wire,
+            .wire = query.wire,
             .deadline_ns = deadline_ns,
         });
         g.flights += 1;
