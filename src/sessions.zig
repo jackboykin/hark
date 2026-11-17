@@ -271,9 +271,15 @@ fn setStanding(s: *Sessions, key: na.AddressKey, kind: Kind, for_ns: i64, capabl
     const of = &s.standing.write(key, @divTrunc(now, std.time.ns_per_ms)).by;
     if (capable and of.get(kind).status(now) != .capable) {
         var ab: [64]u8 = undefined;
-        log.info("{t} server={s} capable", .{ kind, na.format(key.toAddress(), &ab) });
+        log.info("{t} server={s} capable", .{ kind, s.dialed(key, &ab) });
     }
     of.set(kind, .{ .until_ns = now + for_ns, .capable = capable });
+}
+
+fn dialed(s: *const Sessions, key: na.AddressKey, buf: []u8) []const u8 {
+    var to = key.toAddress();
+    to.setPort(s.dot_port);
+    return na.format(to, buf);
 }
 
 fn find(s: *const Sessions, key: na.AddressKey, kind: Kind) ?*Conn {
@@ -337,7 +343,7 @@ fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
         s.stats.getPtr(kind).failed += 1;
         if (c.carrier.heard()) {
             var ab: [64]u8 = undefined;
-            log.info("{t} server={s} damped: {s}, {d} pending, {s}", .{ kind, na.format(c.key.toAddress(), &ab), c.carrier.stage(), c.pending.count(), c.carrier.fault() });
+            log.info("{t} server={s} damped: {s}, {d} pending, {s}", .{ kind, s.dialed(c.key, &ab), c.carrier.stage(), c.pending.count(), c.carrier.fault() });
         }
     } else {
         s.stats.getPtr(kind).closed += 1;
