@@ -15,7 +15,6 @@ const posix = std.posix;
 const mem = std.mem;
 const build_options = @import("build_options");
 const na = @import("net_address.zig");
-const rand = @import("rand.zig");
 const sys = @import("sys.zig");
 const acl = @import("acl.zig");
 const config = @import("config.zig");
@@ -865,7 +864,6 @@ const Server = struct {
 };
 
 pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
-    rand.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
     if (cfg.encrypted_transport == .opportunistic) try e.enableSessions(cfg.upstream_port, cfg.dot_port);

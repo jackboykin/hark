@@ -75,6 +75,7 @@ fn printUsage() void {
 }
 
 fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
+    hark.rand.randomizeHashSeed();
     var config_path: ?[]const u8 = null;
     var trace = false;
     while (args.next()) |arg| {
