@@ -8,6 +8,8 @@ wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
 flights: std.array_hash_map.Auto(CellId, Flight) = .empty,
+idle: std.EnumArray(Family, Idle) = .initFill(.{}),
+idle_max: u32 = std.math.maxInt(u32),
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
 batch: [64]linux.epoll_event = undefined,
@@ -63,8 +65,24 @@ const Timer = struct {
 
 const Flight = struct {
     fd: posix.fd_t,
-    tcp: ?*Tcp = null,
     seq: u32,
+    over: union(enum) {
+        datagram: Family,
+        stream: *Tcp,
+    },
+};
+
+const Family = std.meta.Tag(na.Address);
+
+const Idle = struct {
+    fds: std.ArrayList(posix.fd_t) = .empty,
+    aged: usize = 0,
+
+    fn pop(idle: *Idle) ?posix.fd_t {
+        const fd = idle.fds.pop() orelse return null;
+        idle.aged = @min(idle.aged, idle.fds.items.len);
+        return fd;
+    }
 };
 
 const Tcp = struct {
@@ -92,6 +110,10 @@ pub fn enableSessions(e: *Edge, plain_port: u16, dot_port: u16) !void {
 pub fn deinit(e: *Edge) void {
     for (e.flights.values()) |f| e.close(f);
     e.flights.deinit(e.gpa);
+    for (&e.idle.values) |*idle| {
+        for (idle.fds.items) |fd| sys.close(fd);
+        idle.fds.deinit(e.gpa);
+    }
     if (e.sessions) |s| s.destroy();
     e.timers.deinit(e.gpa);
     e.queue.deinit(e.gpa);
@@ -147,15 +169,19 @@ fn send(e: *Edge, ex: Exchange) !graph.Exposure {
 fn open(e: *Edge, ex: Exchange) !Flight {
     try e.timers.ensureUnusedCapacity(e.gpa, 1);
     try e.flights.ensureUnusedCapacity(e.gpa, 1);
-    const kind: u32 = if (ex.need == .datagram) posix.SOCK.DGRAM else posix.SOCK.STREAM;
-    const fd = try sys.socket(na.afU32(ex.server), kind | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
-    errdefer sys.close(fd);
+    const flags = posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
     if (ex.need == .datagram) {
+        const family = std.meta.activeTag(ex.server);
+        const rested = e.idle.getPtr(family).pop();
+        const fd = rested orelse try sys.socket(na.afU32(ex.server), posix.SOCK.DGRAM | flags, 0);
+        errdefer sys.close(fd);
         try na.connectTo(fd, &ex.server);
         _ = try sys.sendto(fd, ex.wire, 0, null, 0);
-        try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.IN, ex.id);
-        return .{ .fd = fd, .seq = 0 };
+        try e.ctl(if (rested == null) linux.EPOLL.CTL_ADD else linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, ex.id);
+        return .{ .fd = fd, .seq = 0, .over = .{ .datagram = family } };
     }
+    const fd = try sys.socket(na.afU32(ex.server), posix.SOCK.STREAM | flags, 0);
+    errdefer sys.close(fd);
     const t = try e.work.create(Tcp);
     errdefer e.work.destroy(t);
     t.* = .{ .query = try e.work.alloc(u8, 2 + ex.wire.len) };
@@ -167,15 +193,45 @@ fn open(e: *Edge, ex: Exchange) !Flight {
         else => return err,
     };
     try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.OUT, ex.id);
-    return .{ .fd = fd, .tcp = t, .seq = 0 };
+    return .{ .fd = fd, .seq = 0, .over = .{ .stream = t } };
 }
 
 fn close(e: *Edge, f: Flight) void {
-    sys.close(f.fd);
-    if (f.tcp) |t| {
-        e.work.free(t.query);
-        e.work.destroy(t);
+    switch (f.over) {
+        .datagram => |family| e.rest(f.fd, family),
+        .stream => |t| {
+            sys.close(f.fd);
+            e.work.free(t.query);
+            e.work.destroy(t);
+        },
     }
+}
+
+fn rest(e: *Edge, fd: posix.fd_t, family: Family) void {
+    const idle = e.idle.getPtr(family);
+    if (idle.fds.items.len >= e.idle_max or !emptied(fd)) return sys.close(fd);
+    idle.fds.append(e.gpa, fd) catch sys.close(fd);
+}
+
+/// Call about once a second: a socket idle for a whole tick is closed.
+pub fn trim(e: *Edge) void {
+    for (&e.idle.values) |*idle| {
+        for (0..idle.aged) |_| sys.close(idle.fds.pop().?);
+        idle.aged = idle.fds.items.len;
+    }
+}
+
+fn emptied(fd: posix.fd_t) bool {
+    sys.detach(fd) catch return false;
+    // A datagram that arrived before the disconnect is still queued, and the
+    // socket's next exchange would read it. None can arrive now, and a read
+    // of no bytes discards one.
+    var none: [0]u8 = .{};
+    while (true) switch (linux.errno(linux.recvfrom(fd, &none, 0, linux.MSG.DONTWAIT, null, null))) {
+        .SUCCESS, .INTR => {},
+        .AGAIN => return true,
+        else => return false,
+    };
 }
 
 fn finish(e: *Edge, id: CellId, completion: Completion) Event {
@@ -255,7 +311,10 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     }
     const id: CellId = @truncate(d);
     const f = e.flights.getPtr(id) orelse return null;
-    if (f.tcp) |t| return e.readyTcp(id, f.fd, t);
+    switch (f.over) {
+        .datagram => {},
+        .stream => |t| return e.readyTcp(id, f.fd, t),
+    }
     const rc = linux.recvfrom(f.fd, &e.rx, e.rx.len, linux.MSG.DONTWAIT, null, null);
     return switch (linux.errno(rc)) {
         .SUCCESS => e.finish(id, .{ .reply = .{ .bytes = e.rx[0..rc] } }),
@@ -387,4 +446,26 @@ test "no query leaves from the port of the one before it" {
     }
     // The kernel draws from about 28,000 ports, so one chance repeat is allowed.
     try std.testing.expect(repeats <= 1);
+}
+
+test "a socket carries its next exchange deaf to what was sent to its last" {
+    var e = try Edge.init(std.testing.allocator);
+    defer e.deinit();
+    const first = try Peer.init();
+    defer sys.close(first.fd);
+    const second = try Peer.init();
+    defer sys.close(second.fd);
+
+    _ = try e.send(.{ .id = 1, .server = first.addr, .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    const fd = e.flights.get(1).?.fd;
+    const asker = try first.hear();
+    try first.tell(&asker, "reply");
+    try first.tell(&asker, "again");
+    const heard = ((try e.next(std.math.maxInt(i64))) orelse return error.TestUnexpectedResult).exchange;
+    try std.testing.expect(heard.id == 1 and heard.completion == .reply);
+
+    _ = try e.send(.{ .id = 2, .server = second.addr, .need = .datagram, .wire = "ask", .deadline_ns = e.now_ns + 20 * std.time.ns_per_ms });
+    try std.testing.expectEqual(fd, e.flights.get(2).?.fd);
+    const unheard = ((try e.next(std.math.maxInt(i64))) orelse return error.TestUnexpectedResult).exchange;
+    try std.testing.expect(unheard.id == 2 and unheard.completion == .timeout);
 }

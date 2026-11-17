@@ -52,6 +52,16 @@ pub fn connect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t
     };
 }
 
+/// Disconnects a datagram socket. Linux also frees the port it chose for
+/// the socket, so the next connect gets a new one.
+pub fn detach(fd: posix.fd_t) !void {
+    const nobody: posix.sockaddr = .{ .family = posix.AF.UNSPEC, .data = @splat(0) };
+    return switch (linux.errno(linux.connect(fd, &nobody, @sizeOf(posix.sockaddr)))) {
+        .SUCCESS => {},
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
 pub fn close(fd: posix.fd_t) void {
     _ = linux.close(fd);
 }

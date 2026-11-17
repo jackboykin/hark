@@ -59,7 +59,6 @@ func TestFDExhaustionIsUnsentNotATimeout(t *testing.T) {
 	t.Parallel()
 	_, h := launchText(t, oneAuthority, nil)
 	pid := h.cmd.Process.Pid
-	wantRcode(t, h.addr, "a.example.com.", dns.RcodeSuccess, 5*time.Second)
 	var before unix.Rlimit
 	if err := unix.Prlimit(pid, unix.RLIMIT_NOFILE, nil, &before); err != nil {
 		t.Fatal(err)
