@@ -57,18 +57,26 @@ pub const RCode = enum(u4) {
 pub const RType = enum(u16) {
     a = 1,
     ns = 2,
+    md = 3,
+    mf = 4,
     cname = 5,
     soa = 6,
+    mb = 7,
+    mg = 8,
+    mr = 9,
     ptr = 12,
     hinfo = 13,
+    minfo = 14,
     mx = 15,
     txt = 16,
     rp = 17,
     afsdb = 18,
     rt = 21,
+    sig = 24,
     key = 25,
     px = 26,
     aaaa = 28,
+    nxt = 30,
     srv = 33,
     naptr = 35,
     kx = 36,
@@ -852,7 +860,8 @@ const Embedded = struct {
 
 fn embedded(rtype: RType) ?Embedded {
     return switch (rtype) {
-        .ns, .cname, .ptr => .{ .names = 1, .spelling = .rfc1035 },
+        .ns, .md, .mf, .cname, .mb, .mg, .mr, .ptr => .{ .names = 1, .spelling = .rfc1035 },
+        .minfo => .{ .names = 2, .spelling = .rfc1035 },
         .mx => .{ .skip = 2, .names = 1, .spelling = .rfc1035 },
         .soa => .{ .names = 2, .spelling = .rfc1035, .tail = 20 },
         .dname => .{ .names = 1, .spelling = .read_compressed },
@@ -863,6 +872,8 @@ fn embedded(rtype: RType) ?Embedded {
         .px => .{ .skip = 2, .names = 2, .spelling = .read_compressed },
         .srv => .{ .skip = 6, .names = 1, .spelling = .read_compressed },
         .naptr => .{ .skip = 4, .strings = 3, .names = 1, .spelling = .read_compressed },
+        .sig => .{ .skip = 18, .names = 1, .spelling = .read_compressed, .tail = null },
+        .nxt => .{ .names = 1, .spelling = .read_compressed, .tail = null },
         else => null,
     };
 }
@@ -1804,6 +1815,22 @@ test "a pointer flood costs each name its 255 octets, no more" {
     var fixed = std.heap.FixedBufferAllocator.init(room);
     const msg = try parseMessage(fixed.allocator(), buf[0..n]);
     try testing.expectEqual(answers, msg.answers.len);
+}
+
+test "RFC 3597 §4: names in RFC 1035 rdata are decompressed, lowercase, and go back out whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = "\x00\x01\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00" ++
+        "\x07example\x00\x00\x07\x00\x01" ++
+        "\xc0\x0c\x00\x07\x00\x01\x00\x00\x00\x3c\x00\x07\x04MaIl\xc0\x0c" ++
+        "\xc0\x0c\x00\x0e\x00\x01\x00\x00\x00\x3c\x00\x0a\x05Admin\xc0\x0c\xc0\x0c";
+    const msg = try parseMessage(a, wire);
+    try testing.expectEqualSlices(u8, "\x04mail\x07example\x00", msg.answers[0].rdata);
+    try testing.expectEqualSlices(u8, "\x05admin\x07example\x00\x07example\x00", msg.answers[1].rdata);
+    var out: [512]u8 = undefined;
+    const back = try parseMessage(a, try serializeMessage(&out, msg));
+    for (msg.answers, back.answers) |want, got| try testing.expectEqualSlices(u8, want.rdata, got.rdata);
 }
 
 test "a TXT of empty strings costs its record, not a slice a string" {
