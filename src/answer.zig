@@ -539,11 +539,11 @@ const Seen = struct {
     }
 
     fn hash(rr: dns.ResourceRecord) usize {
-        var h: std.hash.Wyhash = .init(rand.hash_seed);
+        var h: rand.Hasher = .init(&rand.hash_key);
         h.update(rr.name.wire);
         h.update(std.mem.asBytes(&[2]u16{ @backingInt(rr.rtype), @backingInt(rr.rclass) }));
         h.update(rr.rdata);
-        return @truncate(h.final());
+        return @truncate(h.finalInt());
     }
 };
 
@@ -555,7 +555,7 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 /// here, asking nobody, for a window that doubles while it keeps failing, up
 /// to 5 minutes. Keyed with CD, since a CD client is owed bogus data.
 const Failures = struct {
-    map: std.array_hash_map.Custom([]const u8, Entry, rand.Seeded, true) = .empty,
+    map: std.array_hash_map.Custom([]const u8, Entry, rand.Keyed, true) = .empty,
 
     const Entry = struct {
         until_ns: i64,
@@ -623,7 +623,7 @@ const Failures = struct {
         try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = first_s, .ede = ede } } });
     }
 
-    /// At `max_entries` another entry is evicted, picked by the seeded hash of
+    /// At `max_entries` another entry is evicted, picked by the keyed hash of
     /// this key so no asker can choose it.
     fn put(f: *Failures, gpa: Allocator, k: []const u8, e: Entry) !void {
         if (f.map.getPtr(k)) |old| {
@@ -631,7 +631,7 @@ const Failures = struct {
             return;
         }
         if (f.map.count() >= max_entries) {
-            const at = rand.Seeded.hash(.{}, k) % f.map.count();
+            const at = rand.Keyed.hash(.{}, k) % f.map.count();
             const old = f.map.keys()[at];
             f.map.swapRemoveAt(at);
             gpa.free(old);

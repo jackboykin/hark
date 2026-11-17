@@ -16,7 +16,7 @@ pub const Value = union(enum) {
 };
 
 pub const Table = struct {
-    map: std.array_hash_map.Custom([]const u8, Value, rand.Seeded, true),
+    map: std.array_hash_map.Custom([]const u8, Value, rand.Keyed, true),
 
     pub fn get(t: Table, key: []const u8, comptime kind: std.meta.Tag(Value)) ?@FieldType(Value, @tagName(kind)) {
         const v = t.map.get(key) orelse return null;

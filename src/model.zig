@@ -55,7 +55,7 @@ pub const Key = struct {
     }
 
     fn hashName(name: []const u8) u32 {
-        return rand.Seeded.hash(.{}, name);
+        return rand.Keyed.hash(.{}, name);
     }
 
     pub fn hash(k: Key) u64 {
@@ -180,11 +180,11 @@ pub const Chain = struct {
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
-test "a key's name hash follows the process seed" {
-    const saved = rand.hash_seed;
-    defer rand.hash_seed = saved;
+test "a key's name hash follows the process key" {
+    const saved = rand.hash_key;
+    defer rand.hash_key = saved;
     const a: Key = .of(.rrset, .lit("www.example"), .a);
-    rand.hash_seed = 0xdeadbeefcafef00d;
+    rand.hash_key[0] ^= 1;
     const b: Key = .of(.rrset, .lit("www.example"), .a);
     try std.testing.expect(a.name_hash != b.name_hash);
 }

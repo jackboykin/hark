@@ -17,18 +17,6 @@ pub fn initIp6(bytes: [16]u8, port: u16) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port } };
 }
 
-/// Murmur3's fmix64. FNV-1a's multiply only carries upward, so without it
-/// the low bits, which the hash map reads, barely vary across IPv4 keys.
-fn fmix64(h0: u64) u64 {
-    var h = h0;
-    h ^= h >> 33;
-    h *%= 0xff51afd7ed558ccd;
-    h ^= h >> 33;
-    h *%= 0xc4ceb9fe1a85ec53;
-    h ^= h >> 33;
-    return h;
-}
-
 pub const AddressKey = struct {
     family: u8,
     addr: [16]u8,
@@ -66,17 +54,11 @@ pub const AddressKey = struct {
 
     pub const HashCtx = struct {
         pub fn hash(_: @This(), key: AddressKey) u64 {
-            const lo = mem.readInt(u64, key.addr[0..8], .little);
-            const hi = mem.readInt(u64, key.addr[8..16], .little);
-            const tag = (@as(u64, key.family) << 16) | key.port;
-            var h: u64 = rand.hash_seed ^ 0xcbf29ce484222325;
-            h ^= lo;
-            h *%= 0x100000001b3;
-            h ^= hi;
-            h *%= 0x100000001b3;
-            h ^= tag;
-            h *%= 0x100000001b3;
-            return fmix64(h);
+            var bytes: [19]u8 = undefined;
+            bytes[0..16].* = key.addr;
+            bytes[16] = key.family;
+            mem.writeInt(u16, bytes[17..19], key.port, .little);
+            return rand.hash(&bytes);
         }
 
         pub fn eql(_: @This(), a: AddressKey, b: AddressKey) bool {
@@ -298,13 +280,13 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     try testing.expect(ctx.hash(a) != ctx.hash(e));
 }
 
-test "AddressKey.HashCtx: the hash seed shifts the hash space" {
+test "AddressKey.HashCtx: the hash key shifts the hash space" {
     const ctx: AddressKey.HashCtx = .{};
     const k = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
     const h0 = ctx.hash(k);
-    const saved = rand.hash_seed;
-    defer rand.hash_seed = saved;
-    rand.hash_seed = 0xdeadbeefcafef00d;
+    const saved = rand.hash_key;
+    defer rand.hash_key = saved;
+    rand.hash_key[0] ^= 1;
     const h1 = ctx.hash(k);
     try testing.expect(h0 != h1);
 }

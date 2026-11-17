@@ -101,7 +101,7 @@ const Zone = struct {
 };
 
 pub const Index = struct {
-    zones: std.array_hash_map.Custom([]const u8, Zone, rand.Seeded, true) = .empty,
+    zones: std.array_hash_map.Custom([]const u8, Zone, rand.Keyed, true) = .empty,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator, st: *store.Store) void {
         var it = ix.zones.iterator();
