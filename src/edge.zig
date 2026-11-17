@@ -340,3 +340,51 @@ test "a timer whose event can't be queued stays due" {
     const ev = ((try e.next(0)) orelse return error.TestUnexpectedResult).exchange;
     try std.testing.expect(ev.id == 1 and ev.completion == .timeout);
 }
+
+const Peer = struct {
+    fd: posix.fd_t,
+    addr: na.Address,
+
+    fn init() !Peer {
+        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+        errdefer sys.close(fd);
+        try na.bindTo(fd, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+        var sa: na.PosixAddress = undefined;
+        var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+        _ = linux.getsockname(fd, &sa.any, &sa_len);
+        return .{ .fd = fd, .addr = na.fromSockaddr(&sa) };
+    }
+
+    fn hear(p: Peer) !na.PosixAddress {
+        var buf: [8]u8 = undefined;
+        var sa: na.PosixAddress = undefined;
+        var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+        if (linux.errno(linux.recvfrom(p.fd, &buf, buf.len, 0, &sa.any, &sa_len)) != .SUCCESS) return error.RecvFailed;
+        return sa;
+    }
+
+    fn tell(p: Peer, to: *const na.PosixAddress, bytes: []const u8) !void {
+        _ = try sys.sendto(p.fd, bytes, 0, &to.any, @sizeOf(posix.sockaddr.in));
+    }
+};
+
+test "no query leaves from the port of the one before it" {
+    var e = try Edge.init(std.testing.allocator);
+    defer e.deinit();
+    const peer = try Peer.init();
+    defer sys.close(peer.fd);
+
+    var last: u16 = 0;
+    var repeats: usize = 0;
+    for (1..9) |id| {
+        _ = try e.send(.{ .id = @intCast(id), .server = peer.addr, .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+        const asker = try peer.hear();
+        try peer.tell(&asker, "reply");
+        const ev = ((try e.next(std.math.maxInt(i64))) orelse return error.TestUnexpectedResult).exchange;
+        try std.testing.expect(ev.id == id and ev.completion == .reply);
+        if (asker.in.port == last) repeats += 1;
+        last = asker.in.port;
+    }
+    // The kernel draws from about 28,000 ports, so one chance repeat is allowed.
+    try std.testing.expect(repeats <= 1);
+}
