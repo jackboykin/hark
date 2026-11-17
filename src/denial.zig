@@ -10,6 +10,7 @@ const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
 const graph = @import("graph.zig");
 const model = @import("model.zig");
+const rand = @import("rand.zig");
 const walk = @import("walk.zig");
 
 const store = @import("store.zig");
@@ -100,7 +101,7 @@ const Zone = struct {
 };
 
 pub const Index = struct {
-    zones: std.array_hash_map.String(Zone) = .empty,
+    zones: std.array_hash_map.Custom([]const u8, Zone, rand.Seeded, true) = .empty,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator, st: *store.Store) void {
         var it = ix.zones.iterator();
