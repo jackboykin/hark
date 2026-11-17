@@ -354,10 +354,12 @@ const Params = struct {
                     if (try number(&v) < 2) return error.TransportParameterError;
                 },
                 .preferred_address => {
-                    if (value.len < 41) return error.TransportParameterError;
-                    const len = value[40];
-                    if (len == 0 or len > 20 or value.len != 41 + @as(usize, len) + 16) return error.TransportParameterError;
-                    p.preferred = .{ .cid = .of(value[41..][0..len]), .token = value[41 + len ..][0..16].* };
+                    // IPv4 address and port, then IPv6 address and port.
+                    const at = 4 + 2 + 16 + 2;
+                    if (value.len < at + 1) return error.TransportParameterError;
+                    const len = value[at];
+                    if (len == 0 or len > 20 or value.len != at + 1 + @as(usize, len) + 16) return error.TransportParameterError;
+                    p.preferred = .{ .cid = .of(value[at + 1 ..][0..len]), .token = value[at + 1 + len ..][0..16].* };
                 },
                 _ => unreachable,
             }
@@ -1929,6 +1931,18 @@ test "RFC 9001 A.4: a Retry's tag proves it answers the Initial sent" {
 test "RFC 9000 A.3: a truncated packet number widens to the nearest" {
     try testing.expectEqual(0xa82f9b32, decodePn(0xa82f30ea, 0x9b32, 2));
     try testing.expectEqual(0, decodePn(null, 0, 1));
+}
+
+test "RFC 9000 18.2: a preferred address's connection id follows both addresses" {
+    const token = "reset token, 16!";
+    const params = [_]u8{ 0x00, 4 } ++ "odci".* ++ [_]u8{ 0x0f, 4 } ++ "isci".* ++
+        [_]u8{ 0x0d, 24 + 1 + 8 + 16 } ++
+        [_]u8{ 192, 0, 2, 1, 0x03, 0x55 } ++
+        [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{ 1, 0x03, 0x55 } ++
+        [_]u8{8} ++ "next cid".* ++ token.*;
+    const p = try Params.read(&params);
+    try testing.expect(p.preferred.?.cid.eql("next cid"));
+    try testing.expectEqualStrings(token, &p.preferred.?.token);
 }
 
 test "ranges merge what touches and keep the highest when full" {
