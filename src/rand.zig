@@ -1,5 +1,5 @@
-//! Each thread's ChaCha CSPRNG, as `thread`, and the seed of every hash over
-//! what a stranger picks.
+//! Each thread's ChaCha CSPRNG, as `thread`, and the seeded hash over what a
+//! stranger picks.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -13,6 +13,15 @@ pub var hash_seed: u64 = 0;
 pub fn randomizeHashSeed() void {
     hash_seed = thread.int(u64);
 }
+
+pub const Seeded = struct {
+    pub fn hash(_: Seeded, k: []const u8) u32 {
+        return @truncate(std.hash.Wyhash.hash(hash_seed, k));
+    }
+    pub fn eql(_: Seeded, a: []const u8, b: []const u8, _: usize) bool {
+        return std.mem.eql(u8, a, b);
+    }
+};
 
 /// Per-thread, not `io.random`: its global mutex costs ~6% CPU on misses.
 pub const thread: std.Random = .{ .ptr = undefined, .fillFn = fill };

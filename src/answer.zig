@@ -555,7 +555,7 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 /// here, asking nobody, for a window that doubles while it keeps failing, up
 /// to 5 minutes. Keyed with CD, since a CD client is owed bogus data.
 const Failures = struct {
-    map: std.array_hash_map.Custom([]const u8, Entry, Seeded, true) = .empty,
+    map: std.array_hash_map.Custom([]const u8, Entry, rand.Seeded, true) = .empty,
 
     const Entry = struct {
         until_ns: i64,
@@ -564,14 +564,6 @@ const Failures = struct {
 
     pub const Held = union(enum) { stale, failed: dns.Ede };
 
-    const Seeded = struct {
-        pub fn hash(_: Seeded, k: []const u8) u32 {
-            return @truncate(std.hash.Wyhash.hash(rand.hash_seed, k));
-        }
-        pub fn eql(_: Seeded, a: []const u8, b: []const u8, _: usize) bool {
-            return std.mem.eql(u8, a, b);
-        }
-    };
     const max_window_s = 300;
     const max_entries = 4096;
 
@@ -639,7 +631,7 @@ const Failures = struct {
             return;
         }
         if (f.map.count() >= max_entries) {
-            const at = Seeded.hash(.{}, k) % f.map.count();
+            const at = rand.Seeded.hash(.{}, k) % f.map.count();
             const old = f.map.keys()[at];
             f.map.swapRemoveAt(at);
             gpa.free(old);

@@ -55,7 +55,7 @@ pub const Key = struct {
     }
 
     fn hashName(name: []const u8) u32 {
-        return @truncate(std.hash.Wyhash.hash(rand.hash_seed, name));
+        return rand.Seeded.hash(.{}, name);
     }
 
     pub fn hash(k: Key) u64 {
