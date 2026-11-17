@@ -7,6 +7,7 @@
 //! - Nothing std marks deprecated is used.
 //! - No `@constCast`.
 //! - No `anyerror` outside a test.
+//! - Nothing under src/ hashes a string with std's fixed seed.
 //! - A function or test is at most 100 lines of code, nests control flow at
 //!   most 4 deep, and takes at most 7 parameters.
 //! - A `pub` declaration is named by another file.
@@ -44,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
         try deprecated(arena, f, &lib);
         constCast(f);
         try anyError(arena, f);
+        try unseeded(arena, f);
         try shape(arena, f);
         unusedImports(f);
     }
@@ -312,6 +314,44 @@ fn anyError(arena: Allocator, f: File) !void {
         if (t.tokenTag(token) == .identifier and mem.eql(u8, t.tokenSlice(token), "anyerror"))
             report(f, token, "anyerror: name the errors that can escape", .{});
     }
+}
+
+const fixed_seed = [_][]const []const u8{
+    &.{"StringHashMap"},
+    &.{"StringHashMapUnmanaged"},
+    &.{"StringArrayHashMapUnmanaged"},
+    &.{"BufMap"},
+    &.{"BufSet"},
+    &.{ "hash_map", "StringHashMap" },
+    &.{ "hash_map", "StringHashMapUnmanaged" },
+    &.{ "hash_map", "StringContext" },
+    &.{ "hash_map", "StringIndexContext" },
+    &.{ "hash_map", "StringIndexAdapter" },
+    &.{ "hash_map", "hashString" },
+    &.{ "array_hash_map", "String" },
+    &.{ "array_hash_map", "StringContext" },
+    &.{ "array_hash_map", "hashString" },
+};
+
+/// Under a known seed, whoever picks the keys grinds collisions offline.
+/// bench/ and lint.zig key their maps with their own data.
+fn unseeded(arena: Allocator, f: File) !void {
+    if (!mem.startsWith(u8, f.path, "src/")) return;
+    const t = f.tree;
+    const aliases = try stdAliases(arena, t);
+    for (0..t.nodes.len) |n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        if (t.nodeTag(node) != .field_access) continue;
+        const path = try chain(arena, t, node, aliases) orelse continue;
+        for (fixed_seed) |name| if (samePath(path, name))
+            report(f, t.nodeData(node).node_and_token[1], "std's string hash has a fixed seed: key with rand.Seeded", .{});
+    }
+}
+
+fn samePath(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!mem.eql(u8, x, y)) return false;
+    return true;
 }
 
 const max_lines = 100;
