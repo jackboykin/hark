@@ -113,13 +113,11 @@ pub fn validateDnskeyRrset(
     const ds = try anchors(scratch, ds_records);
     var anchored: Keyset = try .init(scratch, dnskey_records);
     var n: usize = 0;
-    for (anchored.keys, anchored.tags) |dk, tag| if (anchoredBy(ds, dk, tag, zone_name)) {
-        anchored.keys[n] = dk;
-        anchored.tags[n] = tag;
+    for (anchored.keys) |k| if (anchoredBy(ds, k.dnskey, k.tag, zone_name)) {
+        anchored.keys[n] = k;
         n += 1;
     };
     anchored.keys = anchored.keys[0..n];
-    anchored.tags = anchored.tags[0..n];
 
     // A DS advertising ML-DSA-44 makes its RRSIG the only one that counts
     // (draft-westerbaan-dnssec-mldsa §7.2), or stripping it is a downgrade.
@@ -130,7 +128,7 @@ pub fn validateDnskeyRrset(
         const sig = rrsig_rr.rrsig();
         if (sig.type_covered != .dnskey) continue;
         if (pq and sig.algorithm != .mldsa44) continue;
-        if (!sig.signer_name.eql(zone_name) or !usable(sig, at.now)) continue;
+        if (!sig.signer_name.eql(zone_name) or !usable(sig, at.now) or anchored.of(sig).len == 0) continue;
         if (tried == max_sigs_per_set) break;
         tried += 1;
         if (rrsetVerifiesWithAnyKey(sig, &anchored, filtered, at) catch return null) return sig;
@@ -186,28 +184,45 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     return false;
 }
 
-const Keyset = struct {
-    keys: []dns.DnskeyData,
-    tags: []u16,
+pub const Keyset = struct {
+    keys: []Key,
     zone: ?dns.Name = null,
 
-    fn init(scratch: mem.Allocator, records: []const dns.ResourceRecord) !Keyset {
+    const Key = struct {
+        tag: u16,
+        dnskey: dns.DnskeyData,
+
+        fn order(sig: dns.RrsigData, k: Key) std.math.Order {
+            return mem.order(u16, &.{ sig.key_tag, @backingInt(sig.algorithm) }, &.{ k.tag, @backingInt(k.dnskey.algorithm) });
+        }
+
+        fn lessThan(_: void, a: Key, b: Key) bool {
+            return mem.order(u16, &.{ a.tag, @backingInt(a.dnskey.algorithm) }, &.{ b.tag, @backingInt(b.dnskey.algorithm) }) == .lt;
+        }
+    };
+
+    pub fn init(scratch: mem.Allocator, records: []const dns.ResourceRecord) !Keyset {
         var n: usize = 0;
         for (records) |rr| n += @intFromBool(rr.rtype == .dnskey);
-        var k: Keyset = .{ .keys = try scratch.alloc(dns.DnskeyData, n), .tags = try scratch.alloc(u16, n) };
+        var k: Keyset = .{ .keys = try scratch.alloc(Key, n) };
         n = 0;
         for (records) |rr| {
             if (rr.rtype != .dnskey) continue;
             k.zone = k.zone orelse rr.name;
             const dk = rr.dnskey();
             if (!isValidZoneKey(dk)) continue;
-            k.keys[n] = dk;
-            k.tags[n] = rrsig.keyTag(dk);
+            k.keys[n] = .{ .tag = rrsig.keyTag(dk), .dnskey = dk };
             n += 1;
         }
         k.keys = k.keys[0..n];
-        k.tags = k.tags[0..n];
+        // Stable: keys sharing a tag are tried in the order they came.
+        std.mem.sort(Key, k.keys, {}, Key.lessThan);
         return k;
+    }
+
+    fn of(k: *const Keyset, sig: dns.RrsigData) []const Key {
+        const lo, const hi = std.sort.equalRange(Key, k.keys, sig, Key.order);
+        return k.keys[lo..hi];
     }
 };
 
@@ -231,9 +246,8 @@ fn rrsetVerifiesWithAnyKey(
     set: rrsig.Canonical,
     at: rrsig.Verifier,
 ) error{ValidationBudgetExhausted}!bool {
-    for (keyset.keys, keyset.tags) |dk, tag| {
-        if (tag != sig.key_tag) continue;
-        rrsig.verifyRrsig(sig, dk, set, at) catch |e| switch (e) {
+    for (keyset.of(sig)) |k| {
+        rrsig.verifyRrsig(sig, k.dnskey, set, at) catch |e| switch (e) {
             error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
             else => continue,
         };
@@ -267,14 +281,15 @@ fn usable(sig: dns.RrsigData, now: u32) bool {
     return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, now);
 }
 
-/// Iterates the signatures worth a verify: the zone's own, usable now, at
-/// most `max_sigs_per_set`. `passed` records that some covering one was
-/// skipped.
+/// Iterates the signatures worth a verify: the zone's own, usable now,
+/// that some key could check, at most `max_sigs_per_set`. `passed`
+/// records that some covering one was skipped.
 pub const Weighed = struct {
     rrs: []const dns.ResourceRecord,
     owner: dns.Name,
     rtype: dns.RType,
     zone: dns.Name,
+    keys: *const Keyset,
     now: u32,
     /// For proof records, which are never wildcard-expanded (RFC 4035
     /// §3.1.3.3). Else a real `*.zone NSEC` signature verifies under any
@@ -293,7 +308,7 @@ pub const Weighed = struct {
             const sig = rr.rrsig();
             if (sig.type_covered != w.rtype or !rr.name.eql(w.owner)) continue;
             if (w.n == max_sigs_per_set or !sig.signer_name.eql(w.zone) or !usable(sig, w.now) or
-                (w.unexpanded and sig.labels != rrsig.signedLabels(w.owner)))
+                (w.unexpanded and sig.labels != rrsig.signedLabels(w.owner)) or w.keys.of(sig).len == 0)
             {
                 w.passed = true;
                 continue;
@@ -419,7 +434,7 @@ pub fn validateRrset(
     if (set.records.len == 0) return null;
     const keyset: Keyset = try .init(scratch, dnskey_records);
 
-    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = at.now, .unexpanded = unexpanded };
+    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .keys = &keyset, .now = at.now, .unexpanded = unexpanded };
     while (it.next()) |i| {
         const sig = records[i].rrsig();
         if (rrsetVerifiesWithAnyKey(sig, &keyset, set, at) catch return null) {
@@ -456,7 +471,7 @@ pub fn verifyAuthorityProofSigs(
         // Read whole from the section, not from its group: a validator rests
         // on no order it did not check.
         const set = try collect(scratch, authorities, rr.name, rr.rtype);
-        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = at.now, .unexpanded = true };
+        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .keys = &keyset, .now = at.now, .unexpanded = true };
         const sig = while (it.next()) |j| {
             const sig = authorities[j].rrsig();
             if (rrsetVerifiesWithAnyKey(sig, &keyset, set, at) catch return null) break sig;
@@ -1006,6 +1021,27 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     var budget: rrsig.ValidationBudget = .{};
     const sig = (try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo })).?.sig;
     try testing.expectEqual(@as(u32, 300), rrsig.Cap.of(sig, now).original_ttl);
+}
+
+test "validateRrset: a signature no key could check takes no turn under the cap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recs = [_]dns.ResourceRecord{
+        .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try rrsig.testSignRrset(&recs, .a, rrsig.test_owner, .ed25519, &sig_bytes, &pub_bytes);
+    var keyless = signed.rrsig;
+    keyless.key_tag ^= 0x5555;
+    var answers: [max_sigs_per_set + 2]dns.ResourceRecord = undefined;
+    answers[0] = recs[0];
+    for (answers[1 .. max_sigs_per_set + 1]) |*rr| rr.* = rrsigRr(rrsig.test_owner, keyless);
+    answers[max_sigs_per_set + 1] = rrsigRr(rrsig.test_owner, signed.rrsig);
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
+    var budget: rrsig.ValidationBudget = .{};
+    try testing.expect(try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
+    try testing.expectEqual(1, budget.sig_verify_spent);
 }
 
 test "validateRrset: 70 records verify whole, and a signature over 64 launders no other 6" {

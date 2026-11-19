@@ -407,7 +407,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (c.is == .proof) {
                     s.proved[c.slot] = signer.depth();
                     s.proved_until[c.slot] = cap;
-                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
+                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, keys.records, now);
                     break :f null;
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
@@ -418,7 +418,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                         .bogus, .unchecked => break :f .bogus,
                     }
                 }
-                if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
+                if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, keys.records, now);
                 break :f null;
             },
         };
@@ -577,13 +577,14 @@ fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const 
 
 /// Drops the signatures the verifier did not weigh before a verdict is
 /// stamped on the bytes. Only signatures go, so claim slots do not move.
-fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, zone: dns.Name, now: u32) !void {
+fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, zone: dns.Name, keys: []const RR, now: u32) !void {
     const section = if (c.is == .proof) r.authorities else r.answers;
     const set = dnssec.setFrom(section, c.head);
+    const keyset: dnssec.Keyset = try .init(g.scratch.allocator(), keys);
     var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), section.len);
     keep.appendSliceAssumeCapacity(section[0..c.head]);
     for (set) |rr| if (rr.rtype != .rrsig) keep.appendAssumeCapacity(rr);
-    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .now = now, .unexpanded = c.is == .proof };
+    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .keys = &keyset, .now = now, .unexpanded = c.is == .proof };
     while (w.next()) |i| keep.appendAssumeCapacity(set[i]);
     keep.appendSliceAssumeCapacity(section[c.head + set.len ..]);
     var narrowed = r.*;
