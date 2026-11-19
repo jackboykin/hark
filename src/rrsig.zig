@@ -20,7 +20,7 @@ const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
 const RsaModulus = std.crypto.ff.Modulus(4096);
 const RsaFe = RsaModulus.Fe;
 
-pub const VerifyError = error{
+const VerifyError = error{
     InvalidSignature,
     UnsupportedAlgorithm,
     InvalidKey,

@@ -43,28 +43,63 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
-/// RFC 4509 §3: a SHA-1 DS is ignored when the set has a SHA-256 one. Only
-/// a usable one counts: a SHA-256 DS for an unsupported key algorithm
-/// anchors nothing and must not silence the SHA-1 that does.
-fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
-    if (ds.digest_type != .sha1) return true;
-    for (ds_records) |ds2| if (ds2.digest_type == .sha256 and rrsig.isSupportedAlgorithm(ds2.algorithm)) return false;
-    return true;
+/// The DS set as keys look themselves up in it: sorted by key tag,
+/// algorithm, digest type and digest, so each key is hashed once a digest
+/// type and found by search, never paired with each DS. RFC 4509 §3: a SHA-1 DS is
+/// ignored when the set has a SHA-256 one. Only a usable one counts: a
+/// SHA-256 DS for an unsupported key algorithm anchors nothing and must
+/// not silence the SHA-1 that does.
+fn anchors(scratch: mem.Allocator, ds_records: []const dns.DsData) ![]const dns.DsData {
+    const sha1_ignored = for (ds_records) |ds| {
+        if (ds.digest_type == .sha256 and rrsig.isSupportedAlgorithm(ds.algorithm)) break true;
+    } else false;
+    var kept: std.ArrayList(dns.DsData) = try .initCapacity(scratch, ds_records.len);
+    for (ds_records) |ds| if (ds.digest_type != .sha1 or !sha1_ignored) kept.appendAssumeCapacity(ds);
+    std.mem.sort(dns.DsData, kept.items, {}, struct {
+        fn lessThan(_: void, a: dns.DsData, b: dns.DsData) bool {
+            return dsOrder(a, b) == .lt;
+        }
+    }.lessThan);
+    return kept.items;
+}
+
+fn kindOrder(a: dns.DsData, b: dns.DsData) std.math.Order {
+    const x = [_]u16{ a.key_tag, @backingInt(a.algorithm), @backingInt(a.digest_type) };
+    return mem.order(u16, &x, &.{ b.key_tag, @backingInt(b.algorithm), @backingInt(b.digest_type) });
+}
+
+fn dsOrder(a: dns.DsData, b: dns.DsData) std.math.Order {
+    const o = kindOrder(a, b);
+    return if (o != .eq) o else mem.order(u8, a.digest, b.digest);
+}
+
+fn anchoredBy(ds: []const dns.DsData, dnskey: dns.DnskeyData, tag: u16, owner: dns.Name) bool {
+    inline for (.{ .{ .sha1, Sha1 }, .{ .sha256, Sha256 }, .{ .sha384, Sha384 } }) |h| {
+        var probe: dns.DsData = .{ .key_tag = tag, .algorithm = dnskey.algorithm, .digest_type = h[0], .digest = &.{} };
+        if (std.sort.binarySearch(dns.DsData, ds, probe, kindOrder) != null) {
+            const digest = dsDigest(h[1], owner, dnskey);
+            probe.digest = &digest;
+            if (std.sort.binarySearch(dns.DsData, ds, probe, dsOrder) != null) return true;
+        }
+    }
+    return false;
 }
 
 const test_memo = &rrsig.test_memo;
 
-test "dsEligible: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not to an unusable one" {
+test "anchors: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not to an unusable one" {
     const ds = struct {
         fn make(tag: u16, algo: dns.DnssecAlgorithm, digest_type: dns.DigestType) dns.DsData {
             return .{ .key_tag = tag, .algorithm = algo, .digest_type = digest_type, .digest = &.{} };
         }
     }.make;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     const sha1 = ds(1, .ecdsap256sha256, .sha1);
-    try testing.expect(dsEligible(sha1, &.{sha1}));
-    try testing.expect(!dsEligible(sha1, &.{ sha1, ds(2, .ecdsap256sha256, .sha256) }));
-    try testing.expect(dsEligible(sha1, &.{ sha1, ds(2, .ed448, .sha256) }));
-    try testing.expect(dsEligible(ds(1, .ecdsap256sha256, .sha256), &.{ds(2, .ecdsap256sha256, .sha256)}));
+    try testing.expectEqual(1, (try anchors(a, &.{sha1})).len);
+    try testing.expectEqual(1, (try anchors(a, &.{ sha1, ds(2, .ecdsap256sha256, .sha256) })).len);
+    try testing.expectEqual(2, (try anchors(a, &.{ sha1, ds(2, .ed448, .sha256) })).len);
 }
 
 pub fn validateDnskeyRrset(
@@ -75,24 +110,20 @@ pub fn validateDnskeyRrset(
     at: rrsig.Verifier,
 ) !?dns.RrsigData {
     const filtered = try collect(scratch, dnskey_records, null, .dnskey);
+    const ds = try anchors(scratch, ds_records);
     var anchored: Keyset = try .init(scratch, dnskey_records);
     var n: usize = 0;
-    for (anchored.keys, anchored.tags) |dk, tag| {
-        for (ds_records) |ds| {
-            if (ds.key_tag != tag or ds.algorithm != dk.algorithm or !dsEligible(ds, ds_records)) continue;
-            verifyDs(ds, dk, zone_name) catch continue;
-            anchored.keys[n] = dk;
-            anchored.tags[n] = tag;
-            n += 1;
-            break;
-        }
-    }
+    for (anchored.keys, anchored.tags) |dk, tag| if (anchoredBy(ds, dk, tag, zone_name)) {
+        anchored.keys[n] = dk;
+        anchored.tags[n] = tag;
+        n += 1;
+    };
     anchored.keys = anchored.keys[0..n];
     anchored.tags = anchored.tags[0..n];
 
     // A DS advertising ML-DSA-44 makes its RRSIG the only one that counts
     // (draft-westerbaan-dnssec-mldsa §7.2), or stripping it is a downgrade.
-    const pq = hasMlDsaDs(ds_records);
+    const pq = hasMlDsaDs(ds);
     var tried: usize = 0;
     for (dnskey_records) |rrsig_rr| {
         if (rrsig_rr.rtype != .rrsig) continue;
@@ -107,8 +138,8 @@ pub fn validateDnskeyRrset(
     return null;
 }
 
-fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
-    for (ds_records) |ds| if (ds.algorithm == .mldsa44 and digestSupported(ds.digest_type) and dsEligible(ds, ds_records)) return true;
+fn hasMlDsaDs(anchoring: []const dns.DsData) bool {
+    for (anchoring) |ds| if (ds.algorithm == .mldsa44 and digestSupported(ds.digest_type)) return true;
     return false;
 }
 
@@ -129,7 +160,7 @@ fn digestSupported(digest_type: dns.DigestType) bool {
 /// classical RRSIG finds a key. The result borrows `records` or lives in
 /// `allocator`.
 pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord, ds_records: []const dns.DsData) ![]const dns.ResourceRecord {
-    if (!hasMlDsaDs(ds_records)) return records;
+    if (!hasMlDsaDs(try anchors(allocator, ds_records))) return records;
     var kept: std.ArrayList(dns.ResourceRecord) = .empty;
     for (records) |rr| if (rr.rtype == .dnskey and rr.dnskey().algorithm == .mldsa44) try kept.append(allocator, rr);
     return kept.items;
@@ -142,16 +173,6 @@ pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) [H
     h.update(&.{ dnskey.protocol, @backingInt(dnskey.algorithm) });
     h.update(dnskey.public_key);
     return h.finalResult();
-}
-
-fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) rrsig.VerifyError!void {
-    const ok = switch (ds.digest_type) {
-        .sha1 => mem.eql(u8, &dsDigest(Sha1, owner_name, dnskey), ds.digest),
-        .sha256 => mem.eql(u8, &dsDigest(Sha256, owner_name, dnskey), ds.digest),
-        .sha384 => mem.eql(u8, &dsDigest(Sha384, owner_name, dnskey), ds.digest),
-        _ => return error.UnsupportedAlgorithm,
-    };
-    if (!ok) return error.InvalidSignature;
 }
 
 /// RFC 4035 §5.2: a verified DS set with no supported algorithm and digest
@@ -493,9 +514,9 @@ test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify, a
         const d = try std.fmt.hexToBytes(&digest, c.digest_hex);
         const dnskey: dns.DnskeyData = .{ .flags = c.flags, .protocol = 3, .algorithm = c.algorithm, .public_key = key[0..key_len] };
         try testing.expectEqual(c.tag, rrsig.keyTag(dnskey));
-        try verifyDs(.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }, dnskey, c.owner);
+        try testing.expect(anchoredBy(&.{.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }}, dnskey, c.tag, c.owner));
         d[0] ^= 1;
-        try testing.expectError(error.InvalidSignature, verifyDs(.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }, dnskey, c.owner));
+        try testing.expect(!anchoredBy(&.{.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }}, dnskey, c.tag, c.owner));
     }
 }
 
@@ -689,7 +710,7 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
 
     var digest: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&digest, "812cb1a22af04380e2f72d91c06c14eb1a918cf30037a8a9c67497e9264b4bfa");
-    try verifyDs(.{ .key_tag = 59829, .algorithm = .mldsa44, .digest_type = .sha256, .digest = &digest }, dnskey, rrsig.test_owner);
+    try testing.expect(anchoredBy(&.{.{ .key_tag = 59829, .algorithm = .mldsa44, .digest_type = .sha256, .digest = &digest }}, dnskey, 59829, rrsig.test_owner));
 
     var mx = [_]dns.ResourceRecord{.fixture(.{
         .name = rrsig.test_owner,
