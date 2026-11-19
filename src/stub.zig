@@ -32,6 +32,13 @@ pub fn of(zones: []const Zone, name: dns.Name, qtype: dns.RType) ?*const Zone {
     return under(zones, if (qtype == .ds) name.parent() orelse name else name);
 }
 
+/// The zone hark holds that answers a question no stub zone takes. A stub
+/// zone the operator names overrides hark's defaults (RFC 6303 §3, RFC 6761
+/// §6.2), and `under` keeps one from the rest.
+pub fn held(zones: []const Zone, name: dns.Name, qtype: dns.RType, do_bit: bool) ?*const special_use.Zone {
+    return if (of(zones, name, qtype) != null) null else special_use.answering(name, qtype, do_bit);
+}
+
 pub const Scratch = struct {
     ask: ?walk.Ask = null,
 };

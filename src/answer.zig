@@ -159,9 +159,7 @@ pub const Desk = struct {
     };
 
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
-        // A stub zone the operator named wins over hark's own answers, which are
-        // defaults (RFC 6303 §3, RFC 6761 §6.2).
-        if (stub.of(d.g.cfg.stub_zones, q.name, q.qtype) == null) if (special_use.answering(q.name, q.qtype, c.do_bit)) |z|
+        if (stub.held(d.g.cfg.stub_zones, q.name, q.qtype, c.do_bit)) |z|
             return .{ .synthesized = try ownAnswer(arena, q, z, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
         // RRSIGs are never signed (RFC 4035 §2.2), so an answer of them cannot be

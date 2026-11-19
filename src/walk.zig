@@ -15,7 +15,6 @@ const trust = @import("trust.zig");
 const proof = @import("proof.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
-const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
 const log = std.log.scoped(.graph);
 
@@ -1064,11 +1063,10 @@ fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
 
 fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) bool {
     const zones = g.cfg.stub_zones;
-    const own = stub.of(zones, qname, qtype);
-    if (own != stub.under(zones, zone)) return false;
-    // A question hark answers itself never leaves the host (RFC 6761 §6). An own
-    // zone's DS gets here only for a DO client, so it is classified as one.
-    return own != null or special_use.answering(qname, qtype, true) == null;
+    if (stub.of(zones, qname, qtype) != stub.under(zones, zone)) return false;
+    // A question hark answers itself never leaves the host (RFC 6761 §6). Only a
+    // DO client's DS at a held apex gets here, so it is judged as one.
+    return stub.held(zones, qname, qtype, true) == null;
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) !bool {
