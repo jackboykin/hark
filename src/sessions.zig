@@ -257,7 +257,6 @@ fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn
     if (s.conns.items.len >= max_conns and !try s.evictIdle()) return error.TooManySessions;
     try s.conns.ensureUnusedCapacity(e.gpa, 1);
     try s.by_server.ensureUnusedCapacity(e.gpa, 1);
-    try e.timers.ensureUnusedCapacity(e.gpa, 1);
     const c = try e.gpa.create(Conn);
     errdefer e.gpa.destroy(c);
     s.next_token +%= 1;
@@ -267,11 +266,12 @@ fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn
         .last_ns = e.now_ns,
         .dial_by_ns = e.now_ns + dial_timeout_ns,
     };
+    errdefer c.carrier.close();
+    try s.rearm(c);
     s.conns.appendAssumeCapacity(c);
     const of = s.by_server.getOrPutAssumeCapacity(key);
     if (!of.found_existing) of.value_ptr.* = .initFill(null);
     of.value_ptr.set(kind, c);
-    try s.rearm(c);
     s.stats.getPtr(kind).dials += 1;
     return c;
 }
