@@ -23,6 +23,7 @@ const monotonic = @import("monotonic.zig");
 const response = @import("response.zig");
 const sys_linux = @import("sys_linux.zig");
 const Edge = @import("edge.zig");
+const stream = @import("stream.zig");
 const sink = @import("log.zig");
 const log = std.log.scoped(.serve);
 const query_log = std.log.scoped(.query);
@@ -37,7 +38,7 @@ const Conn = struct {
     fd: posix.fd_t,
     addr: na.Address,
     token: u32,
-    held: std.ArrayList(u8) = .empty,
+    held: stream.Held = .{},
     served: u32 = 0,
     last_ns: i64,
     owed: u32 = 0,
@@ -328,40 +329,32 @@ const Server = struct {
     }
 
     fn readTcp(s: *Server, c: *Conn) !void {
-        const into = s.stream_in[0 .. s.stream_in.len - c.held.items.len];
-        const rc = linux.read(c.fd, into.ptr, into.len);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .AGAIN, .INTR => return,
-            else => return s.drop(c),
+        switch (c.held.read(s.gpa, c.fd, &s.stream_in)) {
+            .bytes => |got| try s.frames(c, got),
+            .wait => {},
+            .ended => s.close(c),
+            .failed => s.drop(c),
         }
-        if (rc == 0) return s.close(c);
-        if (c.held.items.len == 0) return s.frames(c, into[0..rc]);
-        c.held.appendSlice(s.gpa, into[0..rc]) catch return s.drop(c);
-        try s.frames(c, c.held.items);
     }
 
-    fn frames(s: *Server, c: *Conn, bytes: []const u8) !void {
+    fn frames(s: *Server, c: *Conn, bytes: []u8) !void {
         const tok = c.token;
-        var start: usize = 0;
-        while (bytes.len - start >= 2 and c.out.items.len == 0 and !c.draining) {
-            const flen: usize = mem.readInt(u16, bytes[start..][0..2], .big);
-            if (flen == 0 or flen > max_frame) return s.drop(c);
-            if (bytes.len - start < 2 + flen) break;
+        var rest = bytes;
+        while (c.out.items.len == 0 and !c.draining) {
+            // Judged by its length alone, so a frame too long for a query is
+            // never held while it arrives.
+            if (rest.len >= 2 and mem.readInt(u16, rest[0..2], .big) > max_frame) return s.drop(c);
+            const query = stream.framed(rest) orelse break;
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;
-            try s.ask(bytes[start + 2 ..][0..flen], .{ .tcp = c }, false);
+            try s.ask(query, .{ .tcp = c }, false);
             // `ask` may have dropped the connection; `c` is then freed.
             if (s.watched.items[tok & slot_mask].w != .conn) return;
-            start += 2 + flen;
+            rest = rest[2 + query.len ..];
             if (c.served >= s.cfg.tcp_queries_per_conn) return s.drain(c);
         }
-        const rest = bytes[start..];
-        if (rest.len == 0) return c.held.clearAndFree(s.gpa);
-        if (bytes.ptr != c.held.items.ptr) return c.held.appendSlice(s.gpa, rest) catch s.drop(c);
-        mem.copyForwards(u8, c.held.items, rest);
-        c.held.shrinkRetainingCapacity(rest.len);
+        c.held.keep(s.gpa, rest) catch s.drop(c);
     }
 
     fn deinit(s: *Server) void {
@@ -905,7 +898,7 @@ const Server = struct {
         if (c.out.items.len != 0) return;
         if (s.closeIfDone(c)) return;
         s.e.rewatch(c.fd, c.token, c.interest()) catch return s.drop(c);
-        try s.frames(c, c.held.items);
+        try s.frames(c, c.held.bytes);
     }
 
     fn take(s: *Server, c: *Conn, bytes: []const u8) ?usize {

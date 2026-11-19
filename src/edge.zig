@@ -15,7 +15,7 @@ head: usize = 0,
 batch: [64]linux.epoll_event = undefined,
 batch_len: usize = 0,
 batch_at: usize = 0,
-rx: [dns.max_message_len]u8 = undefined,
+rx: [stream.max_frame]u8 = undefined,
 sessions: ?*Sessions = null,
 
 const std = @import("std");
@@ -23,7 +23,6 @@ const linux = std.os.linux;
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 const monotonic = @import("monotonic.zig");
@@ -31,6 +30,7 @@ const rand = @import("rand.zig");
 const graph = @import("graph.zig");
 const model = @import("model.zig");
 const Sessions = @import("sessions.zig");
+const stream = @import("stream.zig");
 
 const CellId = model.CellId;
 const Completion = graph.Completion;
@@ -89,7 +89,7 @@ const Idle = struct {
 const Tcp = struct {
     query: []u8,
     written: usize = 0,
-    got: std.ArrayList(u8) = .empty,
+    held: stream.Held = .{},
 };
 
 const client_tag: u64 = 1 << 32;
@@ -205,7 +205,7 @@ fn close(e: *Edge, f: Flight) void {
         .datagram => |family| e.rest(f.fd, family),
         .stream => |t| {
             sys.close(f.fd);
-            t.got.deinit(e.work);
+            t.held.deinit(e.work);
             e.work.free(t.query);
             e.work.destroy(t);
         },
@@ -346,27 +346,16 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
         if (t.written == t.query.len) try e.ctl(linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, id);
         return null;
     }
-    const rc = linux.read(fd, &e.rx, e.rx.len);
-    switch (linux.errno(rc)) {
-        .SUCCESS => if (rc == 0) return e.finish(id, .timeout),
-        .AGAIN, .INTR => return null,
-        else => return e.finish(id, .timeout),
-    }
-    var held: []const u8 = e.rx[0..rc];
-    if (t.got.items.len > 0 or framed(held) == null) {
-        t.got.appendSlice(e.work, held) catch return e.finish(id, .unheld);
-        held = t.got.items;
-    }
-    const reply = framed(held) orelse return null;
-    // Copied out before `finish` frees the buffer.
-    mem.copyForwards(u8, e.rx[0..reply.len], reply);
-    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..reply.len], .stream = true } });
-}
-
-fn framed(bytes: []const u8) ?[]const u8 {
-    if (bytes.len < 2) return null;
-    const len = mem.readInt(u16, bytes[0..2], .big);
-    return if (bytes.len < 2 + @as(usize, len)) null else bytes[2..][0..len];
+    const got = switch (t.held.read(e.work, fd, &e.rx)) {
+        .bytes => |b| b,
+        .wait => return null,
+        .ended, .failed => return e.finish(id, .timeout),
+    };
+    const reply = stream.framed(got) orelse {
+        t.held.keep(e.work, got) catch return e.finish(id, .unheld);
+        return null;
+    };
+    return e.finish(id, .{ .reply = .{ .bytes = reply, .stream = true } });
 }
 
 test "a consumer that stops between events leaves nothing behind" {

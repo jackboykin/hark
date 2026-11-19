@@ -6,6 +6,7 @@ const mem = std.mem;
 const crypto = std.crypto;
 const tls = crypto.tls;
 const dns = @import("dns.zig");
+const stream = @import("stream.zig");
 const tls13 = @import("tls13.zig");
 const Keys = tls13.Keys;
 
@@ -84,14 +85,10 @@ pub const Session = struct {
 
     pub fn next(s: *Session, rx: *Rx, out: []u8) Error!?Event {
         while (true) {
-            const plain = rx.buf[rx.frame..rx.opened];
-            if (plain.len >= 2) {
-                const n = mem.readInt(u16, plain[0..2], .big);
-                if (plain.len >= 2 + @as(usize, n)) {
-                    if (n < 12) return error.DecodeError;
-                    rx.frame += 2 + @as(usize, n);
-                    return .{ .reply = plain[2..][0..n] };
-                }
+            if (stream.framed(rx.buf[rx.frame..rx.opened])) |m| {
+                if (m.len < 12) return error.DecodeError;
+                rx.frame += 2 + m.len;
+                return .{ .reply = m };
             }
             const len = try tls13.recordLen(rx.buf[rx.at..rx.end]) orelse return null;
             if (rx.at + len > rx.end) return null;
@@ -101,13 +98,19 @@ pub const Session = struct {
         }
     }
 
-    pub fn leftover(s: *Session, rx: *const Rx) struct { plain: []const u8, sealed: []const u8 } {
-        s.plain = @intCast(rx.opened - rx.frame);
-        return .{ .plain = rx.buf[rx.frame..rx.opened], .sealed = rx.buf[rx.at..rx.end] };
+    /// What is left unread: the plain bytes of a message still arriving, then
+    /// the sealed bytes of a record, moved up behind them.
+    pub fn leftover(s: *Session, rx: *Rx) []const u8 {
+        const plain = rx.opened - rx.frame;
+        s.plain = @intCast(plain);
+        const sealed = rx.end - rx.at;
+        mem.copyForwards(u8, rx.buf[rx.opened..][0..sealed], rx.buf[rx.at..rx.end]);
+        return rx.buf[rx.frame..][0 .. plain + sealed];
     }
 
-    pub fn reader(s: *const Session, buf: []u8, held: usize) Rx {
-        return .{ .buf = buf, .opened = s.plain, .at = s.plain, .end = held };
+    /// `buf` starts with what `leftover` gave, `len` bytes with what came after.
+    pub fn reader(s: *const Session, buf: []u8, len: usize) Rx {
+        return .{ .buf = buf, .opened = s.plain, .at = s.plain, .end = len };
     }
 
     fn onRecord(s: *Session, record: []u8, rx: *Rx, out: []u8) Error!?Event {
@@ -279,9 +282,8 @@ const Fake = struct {
                 },
             };
             const left = f.s.leftover(&f.rx);
-            mem.copyForwards(u8, f.rx.buf, left.plain);
-            mem.copyForwards(u8, f.rx.buf[left.plain.len..], left.sealed);
-            f.rx = f.s.reader(f.rx.buf, left.plain.len + left.sealed.len);
+            mem.copyForwards(u8, f.rx.buf, left);
+            f.rx = f.s.reader(f.rx.buf, left.len);
         }
     }
 

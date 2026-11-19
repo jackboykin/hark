@@ -5,7 +5,7 @@ token: u32,
 fd: posix.fd_t,
 state: enum { connecting, handshaking, established, alerted } = .connecting,
 session: dot.Session = undefined,
-held: []u8 = &.{},
+held: stream.Held = .{},
 next_id: u16 = 0,
 unsent: std.ArrayList(u8) = .empty,
 why: []const u8 = "silence",
@@ -22,6 +22,7 @@ const dot = @import("dot.zig");
 const tls13 = @import("tls13.zig");
 const Edge = @import("edge.zig");
 const carrier = @import("carrier.zig");
+const stream = @import("stream.zig");
 
 const Socket = @This();
 
@@ -62,7 +63,7 @@ pub fn close(sock: *Socket) void {
     sys.close(sock.fd);
     if (sock.state != .connecting) sock.session.deinit();
     sock.unsent.deinit(e.gpa);
-    if (sock.held.len != 0) e.work.free(sock.held);
+    sock.held.deinit(e.work);
 }
 
 pub fn heard(sock: *const Socket) bool {
@@ -115,24 +116,19 @@ pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
         if (!try sock.flushUnsent()) return .{ .ended = .closed };
     }
     if (events & (linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR | linux.EPOLL.RDHUP) == 0) return .nothing;
-    const held = sock.held.len;
-    const rc = linux.read(sock.fd, sh.rx[held..].ptr, sh.rx.len - held);
-    switch (linux.errno(rc)) {
-        .SUCCESS => if (rc == 0) {
+    const got = switch (sock.held.read(sock.edge.work, sock.fd, &sh.rx)) {
+        .bytes => |b| b,
+        .wait => return .nothing,
+        .ended => {
             sock.why = "eof";
             return .{ .ended = .closed };
         },
-        .AGAIN, .INTR => return .nothing,
-        else => |err| {
+        .failed => |err| {
             sock.sawErrno(err);
             return .{ .ended = .closed };
         },
-    }
-    @memcpy(sh.rx[0..held], sock.held);
-    sh.read = sock.session.reader(&sh.rx, held);
-    sh.read.end += rc;
-    if (held != 0) sock.edge.work.free(sock.held);
-    sock.held = &.{};
+    };
+    sh.read = sock.session.reader(&sh.rx, got.len);
     return .read;
 }
 
@@ -166,12 +162,7 @@ pub fn next(sock: *Socket, sh: *Shared) !?Event {
             if (err != error.AlertHeard) _ = sock.put(sock.session.alert(&sh.out, tls13.alert(@errorCast(err)))) catch {};
             return .{ .ended = .failed };
         }) orelse {
-            const left = sock.session.leftover(&sh.read);
-            if (left.plain.len + left.sealed.len != 0) {
-                sock.held = try sock.edge.work.alloc(u8, left.plain.len + left.sealed.len);
-                @memcpy(sock.held[0..left.plain.len], left.plain);
-                @memcpy(sock.held[left.plain.len..], left.sealed);
-            }
+            try sock.held.keep(sock.edge.work, sock.session.leftover(&sh.read));
             return null;
         };
         switch (ev) {

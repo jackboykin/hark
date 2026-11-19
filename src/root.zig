@@ -48,6 +48,7 @@ test {
     _ = @import("slab.zig");
     _ = @import("special_use.zig");
     _ = @import("store.zig");
+    _ = @import("stream.zig");
     _ = @import("stub.zig");
     _ = @import("sys.zig");
     _ = @import("sys_linux.zig");
