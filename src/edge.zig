@@ -164,7 +164,7 @@ fn send(e: *Edge, ex: Exchange) !graph.Exposure {
         },
     };
     errdefer e.close(flight);
-    flight.seq = e.seq + 1;
+    flight.seq = e.seq +% 1;
     try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);
     return .cleartext;
@@ -246,7 +246,7 @@ fn finish(e: *Edge, id: CellId, completion: Completion) Event {
 
 pub fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: Timer.Kind) !void {
     try e.reserve();
-    e.seq += 1;
+    e.seq +%= 1;
     try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
 }
 

@@ -193,7 +193,7 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     try c.pending.ensureUnusedCapacity(e.gpa, 1);
     const at = try e.work.create(Carried);
     errdefer e.work.destroy(at);
-    const seq = e.seq + 1;
+    const seq = e.seq +% 1;
     try e.schedule(ex.deadline_ns, ex.id, seq, .carried);
     at.* = .{ .conn = c, .id = ex.id, .seq = seq, .wire = ex.wire, .asked_ns = e.now_ns };
     s.flights.putAssumeCapacity(ex.id, at);
