@@ -849,7 +849,7 @@ pub fn wireNameLen(wire: []const u8) usize {
 
 /// Where the names in a type's rdata lie: after `skip` octets and `strings`
 /// character-strings. `tail` is the octet count after them; null allows any.
-const Embedded = struct {
+pub const Embedded = struct {
     skip: u8 = 0,
     strings: u8 = 0,
     names: u8,
@@ -869,7 +869,7 @@ const Embedded = struct {
     };
 };
 
-fn embedded(rtype: RType) ?Embedded {
+pub fn embedded(rtype: RType) ?Embedded {
     return switch (rtype) {
         .ns, .md, .mf, .cname, .mb, .mg, .mr, .ptr => .{ .names = 1, .spelling = .rfc1035 },
         .minfo => .{ .names = 2, .spelling = .rfc1035 },
@@ -951,6 +951,12 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     const wire = try wireOfDotted(&buf, dotted, true);
     if (wire.len == 1) return .root;
     return .{ .wire = try allocator.dupe(u8, wire) };
+}
+
+/// Bytes, not a Name, which holds names lowercase.
+pub fn spelledWire(allocator: Allocator, dotted: []const u8) Error![]const u8 {
+    var buf: Name.Buf = undefined;
+    return allocator.dupe(u8, try wireOfDotted(&buf, dotted, false));
 }
 
 fn wireOfDotted(buf: *Name.Buf, dotted: []const u8, comptime lower: bool) Error![]u8 {
