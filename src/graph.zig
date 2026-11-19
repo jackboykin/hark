@@ -963,8 +963,10 @@ pub const Graph = struct {
             u.* = r;
             return;
         }
+        // Picked by the newcomer's keyed hash, as the desk's failures are, so
+        // no asker can choose it.
         if (g.failed.count() >= max_failed) {
-            const at = g.edge.rng.uintLessThan(usize, g.failed.count());
+            const at = Key.Context.hash(.{}, key) % g.failed.count();
             const old = g.failed.keys()[at];
             g.failed.swapRemoveAt(at);
             g.gpa.free(old.name);
