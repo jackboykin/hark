@@ -193,8 +193,7 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     try c.pending.ensureUnusedCapacity(e.gpa, 1);
     const at = try e.work.create(Carried);
     errdefer e.work.destroy(at);
-    const seq = e.seq +% 1;
-    try e.schedule(ex.deadline_ns, ex.id, seq, .carried);
+    const seq = try e.schedule(ex.deadline_ns, .{ .carried = ex.id });
     at.* = .{ .conn = c, .id = ex.id, .seq = seq, .wire = ex.wire, .asked_ns = e.now_ns };
     s.flights.putAssumeCapacity(ex.id, at);
     s.stats.getPtr(c.carrier).carried += 1;
@@ -250,8 +249,7 @@ fn rearm(s: *Sessions, c: *Conn) !void {
     if (c.carrier.due()) |d| at = @min(at, d);
     if (c.wake_ns > now and c.wake_ns <= at) return;
     c.wake_ns = at;
-    c.wake_seq +%= 1;
-    try s.edge.schedule(at, c.wake_seq, c.carrier.token(), .conn);
+    c.wake_seq = try s.edge.schedule(at, .{ .conn = c.carrier.token() });
 }
 
 fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn {

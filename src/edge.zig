@@ -47,13 +47,14 @@ pub const Event = union(enum) {
 const Timer = struct {
     at_ns: i64,
     seq: u32,
-    id: CellId,
-    /// By kind: a wake's cell generation, a timeout's flight sequence, or a
-    /// session's token, whose wake sequence then rides in `id`.
-    gen: u32,
-    kind: Kind,
+    due: Due,
 
-    const Kind = enum { timeout, wake, carried, conn };
+    const Due = union(enum) {
+        wake: struct { id: CellId, gen: u32 },
+        timeout: CellId,
+        carried: CellId,
+        conn: u32,
+    };
 
     fn before(_: void, a: Timer, b: Timer) std.math.Order {
         return switch (std.math.order(a.at_ns, b.at_ns)) {
@@ -132,7 +133,7 @@ fn sendErased(ctx: *anyopaque, ex: Exchange) graph.Error!graph.Exposure {
 }
 
 fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) graph.Error!void {
-    try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, gen, .wake);
+    _ = try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, .{ .wake = .{ .id = id, .gen = gen } });
 }
 
 fn tick(e: *Edge) void {
@@ -164,8 +165,7 @@ fn send(e: *Edge, ex: Exchange) !graph.Exposure {
         },
     };
     errdefer e.close(flight);
-    flight.seq = e.seq +% 1;
-    try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
+    flight.seq = try e.schedule(ex.deadline_ns, .{ .timeout = ex.id });
     try e.flights.put(e.gpa, ex.id, flight);
     return .cleartext;
 }
@@ -244,10 +244,11 @@ fn finish(e: *Edge, id: CellId, completion: Completion) Event {
     return .{ .exchange = .{ .id = id, .completion = completion } };
 }
 
-pub fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: Timer.Kind) !void {
+pub fn schedule(e: *Edge, at_ns: i64, due: Timer.Due) !u32 {
     try e.reserve();
     e.seq +%= 1;
-    try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
+    try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .due = due });
+    return e.seq;
 }
 
 /// Room for one more event than there are timers and queued events: a timer
@@ -304,11 +305,11 @@ fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
         _ = e.timers.pop();
-        switch (t.kind) {
-            .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
-            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) e.queue.appendAssumeCapacity(e.finish(t.id, .timeout)),
-            .carried => e.sessions.?.flightDue(t.id, t.gen),
-            .conn => e.sessions.?.connDue(t.gen, t.id),
+        switch (t.due) {
+            .wake => |w| e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = w.id, .completion = .{ .wake = w.gen } } }),
+            .timeout => |id| if (e.flights.get(id)) |f| if (f.seq == t.seq) e.queue.appendAssumeCapacity(e.finish(id, .timeout)),
+            .carried => |id| e.sessions.?.flightDue(id, t.seq),
+            .conn => |token| e.sessions.?.connDue(token, t.seq),
         }
     }
 }
