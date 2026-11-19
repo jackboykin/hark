@@ -65,7 +65,7 @@ func (s *signer) bake(ranges []*rangeBlock, validity time.Duration, originalTTL 
 	}
 	for _, r := range ranges {
 		for _, e := range r.entries {
-			if e.adjust["unsigned"] {
+			if e.unsigned {
 				continue
 			}
 			var forced *key
@@ -117,8 +117,8 @@ func delegationCuts(e *entry) []string {
 
 func (s *signer) section(e *entry, rrs []dns.RR, cuts []string, forced *key, addr netip.Addr, wildcard string) ([]dns.RR, error) {
 	for _, rr := range rrs {
-		if ds, ok := rr.(*dns.DS); ok && ds.Digest == "" {
-			zone := cmp.Or(e.dsFrom[dnsutil.Canonical(ds.Hdr.Name)], ds.Hdr.Name)
+		ds, ok := rr.(*dns.DS)
+		if zone := e.dsFrom[rr.Header().Name]; ok && zone != "" {
 			k := s.named(zone)
 			if k == nil {
 				return nil, fmt.Errorf("placeholder DS at %s but no dnssec-zone %s to take a digest of", ds.Hdr.Name, zone)

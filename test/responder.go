@@ -247,16 +247,16 @@ func (r *responder) reply(addr netip.Addr, q *dns.Msg, tcp bool) *dns.Msg {
 		}
 		return m
 	}
-	if e.adjust["drop"] {
+	if e.drop {
 		return nil
 	}
 	h := e.reply
 	m.Authoritative, m.Truncated, m.RecursionAvailable = h.Authoritative, h.Truncated, h.RecursionAvailable
 	m.AuthenticatedData, m.CheckingDisabled, m.Rcode = h.AuthenticatedData, h.CheckingDisabled, h.Rcode
 	switch {
-	case e.adjust["drop_question"]:
+	case e.echo == "none":
 		m.Question = nil
-	case e.adjust["force_upper_qname"]:
+	case e.echo == "upper":
 		c := q.Question[0].Clone()
 		c.Header().Name = strings.ToUpper(c.Header().Name)
 		m.Question = []dns.RR{c}

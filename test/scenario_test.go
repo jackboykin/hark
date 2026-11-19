@@ -43,7 +43,7 @@ func TestScenarios(t *testing.T) {
 			if m := simOnly.FindSubmatch(text); m != nil {
 				t.Skip(string(m[1]))
 			}
-			sc, err := parse(path, text)
+			sc, err := load(path, text)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -81,28 +81,28 @@ func run(t *testing.T, sc *scenario) {
 		}
 		resp.step.Store(int64(s.n))
 		switch s.kind {
-		case "QUERY":
+		case "query":
 			r, err := askEntry(ctx, h.addr, s.entry, sc.clientTimeout)
 			if err != nil {
 				fail(s, "QUERY: %v", err)
 			}
 			last = r
-		case "CHECK_ANSWER":
+		case "check_answer":
 			if last == nil {
 				fail(s, "CHECK_ANSWER before any QUERY")
 			}
 			if err := checkAnswer(last, s.entry); err != nil {
 				fail(s, "%v", err)
 			}
-		case "CHECK_QUERY_LOG":
+		case "check_query_log":
 			if err := checkQueryLog(resp.queries(), s.entry); err != nil {
 				fail(s, "%v", err)
 			}
-		case "CHECK_MAX_QUERIES":
+		case "check_max_queries":
 			if n := len(resp.queries()); n > s.max {
 				fail(s, "CHECK_MAX_QUERIES: hark sent %d upstream queries, bound is %d", n, s.max)
 			}
-		case "CHECK_OUT_QUERY":
+		case "check_out_query":
 			// A query to another address may still be on its way into the
 			// log and sort before the cursor; no scenario sends one
 			// unawaited.
@@ -117,11 +117,13 @@ func run(t *testing.T, sc *scenario) {
 				fail(s, "(log position %d): %v", cursor, err)
 			}
 			cursor++
-		case "TIME_PASSES":
+		case "time_passes":
 			if err := advanceClock(ctx, h.addr, s.seconds); err != nil {
 				fail(s, "TIME_PASSES: %v", err)
 			}
 			time.Sleep(100 * time.Millisecond)
+		default:
+			fail(s, "%s runs in the sim alone", s.kind)
 		}
 	}
 }

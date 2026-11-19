@@ -28,6 +28,7 @@ func build() (string, error) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("zig %s: %w\n%s", strings.Join(args, " "), err, out)
 	}
+	rplBin = filepath.Join(prefix, "bin", "rpl")
 	return filepath.Join(prefix, "bin", "hark"), nil
 }
 

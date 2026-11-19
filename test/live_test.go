@@ -22,7 +22,7 @@ import (
 
 func launchText(t *testing.T, text string, tune func(*config)) (*responder, *hark) {
 	t.Helper()
-	sc, err := parse(t.Name(), []byte(text))
+	sc, err := load(t.Name(), []byte(text))
 	if err != nil {
 		t.Fatal(err)
 	}

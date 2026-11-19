@@ -1,5 +1,5 @@
 //! Loader for `.rpl` scenarios: the hark dialect of Unbound's testbound
-//! format. Whatever test/rpl.go accepts, this must too.
+//! format, for the sim and, printed as JSON, the live harness.
 //!
 //! Everything is allocated from the caller's arena, never freed piecemeal.
 const std = @import("std");
@@ -698,6 +698,71 @@ const Parser = struct {
         return std.fmt.parseInt(T, text, 10) catch p.fail("bad integer");
     }
 };
+
+/// entry's header, question and records as one DNS message in base64.
+pub fn print(scenario: Scenario, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w };
+    try put(&s, scenario);
+}
+
+fn put(s: *std.json.Stringify, v: anytype) std.Io.Writer.Error!void {
+    const T = @TypeOf(v);
+    if (T == []const u8) return s.write(v);
+    if (T == dns.Name) {
+        var buf: [dns.max_dotted_len + 2]u8 = undefined;
+        const text = v.formatInto(buf[0 .. dns.max_dotted_len + 1]);
+        buf[text.len] = '.';
+        return s.write(buf[0 .. text.len + 1]);
+    }
+    if (T == na.Address) {
+        var buf: [64]u8 = undefined;
+        return s.write(na.format(v, &buf));
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            try s.beginObject();
+            inline for (info.field_names) |field| if (comptime !(T == Entry and inMessage(field))) {
+                const f = @field(v, field);
+                if (@typeInfo(@TypeOf(f)) != .optional or f != null) {
+                    try s.objectField(field);
+                    try put(s, f);
+                }
+            };
+            if (T == Entry) {
+                try s.objectField("message");
+                try putMessage(s, v);
+            }
+            try s.endObject();
+        },
+        .pointer, .array => {
+            try s.beginArray();
+            for (v) |x| try put(s, x);
+            try s.endArray();
+        },
+        .optional => try put(s, v.?),
+        .@"enum" => |info| if (info.mode == .exhaustive) try s.write(@tagName(v)) else try s.write(@backingInt(v)),
+        else => try s.write(v),
+    }
+}
+
+fn inMessage(comptime field: []const u8) bool {
+    for ([_][]const u8{ "flags", "question", "answers", "authorities", "additionals" }) |m| if (mem.eql(u8, field, m)) return true;
+    return false;
+}
+
+fn putMessage(s: *std.json.Stringify, e: Entry) std.Io.Writer.Error!void {
+    var wire: [65535]u8 = undefined;
+    const msg = dns.serializeMessage(&wire, .{
+        .header = .{ .id = 0, .flags = e.flags },
+        .question = e.question,
+        .answers = e.answers,
+        .authorities = e.authorities,
+        .additionals = e.additionals,
+    }) catch return error.WriteFailed;
+    const b64 = std.base64.standard.Encoder;
+    var text: [b64.calcSize(wire.len)]u8 = undefined;
+    try s.write(b64.encode(&text, msg));
+}
 
 fn enumIgnoreCase(comptime E: type, s: []const u8) ?E {
     inline for (@typeInfo(E).@"enum".field_names) |field_name| {

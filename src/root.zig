@@ -4,6 +4,7 @@ pub const config = @import("config.zig");
 pub const log = @import("log.zig");
 pub const monotonic = @import("monotonic.zig");
 pub const rand = @import("rand.zig");
+pub const rpl = @import("sim/rpl.zig");
 pub const serve = @import("serve.zig");
 pub const slab = @import("slab.zig");
 

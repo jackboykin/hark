@@ -46,6 +46,15 @@ pub fn build(b: *std.Build) !void {
         exe.link_function_sections = true;
     }
     b.installArtifact(exe);
+    if (testing_enabled) b.installArtifact(b.addExecutable(.{
+        .name = "rpl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/rpl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hark", .module = mod }},
+        }),
+    }));
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
@@ -77,7 +86,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
 
-    const fmt = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("bench"), b.path("build.zig"), b.path("build.zig.zon"), b.path("lint.zig") }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("bench"), b.path("build.zig"), b.path("build.zig.zon"), b.path("lint.zig"), b.path("test/rpl.zig") }, .check = true });
     b.step("fmt", "Check that every zig file is formatted").dependOn(&fmt.step);
 
     const lint_exe = b.addExecutable(.{
@@ -86,7 +95,7 @@ pub fn build(b: *std.Build) !void {
     });
     const lint = b.addRunArtifact(lint_exe);
     lint.addDirectoryArg(.zig_lib);
-    lint.addArgs(&.{ "src", "bench", "build.zig", "lint.zig" });
+    lint.addArgs(&.{ "src", "bench", "build.zig", "lint.zig", "test/rpl.zig" });
     lint.setCwd(b.path("."));
     // It reads its own file list, which the build cannot see change.
     lint.has_side_effects = true;
