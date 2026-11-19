@@ -109,31 +109,19 @@ pub fn validateDnskeyRrset(
     zone_name: dns.Name,
     at: rrsig.Verifier,
 ) !?dns.RrsigData {
-    const filtered = try collect(scratch, dnskey_records, null, .dnskey);
     const ds = try anchors(scratch, ds_records);
+    // A DS advertising ML-DSA-44 makes its key the only one that counts
+    // (draft-westerbaan-dnssec-mldsa §7.2), or stripping it is a downgrade.
+    const pq = hasMlDsaDs(ds);
     var anchored: Keyset = try .init(scratch, dnskey_records);
     var n: usize = 0;
-    for (anchored.keys) |k| if (anchoredBy(ds, k.dnskey, k.tag, zone_name)) {
+    for (anchored.keys) |k| if ((!pq or k.dnskey.algorithm == .mldsa44) and anchoredBy(ds, k.dnskey, k.tag, zone_name)) {
         anchored.keys[n] = k;
         n += 1;
     };
     anchored.keys = anchored.keys[0..n];
-
-    // A DS advertising ML-DSA-44 makes its RRSIG the only one that counts
-    // (draft-westerbaan-dnssec-mldsa §7.2), or stripping it is a downgrade.
-    const pq = hasMlDsaDs(ds);
-    var tried: usize = 0;
-    for (dnskey_records) |rrsig_rr| {
-        if (rrsig_rr.rtype != .rrsig) continue;
-        const sig = rrsig_rr.rrsig();
-        if (sig.type_covered != .dnskey) continue;
-        if (pq and sig.algorithm != .mldsa44) continue;
-        if (!sig.signer_name.eql(zone_name) or !usable(sig, at.now) or anchored.of(sig).len == 0) continue;
-        if (tried == max_sigs_per_set) break;
-        tried += 1;
-        if (rrsetVerifiesWithAnyKey(sig, &anchored, filtered, at) catch return null) return sig;
-    }
-    return null;
+    const w: Weighed = .{ .rrs = dnskey_records, .owner = zone_name, .rtype = .dnskey, .zone = zone_name, .keys = &anchored, .now = at.now };
+    return if (try weigh(scratch, w, at)) |v| v.sig else null;
 }
 
 fn hasMlDsaDs(anchoring: []const dns.DsData) bool {
@@ -209,6 +197,8 @@ pub const Keyset = struct {
         for (records) |rr| {
             if (rr.rtype != .dnskey) continue;
             k.zone = k.zone orelse rr.name;
+            // A record the signature never covered must not become a key.
+            if (!rr.name.eql(k.zone.?)) return .{ .keys = &.{} };
             const dk = rr.dnskey();
             if (!isValidZoneKey(dk)) continue;
             k.keys[n] = .{ .tag = rrsig.keyTag(dk), .dnskey = dk };
@@ -228,12 +218,12 @@ pub const Keyset = struct {
 
 /// The whole set, however large: verifying part of it would vouch for the
 /// rest.
-fn collect(scratch: mem.Allocator, rrs: []const dns.ResourceRecord, owner: ?dns.Name, rtype: dns.RType) !rrsig.Canonical {
+fn collect(scratch: mem.Allocator, rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType) !rrsig.Canonical {
     var n: usize = 0;
-    for (rrs) |rr| n += @intFromBool(rr.rtype == rtype and (owner == null or rr.name.eql(owner.?)));
+    for (rrs) |rr| n += @intFromBool(rr.rtype == rtype and rr.name.eql(owner));
     const set = try scratch.alloc(dns.ResourceRecord, n);
     n = 0;
-    for (rrs) |rr| if (rr.rtype == rtype and (owner == null or rr.name.eql(owner.?))) {
+    for (rrs) |rr| if (rr.rtype == rtype and rr.name.eql(owner)) {
         set[n] = rr;
         n += 1;
     };
@@ -430,14 +420,18 @@ pub fn validateRrset(
     dnskey_records: []const dns.ResourceRecord,
     at: rrsig.Verifier,
 ) !?Verified {
-    const set = try collect(scratch, records, owner, covered_type);
-    if (set.records.len == 0) return null;
     const keyset: Keyset = try .init(scratch, dnskey_records);
+    const zone = keyset.zone orelse return null;
+    return weigh(scratch, .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = zone, .keys = &keyset, .now = at.now, .unexpanded = unexpanded }, at);
+}
 
-    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .keys = &keyset, .now = at.now, .unexpanded = unexpanded };
+fn weigh(scratch: mem.Allocator, w: Weighed, at: rrsig.Verifier) !?Verified {
+    const set = try collect(scratch, w.rrs, w.owner, w.rtype);
+    if (set.records.len == 0) return null;
+    var it = w;
     while (it.next()) |i| {
-        const sig = records[i].rrsig();
-        if (rrsetVerifiesWithAnyKey(sig, &keyset, set, at) catch return null) {
+        const sig = w.rrs[i].rrsig();
+        if (rrsetVerifiesWithAnyKey(sig, w.keys, set, at) catch return null) {
             // Drain so `passed` covers the signatures after the one that verified.
             while (it.next()) |_| {}
             return .{ .sig = sig, .unweighed = it.passed };
@@ -470,13 +464,9 @@ pub fn verifyAuthorityProofSigs(
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
         // Read whole from the section, not from its group: a validator rests
         // on no order it did not check.
-        const set = try collect(scratch, authorities, rr.name, rr.rtype);
-        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .keys = &keyset, .now = at.now, .unexpanded = true };
-        const sig = while (it.next()) |j| {
-            const sig = authorities[j].rrsig();
-            if (rrsetVerifiesWithAnyKey(sig, &keyset, set, at) catch return null) break sig;
-        } else return null;
-        cap = cap.meet(.of(sig, at.now));
+        const w: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .keys = &keyset, .now = at.now, .unexpanded = true };
+        const v = try weigh(scratch, w, at) orelse return null;
+        cap = cap.meet(.of(v.sig, at.now));
     }
     return cap;
 }
@@ -1042,6 +1032,31 @@ test "validateRrset: a signature no key could check takes no turn under the cap"
     var budget: rrsig.ValidationBudget = .{};
     try testing.expect(try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
     try testing.expectEqual(1, budget.sig_verify_spent);
+}
+
+test "validateDnskeyRrset: a DNSKEY at another owner fails the set, and its key signs nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const now: u32 = 1_700_000_000;
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(testing.io);
+    var zone_pub = kp.public_key.toBytes();
+    const zone_key = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, .{ .flags = dns.DnskeyData.zone_flag, .protocol = 3, .algorithm = .ed25519, .public_key = &zone_pub })};
+    var zone_sig: [64]u8 = undefined;
+    const keys = try rrsig.testSignRrsetBy(kp, &zone_key, .dnskey, rrsig.test_owner, .ed25519, &zone_sig, &zone_pub);
+    var digest = dsDigest(Sha256, rrsig.test_owner, keys.dnskey);
+    const ds: dns.DsData = .{ .key_tag = rrsig.keyTag(keys.dnskey), .algorithm = .ed25519, .digest_type = .sha256, .digest = &digest };
+
+    const a = [_]dns.ResourceRecord{.fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } })};
+    var foreign_sig: [64]u8 = undefined;
+    var foreign_pub: [32]u8 = undefined;
+    const foreign = try rrsig.testSignRrsetBy(std.crypto.sign.Ed25519.KeyPair.generate(testing.io), &a, .a, rrsig.test_owner, .ed25519, &foreign_sig, &foreign_pub);
+
+    const set = [_]dns.ResourceRecord{ zone_key[0], dnskeyRr(.lit("other.example"), foreign.dnskey), rrsigRr(rrsig.test_owner, keys.rrsig) };
+    var budget: rrsig.ValidationBudget = .{};
+    const at: rrsig.Verifier = .{ .now = now, .budget = &budget, .memo = test_memo };
+    try testing.expect(try validateDnskeyRrset(arena.allocator(), &set, &.{ds}, rrsig.test_owner, at) == null);
+    const answers = [_]dns.ResourceRecord{ a[0], rrsigRr(rrsig.test_owner, foreign.rrsig) };
+    try testing.expect(try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &set, at) == null);
 }
 
 test "validateRrset: 70 records verify whole, and a signature over 64 launders no other 6" {
