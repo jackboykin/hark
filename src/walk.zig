@@ -851,7 +851,7 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: 
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
     for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rrsig().labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rrsig().signer_name);
-    std.mem.sort(dns.Name, signers.items, {}, before);
+    dnssec.sort(dns.Name, signers.items, before);
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
         life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);

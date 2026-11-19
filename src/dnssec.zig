@@ -43,6 +43,13 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
+/// In place and unstable, for sets whose equal items are one item or whose
+/// order among equals nothing rests on. Not std.mem.sort: a safe build fills
+/// its 512-item cache on every call, before it looks at the length.
+pub fn sort(comptime T: type, items: []T, comptime lessThan: fn (void, T, T) bool) void {
+    std.sort.heap(T, items, {}, lessThan);
+}
+
 /// The DS set as keys look themselves up in it: sorted by key tag,
 /// algorithm, digest type and digest, so each key is hashed once a digest
 /// type and found by search, never paired with each DS. RFC 4509 §3: a SHA-1 DS is
@@ -55,7 +62,7 @@ fn anchors(scratch: mem.Allocator, ds_records: []const dns.DsData) ![]const dns.
     } else false;
     var kept: std.ArrayList(dns.DsData) = try .initCapacity(scratch, ds_records.len);
     for (ds_records) |ds| if (ds.digest_type != .sha1 or !sha1_ignored) kept.appendAssumeCapacity(ds);
-    std.mem.sort(dns.DsData, kept.items, {}, struct {
+    sort(dns.DsData, kept.items, struct {
         fn lessThan(_: void, a: dns.DsData, b: dns.DsData) bool {
             return dsOrder(a, b) == .lt;
         }
@@ -205,8 +212,7 @@ pub const Keyset = struct {
             n += 1;
         }
         k.keys = k.keys[0..n];
-        // Stable: keys sharing a tag are tried in the order they came.
-        std.mem.sort(Key, k.keys, {}, Key.lessThan);
+        sort(Key, k.keys, Key.lessThan);
         return k;
     }
 
