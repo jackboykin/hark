@@ -128,7 +128,7 @@ pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
 }
 
 fn servfailOf(q: dns.Question, why: model.Failure) Served {
-    var s = servfail(q, .{ .code = why.code(), .text = why.text() });
+    var s = servfail(q, why.ede());
     s.theirs = why.cause() != .zone;
     return s;
 }
@@ -573,14 +573,10 @@ fn failureKey(buf: *[dns.max_name_wire_len + 3]u8, q: dns.Question, cd: bool) []
 
 fn heldFailure(f: *const Failures, q: dns.Question, cd: bool, now_ns: i64) ?Held {
     var buf: [dns.max_name_wire_len + 3]u8 = undefined;
-    const failure = switch (f.get(failureKey(&buf, q, cd), now_ns) orelse return null) {
-        .stale => return .stale,
-        .failure => |x| x,
+    return switch (f.get(failureKey(&buf, q, cd), now_ns) orelse return null) {
+        .stale => .stale,
+        .failure => |x| .{ .failed = x.ede.recalled() },
     };
-    return .{ .failed = switch (failure.ede.code) {
-        .dnssec_bogus, .unsupported_nsec3_iterations => failure.ede,
-        .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota, .stale_answer, .stale_nxdomain_answer => .{ .code = .cached_error },
-    } };
 }
 
 fn noteFailure(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {

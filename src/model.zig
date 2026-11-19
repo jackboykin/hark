@@ -201,6 +201,11 @@ pub const Failure = struct {
         return named.get(f.name).text;
     }
 
+    pub fn ede(f: Failure) dns.Ede {
+        const e: dns.Ede = .{ .code = f.code(), .text = f.text() };
+        return if (f.remembered) e.recalled() else e;
+    }
+
     pub fn cause(f: Failure) Cause {
         return named.get(f.name).cause;
     }

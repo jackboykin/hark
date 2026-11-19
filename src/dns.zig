@@ -672,6 +672,16 @@ pub const Ede = struct {
         over_quota = 32,
     };
 
+    /// What a failure answered from memory may say: hark did no work for this
+    /// asker, so only a DNSSEC failure, true of the data whoever asks, keeps
+    /// its code.
+    pub fn recalled(e: Ede) Ede {
+        return switch (e.code) {
+            .dnssec_bogus, .unsupported_nsec3_iterations => e,
+            .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota, .stale_answer, .stale_nxdomain_answer => .{ .code = .cached_error },
+        };
+    }
+
     pub fn option(self: Ede, buf: *[64]u8) EdnsOption {
         mem.writeInt(u16, buf[0..2], @backingInt(self.code), .big);
         const n = @min(self.text.len, buf.len - 2);
