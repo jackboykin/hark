@@ -14,6 +14,7 @@ const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
 const dnssec = @import("dnssec.zig");
+const rrsig = @import("rrsig.zig");
 const delegation = @import("delegation.zig");
 const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
@@ -109,7 +110,6 @@ pub const ServerConfig = struct {
     }
 
     pub fn trustAnchors(self: ServerConfig) []const dns.DsData {
-        if (comptime !build_options.testing_enabled) return &dnssec.root_ds_records;
         return if (self.trust_anchors.len > 0) self.trust_anchors else &dnssec.root_ds_records;
     }
 };
@@ -276,7 +276,6 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
             cfg.allow_loopback_upstreams = b;
         }
         if (resolver.get("trust-anchors", .string_array)) |entries| {
-            if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.trust_anchors = try parseTrustAnchors(arena, entries);
         }
         if (resolver.get("dnssec", .boolean)) |d| cfg.dnssec = d;
@@ -357,7 +356,19 @@ pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !Serv
 
 fn parseTrustAnchors(arena: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
     const list = try arena.alloc(dns.DsData, strs.len);
-    for (list, strs) |*ta, s| ta.* = try parseTrustAnchor(arena, s);
+    var checkable = strs.len == 0;
+    for (list, strs) |*ta, s| {
+        ta.* = parseTrustAnchor(arena, s) catch |err| {
+            if (err == error.InvalidValue) errLog("config: trust-anchors entry '{s}' must be a DS as \"key-tag algorithm digest-type digest\"", .{s});
+            return err;
+        };
+        checkable = checkable or rrsig.isSupportedAlgorithm(ta.algorithm);
+    }
+    // Anchors hark cannot check would make every answer bogus.
+    if (!checkable) {
+        errLog("config: trust-anchors names no algorithm hark validates", .{});
+        return error.InvalidValue;
+    }
     return list;
 }
 
@@ -572,17 +583,34 @@ test "trust-anchors rejects malformed entries" {
     }) |s| try testing.expectError(error.InvalidValue, parseTrustAnchor(arena.allocator(), s));
 }
 
+test "trust-anchors replace the root's, and must hold one hark can check" {
+    var cfg = try parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["14365 13 2 8E79144156564567D0D745335E55353A4B29A8F4782A6F3CA5C3F49D48097A5C"]
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 1), cfg.trustAnchors().len);
+    try testing.expectEqual(@as(u16, 14365), cfg.trustAnchors()[0].key_tag);
+
+    var unset = try parseConfig(testing.allocator, "[resolver]\ntrust-anchors = []\n");
+    defer unset.deinit();
+    try testing.expectEqual(dnssec.root_ds_records.len, unset.trustAnchors().len);
+
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 5 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
+    ));
+}
+
 test "test-only knobs gated on -Dtesting" {
     const cfg_text =
         \\[resolver]
         \\upstream-port = 5353
-        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
     ;
     if (build_options.testing_enabled) {
         var cfg = try parseConfig(testing.allocator, cfg_text);
         defer cfg.deinit();
         try testing.expectEqual(@as(u16, 5353), cfg.upstream_port);
-        try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
     } else {
         try testing.expectError(error.TestOnlyConfigKey, parseConfig(testing.allocator, cfg_text));
     }
