@@ -235,6 +235,7 @@ const ExchangeScratch = struct {
     /// The payer's deadline came before the wait the server is owed, so a
     /// timeout says nothing about the server or its zone.
     cut_short: bool,
+    outcome: *Value,
 };
 
 pub const Scratch = union(enum) {
@@ -844,7 +845,8 @@ pub const Graph = struct {
                 c.state = .{ .fact = owned };
                 if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
             },
-            .addr, .answer, .exchange, .refresh, .ahead, .parental => {
+            .exchange => |o| return g.settleExchange(id, o),
+            .addr, .answer, .refresh, .ahead, .parental => {
                 const owned = try c.own(value);
                 c.bare_expires_ns = expires_ns;
                 c.state = .{ .fact = owned };
@@ -860,6 +862,16 @@ pub const Graph = struct {
             },
         }
         g.woken(id, value == .answer);
+    }
+
+    fn settleExchange(g: *Graph, id: CellId, outcome: Outcome) void {
+        const c = g.cell(id);
+        std.debug.assert(!c.settled());
+        const owned = c.scratch.exchange.outcome;
+        owned.* = .{ .exchange = outcome };
+        c.bare_expires_ns = g.now();
+        c.state = .{ .fact = owned };
+        g.woken(id, false);
     }
 
     pub fn settleAs(g: *Graph, id: CellId, v: *store.Blob) !void {
@@ -1418,6 +1430,7 @@ pub const Graph = struct {
         const arena = g.cell(id).arena.allocator();
         const query = try dns.buildQuery(arena, qid, qname, qtype, g.cfg.trust_anchors != null, if (case == .random) rng else null);
         const sc = try arena.create(ExchangeScratch);
+        const outcome = try arena.create(Value);
         const est = g.rtt.get(server);
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
@@ -1428,7 +1441,7 @@ pub const Graph = struct {
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
-        sc.* = .{ .id = qid, .sent = query.spelled, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
+        sc.* = .{ .id = qid, .sent = query.spelled, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at, .outcome = outcome };
         g.cell(id).scratch = .{ .exchange = sc };
         const exposure = try g.edge.send(.{
             .id = id,
