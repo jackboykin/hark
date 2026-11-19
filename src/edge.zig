@@ -155,9 +155,13 @@ pub fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
 
 fn send(e: *Edge, ex: Exchange) !graph.Exposure {
     if (e.sessions) |s| if (try s.carry(ex)) return .encrypted;
-    var flight = e.open(ex) catch {
-        try e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
-        return .none;
+    try e.reserve();
+    var flight = e.open(ex) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            e.push(.{ .exchange = .{ .id = ex.id, .completion = .unsent } });
+            return .none;
+        },
     };
     flight.seq = e.seq + 1;
     try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
@@ -240,12 +244,19 @@ fn finish(e: *Edge, id: CellId, completion: Completion) Event {
 }
 
 pub fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: Timer.Kind) !void {
+    try e.reserve();
     e.seq += 1;
     try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
 }
 
-pub fn push(e: *Edge, ev: Event) !void {
-    try e.queue.append(e.gpa, ev);
+/// Room for one more event than there are timers and queued events: a timer
+/// or an exchange yields at most one, so what it owes is always queued.
+fn reserve(e: *Edge) !void {
+    try e.queue.ensureTotalCapacity(e.gpa, e.queue.items.len + e.timers.count() + 1);
+}
+
+pub fn push(e: *Edge, ev: Event) void {
+    e.queue.appendAssumeCapacity(ev);
 }
 
 fn pop(e: *Edge) ?Event {
@@ -291,7 +302,6 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
-        try e.queue.ensureUnusedCapacity(e.gpa, 1);
         _ = e.timers.pop();
         switch (t.kind) {
             .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
@@ -384,26 +394,6 @@ test "a consumer that stops between events leaves nothing behind" {
 
     try std.testing.expect((try e.next(std.math.maxInt(i64))).? == .client);
     try std.testing.expectEqual(2, e.batch_len);
-}
-
-test "a timer whose event can't be queued stays due" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var e = try Edge.init(failing.allocator());
-    defer e.deinit();
-
-    const server = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
-    defer sys.close(server);
-    try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
-    var sa: na.PosixAddress = undefined;
-    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    _ = linux.getsockname(server, &sa.any, &sa_len);
-    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = 0 });
-
-    failing.fail_index = failing.alloc_index;
-    try std.testing.expectError(error.OutOfMemory, e.next(0));
-    failing.fail_index = std.math.maxInt(usize);
-    const ev = ((try e.next(0)) orelse return error.TestUnexpectedResult).exchange;
-    try std.testing.expect(ev.id == 1 and ev.completion == .timeout);
 }
 
 const Peer = struct {

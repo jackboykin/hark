@@ -395,12 +395,12 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
                 c.last_reply_ns = s.edge.now_ns;
                 s.stats.getPtr(c.carrier).answered += 1;
                 s.setStanding(c.key, c.carrier, persistence_ns, true);
-                try s.edge.push(s.completed(at, .{ .reply = .{ .bytes = r.bytes, .stream = true, .queued_ns = at.queued_ns } }));
+                s.edge.push(s.completed(at, .{ .reply = .{ .bytes = r.bytes, .stream = true, .queued_ns = at.queued_ns } }));
             },
             .refused => |id| {
                 const at = (c.pending.fetchSwapRemove(id) orelse continue).value;
                 s.stats.getPtr(c.carrier).refused += 1;
-                try s.edge.push(s.completed(at, .timeout));
+                s.edge.push(s.completed(at, .timeout));
             },
         },
     }
