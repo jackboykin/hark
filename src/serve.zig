@@ -43,11 +43,11 @@ const Conn = struct {
     last_ns: i64,
     owed: u32 = 0,
     draining: bool = false,
-    out: std.ArrayList(u8) = .empty,
+    unsent: stream.Unsent = .{},
     blocked_ns: i64 = 0,
 
     fn interest(c: *const Conn) u32 {
-        const io: u32 = if (c.out.items.len != 0) linux.EPOLL.OUT else if (c.draining) 0 else linux.EPOLL.IN;
+        const io: u32 = if (c.unsent.owing()) linux.EPOLL.OUT else if (c.draining) 0 else linux.EPOLL.IN;
         return io | linux.EPOLL.RDHUP;
     }
 };
@@ -259,7 +259,7 @@ const Server = struct {
             },
             // RFC 7766 §6.2.4: a client that closed its side is sent nothing more,
             // even with answers owed.
-            .conn => |c| if (events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) s.close(c) else if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c),
+            .conn => |c| if (events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) s.close(c) else if (c.unsent.owing()) try s.flush(c) else try s.readTcp(c),
             .signal => |fd| s.onSignal(fd),
             .free => {},
         }
@@ -340,7 +340,7 @@ const Server = struct {
     fn frames(s: *Server, c: *Conn, bytes: []u8) !void {
         const tok = c.token;
         var rest = bytes;
-        while (c.out.items.len == 0 and !c.draining) {
+        while (!c.unsent.owing() and !c.draining) {
             // Judged by its length alone, so a frame too long for a query is
             // never held while it arrives.
             if (rest.len >= 2 and mem.readInt(u16, rest[0..2], .big) > max_frame) return s.drop(c);
@@ -379,7 +379,7 @@ const Server = struct {
     }
 
     fn closeIfDone(s: *Server, c: *Conn) bool {
-        if (!c.draining or c.owed > 0 or c.out.items.len > 0) return false;
+        if (!c.draining or c.owed > 0 or c.unsent.owing()) return false;
         s.close(c);
         return true;
     }
@@ -408,7 +408,7 @@ const Server = struct {
         s.watched.items[c.token & slot_mask].w = .free;
         s.freed.appendAssumeCapacity(c.token & slot_mask);
         s.conns -= 1;
-        c.out.deinit(s.gpa);
+        c.unsent.deinit(s.gpa);
         c.held.deinit(s.gpa);
         s.gpa.destroy(c);
     }
@@ -423,8 +423,8 @@ const Server = struct {
                 .conn => |c| c,
                 .udp, .wildcard, .listen, .signal, .free => continue,
             };
-            const since = if (c.out.items.len != 0) c.blocked_ns else c.last_ns;
-            const owed_ns = if (c.owed > 0 and c.out.items.len == 0) @as(i64, s.g.cfg.resolve_ms) * std.time.ns_per_ms else 0;
+            const since = if (c.unsent.owing()) c.blocked_ns else c.last_ns;
+            const owed_ns = if (c.owed > 0 and !c.unsent.owing()) @as(i64, s.g.cfg.resolve_ms) * std.time.ns_per_ms else 0;
             if (s.e.now_ns - since >= idle_ns + owed_ns) s.drop(c);
         }
     }
@@ -871,44 +871,29 @@ const Server = struct {
                 mem.writeInt(u16, framed[0..2], @intCast(len), .big);
                 c.owed -= 1;
                 c.last_ns = s.e.now_ns;
-                var rest: []const u8 = framed;
-                if (c.out.items.len == 0) {
-                    const n = s.take(c, rest) orelse return;
-                    rest = rest[n..];
-                }
-                if (rest.len == 0) {
-                    _ = s.closeIfDone(c);
-                    return;
-                }
-                c.out.appendSlice(s.gpa, rest) catch return s.drop(c);
-                if (c.out.items.len == rest.len) {
-                    c.blocked_ns = s.e.now_ns;
-                    s.e.rewatch(c.fd, c.token, c.interest()) catch s.drop(c);
+                switch (c.unsent.put(s.gpa, c.fd, framed) catch return s.drop(c)) {
+                    .done => _ = s.closeIfDone(c),
+                    .began => {
+                        c.blocked_ns = s.e.now_ns;
+                        s.e.rewatch(c.fd, c.token, c.interest()) catch s.drop(c);
+                    },
+                    .failed => s.drop(c),
                 }
             },
         }
     }
 
     fn flush(s: *Server, c: *Conn) !void {
-        const n = s.take(c, c.out.items) orelse return;
-        if (n == 0) return;
-        c.last_ns = s.e.now_ns;
-        mem.copyForwards(u8, c.out.items, c.out.items[n..]);
-        c.out.shrinkRetainingCapacity(c.out.items.len - n);
-        if (c.out.items.len != 0) return;
-        if (s.closeIfDone(c)) return;
-        s.e.rewatch(c.fd, c.token, c.interest()) catch return s.drop(c);
-        try s.frames(c, c.held.bytes);
-    }
-
-    fn take(s: *Server, c: *Conn, bytes: []const u8) ?usize {
-        return sys.write(c.fd, bytes) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => {
-                s.drop(c);
-                return null;
+        switch (c.unsent.flush(s.gpa, c.fd)) {
+            .owing => {},
+            .failed => s.drop(c),
+            .drained => {
+                c.last_ns = s.e.now_ns;
+                if (s.closeIfDone(c)) return;
+                s.e.rewatch(c.fd, c.token, c.interest()) catch return s.drop(c);
+                try s.frames(c, c.held.bytes);
             },
-        };
+        }
     }
 };
 

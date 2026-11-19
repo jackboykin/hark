@@ -7,7 +7,7 @@ state: enum { connecting, handshaking, established, alerted } = .connecting,
 session: dot.Session = undefined,
 held: stream.Held = .{},
 next_id: u16 = 0,
-unsent: std.ArrayList(u8) = .empty,
+unsent: stream.Unsent = .{},
 why: []const u8 = "silence",
 
 const std = @import("std");
@@ -55,7 +55,7 @@ pub fn open(edge: *Edge, _: *Shared, server: na.Address, port: u16, token: u32) 
 
 pub fn close(sock: *Socket) void {
     const e = sock.edge;
-    if (sock.state == .established and sock.unsent.items.len == 0) {
+    if (sock.state == .established and !sock.unsent.owing()) {
         var out: [tls13.overhead + 2]u8 = undefined;
         const alert = sock.session.alert(&out, .close_notify);
         _ = linux.write(sock.fd, alert.ptr, alert.len);
@@ -112,9 +112,14 @@ pub fn spent(sock: *const Socket) bool {
 
 pub fn ready(sock: *Socket, sh: *Shared, events: u32) !News {
     if (sock.state == .connecting) return sock.connected();
-    if (sock.unsent.items.len != 0 and events & linux.EPOLL.OUT != 0) {
-        if (!try sock.flushUnsent()) return .{ .ended = .closed };
-    }
+    if (sock.unsent.owing() and events & linux.EPOLL.OUT != 0) switch (sock.unsent.flush(sock.edge.gpa, sock.fd)) {
+        .owing => {},
+        .drained => if (!sock.rewatch(linux.EPOLL.IN)) return .{ .ended = .closed },
+        .failed => |err| {
+            sock.sawErrno(err);
+            return .{ .ended = .closed };
+        },
+    };
     if (events & (linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR | linux.EPOLL.RDHUP) == 0) return .nothing;
     const got = switch (sock.held.read(sock.edge.work, sock.fd, &sh.rx)) {
         .bytes => |b| b,
@@ -200,36 +205,20 @@ pub fn flush(sock: *Socket, sh: *Shared) !bool {
 }
 
 fn put(sock: *Socket, bytes: []const u8) !bool {
-    var rest = bytes;
-    if (sock.unsent.items.len == 0) {
-        const rc = linux.write(sock.fd, rest.ptr, rest.len);
-        switch (linux.errno(rc)) {
-            .SUCCESS => rest = rest[rc..],
-            .AGAIN, .INTR => {},
-            else => |err| {
-                sock.sawErrno(err);
-                return false;
-            },
-        }
-        if (rest.len == 0) return true;
-        if (!sock.rewatch(linux.EPOLL.IN | linux.EPOLL.OUT)) return false;
-    }
-    try sock.unsent.appendSlice(sock.edge.gpa, rest);
-    return true;
-}
-
-fn flushUnsent(sock: *Socket) !bool {
-    const rc = linux.write(sock.fd, sock.unsent.items.ptr, sock.unsent.items.len);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .AGAIN, .INTR => return true,
-        else => |err| {
+    switch (sock.unsent.put(sock.edge.gpa, sock.fd, bytes) catch |err| switch (err) {
+        error.Unread => {
+            sock.why = "unread";
+            return false;
+        },
+        error.OutOfMemory => |e| return e,
+    }) {
+        .done => return true,
+        .began => return sock.rewatch(linux.EPOLL.IN | linux.EPOLL.OUT),
+        .failed => |err| {
             sock.sawErrno(err);
             return false;
         },
     }
-    sock.unsent.replaceRangeAssumeCapacity(0, rc, &.{});
-    return sock.unsent.items.len > 0 or sock.rewatch(linux.EPOLL.IN);
 }
 
 /// A socket whose watch can't change would sleep through its replies or

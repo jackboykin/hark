@@ -87,8 +87,7 @@ const Idle = struct {
 };
 
 const Tcp = struct {
-    query: []u8,
-    written: usize = 0,
+    unsent: stream.Unsent = .{},
     held: stream.Held = .{},
 };
 
@@ -188,10 +187,11 @@ fn open(e: *Edge, ex: Exchange) !Flight {
     errdefer sys.close(fd);
     const t = try e.work.create(Tcp);
     errdefer e.work.destroy(t);
-    t.* = .{ .query = try e.work.alloc(u8, 2 + ex.wire.len) };
-    errdefer e.work.free(t.query);
-    mem.writeInt(u16, t.query[0..2], @intCast(ex.wire.len), .big);
-    @memcpy(t.query[2..], ex.wire);
+    t.* = .{};
+    errdefer t.unsent.deinit(e.work);
+    try t.unsent.bytes.ensureTotalCapacityPrecise(e.work, 2 + ex.wire.len);
+    t.unsent.bytes.appendSliceAssumeCapacity(&mem.toBytes(mem.nativeToBig(u16, @intCast(ex.wire.len))));
+    t.unsent.bytes.appendSliceAssumeCapacity(ex.wire);
     na.connectTo(fd, &ex.server) catch |err| switch (err) {
         error.WouldBlock => {},
         else => return err,
@@ -206,7 +206,7 @@ fn close(e: *Edge, f: Flight) void {
         .stream => |t| {
             sys.close(f.fd);
             t.held.deinit(e.work);
-            e.work.free(t.query);
+            t.unsent.deinit(e.work);
             e.work.destroy(t);
         },
     }
@@ -336,14 +336,12 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
 }
 
 fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
-    if (t.written < t.query.len) {
-        const rc = linux.write(fd, t.query[t.written..].ptr, t.query.len - t.written);
-        switch (linux.errno(rc)) {
-            .SUCCESS => t.written += rc,
-            .AGAIN, .INTR => return null,
-            else => return e.finish(id, .timeout),
+    if (t.unsent.owing()) {
+        switch (t.unsent.flush(e.work, fd)) {
+            .owing => {},
+            .drained => try e.ctl(linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, id),
+            .failed => return e.finish(id, .timeout),
         }
-        if (t.written == t.query.len) try e.ctl(linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, id);
         return null;
     }
     const got = switch (t.held.read(e.work, fd, &e.rx)) {
