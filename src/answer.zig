@@ -10,6 +10,7 @@ const walk = @import("walk.zig");
 const store = @import("store.zig");
 const rand = @import("rand.zig");
 const dns64 = @import("dns64.zig");
+const failures = @import("failures.zig");
 const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
 const response = @import("response.zig");
@@ -182,8 +183,8 @@ pub const Desk = struct {
         return .graph;
     }
 
-    fn hold(d: *Desk, q: dns.Question, c: Client) !?Failures.Held {
-        const held = d.failures.get(q, c.cd, d.g.now()) orelse return null;
+    fn hold(d: *Desk, q: dns.Question, c: Client) !?Held {
+        const held = heldFailure(&d.failures, q, c.cd, d.g.now()) orelse return null;
         // Only a test's chaos may forget a held failure.
         if (!builtin.is_test) return held;
         return if (try d.g.forgets(.forget, .of(.answer, q.name, q.qtype))) null else held;
@@ -256,7 +257,7 @@ pub const Desk = struct {
     }
 
     pub fn derived(d: *Desk, q: dns.Question, c: Client, served: Served) !Served {
-        try d.failures.note(d.g.gpa, q, c.cd, served, d.g.cfg.servfail_ttl, d.g.now());
+        try noteFailure(&d.failures, d.g.gpa, q, c.cd, served, d.g.cfg.servfail_ttl, d.g.now());
         return served;
     }
 };
@@ -553,94 +554,57 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 
 /// RFC 9520 §3.2's failure cache: a question that failed is answered from
 /// here, asking nobody, for a window that doubles while it keeps failing, up
-/// to 5 minutes. Keyed with CD, since a CD client is owed bogus data.
-const Failures = struct {
-    map: std.array_hash_map.Custom([]const u8, Entry, rand.Keyed, true) = .empty,
+/// to 5 minutes. Keyed with CD, since a CD client is owed bogus data. The
+/// graph remembers the fact that failed, for every question resting on it;
+/// this remembers the answer, whose window grows per question.
+const Failures = failures.Memory([]const u8, union(enum) { stale, failure: struct { window_s: u32, ede: dns.Ede } }, rand.Keyed);
 
-    const Entry = struct {
-        until_ns: i64,
-        is: union(enum) { stale, failure: struct { window_s: u32, ede: dns.Ede } },
+const Held = union(enum) { stale, failed: dns.Ede };
+
+const max_window_s = 300;
+
+fn failureKey(buf: *[dns.max_name_wire_len + 3]u8, q: dns.Question, cd: bool) []const u8 {
+    const name = q.name.wire;
+    @memcpy(buf[0..name.len], name);
+    std.mem.writeInt(u16, buf[name.len..][0..2], @backingInt(q.qtype), .little);
+    buf[name.len + 2] = @intFromBool(cd);
+    return buf[0 .. name.len + 3];
+}
+
+fn heldFailure(f: *const Failures, q: dns.Question, cd: bool, now_ns: i64) ?Held {
+    var buf: [dns.max_name_wire_len + 3]u8 = undefined;
+    const failure = switch (f.get(failureKey(&buf, q, cd), now_ns) orelse return null) {
+        .stale => return .stale,
+        .failure => |x| x,
     };
+    return .{ .failed = switch (failure.ede.code) {
+        .dnssec_bogus, .unsupported_nsec3_iterations => failure.ede,
+        .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota, .stale_answer, .stale_nxdomain_answer => .{ .code = .cached_error },
+    } };
+}
 
-    pub const Held = union(enum) { stale, failed: dns.Ede };
-
-    const max_window_s = 300;
-    const max_entries = 4096;
-
-    pub fn deinit(f: *Failures, gpa: Allocator) void {
-        for (f.map.keys()) |k| gpa.free(k);
-        f.map.deinit(gpa);
-    }
-
-    fn key(buf: *[dns.max_name_wire_len + 3]u8, q: dns.Question, cd: bool) []const u8 {
-        const name = q.name.wire;
-        @memcpy(buf[0..name.len], name);
-        std.mem.writeInt(u16, buf[name.len..][0..2], @backingInt(q.qtype), .little);
-        buf[name.len + 2] = @intFromBool(cd);
-        return buf[0 .. name.len + 3];
-    }
-
-    pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?Held {
-        if (f.map.count() == 0) return null;
-        var buf: [dns.max_name_wire_len + 3]u8 = undefined;
-        const e = f.map.get(key(&buf, q, cd)) orelse return null;
-        if (e.until_ns <= now_ns) return null;
-        const failure = switch (e.is) {
-            .stale => return .stale,
-            .failure => |x| x,
-        };
-        return .{ .failed = switch (failure.ede.code) {
-            .dnssec_bogus, .unsupported_nsec3_iterations => failure.ede,
-            .other, .cached_error, .blocked, .not_supported, .no_reachable_authority, .synthesized, .over_quota, .stale_answer, .stale_nxdomain_answer => .{ .code = .cached_error },
-        } };
-    }
-
-    pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
-        if (served.theirs) return;
-        const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
-        if (forgets and f.map.count() == 0) return;
-        var buf: [dns.max_name_wire_len + 3]u8 = undefined;
-        const k = key(&buf, q, cd);
-        if (forgets) {
-            if (f.map.fetchSwapRemove(k)) |kv| gpa.free(kv.key);
-            return;
+fn noteFailure(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
+    if (served.theirs) return;
+    const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
+    if (forgets and f.map.count() == 0) return;
+    var buf: [dns.max_name_wire_len + 3]u8 = undefined;
+    const k = failureKey(&buf, q, cd);
+    if (forgets) return f.forget(gpa, k);
+    if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .is = .stale });
+    var window_s = first_s;
+    if (f.map.get(k)) |e| {
+        if (now_ns < e.until_ns) return;
+        switch (e.is) {
+            .stale => {},
+            .failure => |x| if (now_ns < e.until_ns + @as(i64, x.window_s) * std.time.ns_per_s) {
+                window_s = @min(x.window_s * 2, max_window_s);
+            },
         }
-        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .is = .stale });
-        const ede = served.ede orelse dns.Ede{ .code = .other };
-        if (f.map.getPtr(k)) |e| {
-            if (now_ns < e.until_ns) return;
-            switch (e.is) {
-                .stale => {},
-                .failure => |x| {
-                    const again = now_ns < e.until_ns + @as(i64, x.window_s) * std.time.ns_per_s;
-                    const window_s = if (again) @min(x.window_s * 2, max_window_s) else first_s;
-                    e.* = .{ .until_ns = now_ns + @as(i64, window_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = window_s, .ede = ede } } };
-                    return;
-                },
-            }
-        }
-        if (first_s == 0) return;
-        try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = first_s, .ede = ede } } });
     }
-
-    /// At `max_entries` another entry is evicted, picked by the keyed hash of
-    /// this key so no asker can choose it.
-    fn put(f: *Failures, gpa: Allocator, k: []const u8, e: Entry) !void {
-        if (f.map.getPtr(k)) |old| {
-            old.* = e;
-            return;
-        }
-        if (f.map.count() >= max_entries) {
-            const at = rand.Keyed.hash(.{}, k) % f.map.count();
-            const old = f.map.keys()[at];
-            f.map.swapRemoveAt(at);
-            gpa.free(old);
-        }
-        const own = try gpa.dupe(u8, k);
-        errdefer gpa.free(own);
-        try f.map.put(gpa, own, e);
-    }
-};
+    if (window_s == 0) return;
+    const ede = served.ede orelse dns.Ede{ .code = .other };
+    try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, window_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = window_s, .ede = ede } } });
+}
 
 test "a client is sent what Keep keeps" {
     const R = struct {
@@ -702,31 +666,31 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     const q: dns.Question = .{ .name = try dns.parseDottedName(arena.allocator(), "Example."), .qtype = .a, .qclass = .in };
     const s = std.time.ns_per_s;
     const failed = servfail(q, .{ .code = .no_reachable_authority });
-    try f.note(testing.allocator, q, false, failed, 5, 0);
-    try testing.expectEqual(dns.Ede.Code.cached_error, f.get(q, false, 4 * s).?.failed.code);
-    try testing.expectEqual(null, f.get(q, true, 4 * s));
-    try testing.expectEqual(null, f.get(q, false, 5 * s));
-    try f.note(testing.allocator, q, false, failed, 5, 6 * s);
-    try f.note(testing.allocator, q, false, failed, 5, 6 * s);
-    try testing.expect(f.get(q, false, 15 * s) != null);
-    try testing.expectEqual(null, f.get(q, false, 16 * s));
+    try noteFailure(&f, testing.allocator, q, false, failed, 5, 0);
+    try testing.expectEqual(dns.Ede.Code.cached_error, heldFailure(&f, q, false, 4 * s).?.failed.code);
+    try testing.expectEqual(null, heldFailure(&f, q, true, 4 * s));
+    try testing.expectEqual(null, heldFailure(&f, q, false, 5 * s));
+    try noteFailure(&f, testing.allocator, q, false, failed, 5, 6 * s);
+    try noteFailure(&f, testing.allocator, q, false, failed, 5, 6 * s);
+    try testing.expect(heldFailure(&f, q, false, 15 * s) != null);
+    try testing.expectEqual(null, heldFailure(&f, q, false, 16 * s));
     var ok = failed;
     ok.rcode = .no_error;
-    try f.note(testing.allocator, q, false, ok, 5, 17 * s);
+    try noteFailure(&f, testing.allocator, q, false, ok, 5, 17 * s);
     try testing.expectEqual(0, f.map.count());
     var held = ok;
     held.hold_until_ns = 30 * s;
     held.ede = .{ .code = .stale_answer };
-    try f.note(testing.allocator, q, false, held, 5, 20 * s);
-    try testing.expectEqual(Failures.Held.stale, f.get(q, false, 29 * s).?);
-    try f.note(testing.allocator, q, false, failed, 5, 31 * s);
-    try testing.expect(f.get(q, false, 35 * s) != null);
-    try testing.expectEqual(null, f.get(q, false, 36 * s));
-    try f.note(testing.allocator, q, false, ok, 5, 37 * s);
+    try noteFailure(&f, testing.allocator, q, false, held, 5, 20 * s);
+    try testing.expectEqual(Held.stale, heldFailure(&f, q, false, 29 * s).?);
+    try noteFailure(&f, testing.allocator, q, false, failed, 5, 31 * s);
+    try testing.expect(heldFailure(&f, q, false, 35 * s) != null);
+    try testing.expectEqual(null, heldFailure(&f, q, false, 36 * s));
+    try noteFailure(&f, testing.allocator, q, false, ok, 5, 37 * s);
     for (0..Failures.max_entries + 2) |t| {
         var other = q;
         other.qtype = @fromBackingInt(@intCast(t));
-        try f.note(testing.allocator, other, false, failed, 5, 0);
+        try noteFailure(&f, testing.allocator, other, false, failed, 5, 0);
     }
     try testing.expectEqual(Failures.max_entries, f.map.count());
 }

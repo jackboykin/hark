@@ -26,6 +26,7 @@ const dnssec = @import("dnssec.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
 const denial = @import("denial.zig");
+const failures = @import("failures.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
 const stub = @import("stub.zig");
@@ -185,10 +186,6 @@ pub const Stats = struct {
     } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
-
-const max_failed = 4096;
-
-const Refusal = struct { until_ns: i64, why: Failure.Name };
 
 const refresh_jitter_ns = std.time.ns_per_s;
 
@@ -350,7 +347,7 @@ pub const Graph = struct {
     as_of: i64 = 0,
     unpaid: Budget = undefined,
     flights: u32 = 0,
-    failed: std.array_hash_map.Custom(Key, Refusal, Key.Context, true) = .empty,
+    failed: failures.Memory(Key, Failure.Name, Key.Context) = .{},
     stats: Stats = .{},
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
     /// The top of the ready stack, which threads through the slots: a queued
@@ -397,7 +394,6 @@ pub const Graph = struct {
         g.index.deinit(g.gpa);
         g.answered.deinit(g.gpa);
         g.gpa.destroy(g.rtt);
-        for (g.failed.keys()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
         g.denial.deinit(g.store.gpa, &g.store);
         g.verify_memo.deinit(g.gpa);
@@ -958,30 +954,13 @@ pub const Graph = struct {
     }
 
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
-        const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why.name };
-        if (g.failed.getPtr(key)) |u| {
-            u.* = r;
-            return;
-        }
-        // Picked by the newcomer's keyed hash, as the desk's failures are, so
-        // no asker can choose it.
-        if (g.failed.count() >= max_failed) {
-            const at = Key.Context.hash(.{}, key) % g.failed.count();
-            const old = g.failed.keys()[at];
-            g.failed.swapRemoveAt(at);
-            g.gpa.free(old.name);
-        }
-        var own = key;
-        own.name = try g.gpa.dupe(u8, key.name);
-        errdefer g.gpa.free(own.name);
-        try g.failed.put(g.gpa, own, r);
+        try g.failed.put(g.gpa, key, .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .is = why.name });
     }
 
     fn refused(g: *Graph, key: Key) !?Failure {
-        if (g.failed.count() == 0) return null;
-        const r = g.failed.get(key) orelse return null;
-        if (r.until_ns <= g.now() or try g.forgets(.forget, key)) return null;
-        return .{ .name = r.why, .remembered = true };
+        const why = g.failed.get(key, g.now()) orelse return null;
+        if (try g.forgets(.forget, key)) return null;
+        return .{ .name = why, .remembered = true };
     }
 
     /// An rrset accepted as authentic ends with the signatures that authenticated it (RFC 4035 §5.3.3).

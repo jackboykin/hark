@@ -76,6 +76,14 @@ pub const Key = struct {
         pub fn eql(_: Context, a: Key, b: Key, _: usize) bool {
             return a.eql(b);
         }
+        pub fn own(gpa: mem.Allocator, k: Key) !Key {
+            var o = k;
+            o.name = try gpa.dupe(u8, k.name);
+            return o;
+        }
+        pub fn free(gpa: mem.Allocator, k: Key) void {
+            gpa.free(k.name);
+        }
     };
 };
 

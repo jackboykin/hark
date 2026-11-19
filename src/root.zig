@@ -25,6 +25,7 @@ test {
     _ = @import("dot.zig");
     _ = @import("dot_socket.zig");
     _ = @import("edge.zig");
+    _ = @import("failures.zig");
     _ = @import("fuzz_nsec.zig");
     _ = @import("fuzz_wire.zig");
     _ = @import("graph.zig");

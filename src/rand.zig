@@ -81,6 +81,12 @@ pub const Keyed = struct {
     pub fn eql(_: Keyed, a: []const u8, b: []const u8, _: usize) bool {
         return mem.eql(u8, a, b);
     }
+    pub fn own(gpa: mem.Allocator, k: []const u8) ![]const u8 {
+        return gpa.dupe(u8, k);
+    }
+    pub fn free(gpa: mem.Allocator, k: []const u8) void {
+        gpa.free(k);
+    }
 };
 
 test "thread draws differ across threads" {
