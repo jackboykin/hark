@@ -73,8 +73,8 @@ const Fault = union(enum) {
     }
 };
 
-const bogus: Failure = .{ .code = .dnssec_bogus };
-const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
+const bogus: Failure = .of(.bogus);
+const no_cut: Failure = .of(.no_insecure_cut);
 
 /// Bogus bytes leave the store now: their TTL was the forger's to set (RFC
 /// 4035 §4.7). Not when a budget stopped the judgement: nothing was proven,
@@ -546,7 +546,7 @@ const Probe = struct {
                 const c = g.cell(pid);
                 if (!c.settled()) return .pending;
                 if (c.failure()) |why| {
-                    if (why.cause == .asker) return .{ .stopped = why };
+                    if (why.cause() == .asker) return .{ .stopped = why };
                 } else if (c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires() };
                 p.cell = .none;
             }

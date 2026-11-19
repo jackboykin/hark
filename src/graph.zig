@@ -194,8 +194,8 @@ pub const Budget = struct {
 
     pub fn validationStop(b: *const Budget) ?Failure {
         return switch (b.validation.stopped orelse return null) {
-            .nsec3 => .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
-            .verify => .{ .code = .other, .text = "validation budget spent", .cause = .asker },
+            .nsec3 => .of(.nsec3_spent),
+            .verify => .of(.verifies_spent),
         };
     }
 };
@@ -220,7 +220,7 @@ pub const Stats = struct {
 
 const max_failed = 4096;
 
-const Refusal = struct { until_ns: i64, why: Failure };
+const Refusal = struct { until_ns: i64, why: Failure.Name };
 
 const refresh_jitter_ns = std.time.ns_per_s;
 
@@ -286,7 +286,7 @@ pub const Cell = struct {
         std.debug.assert(@sizeOf(Cell) <= 176);
     }
 
-    pub const State = union(enum) { pending, fact: *Value, failure: *const Failure };
+    pub const State = union(enum) { pending, fact: *Value, failure: Failure };
 
     pub fn expires(c: *const Cell) i64 {
         return if (c.blob) |b| b.expires_ns else c.bare_expires_ns;
@@ -297,7 +297,7 @@ pub const Cell = struct {
     }
 
     pub fn failure(c: *const Cell) ?Failure {
-        return if (c.state == .failure) c.state.failure.* else null;
+        return if (c.state == .failure) c.state.failure else null;
     }
 
     fn own(c: *Cell, v: anytype) !*@TypeOf(v) {
@@ -871,10 +871,9 @@ pub const Graph = struct {
     pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
-        if (g.cfg.trace) log.debug("{t}({f}) failed: {t} {s}", .{ c.key.kind, c.name, why.code, why.text });
-        if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
-        const owned = try c.own(why);
-        c.state = .{ .failure = owned };
+        if (g.cfg.trace) log.debug("{t}({f}) failed: {t} {s}", .{ c.key.kind, c.name, why.code(), why.text() });
+        if (c.key.kind == .secure and why.code() == .dnssec_bogus) g.stats.trust.bogus += 1;
+        c.state = .{ .failure = why };
         c.bare_expires_ns = g.now();
         try g.woken(id, false);
     }
@@ -895,12 +894,12 @@ pub const Graph = struct {
     /// limits, an orphan, a refresh, an address lookup's depth, a send that never left.
     pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
-        if (why.cause == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) try g.remember(c.key, why);
+        if (why.cause() == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) try g.remember(c.key, why);
         try g.fail(id, why);
     }
 
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
-        const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why };
+        const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why.name };
         if (g.failed.getPtr(key)) |u| {
             u.* = r;
             return;
@@ -921,9 +920,7 @@ pub const Graph = struct {
         if (g.failed.count() == 0) return null;
         const r = g.failed.get(key) orelse return null;
         if (r.until_ns <= g.now() or try g.forgets(.forget, key)) return null;
-        var why = r.why;
-        why.remembered = true;
-        return why;
+        return .{ .name = r.why, .remembered = true };
     }
 
     /// An rrset accepted as authentic ends with the signatures that authenticated it (RFC 4035 §5.3.3).
@@ -1182,8 +1179,8 @@ pub const Graph = struct {
     }
 
     pub fn limit(g: *const Graph, b: *const Budget) ?Failure {
-        if (g.now() >= b.deadline_ns) return .{ .code = .other, .text = "resolution deadline passed", .cause = .asker };
-        if (b.queries >= g.cfg.max_queries) return .{ .code = .other, .text = "query budget spent", .cause = .asker };
+        if (g.now() >= b.deadline_ns) return .of(.deadline_passed);
+        if (b.queries >= g.cfg.max_queries) return .of(.queries_spent);
         return null;
     }
 
@@ -1361,7 +1358,7 @@ pub const Graph = struct {
         // room: the shared work goes on at that one's cost.
         if (g.limit(g.payer) != null) g.payer = g.payerOf(by) orelse g.payer;
         const budget = g.payer;
-        const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text else null;
+        const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text() else null;
         if (stop) |why| {
             if (g.cfg.trace) log.debug("{f} {f} refused: {s}", .{ qname, dns.tag(qtype), why });
             return null;

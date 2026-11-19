@@ -36,7 +36,7 @@ pub const Scratch = struct {
     ask: ?walk.Ask = null,
 };
 
-const referred: Failure = .{ .code = .no_reachable_authority, .text = "stub server referred" };
+const referred: Failure = .of(.stub_referred);
 
 pub fn run(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;

@@ -242,8 +242,8 @@ pub const Links = struct {
     n: u8 = 0,
     owners: [max_links]dns.Name = undefined,
 
-    pub const loop: Failure = .{ .code = .other, .text = "cname loop" };
-    const too_long: Failure = .{ .code = .other, .text = "alias chain too long" };
+    pub const loop: Failure = .of(.cname_loop);
+    const too_long: Failure = .of(.alias_too_long);
 
     pub const Step = union(enum) { done, next: dns.Name, broken: Failure };
 
@@ -275,7 +275,7 @@ pub fn cnameAnswers(qtype: dns.RType) bool {
     };
 }
 
-const into_stub: Failure = .{ .code = .no_reachable_authority, .text = "public chain into a stub zone", .cause = .host };
+const into_stub: Failure = .of(.into_stub);
 
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     const kind = g.cell(id).key.kind;
@@ -422,7 +422,7 @@ fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !bool {
     return true;
 }
 
-const unplaced: Failure = .{ .code = .no_reachable_authority, .text = "no probe placed the cut", .unplaced = true };
+const unplaced: Failure = .of(.unplaced);
 
 fn probeable(g: *const Graph, name: dns.Name) bool {
     return g.cfg.qmin and name.depth() <= delegation.max_minimize_count;
@@ -448,7 +448,7 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
         const c = g.cell(slot.*.unwrap().?);
         if (!c.settled()) return .pending;
         const why = c.failure() orelse return .{ .cut = slot.*.unwrap().? };
-        if (!why.unplaced) return .{ .failed = why };
+        if (why.name != .unplaced) return .{ .failed = why };
         const n = startAt(g, qname, from, false);
         if (n.eql(c.name)) return .{ .failed = .unreachable_authority };
         slot.* = .wrap(try g.demand(id, Key.of(.cut, n, .a), n) orelse return .none);
@@ -476,7 +476,7 @@ fn named(wire: []const u8, n: dns.Name) bool {
 }
 
 pub fn runAddr(g: *Graph, id: CellId) !void {
-    if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
+    if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .of(.too_deep));
     const s = g.cell(id).scratch.addr;
     const key = g.cell(id).key;
     const host = g.cell(id).name;
@@ -590,7 +590,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
 }
 
 pub fn ended(g: *const Graph, a: *const Ask) Failure {
-    const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
+    const zones: Failure = .of(if (a.local) .unsendable else .unreachable_authority);
     return if (a.nservers > 0 and a.asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
 }
 
@@ -1091,7 +1091,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(.cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
-        if (cut.failure()) |why| switch (why.cause) {
+        if (cut.failure()) |why| switch (why.cause()) {
             .zone => return .none,
             .host => {
                 a.local = true;
@@ -1210,7 +1210,7 @@ fn unlearned(g: *Graph, id: CellId, a: *Ask, found: *Ask.Found, left: *Left, hos
         for (c.state.fact.addr) |x| a.offer(g, found, x);
         return false;
     };
-    switch (why.cause) {
+    switch (why.cause()) {
         .zone => {},
         .host => a.local = true,
         .asker => if (g.spent(g.payer)) {

@@ -139,13 +139,63 @@ pub const Outcome = union(enum) {
 };
 
 pub const Failure = struct {
-    code: dns.Ede.Code,
-    text: []const u8 = "",
-    cause: enum { zone, host, asker } = .zone,
+    name: Name,
     remembered: bool = false,
-    unplaced: bool = false,
 
-    pub const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
+    pub const Name = enum(u8) {
+        unreachable_authority,
+        unsendable,
+        unplaced,
+        too_deep,
+        stub_referred,
+        into_stub,
+        cname_loop,
+        alias_too_long,
+        bogus,
+        no_insecure_cut,
+        deadline_passed,
+        queries_spent,
+        verifies_spent,
+        nsec3_spent,
+    };
+
+    const Cause = enum { zone, host, asker };
+    const Info = struct { code: dns.Ede.Code, text: []const u8 = "", cause: Cause = .zone };
+
+    const named: std.EnumArray(Name, Info) = .init(.{
+        .unreachable_authority = .{ .code = .no_reachable_authority },
+        .unsendable = .{ .code = .no_reachable_authority, .cause = .host },
+        .unplaced = .{ .code = .no_reachable_authority, .text = "no probe placed the cut" },
+        .too_deep = .{ .code = .no_reachable_authority, .text = "too deep" },
+        .stub_referred = .{ .code = .no_reachable_authority, .text = "stub server referred" },
+        .into_stub = .{ .code = .no_reachable_authority, .text = "public chain into a stub zone", .cause = .host },
+        .cname_loop = .{ .code = .other, .text = "cname loop" },
+        .alias_too_long = .{ .code = .other, .text = "alias chain too long" },
+        .bogus = .{ .code = .dnssec_bogus },
+        .no_insecure_cut = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" },
+        .deadline_passed = .{ .code = .other, .text = "resolution deadline passed", .cause = .asker },
+        .queries_spent = .{ .code = .other, .text = "query budget spent", .cause = .asker },
+        .verifies_spent = .{ .code = .other, .text = "validation budget spent", .cause = .asker },
+        .nsec3_spent = .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
+    });
+
+    pub fn of(name: Name) Failure {
+        return .{ .name = name };
+    }
+
+    pub fn code(f: Failure) dns.Ede.Code {
+        return named.get(f.name).code;
+    }
+
+    pub fn text(f: Failure) []const u8 {
+        return named.get(f.name).text;
+    }
+
+    pub fn cause(f: Failure) Cause {
+        return named.get(f.name).cause;
+    }
+
+    pub const unreachable_authority: Failure = .of(.unreachable_authority);
 };
 
 pub const Value = union(Kind) {

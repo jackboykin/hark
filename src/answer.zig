@@ -127,8 +127,8 @@ pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
 }
 
 fn servfailOf(q: dns.Question, why: model.Failure) Served {
-    var s = servfail(q, .{ .code = why.code, .text = why.text });
-    s.theirs = why.cause != .zone;
+    var s = servfail(q, .{ .code = why.code(), .text = why.text() });
+    s.theirs = why.cause() != .zone;
     return s;
 }
 
