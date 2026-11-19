@@ -88,8 +88,7 @@ const Idle = struct {
 const Tcp = struct {
     query: []u8,
     written: usize = 0,
-    reply: [2 + @as(usize, dns.max_message_len)]u8 = undefined,
-    got: usize = 0,
+    got: std.ArrayList(u8) = .empty,
 };
 
 const client_tag: u64 = 1 << 32;
@@ -201,6 +200,7 @@ fn close(e: *Edge, f: Flight) void {
         .datagram => |family| e.rest(f.fd, family),
         .stream => |t| {
             sys.close(f.fd);
+            t.got.deinit(e.work);
             e.work.free(t.query);
             e.work.destroy(t);
         },
@@ -334,21 +334,27 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
         if (t.written == t.query.len) try e.ctl(linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, id);
         return null;
     }
-    const rc = linux.read(fd, t.reply[t.got..].ptr, t.reply.len - t.got);
+    const rc = linux.read(fd, &e.rx, e.rx.len);
     switch (linux.errno(rc)) {
-        .SUCCESS => {
-            if (rc == 0) return e.finish(id, .timeout);
-            t.got += rc;
-        },
+        .SUCCESS => if (rc == 0) return e.finish(id, .timeout),
         .AGAIN, .INTR => return null,
         else => return e.finish(id, .timeout),
     }
-    if (t.got < 2) return null;
-    const len = mem.readInt(u16, t.reply[0..2], .big);
-    if (t.got < 2 + @as(usize, len)) return null;
+    var held: []const u8 = e.rx[0..rc];
+    if (t.got.items.len > 0 or framed(held) == null) {
+        try t.got.appendSlice(e.work, held);
+        held = t.got.items;
+    }
+    const reply = framed(held) orelse return null;
     // Copied out before `finish` frees the buffer.
-    @memcpy(e.rx[0..len], t.reply[2..][0..len]);
-    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..len], .stream = true } });
+    mem.copyForwards(u8, e.rx[0..reply.len], reply);
+    return e.finish(id, .{ .reply = .{ .bytes = e.rx[0..reply.len], .stream = true } });
+}
+
+fn framed(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 2) return null;
+    const len = mem.readInt(u16, bytes[0..2], .big);
+    return if (bytes.len < 2 + @as(usize, len)) null else bytes[2..][0..len];
 }
 
 test "a consumer that stops between events leaves nothing behind" {
@@ -468,4 +474,38 @@ test "a socket carries its next exchange deaf to what was sent to its last" {
     try std.testing.expectEqual(fd, e.flights.get(2).?.fd);
     const unheard = ((try e.next(std.math.maxInt(i64))) orelse return error.TestUnexpectedResult).exchange;
     try std.testing.expect(unheard.id == 2 and unheard.completion == .timeout);
+}
+
+test "a stream reply holds what has arrived" {
+    var counted: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var e = try Edge.init(std.testing.allocator);
+    defer e.deinit();
+    e.work = counted.allocator();
+
+    const listener = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer sys.close(listener);
+    try na.bindTo(listener, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    if (linux.errno(linux.listen(listener, 1)) != .SUCCESS) return error.ListenFailed;
+    var sa: na.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    _ = linux.getsockname(listener, &sa.any, &sa_len);
+
+    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .stream, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    const rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC);
+    if (linux.errno(rc) != .SUCCESS) return error.AcceptFailed;
+    const server: posix.fd_t = @intCast(rc);
+    defer sys.close(server);
+    try std.testing.expectEqual(null, try e.next(e.now_ns + 20 * std.time.ns_per_ms));
+    var query: [5]u8 = undefined;
+    try std.testing.expectEqual(query.len, linux.read(server, &query, query.len));
+    try std.testing.expectEqualStrings("\x00\x03ask", &query);
+
+    _ = try sys.write(server, "\x00\x05re");
+    try std.testing.expectEqual(null, try e.next(e.now_ns + 20 * std.time.ns_per_ms));
+    try std.testing.expect(counted.allocated_bytes - counted.freed_bytes < 1024);
+
+    _ = try sys.write(server, "ply");
+    const heard = ((try e.next(std.math.maxInt(i64))) orelse return error.TestUnexpectedResult).exchange;
+    try std.testing.expect(heard.id == 1 and heard.completion.reply.stream);
+    try std.testing.expectEqualStrings("reply", heard.completion.reply.bytes);
 }
