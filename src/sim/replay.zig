@@ -176,8 +176,8 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     try requery(gpa, run, opts, report);
     letGoAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| g.complete(ev.id, ev.completion);
-    if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
-        report.msg = "cells, budgets, flights or work bytes outlived the scenario";
+    if (g.live != 0 or g.budgets != 0 or g.flights != 0) {
+        report.msg = "cells, budgets or flights outlived the scenario";
         return error.ScenarioFailed;
     }
 }

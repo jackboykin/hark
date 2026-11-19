@@ -495,7 +495,7 @@ const Server = struct {
             .graph => {},
         }
         const asked = try s.desk.asked(arena, q, client);
-        if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
+        if (s.g.atDoor()) s.reap();
         const admit: graph.Graph.Admit = if (crowded and !s.known(asked)) .join else .new;
         const root = s.g.demandRoot(asked.name, asked.qtype, admit) catch |err| {
             const fate: Unanswered.Fate = switch (err) {
@@ -517,7 +517,7 @@ const Server = struct {
             };
             const canonical = q.name.wire;
             const spelled = q.spelled.?;
-            p.question_bytes = try s.g.work.allocator().alloc(u8, canonical.len + spelled.len);
+            p.question_bytes = try s.g.work.alloc(u8, canonical.len + spelled.len);
             @memcpy(p.question_bytes[0..canonical.len], canonical);
             @memcpy(p.question_bytes[canonical.len..], spelled);
             p.query.question.?.name = .of(p.question_bytes[0..canonical.len]);
@@ -695,7 +695,7 @@ const Server = struct {
     }
 
     fn reap(s: *Server) void {
-        while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
+        while (s.g.atDoor()) {
             const l = s.late.popFront() orelse return;
             const i = s.parkedAs(l) orelse continue;
             const p = s.pending.items[i];
@@ -758,7 +758,7 @@ const Server = struct {
             .live = g.live,
             .flights = g.flights,
             .parked = parked,
-            .work = Kib{ .bytes = g.work.bytes },
+            .owed = Kib{ .bytes = if (g.cfg.owed) |o| o.held else 0 },
         });
     }
 
@@ -803,7 +803,7 @@ const Server = struct {
     fn release(s: *Server, p: Pending) void {
         s.g.unhold(p.root);
         if (p.a) |a| s.g.unhold(a);
-        s.g.work.allocator().free(p.question_bytes);
+        s.g.work.free(p.question_bytes);
     }
 
     fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {
@@ -938,11 +938,11 @@ pub fn run(gpa: Allocator, work: Allocator, owed: *const slab.Share, facts: stor
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
         .max_flights = fdShare(2),
-        .max_work_bytes = cfg.cache_size,
+        .owed = owed,
         .trace = trace,
     }, e.edge());
     defer g.deinit();
-    e.work = g.work.allocator();
+    e.work = g.work;
     const in = try Batch.create(gpa, udp_recv_max);
     defer in.destroy(gpa);
     const out = try Batch.create(gpa, cfg.max_udp_payload);

@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rand = @import("rand.zig");
 const Arena = @import("arena.zig");
+const slab = @import("slab.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
@@ -140,7 +141,7 @@ pub const Config = struct {
     stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
     max_flights: u32 = std.math.maxInt(u32),
-    max_work_bytes: usize = std.math.maxInt(usize),
+    owed: ?*const slab.Share = null,
     servfail_ttl: u32 = 5,
     prefetch: bool = false,
     trust_anchors: ?[]const dns.DsData = null,
@@ -151,42 +152,6 @@ pub const Config = struct {
 
 /// Plain goes only by stream, where a forger cannot follow.
 pub const Case = enum { random, plain };
-
-const Work = struct {
-    child: Allocator,
-    bytes: usize = 0,
-
-    pub fn allocator(w: *Work) Allocator {
-        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, a: mem.Alignment, ra: usize) ?[*]u8 {
-        const w: *Work = @ptrCast(@alignCast(ctx));
-        const p = w.child.rawAlloc(len, a, ra) orelse return null;
-        w.bytes += len;
-        return p;
-    }
-
-    fn resize(ctx: *anyopaque, m: []u8, a: mem.Alignment, len: usize, ra: usize) bool {
-        const w: *Work = @ptrCast(@alignCast(ctx));
-        if (!w.child.rawResize(m, a, len, ra)) return false;
-        w.bytes = w.bytes - m.len + len;
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, m: []u8, a: mem.Alignment, len: usize, ra: usize) ?[*]u8 {
-        const w: *Work = @ptrCast(@alignCast(ctx));
-        const p = w.child.rawRemap(m, a, len, ra) orelse return null;
-        w.bytes = w.bytes - m.len + len;
-        return p;
-    }
-
-    fn free(ctx: *anyopaque, m: []u8, a: mem.Alignment, ra: usize) void {
-        const w: *Work = @ptrCast(@alignCast(ctx));
-        w.child.rawFree(m, a, ra);
-        w.bytes -= m.len;
-    }
-};
 
 pub const Budget = struct {
     queries: u32 = 0,
@@ -372,7 +337,7 @@ const Slot = struct {
 
 pub const Graph = struct {
     gpa: Allocator,
-    work: Work,
+    work: Allocator,
     cfg: Config,
     edge: Edge,
     scratch: Arena,
@@ -403,7 +368,7 @@ pub const Graph = struct {
 
     pub fn init(gpa: Allocator, work: Allocator, cfg: Config, edge: Edge) !Graph {
         const rtt = try ns_rtt.Table.create(gpa);
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = if (cfg.facts) |f| .init(f.allocator, cfg.store_bytes, f.share) else .init(gpa, cfg.store_bytes, null) };
+        var g: Graph = .{ .gpa = gpa, .work = work, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = if (cfg.facts) |f| .init(f.allocator, cfg.store_bytes, f.share) else .init(gpa, cfg.store_bytes, null) };
         errdefer g.deinit();
         g.scratch = try .withFloor(gpa, Arena.scratch_floor);
         g.store.on_evict = evicted;
@@ -421,11 +386,11 @@ pub const Graph = struct {
     pub fn deinit(g: *Graph) void {
         // Not `free`: in slot order a cell would unpin from inputs gone first.
         for (g.cells.items) |s| if (s.cell) |c| {
-            while (c.inputs.popFirst()) |n| g.work.allocator().destroy(Pin.ofInput(n));
+            while (c.inputs.popFirst()) |n| g.work.destroy(Pin.ofInput(n));
             if (c.blob) |bl| g.store.unref(bl);
             if (budgetOf(c)) |b| g.unref(b);
             c.arena.deinit();
-            g.work.allocator().destroy(c);
+            g.work.destroy(c);
         };
         g.cells.deinit(g.gpa);
         g.scratch.deinit();
@@ -465,18 +430,28 @@ pub const Graph = struct {
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !CellId {
         const key = Key.of(.answer, name, qtype);
         if (g.asking(.{ .key = key, .as_of = 0 })) |id| if (!g.cell(id).settled() or g.fresh(id)) {
-            if (!g.cell(id).settled() and g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
+            if (!g.cell(id).settled() and g.atDoor()) return error.Full;
             g.cell(id).holds += 1;
             return id;
         };
         if (admit != .new) return error.Novel;
-        if (g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
+        if (g.flights >= g.cfg.max_flights or g.atDoor()) return error.Full;
         try g.answered.ensureTotalCapacity(g.gpa, g.answered.items.len + g.answering + 1);
         const id = try g.newRoot(key, name, 0, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.answering += 1;
         g.cell(id).holds += 1;
         g.enqueue(id);
         return id;
+    }
+
+    pub fn atDoor(g: *const Graph) bool {
+        const o = g.cfg.owed orelse return false;
+        return o.atDoor();
+    }
+
+    fn pastHalf(g: *const Graph) bool {
+        const o = g.cfg.owed orelse return false;
+        return o.crowded(1, 2);
     }
 
     pub fn unhold(g: *Graph, id: CellId) void {
@@ -510,7 +485,7 @@ pub const Graph = struct {
         std.debug.assert(lapses_ns > 0);
         const rkey = key.at(.refresh, key.rtype);
         if (g.asking(.{ .key = rkey, .as_of = lapses_ns }) != null or try g.skips(.prefetch, rkey)) return;
-        if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
+        if (g.flights >= g.cfg.max_flights / 2 or g.pastHalf()) {
             g.stats.resolver.detail.unrefreshed += 1;
             return;
         }
@@ -716,8 +691,8 @@ pub const Graph = struct {
     }
 
     fn newRoot(g: *Graph, key: Key, name: dns.Name, as_of: i64, budget: Budget) !CellId {
-        const b = try g.work.allocator().create(Budget);
-        errdefer g.work.allocator().destroy(b);
+        const b = try g.work.create(Budget);
+        errdefer g.work.destroy(b);
         b.* = budget;
         b.queries += @intCast(try g.decide(.budget, key, @as(u64, g.cfg.max_queries) + 1));
         const v = &b.validation;
@@ -736,9 +711,9 @@ pub const Graph = struct {
             g.empty = .wrap(@intCast(g.cells.items.len - 1));
         }
         const id = g.empty.unwrap().?;
-        const c = try g.work.allocator().create(Cell);
-        errdefer g.work.allocator().destroy(c);
-        var arena: Arena = .init(g.work.allocator());
+        const c = try g.work.create(Cell);
+        errdefer g.work.destroy(c);
+        var arena: Arena = .init(g.work);
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
         std.debug.assert(key.kind == .exchange or mem.eql(u8, key.name, name.wire));
@@ -778,7 +753,7 @@ pub const Graph = struct {
         const b = g.cell(by);
         std.debug.assert(c.as_of == b.as_of);
         if (g.holdsInput(by, id)) return;
-        const p = try g.work.allocator().create(Pin);
+        const p = try g.work.create(Pin);
         p.* = .{ .on = id, .by = by };
         c.waiters.append(&p.waiter);
         b.inputs.prepend(&p.input);
@@ -801,7 +776,7 @@ pub const Graph = struct {
             const c = g.cell(on);
             c.waiters.remove(&p.waiter);
             if (!by.orphan) c.backers -= 1;
-            g.work.allocator().destroy(p);
+            g.work.destroy(p);
             g.release(on);
         }
     }
@@ -848,7 +823,7 @@ pub const Graph = struct {
             g.unref(b);
         }
         c.arena.deinit();
-        g.work.allocator().destroy(c);
+        g.work.destroy(c);
     }
 
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
@@ -1251,7 +1226,7 @@ pub const Graph = struct {
     fn unref(g: *Graph, b: *Budget) void {
         b.refs -= 1;
         if (b.refs > 0) return;
-        g.work.allocator().destroy(b);
+        g.work.destroy(b);
         g.budgets -= 1;
     }
 
@@ -1574,13 +1549,15 @@ test "a published cell that cannot settle is queued, never left waiting on nothi
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
     const testing = std.testing;
     var q: Quiet = .{};
-    var g = try q.graph(.{ .root_hints = &.{}, .max_work_bytes = 1 });
+    var owed: slab.Share = .{ .limit = 8 };
+    var g = try q.graph(.{ .root_hints = &.{}, .owed = &owed });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
     try testing.expectError(error.Novel, g.demandRoot(name, .a, .join));
     const first = try g.demandRoot(name, .a, .new);
+    owed.held = 7;
     try testing.expectError(error.Full, g.demandRoot(name, .a, .join));
     try testing.expectError(error.Full, g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .new));
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, q.now + std.time.ns_per_s);

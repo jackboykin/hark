@@ -102,7 +102,12 @@ RANGE_END`, i)
 	return b.String()
 }()
 
-func tinyCache(c *config) { c.cacheSize = 32 * 1024 }
+// A large cache with memory just above it leaves about 1 MiB for the rest,
+// so the door is some 90 resolutions past startup.
+func nearDoor(c *config) {
+	c.cacheSize = 8 << 20
+	c.memory = 10785360
+}
 
 func fire(t *testing.T, h *hark, names ...string) {
 	t.Helper()
@@ -123,11 +128,22 @@ func fire(t *testing.T, h *hark, names ...string) {
 }
 
 func silentNames() []string {
-	names := make([]string, 64)
+	names := make([]string, 256)
 	for i := range names {
 		names[i] = fmt.Sprintf("q%d.silent.", i)
 	}
 	return names
+}
+
+// In batches hark has read before the next is sent: one burst would be shed
+// from the queue before it became work.
+func fill(t *testing.T, h *hark) {
+	t.Helper()
+	names := silentNames()
+	for i := 0; i < len(names); i += 64 {
+		fire(t, h, names[i:i+64]...)
+		wantRcode(t, h.addr, "localhost.", dns.RcodeSuccess, 5*time.Second)
+	}
 }
 
 // The second question wakes the loop to look at its timers.
@@ -141,8 +157,8 @@ func advance(t *testing.T, h *hark, seconds int) {
 
 func TestLateWaitersMakeRoomForNewQuestions(t *testing.T) {
 	t.Parallel()
-	_, h := launchText(t, admission, tinyCache)
-	fire(t, h, silentNames()...)
+	_, h := launchText(t, admission, nearDoor)
+	fill(t, h)
 	wantSilence(t, h.addr, "a.live.", 300*time.Millisecond)
 	advance(t, h, 3)
 	fire(t, h, "b.live.")
@@ -155,12 +171,15 @@ func TestLateWaitersMakeRoomForNewQuestions(t *testing.T) {
 
 func TestALeftTCPClientMakesRoomLikeALateOne(t *testing.T) {
 	t.Parallel()
-	_, h := launchText(t, admission, tinyCache)
+	_, h := launchText(t, admission, nearDoor)
 	var conns []net.Conn
 	for i, name := range silentNames() {
 		c := dial(t, h)
 		send(t, c, framed(t, name, uint16(i+1)))
 		conns = append(conns, c)
+		if i%64 == 63 {
+			wantRcode(t, h.addr, "localhost.", dns.RcodeSuccess, 5*time.Second)
+		}
 	}
 	wantRcode(t, h.addr, "localhost.", dns.RcodeSuccess, 5*time.Second)
 	for _, c := range conns {
@@ -255,8 +274,8 @@ func TestACrowdedQueueShedsNovelNamesOnly(t *testing.T) {
 
 func TestTCPTurnedAwayIsServfailOverQuota(t *testing.T) {
 	t.Parallel()
-	_, h := launchText(t, admission, tinyCache)
-	fire(t, h, silentNames()...)
+	_, h := launchText(t, admission, nearDoor)
+	fill(t, h)
 	c, err := net.DialTimeout("tcp", h.addr.String(), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
