@@ -105,13 +105,12 @@ fn synthesized(q: dns.Question, s: special_use.Synthesized) Served {
     return .{ .rcode = s.rcode, .aa = s.aa, .question = q, .answers = s.answers, .authorities = s.authorities, .cacheable = false, .local = true };
 }
 
-fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
-    const served = synthesized(q, try special_use.synthesize(arena, q, o));
+fn ownAnswer(arena: Allocator, q: dns.Question, z: *const special_use.Zone, d64: ?Dns64) !Served {
+    const served = synthesized(q, try special_use.answer(arena, z, q));
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
         var qa = q;
         qa.qtype = .a;
-        const of_a = special_use.classify(qa.name, qa.qtype, false) orelse return served;
-        var a = synthesized(q, try special_use.synthesize(arena, qa, of_a));
+        var a = synthesized(q, try special_use.answer(arena, z, qa));
         a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
     };
@@ -162,8 +161,8 @@ pub const Desk = struct {
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
         // A stub zone the operator named wins over hark's own answers, which are
         // defaults (RFC 6303 §3, RFC 6761 §6.2).
-        if (stub.of(d.g.cfg.stub_zones, q.name, q.qtype) == null) if (special_use.classify(q.name, q.qtype, c.do_bit)) |o|
-            return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
+        if (stub.of(d.g.cfg.stub_zones, q.name, q.qtype) == null) if (special_use.answering(q.name, q.qtype, c.do_bit)) |z|
+            return .{ .synthesized = try ownAnswer(arena, q, z, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
         // RRSIGs are never signed (RFC 4035 §2.2), so an answer of them cannot be
         // validated, and SERVFAIL would read as bogus: NOTIMP instead. Under CD or

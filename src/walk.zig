@@ -1068,7 +1068,7 @@ fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) b
     if (own != stub.under(zones, zone)) return false;
     // A question hark answers itself never leaves the host (RFC 6761 §6). An own
     // zone's DS gets here only for a DO client, so it is classified as one.
-    return own != null or special_use.classify(qname, qtype, true) == null;
+    return own != null or special_use.answering(qname, qtype, true) == null;
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) !bool {

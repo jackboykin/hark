@@ -241,7 +241,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     try checkQuery(alloc, input, msg);
     if (msg.question) |q| {
         try checkName(alloc, q.name);
-        _ = special_use.classify(q.name, q.qtype, true);
+        _ = special_use.answering(q.name, q.qtype, true);
     }
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities, msg.additionals }) |sec| {
         for (sec) |rr| try checkRecord(alloc, msg, rr);
