@@ -10,7 +10,12 @@
 //!
 //! Knobs: CCD (the last), N (resolver threads, 1), V6=0 (no AAAA servers),
 //! LATENCY_MS (netem on lo), PERF=1 (counters on the resolver's cores),
-//! PERF_EVENTS (user and kernel instructions and cycles).
+//! PERF_EVENTS (user and kernel instructions and cycles), SIGNED=1 (both
+//! zones signed and every resolver validating), SYNTH=0 (under SIGNED, the
+//! peers answer no miss from cached NSEC, RFC 8198; kresd has no switch).
+//!
+//! In a config a line led by @KNOB stays only with that knob on, by @!KNOB
+//! only with it off; the rest of the line follows one space.
 const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -21,6 +26,9 @@ const Observer = @import("observe.zig");
 arena: Allocator,
 config: []const u8,
 scratch: []const u8,
+zones: []const u8,
+/// The signed root's DS as "key-tag algorithm digest-type digest".
+ds: []const u8 = "",
 threads: u32,
 observer: Observer,
 pool: []Core,
@@ -97,6 +105,7 @@ pub fn enter(arena: Allocator, config: []const u8) !Rig {
         .arena = arena,
         .config = config,
         .scratch = try arena.print("/tmp/bench-{d}", .{linux.getpid()}),
+        .zones = try arena.print("{s}/zones", .{config}),
         .threads = os.knob(u32, "N", 1),
         .observer = observer,
         .pool = cores[0 .. cores.len - 2],
@@ -123,12 +132,70 @@ fn path(r: *const Rig, comptime fmt: []const u8, args: anytype) ![]const u8 {
     return r.arena.print("{s}/" ++ fmt, .{r.scratch} ++ args);
 }
 
+pub fn signed() bool {
+    return os.knob(bool, "SIGNED", false);
+}
+
+pub fn synth() bool {
+    return os.knob(bool, "SYNTH", true);
+}
+
+fn gated(arena: Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |whole| {
+        var line = whole;
+        const keep = while (line.len > 1 and line[0] == '@') {
+            const end = std.mem.findScalar(u8, line, ' ') orelse line.len;
+            const want = line[1] != '!';
+            const knob = line[(if (want) 1 else 2)..end];
+            const on = if (std.mem.eql(u8, knob, "SIGNED")) signed() else if (std.mem.eql(u8, knob, "SYNTH")) synth() else return error.UnknownKnob;
+            if (on != want) break false;
+            line = line[@min(end + 1, line.len)..];
+        } else true;
+        if (!keep) continue;
+        try out.appendSlice(arena, line);
+        if (lines.peek() != null) try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
 fn template(r: *const Rig, file: []const u8, name: []const u8) ![]u8 {
-    var text = try os.slurp(r.arena, try r.arena.print("{s}/{s}", .{ r.config, file }));
+    var text = try gated(r.arena, try os.slurp(r.arena, try r.arena.print("{s}/{s}", .{ r.config, file })));
     const n = try r.arena.print("{d}", .{r.threads});
-    for ([_][2][]const u8{ .{ "__RUN__", r.scratch }, .{ "__DIR__", r.config }, .{ "__NAME__", name }, .{ "__N__", n } }) |sub|
+    const digest = if (std.mem.findScalarLast(u8, r.ds, ' ')) |at| at + 1 else 0;
+    const quoted = try r.arena.print("{s}\"{s}\"", .{ r.ds[0..digest], r.ds[digest..] });
+    for ([_][2][]const u8{ .{ "__RUN__", r.scratch }, .{ "__DIR__", r.config }, .{ "__ZONES__", r.zones }, .{ "__NAME__", name }, .{ "__N__", n }, .{ "__DS_QUOTED__", quoted }, .{ "__DS__", r.ds } }) |sub|
         text = try std.mem.replaceOwned(u8, r.arena, text, sub[0], sub[1]);
     return text;
+}
+
+/// Both zones signed into the scratch directory under keys made for this
+/// session, so no signature is stale and no key is kept. The root carries
+/// bench.'s DS, and its own becomes every resolver's trust anchor.
+fn sign(r: *Rig) !void {
+    const dir = try r.path("zones", .{});
+    try os.run(r.arena, &.{ "mkdir", "-p", dir });
+    var ds: []const u8 = "";
+    for ([_][2][]const u8{ .{ "bench", "bench." }, .{ "root", "." } }) |z| {
+        const key = std.mem.trim(u8, try os.capture(r.arena, &.{ "dnssec-keygen", "-q", "-K", dir, "-a", "ECDSAP256SHA256", "-f", "KSK", z[1] }), " \n");
+        const plain = try os.slurp(r.arena, try r.arena.print("{s}/{s}.zone", .{ r.zones, z[0] }));
+        const included = try r.arena.print("$INCLUDE {s}/bench.ns", .{r.zones});
+        const unsigned = try r.path("zones/{s}.unsigned", .{z[0]});
+        try os.spit(unsigned, try r.arena.print("{s}\n$INCLUDE {s}/{s}.key\n{s}", .{ try std.mem.replaceOwned(u8, r.arena, plain, "$INCLUDE bench.ns", included), dir, key, ds }));
+        // -z: the one key signs every set, though flagged a KSK.
+        const said = try os.capture(r.arena, &.{ "dnssec-signzone", "-K", dir, "-d", dir, "-z", "-o", z[1], "-f", try r.path("zones/{s}.zone", .{z[0]}), unsigned });
+        ds = os.slurp(r.arena, try r.path("zones/dsset-{s}", .{z[1]})) catch {
+            std.debug.print("bench: {s} was not signed\n{s}\n", .{ z[1], said });
+            return error.Unsigned;
+        };
+    }
+    var fields = std.mem.tokenizeAny(u8, ds[std.mem.find(u8, ds, "DS").? + 2 ..], " \t\n");
+    var anchor: std.ArrayList(u8) = .empty;
+    for (0..3) |_| try anchor.print(r.arena, "{s} ", .{fields.next().?});
+    while (fields.next()) |hex| try anchor.appendSlice(r.arena, hex);
+    r.ds = anchor.items;
+    r.zones = dir;
 }
 
 fn authority(r: *Rig, name: []const u8, cpus: []const u16, zone: []const u8, addrs: []const []const u8) !os.Child {
@@ -145,7 +212,7 @@ fn authority(r: *Rig, name: []const u8, cpus: []const u16, zone: []const u8, add
 pub fn up(r: *Rig) !void {
     try os.run(r.arena, &.{ "mkdir", "-p", r.scratch });
     var addrs: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, try os.slurp(r.arena, try r.arena.print("{s}/zones/bench.ns", .{r.config})), '\n');
+    var lines = std.mem.tokenizeScalar(u8, try os.slurp(r.arena, try r.arena.print("{s}/bench.ns", .{r.zones})), '\n');
     const v6 = os.knob(bool, "V6", true);
     while (lines.next()) |line| {
         var f = std.mem.tokenizeAny(u8, line, " \t");
@@ -159,6 +226,7 @@ pub fn up(r: *Rig) !void {
     const file = try r.path("ip", .{});
     try os.spit(file, batch.items);
     try os.run(r.arena, &.{ "ip", "-batch", file });
+    if (signed()) try r.sign();
     r.authorities[0] = try r.authority("root", r.cpu_aux, ".", &.{"198.41.0.4"});
     r.authorities[1] = try r.authority("bench", r.cpu_authority, "bench.", addrs.items);
     if (os.knob(?[]const u8, "LATENCY_MS", null)) |ms|
@@ -199,9 +267,9 @@ fn logFile(r: *const Rig) ![]const u8 {
 }
 
 fn command(r: *Rig, side: []const u8) ![]const []const u8 {
+    for ([_][]const u8{ "hark.toml", "unbound.conf", "recursor.yml", "named.conf", "kresd.conf" }) |f| try os.spit(try r.path("{s}", .{f}), try r.template(f, ""));
     const peer = std.meta.stringToEnum(Peer, side) orelse
-        return r.arena.dupe([]const u8, &.{ side, "serve", "--config", try r.arena.print("{s}/hark.toml", .{r.config}) });
-    for ([_][]const u8{ "unbound.conf", "recursor.yml", "named.conf" }) |f| try os.spit(try r.path("{s}", .{f}), try r.template(f, ""));
+        return r.arena.dupe([]const u8, &.{ side, "serve", "--config", try r.path("hark.toml", .{}) });
     return r.arena.dupe([]const u8, switch (peer) {
         .unbound => &.{ "unbound", "-d", "-c", try r.path("unbound.conf", .{}) },
         .pdns => &.{ "pdns_recursor", try r.arena.print("--config-dir={s}", .{r.scratch}) },
@@ -209,7 +277,7 @@ fn command(r: *Rig, side: []const u8) ![]const []const u8 {
             const dir = try r.path("kres", .{});
             try os.run(r.arena, &.{ "rm", "-rf", dir });
             try os.run(r.arena, &.{ "mkdir", "-p", dir });
-            break :blk &.{ "kresd", "-n", "-q", "-c", try r.arena.print("{s}/kresd.conf", .{r.config}), dir };
+            break :blk &.{ "kresd", "-n", "-q", "-c", try r.path("kresd.conf", .{}), dir };
         },
         .bind => &.{ "named", "-g", "-n", try r.arena.print("{d}", .{r.threads}), "-c", try r.path("named.conf", .{}) },
     });

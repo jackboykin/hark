@@ -14,7 +14,12 @@ incoming:
   pdns_distributes_queries: false
   allow_from: [127.0.0.0/8]
 dnssec:
-  validation: 'off'
+@!SIGNED   validation: 'off'
+@SIGNED   validation: validate
+@SIGNED   trustanchors:
+@SIGNED     - name: .
+@SIGNED       dsrecords: ['__DS__']
+@SIGNED @!SYNTH   aggressive_nsec_cache_size: 0
 outgoing:
   source_address: [0.0.0.0]
   dont_query: []

@@ -355,7 +355,7 @@ pub fn report(arena: Allocator, runs: []const Ledger.Run) !void {
         } else try sides.append(arena, run.side);
     }
     const r: Report = .{ .arena = arena, .runs = runs };
-    std.debug.print("prof {s} {s}, {s}\n", .{ runs[0].workload, runs[0].session, runs[0].host });
+    std.debug.print("prof {s}{s} {s}, {s}\n", .{ runs[0].workload, runs[0].rig(), runs[0].session, runs[0].host });
     for (sides.items) |s| try r.one(s);
     for (sides.items[1..]) |s| try r.against(sides.items[0], s);
 }

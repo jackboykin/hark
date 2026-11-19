@@ -5,6 +5,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const os = @import("os.zig");
+const Rig = @import("rig.zig");
 
 arena: Allocator,
 file: []const u8,
@@ -27,6 +28,9 @@ pub const Run = struct {
     binary: []const u8 = "",
     identity: []const u8 = "",
     threads: u32 = 1,
+    /// The rig's SIGNED, and under it its SYNTH.
+    signed: bool = false,
+    synth: bool = false,
     secs: u32 = 0,
     cores: []const u8 = "",
     sent: u64 = 0,
@@ -42,6 +46,11 @@ pub const Run = struct {
     syscalls: ?Counts = null,
     failed: ?Counts = null,
     overload: ?Overload = null,
+
+    /// How a report's first line names the rig's knobs.
+    pub fn rig(run: Run) []const u8 {
+        return if (!run.signed) "" else if (run.synth) " signed" else " signed, peers without synthesis";
+    }
 };
 
 const Overload = struct {
@@ -105,6 +114,8 @@ pub fn append(l: *const Ledger, run: Run) !void {
     stamped.session = l.session;
     stamped.bench = l.bench;
     stamped.host = l.host;
+    stamped.signed = Rig.signed();
+    stamped.synth = Rig.signed() and Rig.synth();
     const line = try std.json.Stringify.valueAlloc(l.arena, stamped, .{ .emit_null_optional_fields = false });
     const fd = try os.writer(l.file, true);
     defer _ = linux.close(fd);

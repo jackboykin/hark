@@ -313,7 +313,7 @@ pub fn report(arena: Allocator, runs: []const Ledger.Run, sides: []const []const
     };
     var r: Report = .{ .arena = arena, .runs = runs };
     for (names.items) |n| r.width = @max(r.width, n.len);
-    std.debug.print("tp {s} {s}, {s}\n", .{ runs[0].workload, runs[0].session, runs[0].host });
+    std.debug.print("tp {s}{s} {s}, {s}\n", .{ runs[0].workload, runs[0].rig(), runs[0].session, runs[0].host });
     for (names.items) |n| try r.side(n);
     const a = names.items[0];
     for (names.items[1..]) |b| {
