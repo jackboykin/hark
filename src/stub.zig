@@ -33,10 +33,11 @@ pub fn of(zones: []const Zone, name: dns.Name, qtype: dns.RType) ?*const Zone {
 }
 
 /// The zone hark holds that answers a question no stub zone takes. A stub
-/// zone the operator names overrides hark's defaults (RFC 6303 §3, RFC 6761
-/// §6.2), and `under` keeps one from the rest.
+/// zone the operator names over one of hark's defaults (RFC 6303 §3, RFC 6761
+/// §6.2) leaves hark holding nothing there, its apex's DS included, which
+/// then is its parent's like any other; `under` keeps one from the rest.
 pub fn held(zones: []const Zone, name: dns.Name, qtype: dns.RType, do_bit: bool) ?*const special_use.Zone {
-    return if (of(zones, name, qtype) != null) null else special_use.answering(name, qtype, do_bit);
+    return if (under(zones, name) != null) null else special_use.answering(name, qtype, do_bit);
 }
 
 pub const Scratch = struct {

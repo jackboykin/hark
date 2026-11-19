@@ -1,0 +1,40 @@
+; hark: root-hints = 127.0.10.1
+; hark: stub-zone = home.arpa 127.0.10.2
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a stub zone over one hark holds leaves its DS to the parent
+
+; Naming home.arpa turns its empty zone off for its DS too: a DS is its
+; parent's, asked there even without DO. The root stands in for arpa.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      home.arpa. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    home.arpa. IN DS
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    home.arpa. IN DS
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+ENTRY_END
+
+SCENARIO_END
