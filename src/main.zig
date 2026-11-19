@@ -112,6 +112,10 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
+    if (cgroupMemoryMax()) |max| if (cfg.memoryLimit() > max) {
+        log.err("[server] memory is {d} bytes, over the memory.max of {d} on hark's cgroup or one above it", .{ cfg.memoryLimit(), max });
+        return error.MemoryOverCgroup;
+    };
     reserve.limit = cfg.memoryLimit();
     kept.limit = cfg.cache_size;
     owed.limit = hark.config.ServerConfig.sharesOf(reserve.limit) - cfg.cache_size;
@@ -119,6 +123,35 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
         log.err("server error: {s}", .{@errorName(err)});
         return err;
     };
+}
+
+fn cgroupMemoryMax() ?u64 {
+    var buf: [4096]u8 = undefined;
+    const own = readSmall("/proc/self/cgroup", &buf) orelse return null;
+    const at = std.mem.find(u8, own, "0::") orelse return null;
+    const rest = own[at + 3 ..];
+    var dir = rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len];
+    var least: ?u64 = null;
+    while (dir.len > 1) : (dir = dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse 0]) {
+        var path: [4096 + 32]u8 = undefined;
+        const file = std.mem.printSentinel(&path, "/sys/fs/cgroup{s}/memory.max", .{dir}, 0) catch return least;
+        var limit: [32]u8 = undefined;
+        const text = std.mem.trimEnd(u8, readSmall(file, &limit) orelse continue, "\n");
+        const max = std.fmt.parseInt(u64, text, 10) catch continue;
+        least = @min(least orelse max, max);
+    }
+    return least;
+}
+
+fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const linux = std.os.linux;
+    const rc = linux.open(path, .{ .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    return buf[0..n];
 }
 
 fn loadDefaultConfig(allocator: std.mem.Allocator, io: Io) !hark.config.ServerConfig {
