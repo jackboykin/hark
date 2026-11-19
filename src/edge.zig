@@ -163,6 +163,7 @@ fn send(e: *Edge, ex: Exchange) !graph.Exposure {
             return .none;
         },
     };
+    errdefer e.close(flight);
     flight.seq = e.seq + 1;
     try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);

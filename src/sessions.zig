@@ -178,7 +178,7 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const c = switch (s.best(key, standings)) {
         .plain => return false,
         .dial => |kind| blk: {
-            if (s.find(key, kind)) |old| try s.retire(old);
+            if (s.find(key, kind)) |old| s.retire(old);
             break :blk s.dial(kind, ex.server, key) catch return false;
         },
         .session => |c| c,
@@ -189,6 +189,7 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     try c.queued.ensureUnusedCapacity(e.gpa, 1);
     try c.pending.ensureUnusedCapacity(e.gpa, 1);
     const at = try e.work.create(Carried);
+    errdefer e.work.destroy(at);
     const seq = e.seq + 1;
     try e.schedule(ex.deadline_ns, ex.id, seq, .carried);
     at.* = .{ .conn = c, .id = ex.id, .seq = seq, .wire = ex.wire, .asked_ns = e.now_ns };
@@ -196,9 +197,13 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     s.stats.getPtr(c.carrier).carried += 1;
     c.queued.appendAssumeCapacity(at);
     if (!c.carrier.established() or c.queued.items.len > 1) return true;
-    if (s.unflushed != c) try s.flush();
-    if (try s.drain(c)) s.unflushed = c else try s.drop(c, .closed);
+    s.start(c) catch s.drop(c, .closed);
     return true;
+}
+
+fn start(s: *Sessions, c: *Conn) !void {
+    if (s.unflushed != c) try s.flush();
+    if (try s.drain(c)) s.unflushed = c else s.drop(c, .closed);
 }
 
 pub fn flush(s: *Sessions) !void {
@@ -297,14 +302,15 @@ fn evictIdle(s: *Sessions) !bool {
         if (!c.carrier.established() or c.pending.count() > 0) continue;
         if (oldest == null or c.last_ns < oldest.?.last_ns) oldest = c;
     }
-    try s.drop(oldest orelse return false, .closed);
+    s.drop(oldest orelse return false, .closed);
     return true;
 }
 
-fn retire(s: *Sessions, c: *Conn) !void {
+/// Every carried query's timer reserved room for the event it ends with,
+/// so moving them all allocates nothing.
+fn retire(s: *Sessions, c: *Conn) void {
     if (c.pending.count() == 0) return s.drop(c, .closed);
     const e = s.edge;
-    try e.queue.ensureUnusedCapacity(e.gpa, c.queued.items.len);
     s.unlist(c);
     s.stats.getPtr(c.carrier).moved += c.queued.items.len;
     for (c.queued.items) |at| e.queue.appendAssumeCapacity(s.completed(at, .moved));
@@ -325,9 +331,8 @@ fn unlist(s: *Sessions, c: *const Conn) void {
     _ = s.by_server.remove(c.key);
 }
 
-fn drop(s: *Sessions, c: *Conn, how: carrier.End) !void {
+fn drop(s: *Sessions, c: *Conn, how: carrier.End) void {
     const e = s.edge;
-    try e.queue.ensureUnusedCapacity(e.gpa, c.pending.count() + c.queued.items.len);
     _ = s.conns.swapRemove(mem.findScalar(*Conn, s.conns.items, c).?);
     s.unlist(c);
     if (s.unflushed == c) {
@@ -486,8 +491,9 @@ test "a write lost while queries leave the handshake moves each query once" {
         try s.flights.put(testing.allocator, at.id, at);
         try c.queued.append(testing.allocator, at);
     }
+    try e.queue.ensureUnusedCapacity(e.gpa, queries);
     try testing.expect(!try s.onEstablished(c));
-    try s.drop(c, .closed);
+    s.drop(c, .closed);
     try testing.expectEqual(queries, e.queue.items.len);
     try testing.expectEqual(0, s.flights.count());
 }
