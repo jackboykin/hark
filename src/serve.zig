@@ -304,9 +304,16 @@ const Server = struct {
                 continue;
             }
             posix.setsockopt(cfd, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(client_sndbuf)) catch {};
-            const c = try s.gpa.create(Conn);
+            const c = s.gpa.create(Conn) catch {
+                sys.close(cfd);
+                return false;
+            };
             c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
-            c.token = try s.token(.{ .conn = c });
+            c.token = s.token(.{ .conn = c }) catch {
+                s.gpa.destroy(c);
+                sys.close(cfd);
+                return false;
+            };
             s.conns += 1;
             try s.e.watch(c.fd, c.token, c.interest());
         }
@@ -329,7 +336,7 @@ const Server = struct {
         }
         if (rc == 0) return s.close(c);
         if (c.held.items.len == 0) return s.frames(c, into[0..rc]);
-        try c.held.appendSlice(s.gpa, into[0..rc]);
+        c.held.appendSlice(s.gpa, into[0..rc]) catch return s.drop(c);
         try s.frames(c, c.held.items);
     }
 
@@ -351,7 +358,7 @@ const Server = struct {
         }
         const rest = bytes[start..];
         if (rest.len == 0) return c.held.clearAndFree(s.gpa);
-        if (bytes.ptr != c.held.items.ptr) return c.held.appendSlice(s.gpa, rest);
+        if (bytes.ptr != c.held.items.ptr) return c.held.appendSlice(s.gpa, rest) catch s.drop(c);
         mem.copyForwards(u8, c.held.items, rest);
         c.held.shrinkRetainingCapacity(rest.len);
     }
@@ -399,6 +406,8 @@ const Server = struct {
             p.owes = .{ .left = c.addr };
             if (p.at_ns != Pending.never) continue;
             p.at_ns = @max(p.timeout(), s.e.now_ns);
+            // Only hastens: without the timer the waiter leaves when its
+            // resolution settles, which its deadline bounds.
             s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
         };
         sys.close(c.fd);
@@ -431,11 +440,37 @@ const Server = struct {
         // can't be made to answer each other. Over TCP `validateQuery` answers it.
         if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         if (reply != .tcp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
+        s.question(wire, reply, crowded) catch |err| switch (err) {
+            error.OutOfMemory => s.refused(reply, .{ .id = mem.readInt(u16, wire[0..2], .big), .rcode = .server_failure, .rd = wire[2] & 1 != 0 }),
+            else => |e| return e,
+        };
+    }
+
+    fn refused(s: *Server, reply: Reply, e: response.Refusal) void {
+        if (reply == .tcp) return s.sendError(reply, e);
+        s.clients.unanswered.dropped += 1;
+    }
+
+    fn refuse(s: *Server, i: u32, linked: bool) void {
+        const p = s.pending.items[i];
+        switch (p.owes) {
+            .reply => |r| s.refused(r, .{ .id = p.query.header.id, .opcode = p.query.header.flags.opcode, .rcode = .server_failure, .rd = p.query.header.flags.rd, .question = p.query.question, .client = p.query.edns }),
+            .left => s.forsake(.dropped, p.owes, p.query, p.asked_ns),
+            .nothing => {},
+        }
+        if (linked) s.unpark(i);
+        s.vacate(i);
+    }
+
+    fn question(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
         s.scratch.reset();
         const arena = s.scratch.allocator();
-        const query = dns.readQuery(arena, wire) catch {
-            const id = mem.readInt(u16, wire[0..2], .big);
-            return s.sendError(reply, .{ .id = id, .rcode = .format_error, .rd = wire[2] & 1 != 0 });
+        const query = dns.readQuery(arena, wire) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => {
+                const id = mem.readInt(u16, wire[0..2], .big);
+                return s.sendError(reply, .{ .id = id, .rcode = .format_error, .rd = wire[2] & 1 != 0 });
+            },
         };
         if (response.validateQuery(query)) |v| return s.sendError(reply, .{ .id = query.header.id, .opcode = query.header.flags.opcode, .rcode = v.rcode, .extended_rcode = v.extended_rcode, .rd = query.header.flags.rd, .question = query.question, .client = query.edns });
         const q = query.question.?;
@@ -521,7 +556,10 @@ const Server = struct {
             const first = s.firstOwed(i);
             while (i != Pending.none) {
                 const next = s.pending.items[i].next;
-                try s.ready(i, first);
+                s.ready(i, first) catch |err| switch (err) {
+                    error.OutOfMemory => s.refuse(i, false),
+                    else => |e| return e,
+                };
                 i = next;
             }
         }
@@ -531,14 +569,16 @@ const Server = struct {
             const p = &s.pending.items[t.slot];
             if (p.phase == .vacant or p.gen != t.gen or p.at_ns != t.at_ns) continue;
             if (p.phase == .echoing) {
-                try s.ready(t.slot, p.asked_ns);
+                s.ready(t.slot, p.asked_ns) catch |err| switch (err) {
+                    error.OutOfMemory => s.refuse(t.slot, false),
+                    else => |e| return e,
+                };
                 continue;
             }
-            if (t.at_ns == p.patience()) try s.impatient(p);
-            if (try s.gone(t.slot)) {
-                s.unpark(t.slot);
-                s.vacate(t.slot);
-            } else try s.schedule(t.slot);
+            s.lapse(t.slot, t.at_ns) catch |err| switch (err) {
+                error.OutOfMemory => s.refuse(t.slot, true),
+                else => |e| return e,
+            };
         }
     }
 
@@ -627,6 +667,15 @@ const Server = struct {
             Pending.never;
         if (p.at_ns == Pending.never) return;
         try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
+    }
+
+    fn lapse(s: *Server, i: u32, at_ns: i64) !void {
+        const p = &s.pending.items[i];
+        if (at_ns == p.patience()) try s.impatient(p);
+        if (try s.gone(i)) {
+            s.unpark(i);
+            s.vacate(i);
+        } else try s.schedule(i);
     }
 
     fn gone(s: *Server, i: u32) !bool {
