@@ -129,7 +129,7 @@ pub const Answer = struct {
 };
 
 pub const Outcome = union(enum) {
-    reply: struct { msg: dns.Message, rtt_ns: i64, stream: bool },
+    reply: struct { wire: []const u8, rtt_ns: i64, stream: bool },
     timeout,
     unsent,
     moved,

@@ -1264,6 +1264,11 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!Parsed {
     };
 }
 
+pub fn parseHead(allocator: Allocator, bytes: []const u8) Error!Message {
+    const hdr, _, const question = try readHead(allocator, bytes);
+    return .{ .header = hdr, .question = question };
+}
+
 fn readHead(allocator: Allocator, bytes: []const u8) Error!struct { Header, Parser, ?Question } {
     if (bytes.len < header_len) return error.EndOfData;
     const hdr = Header.parse(bytes[0..12]);

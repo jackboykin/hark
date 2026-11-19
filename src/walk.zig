@@ -197,9 +197,9 @@ pub const Ask = struct {
 
     /// Bare SERVFAIL, never the held rcode: a REFUSED or FORMERR passed through
     /// reads as hark's own policy, and server order must not change what a client sees.
-    fn giveUp(a: *Ask, g: *Graph) Result {
+    fn giveUp(a: *Ask, g: *Graph) !Result {
         std.debug.assert(a.nattempts == 0);
-        var msg = g.cell(a.held.unwrap() orelse return .exhausted).state.fact.exchange.reply.msg;
+        var msg = try g.read(a.held.unwrap() orelse return .exhausted) orelse return .exhausted;
         msg.header.flags.rcode = .server_failure;
         msg.answers = &.{};
         msg.authorities = &.{};
@@ -572,7 +572,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .aa = true, .target = name, .zone = zone, .stored_ns = g.now() };
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
-                    a.* = .{ .zone = ref.zone_cut };
+                    a.* = .{ .zone = try ref.zone_cut.clone(g.cell(id).arena.allocator()) };
                     try a.seed(g, cut.value.cut);
                     continue;
                 }
@@ -970,7 +970,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
     var refused = false;
     while (true) {
         if (try reap(g, id, a, qname, qtype, &refused)) |kept| return .{ .reply = kept };
-        if (refused) return if (a.nattempts > 0) .pending else a.giveUp(g);
+        if (refused) return if (a.nattempts > 0) .pending else try a.giveUp(g);
         if (a.nattempts > 0 and (g.cfg.stagger_ms == 0 or a.nattempts == max_hedge)) return .pending;
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
@@ -1020,7 +1020,7 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
             return error.OutOfMemory;
         }
         const at = a.end(i);
-        const again: ?Way = switch (ex.state.fact.exchange) {
+        const again: ?Way = heard: switch (ex.state.fact.exchange) {
             // The deadline cut the wait before the server was due: it was asked
             // nothing, and may be tried again.
             .timeout => way: {
@@ -1038,8 +1038,9 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
             // and a server that normalises 0x20 case answers.
             .mismatch, .malformed => if (at.case == .random) .{ .need = .stream, .case = .plain } else null,
             // TC over a stream is a broken server, as good as a timeout.
-            .reply => |r| if (r.msg.header.flags.tc) (if (r.stream) null else Way{ .need = .stream, .case = .random }) else way: {
-                const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
+            .reply => |r| if (dns.Header.parse(r.wire[0..12]).flags.tc) (if (r.stream) null else Way{ .need = .stream, .case = .random }) else way: {
+                const msg = try g.read(at.exchange) orelse continue :heard .malformed;
+                const kept = if (delegation.shouldTrySibling(msg, a.zone)) null else try judge(g, msg, a.zone, qname, qtype);
                 if (kept) |k| {
                     a.nattempts = 0;
                     return k;

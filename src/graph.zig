@@ -636,8 +636,8 @@ pub const Graph = struct {
             const over: []const u8 = if (completion == .reply and completion.reply.stream) " over a session" else "";
             log.debug("{f} {f} {f} {t}{s} -> {t}", .{ sc.server, c.name, dns.tag(sc.qtype), sc.need, over, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
-                const m = outcome.reply.msg;
-                log.debug("    aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
+                const h = dns.Header.parse(outcome.reply.wire[0..12]);
+                log.debug("    aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}", .{ h.flags.aa, h.flags.tc, h.flags.ra, dns.tag(h.flags.rcode), h.an_count, h.ns_count, h.ar_count });
             }
         }
         switch (outcome) {
@@ -656,7 +656,6 @@ pub const Graph = struct {
 
     fn outcomeOf(g: *Graph, c: *Cell, completion: Completion) Error!Outcome {
         const sc = c.scratch.exchange;
-        const arena = c.arena.allocator();
         return switch (completion) {
             .wake => unreachable,
             .unheld => error.OutOfMemory,
@@ -664,30 +663,38 @@ pub const Graph = struct {
             .unsent => .unsent,
             .moved => .moved,
             .reply => |heard| blk: {
-                const bytes = try arena.dupe(u8, heard.bytes);
-                var p = dns.parse(arena, bytes) catch |err| switch (err) {
+                const m = dns.parseHead(g.scratch.allocator(), heard.bytes) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => break :blk .malformed,
                 };
-                if (p.header.id != sc.id) break :blk .mismatch;
-                dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
+                if (m.header.id != sc.id) break :blk .mismatch;
+                dns.validateResponse(m, sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // After the match, so a forger gains nothing over a mismatch.
-                if (!heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
-                inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
-                    var n: usize = 0;
-                    for (section.*) |rr| if (rr.rclass == .in) {
-                        section.*[n] = rr;
-                        n += 1;
-                    };
-                    section.* = section.*[0..n];
-                }
-                const scratch = g.scratch.allocator();
-                p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
-                p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
-                p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
-                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns, .stream = heard.stream } };
+                if (!heard.stream and heard.bytes.len > dns.edns_udp_payload) break :blk .oversized;
+                break :blk .{ .reply = .{ .wire = try c.arena.allocator().dupe(u8, heard.bytes), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns, .stream = heard.stream } };
             },
         };
+    }
+
+    pub fn read(g: *Graph, exchange_id: CellId) Error!?dns.Message {
+        const c = g.cell(exchange_id);
+        const scratch = g.scratch.allocator();
+        var p = dns.parse(scratch, c.state.fact.exchange.reply.wire) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => return null,
+        };
+        inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
+            var n: usize = 0;
+            for (section.*) |rr| if (rr.rclass == .in) {
+                section.*[n] = rr;
+                n += 1;
+            };
+            section.* = section.*[0..n];
+        }
+        p.answers = try dnssec.bindSets(scratch, p.answers, c.scratch.exchange.qtype == .rrsig);
+        p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
+        p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
+        return p.message();
     }
 
     fn newRoot(g: *Graph, key: Key, name: dns.Name, as_of: i64, budget: Budget) !CellId {
@@ -1544,6 +1551,45 @@ test "a published cell that cannot settle is queued, never left waiting on nothi
         break;
     }
     try testing.expect(refused > 0);
+}
+
+test "an exchange holds a reply as it arrived, whatever its names expand to" {
+    const testing = std.testing;
+    var counted: testing.FailingAllocator = .init(testing.allocator, .{});
+    var q: Quiet = .{};
+    var g = try q.graphOn(testing.allocator, counted.allocator(), .{ .root_hints = &.{} });
+    defer g.deinit();
+    var long: [253]u8 = @splat('z');
+    for (0..4) |i| long[i * 63] = 62;
+    long[252] = 0;
+    const name: dns.Name = .of(&long);
+    const root = try g.demandRoot(name, .a, .new);
+    g.payer = g.cell(root).scratch.answer.budget;
+    const asker = try g.newInput(Key.of(.rrset, name, .a), name, root);
+    const sent = (try g.exchange(asker, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .{ .name = name, .qtype = .a, .need = .stream, .case = .random }, true)).?;
+    const sc = g.cell(sent.id).scratch.exchange;
+
+    var wire: [dns.max_message_len]u8 = @splat(0);
+    mem.writeInt(u16, wire[0..2], sc.id, .big);
+    mem.writeInt(u16, wire[2..4], 0x8400, .big);
+    mem.writeInt(u16, wire[4..6], 1, .big);
+    @memcpy(wire[12..][0..sc.sent.len], sc.sent);
+    var at: usize = 12 + sc.sent.len;
+    wire[at..][0..4].* = .{ 0, 1, 0, 1 };
+    at += 4;
+    var records: u16 = 0;
+    // Each owner and each NS target is one label and a pointer to the question.
+    const record = [_]u8{ 1, 'o', 0xc0, 12, 0, 2, 0, 1, 0, 0, 0, 60, 0, 4, 1, 't', 0xc0, 12 };
+    while (at + record.len <= wire.len) : (records += 1) {
+        @memcpy(wire[at..][0..record.len], &record);
+        at += record.len;
+    }
+    mem.writeInt(u16, wire[6..8], records, .big);
+
+    const before = counted.allocated_bytes - counted.freed_bytes;
+    const outcome = try g.outcomeOf(g.cell(sent.id), .{ .reply = .{ .bytes = wire[0..at], .stream = true } });
+    try testing.expectEqual(at, outcome.reply.wire.len);
+    try testing.expect(counted.allocated_bytes - counted.freed_bytes - before < 2 * at);
 }
 
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
