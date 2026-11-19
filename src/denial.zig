@@ -60,7 +60,7 @@ const Zone = struct {
         for (z.spans.items) |sp| if (sp.expires_ns > g.now()) {
             z.spans.items[w] = sp;
             w += 1;
-        } else sp.deinit(g.gpa, &g.store);
+        } else sp.deinit(g.store.gpa, &g.store);
         z.spans.shrinkRetainingCapacity(w);
     }
 
@@ -133,7 +133,7 @@ pub fn evicted(g: *Graph, blob: *store.Blob) void {
         const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
         if (pos < z.spans.items.len and z.spans.items[pos].judged == blob) {
-            z.spans.items[pos].deinit(g.gpa, &g.store);
+            z.spans.items[pos].deinit(g.store.gpa, &g.store);
             _ = z.spans.orderedRemove(pos);
             dropIfEmpty(g, zi);
             return;
@@ -144,17 +144,17 @@ pub fn evicted(g: *Graph, blob: *store.Blob) void {
 fn dropIfEmpty(g: *Graph, i: usize) void {
     const z = &g.denial.zones.values()[i];
     if (z.spans.items.len != 0 or z.soa != null) return;
-    z.spans.deinit(g.gpa);
+    z.spans.deinit(g.store.gpa);
     const owned = g.denial.zones.keys()[i];
     g.denial.zones.swapRemoveAt(i);
-    g.gpa.free(owned);
+    g.store.gpa.free(owned);
 }
 
 fn zoneFor(g: *Graph, key: []const u8) !*Zone {
-    const gop = try g.denial.zones.getOrPut(g.gpa, key);
+    const gop = try g.denial.zones.getOrPut(g.store.gpa, key);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
-        gop.key_ptr.* = g.gpa.dupe(u8, gop.key_ptr.*) catch |e| {
+        gop.key_ptr.* = g.store.gpa.dupe(u8, gop.key_ptr.*) catch |e| {
             g.denial.zones.swapRemoveAt(gop.index);
             return e;
         };
@@ -186,16 +186,16 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
             z.soa = .{ .judged = judged, .expires_ns = expires };
             continue;
         }
-        const sp = Span.init(g.gpa, rr, expires, judged) catch |e| {
+        const sp = Span.init(g.store.gpa, rr, expires, judged) catch |e| {
             g.store.unref(judged);
             return e;
         };
         const pos = z.position(rr.name);
         if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(rr.name)) {
-            z.spans.items[pos].deinit(g.gpa, &g.store);
+            z.spans.items[pos].deinit(g.store.gpa, &g.store);
             z.spans.items[pos] = sp;
-        } else z.spans.insert(g.gpa, pos, sp) catch |e| {
-            sp.deinit(g.gpa, &g.store);
+        } else z.spans.insert(g.store.gpa, pos, sp) catch |e| {
+            sp.deinit(g.store.gpa, &g.store);
             return e;
         };
     }

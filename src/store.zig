@@ -7,6 +7,7 @@ const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const model = @import("model.zig");
+const slab = @import("slab.zig");
 
 const Kind = model.Kind;
 const Key = model.Key;
@@ -100,14 +101,17 @@ pub const Life = struct {
 
 const OnEvict = *const fn (*Store, *Blob) void;
 
+pub const Facts = struct { allocator: Allocator, share: *const slab.Share };
+
 pub const Store = struct {
     gpa: Allocator,
     map: std.array_hash_map.Custom(Ref, void, ByRef, false) = .empty,
     /// Every live blob's bytes, whoever holds a reference.
     bytes: usize = 0,
-    /// The bytes of the blobs the map holds; `cap` bounds this.
+    /// The bytes of the blobs the map holds.
     held: usize = 0,
     cap: usize,
+    share: ?*const slab.Share = null,
     visited: std.bit_set.Dynamic = .{},
     hand: usize = 0,
     /// Over the cap a new key is turned away the first time and admitted the
@@ -164,8 +168,15 @@ pub const Store = struct {
         return s.map.getIndexAdapted(Probe{ .key = key, .h = key.hash() }, ByKey{});
     }
 
-    pub fn init(gpa: Allocator, cap: usize) Store {
-        return .{ .gpa = gpa, .cap = cap };
+    pub fn init(gpa: Allocator, cap: usize, share: ?*const slab.Share) Store {
+        return .{ .gpa = gpa, .cap = cap, .share = share };
+    }
+
+    /// What the store holds that eviction can give back: all its tenant holds
+    /// but blobs only others still read.
+    fn footprint(s: *const Store) usize {
+        const sh = s.share orelse return s.held;
+        return sh.held - (s.bytes - s.held);
     }
 
     pub fn deinit(s: *Store) void {
@@ -205,7 +216,7 @@ pub const Store = struct {
         const old: ?*Blob = if (gop.found_existing) gop.key_ptr.blob() else null;
         if (old == null) {
             errdefer s.map.swapRemoveAt(gop.index);
-            if (s.held + blob.len > s.cap and !s.knock(blob.key())) {
+            if (s.footprint() + blob.len > s.cap and !s.knock(blob.key())) {
                 s.unadmitted += 1;
                 return error.Refused;
             }
@@ -218,7 +229,7 @@ pub const Store = struct {
             if (s.on_evict) |f| f(s, o);
             s.letGo(o);
         }
-        while (s.held > s.cap and s.map.count() > 1) s.evict();
+        while (s.footprint() > s.cap and s.map.count() > 1) s.evict();
     }
 
     fn letGo(s: *Store, b: *Blob) void {
@@ -596,7 +607,7 @@ test "a fact survives the blob byte for byte" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var s: Store = .init(testing.allocator, 1 << 20);
+    var s: Store = .init(testing.allocator, 1 << 20, null);
     defer s.deinit();
 
     const owner = try dns.parseDottedName(arena, "www.example.com.");
@@ -690,7 +701,7 @@ test "a blob holds an rrset larger than any message" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var s: Store = .init(testing.allocator, 1 << 20);
+    var s: Store = .init(testing.allocator, 1 << 20, null);
     defer s.deinit();
 
     // A reply spells each 255-octet target in two octets past the first.
@@ -715,7 +726,7 @@ test "a blob holds an rrset larger than any message" {
 
 test "the cap holds by eviction and admission" {
     const testing = std.testing;
-    var s: Store = .init(testing.allocator, 2048);
+    var s: Store = .init(testing.allocator, 2048, null);
     defer s.deinit();
     var names: [64][5]u8 = undefined;
     for (&names, 0..) |*buf, i| {
@@ -738,6 +749,33 @@ test "the cap holds by eviction and admission" {
     try testing.expectEqual(s.held, s.bytes);
 }
 
+test "a store on a share evicts for all it holds but what only others read" {
+    const testing = std.testing;
+    var reserve: slab.Reserve = .{};
+    defer reserve.deinit();
+    var kept: slab.Share = .{};
+    var facts: slab.Tenant = .in(&reserve, &kept);
+    var s: Store = .init(facts.allocator(), 4096, &kept);
+    var read: [64]*Blob = undefined;
+    var names: [64][5]u8 = undefined;
+    for (&names, &read, 0..) |*buf, *r, i| {
+        const zone: dns.Name = .of(try std.mem.print(buf, "{c}k{d}\x00", .{ @as(u8, if (i < 10) 2 else 3), i }));
+        const blob = try s.build(.of(.cut, zone, .a), .{ .cut = .{ .zone = zone } }, 10);
+        r.* = blob.ref();
+        s.put(blob) catch {
+            try s.put(blob);
+        };
+    }
+    try testing.expect(s.evictions > 0);
+    try testing.expect(s.footprint() <= s.cap);
+    try testing.expect(kept.held > s.cap);
+    try testing.expect(s.map.count() > 1);
+    for (read) |b| s.unref(b);
+    s.deinit();
+    reserve.drain();
+    try testing.expectEqual(0, kept.held);
+}
+
 test "a replaced version leaves as one evicted" {
     const testing = std.testing;
     const Watched = struct {
@@ -750,7 +788,7 @@ test "a replaced version leaves as one evicted" {
             w.last = b;
         }
     };
-    var w: Watched = .{ .store = .init(testing.allocator, 1 << 16) };
+    var w: Watched = .{ .store = .init(testing.allocator, 1 << 16, null) };
     defer w.store.deinit();
     w.store.on_evict = Watched.evicted;
     const zone: dns.Name = .lit("x");

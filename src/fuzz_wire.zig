@@ -300,7 +300,7 @@ test "fuzz: store round trip" {
             defer arena.deinit();
             const alloc = arena.allocator();
             const msg = dns.parseMessage(alloc, genMessage(s, &w)) catch return;
-            if (shared_store == null) shared_store = store.Store.init(std.heap.smp_allocator, 64 * 1024);
+            if (shared_store == null) shared_store = store.Store.init(std.heap.smp_allocator, 64 * 1024, null);
             const st = &shared_store.?;
             const owner = if (msg.question) |q| q.name else dns.Name.root;
             const reply: model.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };

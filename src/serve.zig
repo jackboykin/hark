@@ -7,6 +7,7 @@ const graph = @import("graph.zig");
 const model = @import("model.zig");
 const answer = @import("answer.zig");
 const Arena = @import("arena.zig");
+const store = @import("store.zig");
 const slab = @import("slab.zig");
 const Batch = @import("batch.zig");
 
@@ -918,7 +919,7 @@ const Server = struct {
     }
 };
 
-pub fn run(gpa: Allocator, work: Allocator, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
+pub fn run(gpa: Allocator, work: Allocator, facts: store.Facts, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
     var e = try Edge.init(gpa);
     defer e.deinit();
     e.idle_max = fdShare(16);
@@ -931,7 +932,9 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: *slab.Reserve, cfg: *const 
         .stagger_ms = cfg.stagger_ms,
         .max_queries = cfg.max_queries,
         .trust_anchors = if (cfg.dnssec) cfg.trustAnchors() else null,
-        .store_bytes = cfg.cache_size,
+        // An eighth is room for blobs cells still read after the store lets them go.
+        .store_bytes = cfg.cache_size / 8 * 7,
+        .facts = facts,
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
         .max_flights = fdShare(2),

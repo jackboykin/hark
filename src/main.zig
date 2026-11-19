@@ -22,7 +22,9 @@ const log = std.log;
 const leaks = std.log.scoped(.slab);
 
 var reserve: hark.slab.Reserve = .{};
+var kept: hark.slab.Share = .{};
 var owed: hark.slab.Share = .{};
+var facts: hark.slab.Tenant = .in(&reserve, &kept);
 var lasting: hark.slab.Tenant = .in(&reserve, &owed);
 var work: hark.slab.Tenant = .in(&reserve, &owed);
 
@@ -30,7 +32,7 @@ pub fn main(init: std.process.Init) u8 {
     defer hark.log.drain();
     const status: u8 = if (command(init)) 0 else |_| 1;
     reserve.drain();
-    if (owed.held > 0) leaks.err("{d} bytes still held at exit", .{owed.held});
+    if (kept.held + owed.held > 0) leaks.err("{d} bytes cached and {d} owed still held at exit", .{ kept.held, owed.held });
     return status;
 }
 
@@ -110,7 +112,8 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    hark.serve.run(allocator, work_allocator, &reserve, &cfg, trace) catch |err| {
+    kept.limit = cfg.cache_size;
+    hark.serve.run(allocator, work_allocator, .{ .allocator = facts.allocator(), .share = &kept }, &reserve, &cfg, trace) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         return err;
     };

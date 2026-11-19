@@ -145,6 +145,7 @@ pub const Config = struct {
     prefetch: bool = false,
     trust_anchors: ?[]const dns.DsData = null,
     store_bytes: usize = 12 << 20,
+    facts: ?store.Facts = null,
     trace: bool = false,
 };
 
@@ -402,7 +403,7 @@ pub const Graph = struct {
 
     pub fn init(gpa: Allocator, work: Allocator, cfg: Config, edge: Edge) !Graph {
         const rtt = try ns_rtt.Table.create(gpa);
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = .init(gpa, cfg.store_bytes) };
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = if (cfg.facts) |f| .init(f.allocator, cfg.store_bytes, f.share) else .init(gpa, cfg.store_bytes, null) };
         errdefer g.deinit();
         g.scratch = try .withFloor(gpa, Arena.scratch_floor);
         g.store.on_evict = evicted;
@@ -433,7 +434,7 @@ pub const Graph = struct {
         g.gpa.destroy(g.rtt);
         for (g.failed.keys()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
-        g.denial.deinit(g.gpa, &g.store);
+        g.denial.deinit(g.store.gpa, &g.store);
         g.verify_memo.deinit(g.gpa);
         g.store.deinit();
     }
