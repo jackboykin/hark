@@ -384,7 +384,9 @@ pub const Graph = struct {
     failed: std.array_hash_map.Custom(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
-    ready: std.ArrayList(Queued) = .empty,
+    /// The top of the ready stack, which threads through the slots: a queued
+    /// slot's `next` is the one below it, and the bottom one names itself.
+    ready: OptionalCellId = .none,
     answered: std.ArrayList(CellId) = .empty,
     rtt: *ns_rtt.Table,
     schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
@@ -422,7 +424,6 @@ pub const Graph = struct {
         g.cells.deinit(g.gpa);
         g.scratch.deinit();
         g.index.deinit(g.gpa);
-        g.ready.deinit(g.gpa);
         g.answered.deinit(g.gpa);
         g.gpa.destroy(g.rtt);
         for (g.failed.keys()) |k| g.gpa.free(k.name);
@@ -467,7 +468,7 @@ pub const Graph = struct {
         const id = try g.newRoot(key, name, 0, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
-        try g.enqueue(id);
+        g.enqueue(id);
         return id;
     }
 
@@ -489,7 +490,7 @@ pub const Graph = struct {
         g.payer.refs += 1;
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
-        try g.enqueue(id);
+        g.enqueue(id);
         g.stats.resolver.detail.ahead += 1;
         if (g.cfg.trace) {
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -519,36 +520,71 @@ pub const Graph = struct {
         }
     }
 
-    const Queued = struct { id: CellId, gen: u32 };
-
-    pub fn enqueue(g: *Graph, id: CellId) !void {
-        try g.ready.append(g.gpa, .{ .id = id, .gen = g.gen(id) });
+    pub fn enqueue(g: *Graph, id: CellId) void {
+        const s = &g.cells.items[id];
+        if (s.next != .none) return;
+        s.next = if (g.ready == .none) .wrap(id) else g.ready;
+        g.ready = .wrap(id);
     }
 
     pub fn drain(g: *Graph) Error!void {
-        while (try g.nextReady()) |q| if (g.gen(q.id) == q.gen) try g.run(q.id);
+        while (try g.nextReady()) |id| {
+            if (g.alive(id) == null) {
+                g.cells.items[id].next = g.empty;
+                g.empty = .wrap(id);
+            } else try g.run(id);
+        }
     }
 
-    fn nextReady(g: *Graph) !?Queued {
-        const ch = g.chaosAt(.settle) orelse return g.ready.pop();
-        const n = g.ready.items.len;
-        if (n == 0) return null;
-        for (g.ready.items, 0..) |q, i| if (g.gen(q.id) != q.gen or g.cell(q.id).settled()) return g.ready.orderedRemove(i);
-        var pick = n - 1;
-        if (n > 1) {
-            var top: u64 = 0;
-            for (g.ready.items, 0..) |q, i| {
-                const key = g.cell(q.id).key;
+    fn below(g: *const Graph, id: CellId) ?CellId {
+        const n = g.cells.items[id].next.unwrap().?;
+        return if (n == id) null else n;
+    }
+
+    fn unqueue(g: *Graph, id: CellId, above: ?CellId) void {
+        const under = g.below(id);
+        if (above) |a| g.cells.items[a].next = .wrap(under orelse a) else g.ready = .wrap(under);
+        g.cells.items[id].next = .none;
+    }
+
+    fn nextReady(g: *Graph) !?CellId {
+        const top = g.ready.unwrap() orelse return null;
+        const ch = g.chaosAt(.settle) orelse {
+            g.unqueue(top, null);
+            return top;
+        };
+        var above: ?CellId = null;
+        var at: ?CellId = top;
+        while (at) |id| : (at = g.below(id)) {
+            const c = g.alive(id) orelse return g.unqueued(id, above);
+            if (c.settled()) return g.unqueued(id, above);
+            above = id;
+        }
+        var pick = top;
+        var pick_above: ?CellId = null;
+        if (g.below(top) != null) {
+            var best: ?u64 = null;
+            above = null;
+            at = top;
+            while (at) |id| : (at = g.below(id)) {
+                const key = g.cell(id).key;
                 const draw = try ch.choose(.settle, ch.peek(.settle, key), std.math.maxInt(u64), .{ .key = key });
-                if (draw >= top) {
-                    pick = i;
-                    top = draw;
+                if (best == null or draw > best.?) {
+                    pick = id;
+                    pick_above = above;
+                    best = draw;
                 }
+                above = id;
             }
         }
-        const q = g.ready.orderedRemove(pick);
-        try ch.spend(.settle, g.cell(q.id).key);
-        return q;
+        g.unqueue(pick, pick_above);
+        try ch.spend(.settle, g.cell(pick).key);
+        return pick;
+    }
+
+    fn unqueued(g: *Graph, id: CellId, above: ?CellId) CellId {
+        g.unqueue(id, above);
+        return id;
     }
 
     fn chaosAt(g: *const Graph, site: chaos.Site) ?*chaos.Chaos {
@@ -600,7 +636,7 @@ pub const Graph = struct {
 
     pub fn complete(g: *Graph, id: CellId, completion: Completion) Error!void {
         if (completion == .wake) {
-            if (g.gen(id) == completion.wake) try g.enqueue(id);
+            if (g.gen(id) == completion.wake) g.enqueue(id);
             return g.drain();
         }
         const c = g.cell(id);
@@ -696,6 +732,7 @@ pub const Graph = struct {
         // Nothing fallible past here: the errdefers assume `c` unbuilt.
         const s = &g.cells.items[id];
         g.empty = s.next;
+        s.next = .none;
         s.cell = c;
         c.* = .{
             .key = own_key,
@@ -770,8 +807,9 @@ pub const Graph = struct {
         const c = g.cell(id);
         _ = g.index.swapRemoveAdapted(Asked{ .key = c.key, .as_of = c.as_of }, Own{ .id = id });
         const s = &g.cells.items[id];
-        s.* = .{ .gen = s.gen +% 1, .next = g.empty };
-        g.empty = .wrap(id);
+        const queued = s.next != .none;
+        s.* = .{ .gen = s.gen +% 1, .next = if (queued) s.next else g.empty };
+        if (!queued) g.empty = .wrap(id);
         g.live -= 1;
         g.unpinAll(c);
         if (c.blob) |b| g.store.unref(b);
@@ -881,7 +919,7 @@ pub const Graph = struct {
     fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
         const c = g.cell(id);
         var it = c.waiterIds();
-        while (it.next()) |w| try g.enqueue(w);
+        while (it.next()) |w| g.enqueue(w);
         if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
         // An answer serves from its hops; everything else has copied out.
         if (!keep_inputs) g.unpinAll(c);
@@ -1126,7 +1164,7 @@ pub const Graph = struct {
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name, g.as_of);
         try g.pin(id, by);
-        if (try g.refused(key)) |why| try g.fail(id, why) else try g.enqueue(id);
+        if (try g.refused(key)) |why| try g.fail(id, why) else g.enqueue(id);
         return id;
     }
 
@@ -1429,7 +1467,7 @@ test "a cell replacing an expired one keeps the index entry when the old one goe
     g.unhold(second);
 }
 
-test "a cell freed while queued leaves its slot's next tenant waiting" {
+test "a slot freed while queued takes no tenant until it leaves the queue" {
     const testing = std.testing;
     var q: Quiet = .{};
     var g = try q.graph(.{ .root_hints = &.{} });
@@ -1441,10 +1479,12 @@ test "a cell freed while queued leaves its slot's next tenant waiting" {
     g.unhold(gone);
     try testing.expect(g.alive(gone) == null);
     try g.refresh(Key.of(.answer, name, .a), name, q.now + 60 * std.time.ns_per_s);
-    const tenant = g.alive(gone).?;
+    try testing.expect(g.alive(gone) == null);
+    const tenant = g.cell(@intCast(g.cells.items.len - 1));
     try testing.expectEqual(.refresh, tenant.key.kind);
     try g.drain();
     try testing.expect(!tenant.settled());
+    try testing.expectEqual(gone, try g.newCell(.init(.exchange, "", .a), name, 0));
 }
 
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
