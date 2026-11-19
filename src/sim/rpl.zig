@@ -43,8 +43,8 @@ pub const QueryLogRow = struct {
     dest: ?na.Address,
 };
 
-/// `DS PLACEHOLDER [<zone>]`: parsed with key tag 0, which the signer swaps
-/// for the digest of `zone`'s minted key (default: the owner's).
+/// `DS PLACEHOLDER [<zone>]`: a DS at `owner` the signer swaps for the
+/// digest of `zone`'s minted key (default: the owner's).
 pub const DsFrom = struct { owner: dns.Name, zone: dns.Name };
 
 pub const Entry = struct {
@@ -525,7 +525,7 @@ const Parser = struct {
                         .key_tag = 0,
                         .algorithm = .ecdsap256sha256,
                         .digest_type = @fromBackingInt(2),
-                        .digest = try arena.alloc(u8, 32),
+                        .digest = &@as([32]u8, @splat(0)),
                     } };
                 }
                 return .{ .ds = .{

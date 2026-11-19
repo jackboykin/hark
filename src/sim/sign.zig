@@ -101,12 +101,8 @@ pub const Signer = struct {
     fn bakeSection(self: *Signer, rrs: []const RR, ds_from: []const rpl.DsFrom, cuts: []const dns.Name, forced: ?*const Key, address: na.Address, wildcard: ?dns.Name) ![]const RR {
         var out: std.ArrayList(RR) = .empty;
         try out.appendSlice(self.arena, rrs);
-        for (out.items) |*rr| if (rr.rtype == .ds and rr.ds().key_tag == 0) {
-            var zone = rr.name;
-            for (ds_from) |d| if (d.owner.eql(rr.name)) {
-                zone = d.zone;
-            };
-            const key = self.keyNamed(zone) orelse return error.PlaceholderDsWithoutKey;
+        for (ds_from) |d| for (out.items) |*rr| if (rr.rtype == .ds and rr.name.eql(d.owner)) {
+            const key = self.keyNamed(d.zone) orelse return error.PlaceholderDsWithoutKey;
             rr.* = try .init(self.arena, .{ .name = rr.name, .rtype = .ds, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = .{ .ds = key.ds } });
         };
         // Signing appends to `out`, which may move it.
