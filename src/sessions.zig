@@ -179,7 +179,10 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
         .plain => return false,
         .dial => |kind| blk: {
             if (s.find(key, kind)) |old| s.retire(old);
-            break :blk s.dial(kind, ex.server, key) catch return false;
+            break :blk s.dial(kind, ex.server, key) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => return false,
+            };
         },
         .session => |c| c,
     };
