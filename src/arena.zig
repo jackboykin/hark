@@ -40,19 +40,25 @@ pub fn allocator(a: *Arena) Allocator {
     return .{ .ptr = a, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
 
+pub const scratch_floor = 64 << 10;
+
+pub fn withFloor(child: Allocator, floor: usize) Allocator.Error!Arena {
+    var a: Arena = .init(child);
+    _ = a.open(mem.alignForward(usize, floor, @alignOf(Foot)), @returnAddress()) orelse return error.OutOfMemory;
+    return a;
+}
+
 pub fn reset(a: *Arena) void {
-    const newest = a.foot orelse return;
-    if (newest.older == null) {
-        @memset(newest.base[0 .. a.at - @intFromPtr(newest.base)], undefined);
-        a.at = @intFromPtr(newest.base);
-        return;
+    var oldest = a.foot orelse return;
+    var used = a.at - @intFromPtr(oldest.base);
+    while (oldest.older) |older| {
+        a.child.rawFree(oldest.chunk(), .of(Foot), @returnAddress());
+        oldest = older;
+        used = @intFromPtr(oldest) - @intFromPtr(oldest.base);
     }
-    var room: usize = @sizeOf(Foot);
-    var it = a.foot;
-    while (it) |f| : (it = f.older) room += f.chunk().len - @sizeOf(Foot);
-    a.deinit();
-    a.* = .{ .child = a.child };
-    _ = a.open(room, @returnAddress());
+    @memset(oldest.base[0..used], undefined);
+    a.foot = oldest;
+    a.at = @intFromPtr(oldest.base);
 }
 
 fn open(a: *Arena, size: usize, ra: usize) ?usize {
@@ -175,6 +181,19 @@ test "a reset arena gives the same memory again" {
     const a = arena.allocator();
     const first = try a.alloc(u8, 100);
     arena.reset();
+    try testing.expectEqual(first.ptr, (try a.alloc(u8, 100)).ptr);
+}
+
+test "a reset keeps the floor and gives back every chunk past it" {
+    var no_growth: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    var arena: Arena = try .withFloor(no_growth.allocator(), 1024);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try a.alloc(u8, 100);
+    _ = try a.alloc(u8, 4096);
+    try testing.expect(arena.foot.?.older != null);
+    arena.reset();
+    try testing.expect(arena.foot.?.older == null);
     try testing.expectEqual(first.ptr, (try a.alloc(u8, 100)).ptr);
 }
 

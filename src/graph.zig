@@ -397,6 +397,7 @@ pub const Graph = struct {
         const rtt = try ns_rtt.Table.create(gpa);
         var g: Graph = .{ .gpa = gpa, .work = .{ .child = work }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = .init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
+        g.scratch = try .withFloor(gpa, Arena.scratch_floor);
         g.store.on_evict = evicted;
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
         if (cfg.trust_anchors != null and !forgoes) g.verify_memo = try .init(gpa);
