@@ -47,6 +47,19 @@ pub const QueryLogRow = struct {
 /// digest of `zone`'s minted key (default: the owner's).
 pub const DsFrom = struct { owner: dns.Name, zone: dns.Name };
 
+/// A record as the scenario wrote it: `rr` as hark reads it off the wire,
+/// `owner` and `rdata` in the case written, which is how an authority
+/// serves it (RFC 4343 §4.1).
+pub const Record = struct {
+    rr: dns.ResourceRecord,
+    owner: []const u8,
+    rdata: []const u8,
+
+    pub fn of(rr: dns.ResourceRecord) Record {
+        return .{ .rr = rr, .owner = rr.name.wire, .rdata = rr.rdata };
+    }
+};
+
 pub const Entry = struct {
     match: Match = .{},
     flags: dns.Header.Flags = .{},
@@ -60,9 +73,9 @@ pub const Entry = struct {
     wildcard: ?dns.Name = null,
     ds_from: []const DsFrom = &.{},
     question: ?dns.Question = null,
-    answers: []const dns.ResourceRecord = &.{},
-    authorities: []const dns.ResourceRecord = &.{},
-    additionals: []const dns.ResourceRecord = &.{},
+    answers: []const Record = &.{},
+    authorities: []const Record = &.{},
+    additionals: []const Record = &.{},
     query_log: []const QueryLogRow = &.{},
 };
 
@@ -134,6 +147,7 @@ const Parser = struct {
     lineno: usize = 0,
     cur: ?[]const u8 = null,
     scenario: Scenario = .{},
+    spelled: std.ArrayList(u8) = .empty,
 
     fn fail(p: *Parser, msg: []const u8) Error {
         p.diag.* = .{ .line = p.lineno, .msg = msg };
@@ -323,9 +337,9 @@ const Parser = struct {
     fn entry(p: *Parser) Error!Entry {
         var e: Entry = .{};
         var section: ?Section = null;
-        var answers: std.ArrayList(dns.ResourceRecord) = .empty;
-        var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
-        var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
+        var answers: std.ArrayList(Record) = .empty;
+        var authorities: std.ArrayList(Record) = .empty;
+        var additionals: std.ArrayList(Record) = .empty;
         var query_log: std.ArrayList(QueryLogRow) = .empty;
         var ds_from: std.ArrayList(DsFrom) = .empty;
         while (try p.peek()) |line| {
@@ -433,10 +447,13 @@ const Parser = struct {
         if (toks.next() != null) return p.fail("bad QUESTION line");
         const type_tok = b orelse a;
         if (b != null and !eqlIgnoreCase(a, "in")) return p.fail("only class IN is supported");
+        const canonical = try p.name(owner);
+        const spelled = try p.spelledName(owner);
         return .{
-            .name = try p.name(owner),
+            .name = canonical,
             .qtype = rtypeFromText(type_tok) orelse return p.fail("bad QUESTION type"),
             .qclass = .in,
+            .spelled = if (mem.eql(u8, spelled, canonical.wire)) null else spelled,
         };
     }
 
@@ -453,7 +470,7 @@ const Parser = struct {
         };
     }
 
-    fn parseRr(p: *Parser, raw: []const u8, ds_from: *std.ArrayList(DsFrom)) Error!dns.ResourceRecord {
+    fn parseRr(p: *Parser, raw: []const u8, ds_from: *std.ArrayList(DsFrom)) Error!Record {
         var line = raw;
         var quoted = false;
         for (raw, 0..) |c, i| {
@@ -464,7 +481,8 @@ const Parser = struct {
             }
         }
         var toks = mem.tokenizeAny(u8, line, " \t");
-        const owner = try p.name(toks.next().?);
+        const owner_text = toks.next().?;
+        const owner = try p.name(owner_text);
         var ttl: u32 = default_ttl;
         var t = toks.next() orelse return p.fail("RR needs a type");
         if (isDigits(t)) {
@@ -482,7 +500,36 @@ const Parser = struct {
             t = toks.next() orelse return p.fail("RR needs a type");
         }
         const rtype = rtypeFromText(t) orelse return p.fail("unknown RR type");
-        return dns.ResourceRecord.init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) });
+        p.spelled.clearRetainingCapacity();
+        const rr: dns.ResourceRecord = try .init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) });
+        return p.written(rr, try p.spelledName(owner_text));
+    }
+
+    /// The names in rdata lie together after `skip` octets (none of these
+    /// types has character-strings ahead of them), and differ from hark's
+    /// only in case.
+    fn written(p: *Parser, rr: dns.ResourceRecord, owner: []const u8) Error!Record {
+        var held = rr;
+        const e = dns.embedded(rr.rtype) orelse return .{ .rr = rr, .owner = owner, .rdata = rr.rdata };
+        const spelled = try p.arena.dupe(u8, rr.rdata);
+        @memcpy(spelled[e.skip..][0..p.spelled.items.len], p.spelled.items);
+        // RFC 6840 §5.1: an NSEC's next name is signed, and read, as written.
+        // Said here, not taken from hark's reader, which is what this checks.
+        if (rr.rtype == .nsec) held.rdata = spelled;
+        return .{ .rr = held, .owner = owner, .rdata = spelled };
+    }
+
+    fn rdataName(p: *Parser, text: []const u8) Error!dns.Name {
+        const n = try p.name(text);
+        try p.spelled.appendSlice(p.arena, try p.spelledName(text));
+        return n;
+    }
+
+    fn spelledName(p: *Parser, text: []const u8) Error![]const u8 {
+        return dns.spelledWire(p.arena, text) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => p.fail("bad domain name"),
+        };
     }
 
     fn rdata(p: *Parser, rtype: dns.RType, owner: dns.Name, toks: *mem.TokenIterator(u8, .any), ds_from: *std.ArrayList(DsFrom)) Error!dns.RData {
@@ -498,17 +545,17 @@ const Parser = struct {
                 if (addr != .ip6) return p.fail("AAAA rdata is not IPv6");
                 return .{ .aaaa = addr.ip6.bytes };
             },
-            .ns => return .{ .ns = try p.name(try p.word(toks)) },
-            .cname => return .{ .cname = try p.name(try p.word(toks)) },
-            .dname => return .{ .dname = try p.name(try p.word(toks)) },
-            .ptr => return .{ .ptr = try p.name(try p.word(toks)) },
+            .ns => return .{ .ns = try p.rdataName(try p.word(toks)) },
+            .cname => return .{ .cname = try p.rdataName(try p.word(toks)) },
+            .dname => return .{ .dname = try p.rdataName(try p.word(toks)) },
+            .ptr => return .{ .ptr = try p.rdataName(try p.word(toks)) },
             .mx => return .{ .mx = .{
                 .preference = try p.int(u16, try p.word(toks)),
-                .exchange = try p.name(try p.word(toks)),
+                .exchange = try p.rdataName(try p.word(toks)),
             } },
             .soa => return .{ .soa = .{
-                .mname = try p.name(try p.word(toks)),
-                .rname = try p.name(try p.word(toks)),
+                .mname = try p.rdataName(try p.word(toks)),
+                .rname = try p.rdataName(try p.word(toks)),
                 .serial = try p.int(u32, try p.word(toks)),
                 .refresh = try p.int(u32, try p.word(toks)),
                 .retry = try p.int(u32, try p.word(toks)),
@@ -549,11 +596,11 @@ const Parser = struct {
                 .sig_expiration = try p.sigTime(try p.word(toks)),
                 .sig_inception = try p.sigTime(try p.word(toks)),
                 .key_tag = try p.int(u16, try p.word(toks)),
-                .signer_name = try p.name(try p.word(toks)),
+                .signer_name = try p.rdataName(try p.word(toks)),
                 .signature = try p.base64(toks),
             } },
             .nsec => return .{ .nsec = .{
-                .next_domain_name = try p.name(try p.word(toks)),
+                .next_domain_name = try p.rdataName(try p.word(toks)),
                 .type_bit_maps = try p.typeBitmap(toks),
             } },
             .nsec3 => {
@@ -699,13 +746,12 @@ const Parser = struct {
     }
 };
 
-/// entry's header, question and records as one DNS message in base64.
-pub fn print(scenario: Scenario, w: *std.Io.Writer) std.Io.Writer.Error!void {
+pub fn print(arena: Allocator, scenario: Scenario, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var s: std.json.Stringify = .{ .writer = w };
-    try put(&s, scenario);
+    try put(&s, arena, scenario);
 }
 
-fn put(s: *std.json.Stringify, v: anytype) std.Io.Writer.Error!void {
+fn put(s: *std.json.Stringify, arena: Allocator, v: anytype) std.Io.Writer.Error!void {
     const T = @TypeOf(v);
     if (T == []const u8) return s.write(v);
     if (T == dns.Name) {
@@ -725,21 +771,21 @@ fn put(s: *std.json.Stringify, v: anytype) std.Io.Writer.Error!void {
                 const f = @field(v, field);
                 if (@typeInfo(@TypeOf(f)) != .optional or f != null) {
                     try s.objectField(field);
-                    try put(s, f);
+                    try put(s, arena, f);
                 }
             };
             if (T == Entry) {
                 try s.objectField("message");
-                try putMessage(s, v);
+                try putMessage(s, arena, v);
             }
             try s.endObject();
         },
         .pointer, .array => {
             try s.beginArray();
-            for (v) |x| try put(s, x);
+            for (v) |x| try put(s, arena, x);
             try s.endArray();
         },
-        .optional => try put(s, v.?),
+        .optional => try put(s, arena, v.?),
         .@"enum" => |info| if (info.mode == .exhaustive) try s.write(@tagName(v)) else try s.write(@backingInt(v)),
         else => try s.write(v),
     }
@@ -750,18 +796,58 @@ fn inMessage(comptime field: []const u8) bool {
     return false;
 }
 
-fn putMessage(s: *std.json.Stringify, e: Entry) std.Io.Writer.Error!void {
+fn putMessage(s: *std.json.Stringify, arena: Allocator, e: Entry) std.Io.Writer.Error!void {
     var wire: [65535]u8 = undefined;
-    const msg = dns.serializeMessage(&wire, .{
-        .header = .{ .id = 0, .flags = e.flags },
-        .question = e.question,
-        .answers = e.answers,
-        .authorities = e.authorities,
-        .additionals = e.additionals,
-    }) catch return error.WriteFailed;
+    const msg = serve(arena, &wire, .{ .id = 0, .flags = e.flags }, e.question, .{ e.answers, e.authorities, e.additionals }) catch return error.WriteFailed;
     const b64 = std.base64.standard.Encoder;
     var text: [b64.calcSize(wire.len)]u8 = undefined;
     try s.write(b64.encode(&text, msg));
+}
+
+/// A message of `sections` as an authority serves it, in the case written.
+/// hark's serializer compresses on the names hark holds, which differ from
+/// the written ones in case alone, so every octet keeps its place and only
+/// takes the written case; a pointer keeps the case of what it points at.
+pub fn serve(arena: Allocator, buf: []u8, header: dns.Header, question: ?dns.Question, sections: [3][]const Record) ![]const u8 {
+    var held: [3][]dns.ResourceRecord = undefined;
+    for (&held, sections) |*h, records| {
+        h.* = try arena.alloc(dns.ResourceRecord, records.len);
+        for (h.*, records) |*rr, r| rr.* = r.rr;
+    }
+    const len = (try dns.serializeMessage(buf, .{ .header = header, .question = question, .answers = held[0], .authorities = held[1], .additionals = held[2] })).len;
+    const wire = buf[0..len];
+    // The question is the first name, which nothing earlier can compress.
+    var at: usize = 12 + if (question) |q| (q.spelled orelse q.name.wire).len + 4 else 0;
+    for (sections) |records| for (records) |r| {
+        at = spellName(wire, at, r.owner);
+        const rdlength = mem.readInt(u16, wire[at + 8 ..][0..2], .big);
+        at += 10;
+        // Only names the serializer may compress move from where rdata holds them.
+        const rdata = wire[at..][0..rdlength];
+        const e = dns.embedded(r.rr.rtype);
+        if (e != null and e.?.spelling == .rfc1035) spellNames(rdata, r.rdata, e.?) else @memcpy(rdata, r.rdata);
+        at += rdlength;
+    };
+    return wire;
+}
+
+fn spellNames(wire: []u8, spelled: []const u8, e: dns.Embedded) void {
+    var at: usize = e.skip;
+    var from: usize = e.skip;
+    for (0..e.names) |_| {
+        at = spellName(wire, at, spelled[from..]);
+        from += dns.wireNameLen(spelled[from..]);
+    }
+}
+
+fn spellName(wire: []u8, at: usize, spelled: []const u8) usize {
+    var i = at;
+    var j: usize = 0;
+    while (wire[i] != 0 and wire[i] < 0xc0) : ({
+        j += 1 + wire[i];
+        i += 1 + wire[i];
+    }) @memcpy(wire[i + 1 ..][0..wire[i]], spelled[j + 1 ..][0..wire[i]]);
+    return i + @as(usize, if (wire[i] == 0) 1 else 2);
 }
 
 fn enumIgnoreCase(comptime E: type, s: []const u8) ?E {

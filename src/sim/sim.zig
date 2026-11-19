@@ -133,19 +133,14 @@ pub const Sim = struct {
                 try s.hear(q, silence);
                 return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
             }
-            var msg = query;
-            msg.header.flags = .{ .qr = true, .rd = query.header.flags.rd, .rcode = .refused };
-            msg.answers = &.{};
+            var reply: Reply = .{ .header = .{ .id = query.header.id, .flags = .{ .qr = true, .rd = query.header.flags.rd, .rcode = .refused } }, .question = q };
             // Unmatched is REFUSED, not silence, so a coverage gap can't pass for a blackhole.
-            if (try s.signer.dnskeyAnswer(ex.server, q)) |rrs| {
-                msg.header.flags.aa = true;
-                msg.header.flags.rcode = .no_error;
-                msg.answers = rrs;
+            if (try s.signer.dnskeyAnswer(ex.server, q)) |records| {
+                reply.header.flags.aa = true;
+                reply.header.flags.rcode = .no_error;
+                reply.sections[0] = records;
             }
-            msg.authorities = &.{};
-            msg.additionals = &.{};
-            msg.opt = null;
-            return s.deliver(ex, query, msg, delay, tie);
+            return s.deliver(ex, query, reply, delay, tie);
         };
         if (entry.drop) {
             try s.hear(q, silence);
@@ -164,28 +159,39 @@ pub const Sim = struct {
                 question.spelled = spelled;
             },
         }
-        const msg: dns.Message = .{
+        const reply: Reply = .{
             .header = .{ .id = query.header.id, .flags = flags },
             .question = if (entry.echo == .none) null else question,
-            .answers = entry.answers,
-            .authorities = entry.authorities,
-            .additionals = entry.additionals,
+            .sections = .{ entry.answers, entry.authorities, entry.additionals },
         };
-        return s.deliver(ex, query, msg, delay, tie);
+        return s.deliver(ex, query, reply, delay, tie);
     }
 
-    fn deliver(s: *Sim, ex: Exchange, query: dns.Message, msg: dns.Message, latency_ns: i64, tie: u64) !void {
-        var said = msg;
+    const Reply = struct {
+        header: dns.Header,
+        question: ?dns.Question,
+        sections: [3][]const rpl.Record = .{ &.{}, &.{}, &.{} },
+    };
+
+    fn serve(s: *Sim, r: Reply) !?[]const u8 {
+        return rpl.serve(s.arena, &s.reply_buf, r.header, r.question, r.sections) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        };
+    }
+
+    fn deliver(s: *Sim, ex: Exchange, query: dns.Message, reply: Reply, latency_ns: i64, tie: u64) !void {
+        var said = reply;
         said.header.id = 0;
         said.question = null;
-        const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+        const content = try s.serve(said) orelse return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         try s.hear(query.question.?, std.hash.Wyhash.hash(0, content));
-        var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+        var wire = try s.serve(reply) orelse return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
         if (ex.need == .datagram and wire.len > payload) {
-            var hdr = msg.header;
+            var hdr = reply.header;
             hdr.flags.tc = true;
-            wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .question = msg.question }) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+            wire = try s.serve(.{ .header = hdr, .question = reply.question }) orelse return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);

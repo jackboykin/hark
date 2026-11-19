@@ -89,24 +89,26 @@ pub const Signer = struct {
         if (e.unsigned) return;
         const forced = if (e.sign_as) |z| self.keyNamed(z) else null;
         var cuts: std.ArrayList(dns.Name) = .empty;
-        for ([_][]const RR{ e.answers, e.authorities, e.additionals }) |sec| for (sec) |rr| if (rr.rtype == .ds) try addName(self.arena, &cuts, rr.name);
+        for ([_][]const rpl.Record{ e.answers, e.authorities, e.additionals }) |sec| for (sec) |r| if (r.rr.rtype == .ds) try addName(self.arena, &cuts, r.rr.name);
         var soa = false;
-        for (e.authorities) |rr| soa = soa or rr.rtype == .soa;
-        if (e.answers.len == 0 and !soa) for (e.authorities) |rr| if (rr.rtype == .ns) try addName(self.arena, &cuts, rr.name);
+        for (e.authorities) |r| soa = soa or r.rr.rtype == .soa;
+        if (e.answers.len == 0 and !soa) for (e.authorities) |r| if (r.rr.rtype == .ns) try addName(self.arena, &cuts, r.rr.name);
         e.answers = try self.bakeSection(e.answers, e.ds_from, cuts.items, forced, address, e.wildcard);
         e.authorities = try self.bakeSection(e.authorities, e.ds_from, cuts.items, forced, address, null);
         e.additionals = try self.bakeSection(e.additionals, e.ds_from, cuts.items, forced, address, null);
     }
 
-    fn bakeSection(self: *Signer, rrs: []const RR, ds_from: []const rpl.DsFrom, cuts: []const dns.Name, forced: ?*const Key, address: na.Address, wildcard: ?dns.Name) ![]const RR {
-        var out: std.ArrayList(RR) = .empty;
-        try out.appendSlice(self.arena, rrs);
-        for (ds_from) |d| for (out.items) |*rr| if (rr.rtype == .ds and rr.name.eql(d.owner)) {
+    fn bakeSection(self: *Signer, records: []const rpl.Record, ds_from: []const rpl.DsFrom, cuts: []const dns.Name, forced: ?*const Key, address: na.Address, wildcard: ?dns.Name) ![]const rpl.Record {
+        var out: std.ArrayList(rpl.Record) = .empty;
+        try out.appendSlice(self.arena, records);
+        for (ds_from) |d| for (out.items) |*r| if (r.rr.rtype == .ds and r.rr.name.eql(d.owner)) {
             const key = self.keyNamed(d.zone) orelse return error.PlaceholderDsWithoutKey;
-            rr.* = try .init(self.arena, .{ .name = rr.name, .rtype = .ds, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = .{ .ds = key.ds } });
+            const ds: RR = try .init(self.arena, .{ .name = r.rr.name, .rtype = .ds, .rclass = r.rr.rclass, .ttl = r.rr.ttl, .rdata = .{ .ds = key.ds } });
+            r.* = .{ .rr = ds, .owner = r.owner, .rdata = ds.rdata };
         };
         // Signing appends to `out`, which may move it.
-        const originals = try self.arena.dupe(RR, out.items);
+        const originals = try self.arena.alloc(RR, out.items.len);
+        for (originals, out.items) |*rr, r| rr.* = r.rr;
         for (originals, 0..) |head, i| {
             if (head.rtype == .rrsig or head.rclass != .in) continue;
             var first = true;
@@ -127,7 +129,8 @@ pub const Signer = struct {
             if (covered) continue;
             var set: std.ArrayList(RR) = .empty;
             for (originals) |rr| if (rr.rclass == .in and rr.rtype == head.rtype and rr.name.eql(head.name)) try set.append(self.arena, rr);
-            try out.append(self.arena, try self.sign(key, .sort(set.items), if (self.expands(wildcard, head.name, key, forced)) wildcard else null));
+            const sig = try self.sign(key, .sort(set.items), if (self.expands(wildcard, head.name, key, forced)) wildcard else null);
+            try out.append(self.arena, .{ .rr = sig, .owner = out.items[i].owner, .rdata = sig.rdata });
         }
         return out.items;
     }
@@ -197,14 +200,15 @@ pub const Signer = struct {
         return .init(self.arena, .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } });
     }
 
-    pub fn dnskeyAnswer(self: *Signer, address: na.Address, q: dns.Question) !?[]const RR {
+    pub fn dnskeyAnswer(self: *Signer, address: na.Address, q: dns.Question) !?[]const rpl.Record {
         if (q.qtype != .dnskey) return null;
         for (self.served.items) |s| {
             if (!na.ipEqual(s.address, address) or !s.key.zone.eql(q.name)) continue;
-            const rrs = try self.arena.alloc(RR, 2);
-            rrs[0] = try .init(self.arena, .{ .name = s.key.zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = s.key.dnskey } });
-            rrs[1] = try self.sign(s.key, .sort(rrs[0..1]), null);
-            return rrs;
+            var key: [1]RR = .{try .init(self.arena, .{ .name = s.key.zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = s.key.dnskey } })};
+            const records = try self.arena.alloc(rpl.Record, 2);
+            records[0] = .of(key[0]);
+            records[1] = .of(try self.sign(s.key, .sort(&key), null));
+            return records;
         }
         return null;
     }

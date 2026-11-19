@@ -568,9 +568,9 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) 
 const ttl_slack: u32 = 3;
 
 /// Multiset equality. RRSIGs in `actual` count only when `expected` carries any.
-fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.ResourceRecord, compare_ttl: bool) bool {
+fn sectionEql(actual: []const dns.ResourceRecord, expected: anytype, compare_ttl: bool) bool {
     var want_sigs = false;
-    for (expected) |rr| want_sigs = want_sigs or rr.rtype == .rrsig;
+    for (expected) |x| want_sigs = want_sigs or asRead(x).rtype == .rrsig;
     var used: [256]bool = @splat(false);
     var count: usize = 0;
     for (actual) |a| {
@@ -580,7 +580,7 @@ fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.Resource
         var found = false;
         for (expected, 0..) |x, i| {
             if (i >= used.len or used[i]) continue;
-            if (rrEql(a, x, compare_ttl)) {
+            if (rrEql(a, asRead(x), compare_ttl)) {
                 used[i] = true;
                 found = true;
                 break;
@@ -589,6 +589,10 @@ fn sectionEql(actual: []const dns.ResourceRecord, expected: []const dns.Resource
         if (!found) return false;
     }
     return count == expected.len;
+}
+
+fn asRead(x: anytype) dns.ResourceRecord {
+    return if (@TypeOf(x) == rpl.Record) x.rr else x;
 }
 
 fn rrEql(a: dns.ResourceRecord, b: dns.ResourceRecord, compare_ttl: bool) bool {

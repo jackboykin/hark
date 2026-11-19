@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) u8 {
     };
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
-    rpl.print(scenario, &out.interface) catch return 1;
+    rpl.print(arena, scenario, &out.interface) catch return 1;
     out.interface.flush() catch return 1;
     return 0;
 }

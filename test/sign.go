@@ -118,7 +118,7 @@ func delegationCuts(e *entry) []string {
 func (s *signer) section(e *entry, rrs []dns.RR, cuts []string, forced *key, addr netip.Addr, wildcard string) ([]dns.RR, error) {
 	for _, rr := range rrs {
 		ds, ok := rr.(*dns.DS)
-		if zone := e.dsFrom[rr.Header().Name]; ok && zone != "" {
+		if zone := e.dsFrom[dnsutil.Canonical(rr.Header().Name)]; ok && zone != "" {
 			k := s.named(zone)
 			if k == nil {
 				return nil, fmt.Errorf("placeholder DS at %s but no dnssec-zone %s to take a digest of", ds.Hdr.Name, zone)
