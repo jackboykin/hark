@@ -36,8 +36,7 @@ const Conn = struct {
     fd: posix.fd_t,
     addr: na.Address,
     token: u32,
-    buf: [2 + max_frame]u8 = undefined,
-    len: usize = 0,
+    held: std.ArrayList(u8) = .empty,
     served: u32 = 0,
     last_ns: i64,
     owed: u32 = 0,
@@ -194,6 +193,7 @@ const Server = struct {
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
     frame: [2 + @as(usize, dns.max_message_len)]u8 = undefined,
+    stream_in: [2 + max_frame]u8 = undefined,
     freed: std.ArrayList(u32) = .empty,
     scratch: Arena,
     in: *Batch,
@@ -320,35 +320,40 @@ const Server = struct {
     }
 
     fn readTcp(s: *Server, c: *Conn) !void {
-        const rc = linux.read(c.fd, c.buf[c.len..].ptr, c.buf.len - c.len);
+        const into = s.stream_in[0 .. s.stream_in.len - c.held.items.len];
+        const rc = linux.read(c.fd, into.ptr, into.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .AGAIN, .INTR => return,
             else => return s.drop(c),
         }
         if (rc == 0) return s.close(c);
-        c.len += rc;
-        try s.frames(c);
+        if (c.held.items.len == 0) return s.frames(c, into[0..rc]);
+        try c.held.appendSlice(s.gpa, into[0..rc]);
+        try s.frames(c, c.held.items);
     }
 
-    fn frames(s: *Server, c: *Conn) !void {
+    fn frames(s: *Server, c: *Conn, bytes: []const u8) !void {
         const tok = c.token;
         var start: usize = 0;
-        while (c.len - start >= 2 and c.out.items.len == 0 and !c.draining) {
-            const flen: usize = mem.readInt(u16, c.buf[start..][0..2], .big);
+        while (bytes.len - start >= 2 and c.out.items.len == 0 and !c.draining) {
+            const flen: usize = mem.readInt(u16, bytes[start..][0..2], .big);
             if (flen == 0 or flen > max_frame) return s.drop(c);
-            if (c.len - start < 2 + flen) break;
+            if (bytes.len - start < 2 + flen) break;
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;
-            try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c }, false);
+            try s.ask(bytes[start + 2 ..][0..flen], .{ .tcp = c }, false);
             // `ask` may have dropped the connection; `c` is then freed.
             if (s.watched.items[tok & slot_mask].w != .conn) return;
             start += 2 + flen;
             if (c.served >= s.cfg.tcp_queries_per_conn) return s.drain(c);
         }
-        mem.copyForwards(u8, c.buf[0 .. c.len - start], c.buf[start..c.len]);
-        c.len -= start;
+        const rest = bytes[start..];
+        if (rest.len == 0) return c.held.clearAndFree(s.gpa);
+        if (bytes.ptr != c.held.items.ptr) return c.held.appendSlice(s.gpa, rest);
+        mem.copyForwards(u8, c.held.items, rest);
+        c.held.shrinkRetainingCapacity(rest.len);
     }
 
     fn deinit(s: *Server) void {
@@ -401,6 +406,7 @@ const Server = struct {
         s.freed.appendAssumeCapacity(c.token & slot_mask);
         s.conns -= 1;
         c.out.deinit(s.gpa);
+        c.held.deinit(s.gpa);
         s.gpa.destroy(c);
     }
 
@@ -849,7 +855,7 @@ const Server = struct {
         if (c.out.items.len != 0) return;
         if (s.closeIfDone(c)) return;
         s.e.rewatch(c.fd, c.token, c.interest()) catch return s.drop(c);
-        try s.frames(c);
+        try s.frames(c, c.held.items);
     }
 
     fn take(s: *Server, c: *Conn, bytes: []const u8) ?usize {
