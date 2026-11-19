@@ -202,13 +202,17 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
 }
 
 fn start(s: *Sessions, c: *Conn) !void {
-    if (s.unflushed != c) try s.flush();
+    if (s.unflushed != c) s.flush();
     if (try s.drain(c)) s.unflushed = c else s.drop(c, .closed);
 }
 
-pub fn flush(s: *Sessions) !void {
+pub fn flush(s: *Sessions) void {
     const c = s.unflushed orelse return;
     s.unflushed = null;
+    s.flushOne(c) catch s.drop(c, .closed);
+}
+
+fn flushOne(s: *Sessions, c: *Conn) !void {
     if (!try c.carrier.flush(&s.shared)) return s.drop(c, .closed);
     try s.rearm(c);
 }
@@ -375,9 +379,13 @@ fn closeConn(s: *Sessions, c: *Conn) void {
     e.gpa.destroy(c);
 }
 
-pub fn ready(s: *Sessions, token: u32, events: u32) !void {
-    try s.flush();
+pub fn ready(s: *Sessions, token: u32, events: u32) void {
+    s.flush();
     const c = s.byToken(token) orelse return;
+    s.onReady(c, events) catch s.drop(c, .closed);
+}
+
+fn onReady(s: *Sessions, c: *Conn, events: u32) !void {
     try s.onNews(c, try c.carrier.ready(&s.shared, events));
 }
 
@@ -389,7 +397,7 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
             .established => if (!try s.onEstablished(c)) return s.drop(c, .closed),
             .room => {
                 if (!try s.drain(c)) return s.drop(c, .closed);
-                if (s.unflushed != c) try s.flush();
+                if (s.unflushed != c) s.flush();
                 s.unflushed = c;
             },
             .ended => |how| return s.drop(c, how),
@@ -410,7 +418,7 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
         },
     }
     if (s.retired(c)) return s.drop(c, .closed);
-    if (s.unflushed != c) try s.flush();
+    if (s.unflushed != c) s.flush();
     s.unflushed = c;
     try s.rearm(c);
 }
@@ -426,7 +434,7 @@ fn onEstablished(s: *Sessions, c: *Conn) !bool {
     return try c.carrier.flush(&s.shared) and asked;
 }
 
-pub fn flightDue(s: *Sessions, id: CellId, seq: u32) !void {
+pub fn flightDue(s: *Sessions, id: CellId, seq: u32) void {
     const at = s.flights.get(id) orelse return;
     if (at.seq != seq) return;
     const c = at.conn;
@@ -444,17 +452,21 @@ pub fn flightDue(s: *Sessions, id: CellId, seq: u32) !void {
     queue.appendAssumeCapacity(s.completed(at, .timeout));
     const heard = c.last_reply_ns orelse return s.drop(c, .failed);
     if (heard < left_ns or s.retired(c)) return s.drop(c, .closed);
-    if (s.unflushed != c) try s.flush();
+    if (s.unflushed != c) s.flush();
     s.unflushed = c;
 }
 
-pub fn connDue(s: *Sessions, token: u32, seq: u32) !void {
+pub fn connDue(s: *Sessions, token: u32, seq: u32) void {
     const c = s.byToken(token) orelse return;
     if (seq != c.wake_seq) return;
     c.wake_ns = std.math.maxInt(i64);
     const now = s.edge.now_ns;
     if (!c.carrier.established() and now >= c.dial_by_ns) return s.drop(c, .failed);
     if (c.carrier.established() and now >= c.last_ns + idle_ns and c.pending.count() == 0) return s.drop(c, .closed);
+    s.onFire(c) catch s.drop(c, .closed);
+}
+
+fn onFire(s: *Sessions, c: *Conn) !void {
     try s.onNews(c, try c.carrier.fire(&s.shared));
 }
 
@@ -529,7 +541,7 @@ test "a spent session keeps its pending to the end while a successor takes the r
     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
     const deadline = e.now_ns + std.time.ns_per_s;
     try testing.expect(try s.carry(.{ .id = 1, .server = server, .need = .datagram, .wire = &wire, .deadline_ns = deadline }));
-    try s.flush();
+    s.flush();
     c.carrier.dot.session.write.seq = 1 << 24;
     try testing.expect(try s.carry(.{ .id = 2, .server = server, .need = .datagram, .wire = &wire, .deadline_ns = deadline }));
     try testing.expect(mem.findScalar(*Conn, s.conns.items, c) != null);
@@ -541,7 +553,7 @@ test "a spent session keeps its pending to the end while a successor takes the r
     var keys: tls13.Keys = .of(&secret);
     var record: [64]u8 = undefined;
     _ = try sys.write(pair[1], keys.seal(&record, .application_data, &frame));
-    try s.ready(0, linux.EPOLL.IN);
+    s.ready(0, linux.EPOLL.IN);
     try testing.expect(mem.findScalar(*Conn, s.conns.items, c) == null);
     try testing.expectEqual(1, e.queue.items.len);
     try testing.expect(e.queue.items[0].exchange.completion == .reply);

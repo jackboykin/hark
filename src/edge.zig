@@ -280,7 +280,7 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
             if (try e.ready(polled)) |ev| return ev;
             continue;
         }
-        if (e.sessions) |s| try s.flush();
+        if (e.sessions) |s| s.flush();
         e.tick();
         try e.fire();
         if (e.pop()) |ev| return ev;
@@ -307,8 +307,8 @@ fn fire(e: *Edge) !void {
         switch (t.kind) {
             .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
             .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) e.queue.appendAssumeCapacity(e.finish(t.id, .timeout)),
-            .carried => try e.sessions.?.flightDue(t.id, t.gen),
-            .conn => try e.sessions.?.connDue(t.gen, t.id),
+            .carried => e.sessions.?.flightDue(t.id, t.gen),
+            .conn => e.sessions.?.connDue(t.gen, t.id),
         }
     }
 }
@@ -317,7 +317,7 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     const d = ev.data.u64;
     if (d & client_tag != 0) return .{ .client = .{ .token = @truncate(d), .events = ev.events } };
     if (d & session_tag != 0) {
-        try e.sessions.?.ready(@truncate(d), ev.events);
+        e.sessions.?.ready(@truncate(d), ev.events);
         return null;
     }
     const id: CellId = @truncate(d);
