@@ -625,18 +625,19 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
 
 /// Marks each NSEC or NSEC3 set `p` rests on, with its signatures.
 fn keepProof(authorities: []const dns.ResourceRecord, kept: []bool, p: proof.NoCloserMatch, zone: dns.Name) void {
-    for (authorities) |rr| {
-        if ((rr.rtype != .nsec and rr.rtype != .nsec3) or !p.restsOn(rr, zone)) continue;
-        for (authorities, kept) |of, *k| {
-            if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) k.* = true;
-        }
-    }
+    var sets: dnssec.Sets = .{ .rrs = authorities };
+    while (sets.next()) |set| for (set) |rr| if (p.restsOn(rr, zone)) {
+        @memset(kept[sets.at..sets.end], true);
+        break;
+    };
 }
 
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
-    for (reply.answers, 0..) |d, i| {
+    var sets: dnssec.Sets = .{ .rrs = reply.answers };
+    while (sets.next()) |set| {
+        const d = set[0];
         if (d.rtype != .dname) continue;
-        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = dnssec.setFrom(reply.answers, i), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = set, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         try g.publish(Key.of(.rrset, d.name, .dname), d.name, by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -850,29 +851,38 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: 
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
     for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rrsig().labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rrsig().signer_name);
+    std.mem.sort(dns.Name, signers.items, {}, before);
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
         life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);
     };
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
-    for (rrs) |rr| switch (dnssec.covers(rr)) {
-        .soa => if (zone) |z| if (rr.name.eql(z)) {
+    var sets: dnssec.Sets = .{ .rrs = rrs };
+    while (sets.next()) |set| switch (dnssec.covers(set[0])) {
+        .soa => if (zone != null and set[0].name.eql(zone.?)) for (set) |rr| {
             var levelled = rr;
             levelled.ttl = @min(rr.ttl, life);
             keep.appendAssumeCapacity(levelled);
         },
-        .nsec, .nsec3 => if (flood or signedByAny(rrs, rr, signers.items)) keep.appendAssumeCapacity(rr),
-        else => if (rest) keep.appendAssumeCapacity(rr),
+        .nsec, .nsec3 => {
+            const signed = for (set) |rr| {
+                if (signs(signers.items, rr)) break true;
+            } else false;
+            for (set) |rr| if (flood or (rr.rtype != .rrsig and signed) or signs(signers.items, rr)) keep.appendAssumeCapacity(rr);
+        },
+        else => if (rest) keep.appendSliceAssumeCapacity(set),
     };
     return keep.items;
 }
 
-fn signedByAny(rrs: []const dns.ResourceRecord, rr: dns.ResourceRecord, signers: []const dns.Name) bool {
-    for (signers) |sn| {
-        if (rr.rtype == .rrsig and rr.rrsig().signer_name.eql(sn)) return true;
-        if (rr.rtype != .rrsig and dnssec.signedBy(rrs, rr.name, rr.rtype, sn)) return true;
-    }
-    return false;
+fn before(_: void, a: dns.Name, b: dns.Name) bool {
+    return a.order(b) == .lt;
+}
+
+/// Searches `signers`, sorted: a section's signatures and a reply's signers
+/// are both the sender's to multiply.
+fn signs(signers: []const dns.Name, rr: dns.ResourceRecord) bool {
+    return rr.rtype == .rrsig and std.sort.binarySearch(dns.Name, signers, rr.rrsig().signer_name, dns.Name.order) != null;
 }
 
 fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {
@@ -899,13 +909,17 @@ pub fn replyTtl(reply: Reply) u32 {
         },
         .nodata, .nxdomain => {
             var found = false;
-            if (reply.aa) for (reply.authorities) |rr| {
-                if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
+            var sets: dnssec.Sets = .{ .rrs = if (reply.aa) reply.authorities else &.{} };
+            while (sets.next()) |set| {
+                const owner = set[0].name;
+                if (set[0].rtype != .soa or !reply.target.isSubdomainOf(owner)) continue;
                 // An SOA above the zone asked counts only signed, for the validator to judge.
-                if (!rr.name.isSubdomainOf(reply.zone) and !dnssec.signedBy(reply.authorities, rr.name, .soa, rr.name)) continue;
-                ttl = @min(ttl, rr.ttl, rr.soa().minimum);
+                if (!owner.isSubdomainOf(reply.zone) and !dnssec.signedBy(set, owner, .soa, owner)) continue;
+                for (set) |rr| if (rr.rtype == .soa) {
+                    ttl = @min(ttl, rr.ttl, rr.soa().minimum);
+                };
                 found = true;
-            };
+            }
             ttl = if (found) @min(ttl, dns.max_negative_ttl) else 0;
         },
     }

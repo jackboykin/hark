@@ -482,19 +482,19 @@ const Claims = struct {
         const auth = it.r.authorities;
         while (it.p < auth.len) {
             const i = it.p;
-            it.p += 1;
+            it.p += dnssec.setFrom(auth, i).len;
             const rr = auth[i];
             switch (rr.rtype) {
-                .nsec, .nsec3, .soa => if (firstOfRrset(auth, i)) return it.claim(rr.name, rr.rtype, i, .proof),
+                .nsec, .nsec3, .soa => return it.claim(rr.name, rr.rtype, i, .proof),
                 else => {},
             }
         }
         const answers = it.r.answers;
         while (it.i < answers.len) {
             const i = it.i;
-            it.i += 1;
+            it.i += dnssec.setFrom(answers, i).len;
             const rr = answers[i];
-            if (rr.rtype == .rrsig or !firstOfRrset(answers, i)) continue;
+            if (rr.rtype == .rrsig) continue;
             var dname: ?RR = null;
             if (rr.rtype == .cname) for (answers) |d| {
                 if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
@@ -593,11 +593,6 @@ fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claim
 
 fn synthesisedUnder(rr: RR, dname: RR) bool {
     return rr.rtype == .cname and rr.name.depth() > dname.name.depth() and rr.name.isSubdomainOf(dname.name);
-}
-
-/// Assumes `bindSets` order: a set's records are adjacent.
-fn firstOfRrset(rrs: []const RR, i: usize) bool {
-    return i == 0 or rrs[i - 1].rtype != rrs[i].rtype or !rrs[i - 1].name.eql(rrs[i].name);
 }
 
 /// On a denial only the NSEC or NSEC3 proof is kept: the child's NS in a

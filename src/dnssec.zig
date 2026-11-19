@@ -363,6 +363,21 @@ pub fn setAt(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType)
     return &.{};
 }
 
+pub const Sets = struct {
+    rrs: []const dns.ResourceRecord,
+    /// Where the set `next` returned starts.
+    at: usize = 0,
+    end: usize = 0,
+
+    pub fn next(s: *Sets) ?[]const dns.ResourceRecord {
+        if (s.end == s.rrs.len) return null;
+        s.at = s.end;
+        const set = setFrom(s.rrs, s.at);
+        s.end += set.len;
+        return set;
+    }
+};
+
 pub fn covers(rr: dns.ResourceRecord) dns.RType {
     return if (rr.rtype == .rrsig) rr.rrsig().type_covered else rr.rtype;
 }
@@ -411,13 +426,14 @@ pub fn verifyAuthorityProofSigs(
     const zone = keyset.zone orelse return null;
 
     var cap: rrsig.Cap = .none;
-    for (authorities, 0..) |rr, i| {
+    var sets: Sets = .{ .rrs = authorities };
+    while (sets.next()) |group| {
+        const rr = for (group) |x| {
+            if (x.rtype != .rrsig) break x;
+        } else continue;
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
-        const seen = for (authorities[0..i]) |prev| {
-            if (prev.rtype == rr.rtype and prev.name.eql(rr.name)) break true;
-        } else false;
-        if (seen) continue;
-
+        // Read whole from the section, not from its group: a validator rests
+        // on no order it did not check.
         const set = try collect(scratch, authorities, rr.name, rr.rtype);
         var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = at.now, .unexpanded = true };
         const sig = while (it.next()) |j| {

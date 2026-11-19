@@ -167,12 +167,18 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
     const zkey = signer.wire;
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
-    for (r.authorities, 0..) |rr, i| {
+    var sets: dnssec.Sets = .{ .rrs = r.authorities };
+    while (sets.next()) |rrs| {
+        // A set is one fact. The index holds one span an owner, so of a set
+        // of several NSEC the last stands.
+        var last: ?RR = null;
+        for (rrs) |x| if (x.rtype != .rrsig and !(x.rtype == .nsec and minimal(x))) {
+            last = x;
+        };
+        const rr = last orelse continue;
         if ((rr.rtype != .nsec and rr.rtype != .soa) or !rr.name.isSubdomainOf(signer)) continue;
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
-        if (rr.rtype == .nsec and minimal(rr)) continue;
-        const rrs = dnssec.setFrom(r.authorities, i);
-        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
+        const expires = @min(proven_until[sets.at], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
         const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         const kind: model.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up only after.
