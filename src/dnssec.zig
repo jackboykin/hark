@@ -53,7 +53,6 @@ fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
 }
 
 const test_memo = &rrsig.test_memo;
-var test_scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 
 test "dsEligible: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not to an unusable one" {
     const ds = struct {
@@ -511,6 +510,8 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
 }
 
 test "validateDnskeyRrset: 65 keys verify whole, and a signature over 64 launders no 65th" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var recs: [65]dns.ResourceRecord = undefined;
     var pub_bufs: [65][32]u8 = undefined;
     for (&recs, 0..) |*r, i| {
@@ -543,14 +544,16 @@ test "validateDnskeyRrset: 65 keys verify whole, and a signature over 64 launder
     @memcpy(set[0..65], &recs);
     set[65] = rrsigRr(rrsig.test_owner, whole.rrsig);
     var budget: rrsig.ValidationBudget = .{};
-    _ = (try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo })).?;
+    _ = (try validateDnskeyRrset(arena.allocator(), &set, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo })).?;
 
     set[65] = rrsigRr(rrsig.test_owner, part.rrsig);
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &set, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) == null);
+    try testing.expect(try validateDnskeyRrset(arena.allocator(), &set, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) == null);
 }
 
 test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the budget" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var digest = dsDigest(Sha256, rrsig.test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = rrsig.keyTag(test_dnskey),
@@ -581,7 +584,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
 
     const cap: u32 = 8;
     var budget: rrsig.ValidationBudget = .{ .max_sig_verify = cap };
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &records, &.{ds}, rrsig.test_owner, .{ .now = 1700000000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try validateDnskeyRrset(arena.allocator(), &records, &.{ds}, rrsig.test_owner, .{ .now = 1700000000, .budget = &budget, .memo = test_memo }) == null);
     try testing.expectEqual(cap, budget.sig_verify_spent);
     try testing.expect(budget.stopped != null);
 }
@@ -701,6 +704,8 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
 }
 
 test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const zone: dns.Name = .lit("example.com");
     const next_owner: [20]u8 = @splat(0xFF);
     const key: dns.ResourceRecord = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } });
@@ -723,10 +728,10 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
         } } });
     }
     var at_cap: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), rrs[0 .. 2 * proof.max_proof_records], &.{key}, .{ .now = 1700000000, .budget = &at_cap, .memo = test_memo }) == null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), rrs[0 .. 2 * proof.max_proof_records], &.{key}, .{ .now = 1700000000, .budget = &at_cap, .memo = test_memo }) == null);
     try testing.expect(at_cap.sig_verify_spent > 0);
     var past: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &rrs, &.{key}, .{ .now = 1700000000, .budget = &past, .memo = test_memo }) == null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &rrs, &.{key}, .{ .now = 1700000000, .budget = &past, .memo = test_memo }) == null);
     try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
@@ -739,6 +744,8 @@ fn rrsigRr(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
 }
 
 test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const alpha = dns.Name.lit("alpha.example.com");
     const gamma = dns.Name.lit("gamma.example.com");
     const nsecs = [_]dns.ResourceRecord{
@@ -752,11 +759,13 @@ test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" 
     const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, a.dnskey), dnskeyRr(rrsig.test_owner, g.dnskey) };
     const signed = [_]dns.ResourceRecord{ nsecs[0], rrsigRr(alpha, a.rrsig), nsecs[1], rrsigRr(gamma, g.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &signed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), signed[0..3], &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &signed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), signed[0..3], &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
 }
 
 test "verifyAuthorityProofSigs: a signature over part of a set verifies none of it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .lit("a.example.com"))};
     var soas: [17]dns.ResourceRecord = undefined;
     for (&soas, 0..) |*r, i| r.* = .fixture(.{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
@@ -775,11 +784,13 @@ test "verifyAuthorityProofSigs: a signature over part of a set verifies none of 
     const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, n.dnskey), dnskeyRr(rrsig.test_owner, s.dnskey) };
     const sigs = [_]dns.ResourceRecord{ nsec[0], rrsigRr(rrsig.test_owner, n.rrsig), rrsigRr(rrsig.test_owner, s.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas[0..16].*), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &(sigs ++ soas), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &(sigs ++ soas[0..16].*), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &(sigs ++ soas), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
@@ -796,12 +807,14 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
 
     var budget: rrsig.ValidationBudget = .{};
     const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.lit("other.com"), signed.rrsig) };
-    try testing.expect(try validateRrset(test_scratch.allocator(), &moved, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try validateRrset(arena.allocator(), &moved, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo }) == null);
     const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
-    try testing.expect(try validateRrset(test_scratch.allocator(), &home, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo }) != null);
+    try testing.expect(try validateRrset(arena.allocator(), &home, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo }) != null);
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const star = dns.Name.lit("*.example.com");
     const a = dns.Name.lit("a.example.com");
     const v = dns.Name.lit("v.example.com");
@@ -813,19 +826,19 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const sig_rr = dns.ResourceRecord.fixture(.{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const replayed = [_]dns.ResourceRecord{ proof.nsecRr(v, a), sig_rr };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &replayed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &replayed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
 
     const own_sig = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &genuine, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) != null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &genuine, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) != null);
 
     var fewer = signed.rrsig;
     fewer.labels -= 1;
     const stray = dns.ResourceRecord.fixture(.{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = fewer } });
     const strayed = [_]dns.ResourceRecord{ real[0], stray, own_sig };
     var budget3: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(test_scratch.allocator(), &strayed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget3, .memo = test_memo }) != null);
+    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &strayed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget3, .memo = test_memo }) != null);
 }
 
 fn testSignMlDsa(
@@ -858,6 +871,8 @@ fn testSignMlDsa(
 }
 
 test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the only one that counts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const pq_kp = try MlDsa44.KeyPair.generateDeterministic(@splat(7));
     const pq_pub = pq_kp.public_key.toBytes();
     const pq_key = dns.DnskeyData{ .flags = 257, .protocol = 3, .algorithm = .mldsa44, .public_key = &pq_pub };
@@ -884,33 +899,33 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
 
     const stripped = keys ++ [_]dns.ResourceRecord{key.sig(ed.rrsig)};
     var b1: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, pq_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b1, .memo = test_memo }) == null);
+    try testing.expect(try validateDnskeyRrset(arena.allocator(), &stripped, &.{ ed_ds, pq_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b1, .memo = test_memo }) == null);
 
     const dual = keys ++ [_]dns.ResourceRecord{ key.sig(ed.rrsig), key.sig(pq) };
     var b2: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual, &.{ ed_ds, pq_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b2, .memo = test_memo })).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(arena.allocator(), &dual, &.{ ed_ds, pq_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b2, .memo = test_memo })).?.algorithm);
     const dual_rev = keys ++ [_]dns.ResourceRecord{ key.sig(pq), key.sig(ed.rrsig) };
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(test_scratch.allocator(), &dual_rev, &.{ pq_ds, ed_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b2, .memo = test_memo })).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(arena.allocator(), &dual_rev, &.{ pq_ds, ed_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b2, .memo = test_memo })).?.algorithm);
 
     const odd_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
     var b4: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b4, .memo = test_memo })).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(arena.allocator(), &stripped, &.{ ed_ds, odd_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b4, .memo = test_memo })).?.algorithm);
     var pq_sha1 = dsDigest(Sha1, rrsig.test_owner, pq_key);
     const sha1_ds = dns.DsData{ .key_tag = rrsig.keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b4, .memo = test_memo })).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(arena.allocator(), &stripped, &.{ ed_ds, sha1_ds }, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b4, .memo = test_memo })).?.algorithm);
 
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
     try testing.expectEqual(dual.len, (try usableKeys(arena.allocator(), &dual, &.{ed_ds})).len);
     const kept = try usableKeys(arena.allocator(), &dual, &.{ ed_ds, pq_ds });
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].dnskey().algorithm);
 
     var b3: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(test_scratch.allocator(), &stripped, &.{ed_ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b3, .memo = test_memo })).?.algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(arena.allocator(), &stripped, &.{ed_ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &b3, .memo = test_memo })).?.algorithm);
 }
 
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
     var recs: [2]dns.ResourceRecord = undefined;
@@ -926,10 +941,12 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
         .digest = &digest,
     };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateDnskeyRrset(test_scratch.allocator(), &recs, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expect(try validateDnskeyRrset(arena.allocator(), &recs, &.{ds}, rrsig.test_owner, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
 }
 
 test "validateRrset: the TTL cap comes from the signature that verified" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     const now: u32 = 1_700_000_000;
     const recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
@@ -950,11 +967,13 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } }),
     };
     var budget: rrsig.ValidationBudget = .{};
-    const sig = (try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo })).?.sig;
+    const sig = (try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = now, .budget = &budget, .memo = test_memo })).?.sig;
     try testing.expectEqual(@as(u32, 300), rrsig.Cap.of(sig, now).original_ttl);
 }
 
 test "validateRrset: 70 records verify whole, and a signature over 64 launders no other 6" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var recs: [70]dns.ResourceRecord = undefined;
     for (&recs, 0..) |*r, i| r.* = .fixture(.{
         .name = rrsig.test_owner,
@@ -975,9 +994,9 @@ test "validateRrset: 70 records verify whole, and a signature over 64 launders n
     @memcpy(answers[0..70], &recs);
     answers[70] = rrsigRr(rrsig.test_owner, whole.rrsig);
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
+    try testing.expect(try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
 
     answers[70] = rrsigRr(rrsig.test_owner, part.rrsig);
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(try validateRrset(test_scratch.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) == null);
+    try testing.expect(try validateRrset(arena.allocator(), &answers, rrsig.test_owner, .a, false, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget2, .memo = test_memo }) == null);
 }

@@ -2,6 +2,7 @@
 //! string arrays and tables.
 
 const std = @import("std");
+const slab = @import("slab.zig");
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
@@ -182,7 +183,7 @@ fn parseArray(arena: Allocator, raw: []const u8) ParseError![]const []const u8 {
     return items.items;
 }
 
-var test_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+var test_arena: std.heap.ArenaAllocator = .init(slab.scaffold.allocator());
 
 fn parseTest(input: []const u8) ParseError!Table {
     return parse(test_arena.allocator(), input);

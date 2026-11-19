@@ -286,7 +286,11 @@ pub fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
 /// Debug test builds only: each thread runs the math for a signature once,
 /// so Debug's re-check of every memo hit stays cheap. Keyed by the signed
 /// data, not the memo's tag, so a wrong memo hit is still caught.
-threadlocal var proven: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+threadlocal var proven: [1 << 12][32]u8 = @splat(@splat(0));
+
+fn provenSlot(t: *const [32]u8) *[32]u8 {
+    return &proven[mem.readInt(u32, t[0..4], .little) & (proven.len - 1)];
+}
 
 fn proveMath(
     comptime algorithm: dns.DnssecAlgorithm,
@@ -300,9 +304,9 @@ fn proveMath(
     data.feed(&h);
     var t: [32]u8 = undefined;
     h.final(&t);
-    if (proven.contains(t)) return;
+    if (mem.eql(u8, provenSlot(&t), &t)) return;
     try verifyMath(algorithm, signature, data, digest, key);
-    proven.put(std.heap.smp_allocator, t, {}) catch {};
+    provenSlot(&t).* = t;
 }
 
 /// Must stay a pure function of its arguments, or memo hits bypass the

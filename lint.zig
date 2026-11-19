@@ -8,6 +8,8 @@
 //! - No `@constCast`.
 //! - No `anyerror` outside a test.
 //! - Nothing under src/ hashes a string with std's fixed seed.
+//! - Nothing under src/ but slab.zig takes memory from std's allocators
+//!   outside a test, so the reserve sees all hark holds.
 //! - A function or test is at most 100 lines of code, nests control flow at
 //!   most 4 deep, and takes at most 7 parameters.
 //! - A `pub` declaration is named by another file.
@@ -46,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
         constCast(f);
         try anyError(arena, f);
         try unseeded(arena, f);
+        try unreserved(arena, f);
         try shape(arena, f);
         unusedImports(f);
     }
@@ -345,6 +348,33 @@ fn unseeded(arena: Allocator, f: File) !void {
         const path = try chain(arena, t, node, aliases) orelse continue;
         for (fixed_seed) |name| if (samePath(path, name))
             report(f, t.nodeData(node).node_and_token[1], "std's string hash has a fixed seed: key with rand.Keyed", .{});
+    }
+}
+
+const std_allocators = [_][]const []const u8{
+    &.{ "heap", "page_allocator" },
+    &.{ "heap", "smp_allocator" },
+    &.{ "heap", "c_allocator" },
+    &.{ "heap", "raw_c_allocator" },
+    &.{ "heap", "wasm_allocator" },
+    &.{ "heap", "PageAllocator" },
+    &.{ "heap", "DebugAllocator" },
+    &.{ "heap", "GeneralPurposeAllocator" },
+};
+
+fn unreserved(arena: Allocator, f: File) !void {
+    if (!mem.startsWith(u8, f.path, "src/") or mem.eql(u8, f.path, "src/slab.zig")) return;
+    const t = f.tree;
+    const aliases = try stdAliases(arena, t);
+    const tests = try testRanges(arena, t);
+    nodes: for (0..t.nodes.len) |n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        if (t.nodeTag(node) != .field_access) continue;
+        const at = t.nodeData(node).node_and_token[1];
+        for (tests) |r| if (at >= r[0] and at <= r[1]) continue :nodes;
+        const path = try chain(arena, t, node, aliases) orelse continue;
+        for (std_allocators) |name| if (samePath(path, name))
+            report(f, at, "std's allocator: take memory from a slab tenant, which the reserve counts", .{});
     }
 }
 

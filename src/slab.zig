@@ -265,6 +265,9 @@ pub const Reserve = struct {
     }
 };
 
+pub var scaffold: Tenant = .init(&scaffold_reserve);
+var scaffold_reserve: Reserve = .{};
+
 pub const Tenant = struct {
     reserve: *Reserve,
     share: *Share,
