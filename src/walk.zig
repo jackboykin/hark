@@ -71,8 +71,8 @@ pub const Ask = struct {
 
     const Found = struct { held: u8, new: usize = 0 };
 
-    fn gather(a: *Ask, g: *Graph) Found {
-        if (a.nservers == 0) a.stream_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
+    fn gather(a: *Ask, g: *Graph) !Found {
+        if (a.nservers == 0) a.stream_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and try zoneTruncates(g, a.zone);
         return .{ .held = a.nservers };
     }
 
@@ -176,8 +176,8 @@ pub const Ask = struct {
         return true;
     }
 
-    fn seed(a: *Ask, g: *Graph, cut: model.Cut) void {
-        var found = a.gather(g);
+    fn seed(a: *Ask, g: *Graph, cut: model.Cut) !void {
+        var found = try a.gather(g);
         a.more = reach(g, a, &found, a.take(cut));
     }
 
@@ -379,7 +379,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         return settleInside(g, id, parent, serving(g, known));
     if (s.ask == null) {
         s.ask = .{ .zone = pc.zone };
-        s.ask.?.seed(g, pc);
+        try s.ask.?.seed(g, pc);
     }
     const a = &s.ask.?;
     switch (try ask(g, id, a, name, .a)) {
@@ -476,7 +476,7 @@ fn named(wire: []const u8, n: dns.Name) bool {
 }
 
 pub fn runAddr(g: *Graph, id: CellId) !void {
-    if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .of(.too_deep));
+    if (try g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .of(.too_deep));
     const s = g.cell(id).scratch.addr;
     const key = g.cell(id).key;
     const host = g.cell(id).name;
@@ -554,7 +554,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .silent => {},
         }
         s.ask = .{ .zone = cut.state.fact.cut.zone };
-        s.ask.?.seed(g, cut.state.fact.cut);
+        try s.ask.?.seed(g, cut.state.fact.cut);
     }
     const a = &s.ask.?;
     while (true) {
@@ -573,7 +573,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     a.* = .{ .zone = ref.zone_cut };
-                    a.seed(g, cut.value.cut);
+                    try a.seed(g, cut.value.cut);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
@@ -1066,9 +1066,9 @@ fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) b
     return own != null or special_use.classify(qname, qtype, true) == null;
 }
 
-fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
+fn zoneTruncates(g: *Graph, zone: dns.Name) !bool {
     const key = Key.of(.rrset, zone, .ds);
-    const ds = (g.peek(key) catch return false) orelse return false;
+    const ds = try g.peek(key) orelse return false;
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
@@ -1082,7 +1082,7 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, q: Graph.Query
 }
 
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped, ready } {
-    var found = a.gather(g);
+    var found = try a.gather(g);
     const zone = a.zone;
     var left: Left = .{};
     if (told(g, zone)) |servers| {
@@ -1115,7 +1115,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, stopped,
         const unknown = left.unknown.items;
         if (found.new == 0 and !a.fetched_unglued and unknown.len > 0) {
             a.fetched_unglued = true;
-            const limit: usize = switch (g.level(id)) {
+            const limit: usize = switch (try g.level(id)) {
                 0 => 3,
                 1 => 2,
                 else => 1,

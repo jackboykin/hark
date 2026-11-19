@@ -940,7 +940,7 @@ pub const Graph = struct {
     /// Remembering only makes a failure quicker, so a shortage forgoes it.
     pub fn failRemembered(g: *Graph, id: CellId, why: Failure) void {
         const c = g.cell(id);
-        if (why.cause() == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) g.remember(c.key, why) catch {};
+        if (why.cause() == .zone and !why.remembered and !c.orphan and c.as_of == 0 and (g.level(id) catch 1) == 0) g.remember(c.key, why) catch {};
         g.fail(id, why);
     }
 
@@ -1177,18 +1177,18 @@ pub const Graph = struct {
     }
 
     pub fn join(g: *Graph, by: CellId, id: CellId) !?CellId {
-        if (!g.fresh(id) and g.reaches(by, id)) return null;
+        if (!g.fresh(id) and try g.reaches(by, id)) return null;
         try g.pin(id, by);
         return id;
     }
 
-    fn payerOf(g: *Graph, id: CellId) ?*Budget {
+    fn payerOf(g: *Graph, id: CellId) !?*Budget {
         g.checks += 1;
         var first: ?*Budget = null;
         var roomy: std.ArrayList(*Budget) = .empty;
         const ch = g.chaosAt(.payer);
         var stack: std.ArrayList(CellId) = .empty;
-        stack.append(g.scratch.allocator(), id) catch return null;
+        try stack.append(g.scratch.allocator(), id);
         while (stack.pop()) |i| {
             const c = g.cell(i);
             if (c.seen == g.checks or c.orphan) continue;
@@ -1196,16 +1196,16 @@ pub const Graph = struct {
             if (budgetOf(c)) |b| {
                 if (!g.spent(b)) {
                     if (ch == null) return b;
-                    roomy.append(g.scratch.allocator(), b) catch return b;
+                    try roomy.append(g.scratch.allocator(), b);
                 }
                 first = first orelse b;
                 continue;
             }
             // Last first, so the stack pops them in pin order.
             var n = c.waiters.last;
-            while (n) |w| : (n = w.prev) stack.append(g.scratch.allocator(), Pin.ofWaiter(w).by) catch return first;
+            while (n) |w| : (n = w.prev) try stack.append(g.scratch.allocator(), Pin.ofWaiter(w).by);
         }
-        if (roomy.items.len > 0) return roomy.items[@intCast(g.decide(.payer, g.cell(id).key, roomy.items.len) catch 0)];
+        if (roomy.items.len > 0) return roomy.items[@intCast(try g.decide(.payer, g.cell(id).key, roomy.items.len))];
         return first;
     }
 
@@ -1236,12 +1236,12 @@ pub const Graph = struct {
 
     /// NS-address sub-resolutions between `id` and its nearest question, along
     /// the shortest demand chain; 0 for an orphan.
-    pub fn level(g: *Graph, id: CellId) u8 {
+    pub fn level(g: *Graph, id: CellId) Allocator.Error!u8 {
         g.checks += 1;
         const gpa = g.scratch.allocator();
         var here: std.ArrayList(CellId) = .empty;
         var next: std.ArrayList(CellId) = .empty;
-        here.append(gpa, id) catch return 0;
+        try here.append(gpa, id);
         var d: u8 = 0;
         while (true) : (d +|= 1) {
             while (here.pop()) |i| {
@@ -1252,7 +1252,7 @@ pub const Graph = struct {
                 var it = c.waiterIds();
                 while (it.next()) |w| {
                     const list = if (c.key.kind == .rrset and g.cell(w).key.kind == .addr) &next else &here;
-                    list.append(gpa, w) catch return d;
+                    try list.append(gpa, w);
                 }
             }
             if (next.items.len == 0) return 0;
@@ -1260,17 +1260,17 @@ pub const Graph = struct {
         }
     }
 
-    fn reaches(g: *Graph, from: CellId, target: CellId) bool {
+    fn reaches(g: *Graph, from: CellId, target: CellId) !bool {
         g.checks += 1;
         var stack: std.ArrayList(CellId) = .empty;
-        stack.append(g.scratch.allocator(), from) catch return true;
+        try stack.append(g.scratch.allocator(), from);
         while (stack.pop()) |id| {
             if (id == target) return true;
             const c = g.cell(id);
             if (c.seen == g.checks) continue;
             c.seen = g.checks;
             var it = c.waiterIds();
-            while (it.next()) |w| stack.append(g.scratch.allocator(), w) catch return true;
+            while (it.next()) |w| try stack.append(g.scratch.allocator(), w);
         }
         return false;
     }
@@ -1319,7 +1319,7 @@ pub const Graph = struct {
         }
         g.scratch.reset();
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
-        g.payer = g.payerOf(id) orelse &g.unpaid;
+        g.payer = try g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;
         g.as_of = c.as_of;
         defer g.as_of = 0;
@@ -1402,7 +1402,7 @@ pub const Graph = struct {
         std.debug.assert(case == .random or need == .stream);
         // The run's payer may spend itself mid-run while another waiter still has
         // room: the shared work goes on at that one's cost.
-        if (g.limit(g.payer) != null) g.payer = g.payerOf(by) orelse g.payer;
+        if (g.limit(g.payer) != null) g.payer = try g.payerOf(by) orelse g.payer;
         const budget = g.payer;
         const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text() else null;
         if (stop) |why| {
@@ -1569,9 +1569,9 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     try g.pin(shared, first);
     try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
-    try testing.expectEqual(g.cell(second).scratch.answer.budget, g.payerOf(shared).?);
+    try testing.expectEqual(g.cell(second).scratch.answer.budget, (try g.payerOf(shared)).?);
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
-    try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
+    try testing.expectEqual(g.cell(first).scratch.answer.budget, (try g.payerOf(shared)).?);
     g.payer = g.cell(first).scratch.answer.budget;
     try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .{ .name = host, .qtype = .a, .need = .datagram, .case = .random }, true));
     g.cell(second).scratch.answer.budget.queries = 0;
