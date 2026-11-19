@@ -86,7 +86,7 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
         b.shorten(g.now());
         g.store.drop(b);
     }
-    try g.fail(id, bogus);
+    g.fail(id, bogus);
 }
 
 /// A bogus DS or keyset is remembered (RFC 9520 §3.4): judging it again per
@@ -137,14 +137,14 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     }
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
-        .stopped => |why| try g.fail(id, why),
+        .stopped => |why| g.fail(id, why),
         .insecure => |until| {
             try g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
         },
         // Remembered: otherwise every probe below judges this zone again,
         // doubling per label.
-        .none => if (s.fault.?.failure(g)) |why| try g.failRemembered(id, why) else try failChain(g, id, s.rrset.unwrap().?),
+        .none => if (s.fault.?.failure(g)) |why| g.failRemembered(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
 }
 
@@ -202,9 +202,9 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                         try g.keep(s.rrset.unwrap().?);
                         try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
                     },
-                    .unchecked, .insecure, .bogus => try g.fail(id, g.payer.validationStop() orelse no_cut),
+                    .unchecked, .insecure, .bogus => g.fail(id, g.payer.validationStop() orelse no_cut),
                 },
-                .bogus => try g.fail(id, g.payer.validationStop() orelse no_cut),
+                .bogus => g.fail(id, g.payer.validationStop() orelse no_cut),
             }
         },
         .alias, .yxdomain => unreachable,

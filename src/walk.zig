@@ -347,7 +347,7 @@ fn settleAnswer(g: *Graph, id: CellId, a: model.Answer, expires: i64) !void {
 
 fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
-    try g.fail(id, why);
+    g.fail(id, why);
 }
 
 fn lapsing(g: *Graph, hops: []const model.Answer.Hop) ?i64 {
@@ -384,7 +384,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     const a = &s.ask.?;
     switch (try ask(g, id, a, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, ended(g, a)),
+        .exhausted => g.fail(id, ended(g, a)),
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone)) {
@@ -402,7 +402,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     if (!try publishNxdomain(g, id, kept, name)) return g.fail(id, unplaced);
                     try settleInside(g, id, parent, g.now());
                 },
-                .failed => try g.fail(id, unplaced),
+                .failed => g.fail(id, unplaced),
             }
         },
     }

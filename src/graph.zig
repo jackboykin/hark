@@ -388,6 +388,8 @@ pub const Graph = struct {
     /// slot's `next` is the one below it, and the bottom one names itself.
     ready: OptionalCellId = .none,
     answered: std.ArrayList(CellId) = .empty,
+    /// Answer cells not yet settled: `answered` keeps room for each.
+    answering: u32 = 0,
     rtt: *ns_rtt.Table,
     schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     runs: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
@@ -465,9 +467,10 @@ pub const Graph = struct {
         };
         if (admit != .new) return error.Novel;
         if (g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) return error.Full;
+        try g.answered.ensureTotalCapacity(g.gpa, g.answered.items.len + g.answering + 1);
         const id = try g.newRoot(key, name, 0, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
+        g.answering += 1;
         g.cell(id).holds += 1;
-        errdefer g.unhold(id);
         g.enqueue(id);
         return id;
     }
@@ -811,6 +814,7 @@ pub const Graph = struct {
         s.* = .{ .gen = s.gen +% 1, .next = if (queued) s.next else g.empty };
         if (!queued) g.empty = .wrap(id);
         g.live -= 1;
+        if (c.key.kind == .answer and !c.settled()) g.answering -= 1;
         g.unpinAll(c);
         if (c.blob) |b| g.store.unref(b);
         if (budgetOf(c)) |b| {
@@ -855,7 +859,7 @@ pub const Graph = struct {
                 try g.keep(t);
             },
         }
-        try g.woken(id, value == .answer);
+        g.woken(id, value == .answer);
     }
 
     pub fn settleAs(g: *Graph, id: CellId, v: *store.Blob) !void {
@@ -871,7 +875,7 @@ pub const Graph = struct {
         };
         c.blob = blob;
         c.state = .{ .fact = owned };
-        try g.woken(id, false);
+        g.woken(id, false);
     }
 
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
@@ -906,21 +910,24 @@ pub const Graph = struct {
         };
     }
 
-    pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
+    pub fn fail(g: *Graph, id: CellId, why: Failure) void {
         const c = g.cell(id);
         std.debug.assert(!c.settled());
         if (g.cfg.trace) log.debug("{t}({f}) failed: {t} {s}", .{ c.key.kind, c.name, why.code(), why.text() });
         if (c.key.kind == .secure and why.code() == .dnssec_bogus) g.stats.trust.bogus += 1;
         c.state = .{ .failure = why };
         c.bare_expires_ns = g.now();
-        try g.woken(id, false);
+        g.woken(id, false);
     }
 
-    fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
+    fn woken(g: *Graph, id: CellId, keep_inputs: bool) void {
         const c = g.cell(id);
         var it = c.waiterIds();
         while (it.next()) |w| g.enqueue(w);
-        if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
+        if (c.key.kind == .answer) {
+            g.answered.appendAssumeCapacity(id);
+            g.answering -= 1;
+        }
         // An answer serves from its hops; everything else has copied out.
         if (!keep_inputs) g.unpinAll(c);
         // The run's hold still pins a self-held root; the one release is below.
@@ -930,10 +937,11 @@ pub const Graph = struct {
 
     /// Remembered (RFC 9520 §3.2) unless the asker may have caused it: its
     /// limits, an orphan, a refresh, an address lookup's depth, a send that never left.
-    pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
+    /// Remembering only makes a failure quicker, so a shortage forgoes it.
+    pub fn failRemembered(g: *Graph, id: CellId, why: Failure) void {
         const c = g.cell(id);
-        if (why.cause() == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) try g.remember(c.key, why);
-        try g.fail(id, why);
+        if (why.cause() == .zone and !why.remembered and !c.orphan and c.as_of == 0 and g.level(id) == 0) g.remember(c.key, why) catch {};
+        g.fail(id, why);
     }
 
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
@@ -1164,7 +1172,7 @@ pub const Graph = struct {
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name, g.as_of);
         try g.pin(id, by);
-        if (try g.refused(key)) |why| try g.fail(id, why) else g.enqueue(id);
+        if (try g.refused(key)) |why| g.fail(id, why) else g.enqueue(id);
         return id;
     }
 
