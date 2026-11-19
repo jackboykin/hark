@@ -51,6 +51,10 @@ fn classFor(len: usize, alignment: Alignment) ?u8 {
     return classOf(n);
 }
 
+fn paged(len: usize) usize {
+    return mem.alignForward(usize, len, std.heap.pageSize());
+}
+
 const Slot = struct { next: ?*Slot };
 
 const most_slots = slab_len / 16;
@@ -153,7 +157,20 @@ const Region = struct {
     }
 };
 
+pub const Share = struct {
+    held: usize = 0,
+    limit: usize = std.math.maxInt(usize),
+
+    fn room(s: *const Share, n: usize) bool {
+        return s.held + n <= s.limit;
+    }
+};
+
 pub const Reserve = struct {
+    limit: usize = std.math.maxInt(usize),
+    whole: Share = .{},
+    regions: usize = 0,
+    mapped: usize = 0,
     dirty: std.DoublyLinkedList = .{},
     dirty_count: usize = 0,
     aged: usize = 0,
@@ -189,10 +206,24 @@ pub const Reserve = struct {
         r.* = .{};
     }
 
+    fn resident(r: *const Reserve) usize {
+        return (r.held + r.dirty_count + r.regions) * slab_len + r.mapped;
+    }
+
+    fn fits(r: *const Reserve, n: usize) bool {
+        return r.resident() + n <= r.limit;
+    }
+
+    /// A dirty slab is already resident, so it is free to take. A clean one, or a
+    /// new region with its header slab, must fit under the limit.
     fn take(r: *Reserve) ?*Slab {
-        const node = r.dirty.popFirst() orelse r.clean.popFirst() orelse blk: {
-            r.grow() orelse return null;
-            break :blk r.clean.popFirst().?;
+        const node = r.dirty.popFirst() orelse blk: {
+            if (!r.fits(slab_len)) return null;
+            break :blk r.clean.popFirst() orelse grown: {
+                if (!r.fits(2 * slab_len)) return null;
+                r.grow() orelse return null;
+                break :grown r.clean.popFirst().?;
+            };
         };
         const slab = Slab.from(node);
         if (slab.dirty) {
@@ -221,17 +252,23 @@ pub const Reserve = struct {
         const region: *Region = @ptrFromInt(start);
         region.* = .{ .slabs = @splat(.{}), .older = r.newest };
         r.newest = region;
+        r.regions += 1;
         for (region.slabs[1..]) |*slab| r.clean.append(&slab.node);
     }
 };
 
 pub const Tenant = struct {
     reserve: *Reserve,
+    share: *Share,
     current: [class_count]?*Slab = @splat(null),
     partial: [class_count]std.DoublyLinkedList = @splat(.{}),
 
     pub fn init(reserve: *Reserve) Tenant {
-        return .{ .reserve = reserve };
+        return .in(reserve, &reserve.whole);
+    }
+
+    pub fn in(reserve: *Reserve, share: *Share) Tenant {
+        return .{ .reserve = reserve, .share = share };
     }
 
     pub fn allocator(t: *Tenant) Allocator {
@@ -242,10 +279,15 @@ pub const Tenant = struct {
         const t: *Tenant = @ptrCast(@alignCast(ctx));
         const c = classFor(len, alignment) orelse {
             @branchHint(.unlikely);
-            return std.heap.PageAllocator.map(len, alignment);
+            if (!t.mappable(paged(len))) return null;
+            const p = std.heap.PageAllocator.map(len, alignment) orelse return null;
+            t.mapped(paged(len), 0);
+            return p;
         };
-        if (t.current[c]) |slab| if (take(slab)) |slot| return slot;
-        return t.refill(c);
+        if (!t.share.room(slot_sizes[c])) return null;
+        const slot = (if (t.current[c]) |slab| take(slab) else null) orelse t.refill(c) orelse return null;
+        t.share.held += slot_sizes[c];
+        return slot;
     }
 
     fn take(slab: *Slab) ?[*]u8 {
@@ -279,28 +321,48 @@ pub const Tenant = struct {
 
     /// `free` tells a mapping from a slot by length alone, so no resize may
     /// carry an allocation across `max_slot`.
-    fn resize(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
         if (classFor(memory.len, alignment) == null) {
             if (classFor(new_len, alignment) != null) return false;
-            return std.heap.PageAllocator.realloc(memory, alignment, new_len, false) != null;
+            return @as(*Tenant, @ptrCast(@alignCast(ctx))).remapped(memory, alignment, new_len, false) != null;
         }
         return new_len <= slot_sizes[Slab.of(memory.ptr).class];
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
         if (classFor(memory.len, alignment) == null and classFor(new_len, alignment) == null)
-            return std.heap.PageAllocator.realloc(memory, alignment, new_len, true);
+            return @as(*Tenant, @ptrCast(@alignCast(ctx))).remapped(memory, alignment, new_len, true);
         return if (resize(ctx, memory, alignment, new_len, ra)) memory.ptr else null;
+    }
+
+    fn remapped(t: *Tenant, memory: []u8, alignment: Alignment, new_len: usize, may_move: bool) ?[*]u8 {
+        const old = paged(memory.len);
+        const new = paged(new_len);
+        if (new > old and !t.mappable(new - old)) return null;
+        const p = std.heap.PageAllocator.realloc(memory, alignment, new_len, may_move) orelse return null;
+        t.mapped(new, old);
+        return p;
+    }
+
+    fn mappable(t: *const Tenant, n: usize) bool {
+        return t.share.room(n) and t.reserve.fits(n);
+    }
+
+    fn mapped(t: *Tenant, new: usize, old: usize) void {
+        t.share.held = t.share.held - old + new;
+        t.reserve.mapped = t.reserve.mapped - old + new;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, _: usize) void {
         const t: *Tenant = @ptrCast(@alignCast(ctx));
         if (classFor(memory.len, alignment) == null) {
             @branchHint(.unlikely);
+            t.mapped(0, paged(memory.len));
             return std.heap.PageAllocator.unmap(@alignCast(memory));
         }
         const slab = Slab.of(memory.ptr);
         assert(slab.owner == t and slab.used > 0);
+        t.share.held -= slot_sizes[slab.class];
         if (!safe) return release(slab, memory.ptr);
         if (slab.fault(memory)) |why| @panic(why);
         slab.out.unset(slab.slot(memory.ptr).?);
@@ -378,8 +440,42 @@ test "slots keep their bytes, and every slab goes home when all is freed" {
         for (x.bytes) |b| try testing.expectEqual(x.fill, b);
         a.free(x.bytes);
     }
+    try testing.expectEqual(0, reserve.whole.held);
     reserve.drain();
     try testing.expectEqual(0, reserve.held);
+}
+
+test "a tenant holds its slots at their size and its mappings in pages" {
+    var reserve: Reserve = .{};
+    defer reserve.deinit();
+    var t: Tenant = .init(&reserve);
+    const a = t.allocator();
+    const small = try a.alloc(u8, 17);
+    const mid = try a.alloc(u8, 200);
+    var big = try a.alloc(u8, max_slot + 1);
+    try testing.expectEqual(slot_sizes[classOf(17)] + slot_sizes[classOf(200)] + paged(max_slot + 1), reserve.whole.held);
+    big = try a.realloc(big, 4 * max_slot);
+    try testing.expectEqual(slot_sizes[classOf(17)] + slot_sizes[classOf(200)] + paged(4 * max_slot), reserve.whole.held);
+    a.free(big);
+    a.free(mid);
+    a.free(small);
+    try testing.expectEqual(0, reserve.whole.held);
+}
+
+test "a reserve grants nothing past its limit, nor a share past its own" {
+    var reserve: Reserve = .{ .limit = 3 * slab_len };
+    defer reserve.deinit();
+    var small: Share = .{ .limit = 64 };
+    var t: Tenant = .in(&reserve, &small);
+    var u: Tenant = .init(&reserve);
+    const one = try t.allocator().alloc(u8, 40);
+    try testing.expectError(error.OutOfMemory, t.allocator().alloc(u8, 40));
+    const two = try u.allocator().alloc(u8, 400);
+    try testing.expectError(error.OutOfMemory, u.allocator().alloc(u8, 4000));
+    try testing.expectError(error.OutOfMemory, u.allocator().alloc(u8, max_slot + 1));
+    t.allocator().free(one);
+    u.allocator().free(two);
+    try testing.expectEqual(0, small.held + reserve.whole.held);
 }
 
 test "slabs one class emptied serve another, and the rest go back to the OS" {
