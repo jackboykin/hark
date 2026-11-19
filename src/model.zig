@@ -157,6 +157,7 @@ pub const Failure = struct {
         queries_spent,
         verifies_spent,
         nsec3_spent,
+        memory,
     };
 
     const Cause = enum { zone, host, asker };
@@ -177,6 +178,7 @@ pub const Failure = struct {
         .queries_spent = .{ .code = .other, .text = "query budget spent", .cause = .asker },
         .verifies_spent = .{ .code = .other, .text = "validation budget spent", .cause = .asker },
         .nsec3_spent = .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
+        .memory = .{ .code = .other, .text = "out of memory", .cause = .asker },
     });
 
     pub fn of(name: Name) Failure {

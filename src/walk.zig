@@ -1015,6 +1015,10 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
             i += 1;
             continue;
         }
+        if (ex.failure()) |why| {
+            std.debug.assert(why.name == .memory);
+            return error.OutOfMemory;
+        }
         const at = a.end(i);
         const again: ?Way = switch (ex.state.fact.exchange) {
             // The deadline cut the wait before the server was due: it was asked

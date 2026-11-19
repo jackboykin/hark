@@ -286,7 +286,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     } else 0;
     try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);
-    try g.keep(id);
+    g.keep(id);
     return true;
 }
 

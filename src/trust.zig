@@ -139,7 +139,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .pending => {},
         .stopped => |why| g.fail(id, why),
         .insecure => |until| {
-            try g.keep(s.rrset.unwrap().?);
+            g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
         },
         // Remembered: otherwise every probe below judges this zone again,
@@ -181,7 +181,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                 return .bogus).sig;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
-            try g.keep(s.rrset.unwrap().?);
+            g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires(), keys.expires()));
         },
         .nodata, .nxdomain => {
@@ -193,13 +193,13 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             const until = @min(rs.expires(), keys.expires());
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => {
-                    try g.keep(s.rrset.unwrap().?);
+                    g.keep(s.rrset.unwrap().?);
                     try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
                 },
                 // A signed denial of the DS that shows no delegation either: no zone.
                 .unproven => switch (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget)) {
                     .secure => {
-                        try g.keep(s.rrset.unwrap().?);
+                        g.keep(s.rrset.unwrap().?);
                         try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
                     },
                     .unchecked, .insecure, .bogus => g.fail(id, g.payer.validationStop() orelse no_cut),
@@ -264,7 +264,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
         return failChain(g, id, s.rrset.unwrap().?);
     g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
-    try g.keep(s.rrset.unwrap().?);
+    g.keep(s.rrset.unwrap().?);
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires(), ds.expires()));
 }
 
@@ -277,9 +277,8 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == g.gen(rid);
         if (same and (!c.settled() or g.fresh(sid))) return g.join(by, sid);
     }
-    const sid = try g.newCell(key, t.name, g.as_of);
+    const sid = try g.newInput(key, t.name, by);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = g.gen(rid) };
-    try g.pin(sid, by);
     if (t.blob) |b| if (b.verdict.standing(g.instant())) |v| {
         try g.settle(sid, .{ .secure = v }, b.verdict.until_ns);
         return sid;

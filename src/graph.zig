@@ -191,6 +191,7 @@ pub const Budget = struct {
     deadline_ns: i64,
     refs: u32 = 1,
     validation: rrsig.ValidationBudget = .{},
+    starved: bool = false,
 
     pub fn validationStop(b: *const Budget) ?Failure {
         return switch (b.validation.stopped orelse return null) {
@@ -531,12 +532,12 @@ pub const Graph = struct {
         g.ready = .wrap(id);
     }
 
-    pub fn drain(g: *Graph) Error!void {
-        while (try g.nextReady()) |id| {
+    pub fn drain(g: *Graph) void {
+        while (g.nextReady()) |id| {
             if (g.alive(id) == null) {
                 g.cells.items[id].next = g.empty;
                 g.empty = .wrap(id);
-            } else try g.run(id);
+            } else g.run(id);
         }
     }
 
@@ -551,7 +552,7 @@ pub const Graph = struct {
         g.cells.items[id].next = .none;
     }
 
-    fn nextReady(g: *Graph) !?CellId {
+    fn nextReady(g: *Graph) ?CellId {
         const top = g.ready.unwrap() orelse return null;
         const ch = g.chaosAt(.settle) orelse {
             g.unqueue(top, null);
@@ -572,7 +573,7 @@ pub const Graph = struct {
             at = top;
             while (at) |id| : (at = g.below(id)) {
                 const key = g.cell(id).key;
-                const draw = try ch.choose(.settle, ch.peek(.settle, key), std.math.maxInt(u64), .{ .key = key });
+                const draw = ch.choose(.settle, ch.peek(.settle, key), std.math.maxInt(u64), .{ .key = key }) catch 0;
                 if (best == null or draw > best.?) {
                     pick = id;
                     pick_above = above;
@@ -582,7 +583,7 @@ pub const Graph = struct {
             }
         }
         g.unqueue(pick, pick_above);
-        try ch.spend(.settle, g.cell(pick).key);
+        ch.spend(.settle, g.cell(pick).key) catch {};
         return pick;
     }
 
@@ -638,7 +639,7 @@ pub const Graph = struct {
         return g.edge.wake(id, g.gen(id), at_ns);
     }
 
-    pub fn complete(g: *Graph, id: CellId, completion: Completion) Error!void {
+    pub fn complete(g: *Graph, id: CellId, completion: Completion) void {
         if (completion == .wake) {
             if (g.gen(id) == completion.wake) g.enqueue(id);
             return g.drain();
@@ -646,32 +647,12 @@ pub const Graph = struct {
         const c = g.cell(id);
         std.debug.assert(c.key.kind == .exchange);
         const sc = c.scratch.exchange;
-        const arena = c.arena.allocator();
-        const outcome: Outcome = switch (completion) {
-            .wake => unreachable,
-            .timeout => .timeout,
-            .unsent => .unsent,
-            .moved => .moved,
-            .reply => |heard| blk: {
-                const bytes = try arena.dupe(u8, heard.bytes);
-                var p = dns.parse(arena, bytes) catch break :blk .malformed;
-                if (p.header.id != sc.id) break :blk .mismatch;
-                dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
-                // After the match, so a forger gains nothing over a mismatch.
-                if (!heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
-                inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
-                    var n: usize = 0;
-                    for (section.*) |rr| if (rr.rclass == .in) {
-                        section.*[n] = rr;
-                        n += 1;
-                    };
-                    section.* = section.*[0..n];
-                }
-                const scratch = g.scratch.allocator();
-                p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
-                p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
-                p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
-                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns, .stream = heard.stream } };
+        c.holds -= 1;
+        g.flights -= 1;
+        const outcome = g.outcomeOf(c, completion) catch |err| switch (err) {
+            error.OutOfMemory => {
+                g.fail(id, .of(.memory));
+                return g.drain();
             },
         };
         if (g.cfg.trace) {
@@ -692,10 +673,43 @@ pub const Graph = struct {
             .moved => g.stats.resolver.faults.moved += 1,
             .mismatch, .malformed, .oversized => {},
         }
-        c.holds -= 1;
-        g.flights -= 1;
-        try g.settle(id, .{ .exchange = outcome }, g.now());
-        try g.drain();
+        g.settleExchange(id, outcome);
+        g.drain();
+    }
+
+    fn outcomeOf(g: *Graph, c: *Cell, completion: Completion) Error!Outcome {
+        const sc = c.scratch.exchange;
+        const arena = c.arena.allocator();
+        return switch (completion) {
+            .wake => unreachable,
+            .timeout => .timeout,
+            .unsent => .unsent,
+            .moved => .moved,
+            .reply => |heard| blk: {
+                const bytes = try arena.dupe(u8, heard.bytes);
+                var p = dns.parse(arena, bytes) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => break :blk .malformed,
+                };
+                if (p.header.id != sc.id) break :blk .mismatch;
+                dns.validateResponse(p.message(), sc.sent, sc.qtype, sc.case == .random) catch break :blk .mismatch;
+                // After the match, so a forger gains nothing over a mismatch.
+                if (!heard.stream and bytes.len > dns.edns_udp_payload) break :blk .oversized;
+                inline for (.{ &p.answers, &p.authorities, &p.additionals }) |section| {
+                    var n: usize = 0;
+                    for (section.*) |rr| if (rr.rclass == .in) {
+                        section.*[n] = rr;
+                        n += 1;
+                    };
+                    section.* = section.*[0..n];
+                }
+                const scratch = g.scratch.allocator();
+                p.answers = try dnssec.bindSets(scratch, p.answers, sc.qtype == .rrsig);
+                p.authorities = try dnssec.bindSets(scratch, p.authorities, false);
+                p.additionals = try dnssec.bindSets(scratch, p.additionals, false);
+                break :blk .{ .reply = .{ .msg = p.message(), .rtt_ns = g.now() - sc.sent_ns - heard.queued_ns, .stream = heard.stream } };
+            },
+        };
     }
 
     fn newRoot(g: *Graph, key: Key, name: dns.Name, as_of: i64, budget: Budget) !CellId {
@@ -713,7 +727,7 @@ pub const Graph = struct {
         return id;
     }
 
-    pub fn newCell(g: *Graph, key: Key, name: dns.Name, as_of: i64) !CellId {
+    fn newCell(g: *Graph, key: Key, name: dns.Name, as_of: i64) !CellId {
         if (g.empty == .none) {
             try g.cells.append(g.gpa, .{});
             g.empty = .wrap(@intCast(g.cells.items.len - 1));
@@ -746,6 +760,13 @@ pub const Graph = struct {
             .scratch = scratch,
         };
         g.live += 1;
+        return id;
+    }
+
+    pub fn newInput(g: *Graph, key: Key, name: dns.Name, by: CellId) !CellId {
+        const id = try g.newCell(key, name, g.as_of);
+        errdefer g.free(id);
+        try g.pin(id, by);
         return id;
     }
 
@@ -843,7 +864,7 @@ pub const Graph = struct {
                 };
                 c.blob = blob;
                 c.state = .{ .fact = owned };
-                if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
+                if (!g.awaitsVerdict(c.key.kind)) g.keep(id);
             },
             .exchange => |o| return g.settleExchange(id, o),
             .addr, .answer, .refresh, .ahead, .parental => {
@@ -858,7 +879,7 @@ pub const Graph = struct {
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
                 const t = c.scratch.secure.target;
                 if (g.cell(t).blob) |b| b.verdict.stamp(v, expires_ns, g.now());
-                try g.keep(t);
+                g.keep(t);
             },
         }
         g.woken(id, value == .answer);
@@ -906,20 +927,15 @@ pub const Graph = struct {
         return kind == .rrset and g.cfg.trust_anchors != null;
     }
 
-    pub fn keep(g: *Graph, id: CellId) !void {
+    pub fn keep(g: *Graph, id: CellId) void {
         const c = g.cell(id);
         const blob = c.blob orelse return;
         if (blob.expires_ns <= g.now()) return;
         if (g.store.any(c.key) == blob) return;
-        if (try g.forgets(.keep, c.key)) return;
+        if (g.forgets(.keep, c.key) catch false) return;
         std.debug.assert(blob.key().eql(c.key));
-        g.store.put(blob.ref()) catch |err| {
-            g.store.unref(blob);
-            switch (err) {
-                error.Refused => {},
-                error.OutOfMemory => |e| return e,
-            }
-        };
+        // Refused or short of memory, the bytes are not kept: the fact stands.
+        g.store.put(blob.ref()) catch g.store.unref(blob);
     }
 
     pub fn fail(g: *Graph, id: CellId, why: Failure) void {
@@ -1182,13 +1198,13 @@ pub const Graph = struct {
     fn demandFound(g: *Graph, by: CellId, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
         if (try g.lookup(key, name, live, found)) |id| return g.join(by, id);
         if (g.cell(by).orphan) return null;
-        const id = try g.newCell(key, name, g.as_of);
-        try g.pin(id, by);
+        const id = try g.newInput(key, name, by);
         if (try g.refused(key)) |why| g.fail(id, why) else g.enqueue(id);
         return id;
     }
 
     pub fn join(g: *Graph, by: CellId, id: CellId) !?CellId {
+        errdefer g.release(id);
         if (!g.fresh(id) and try g.reaches(by, id)) return null;
         try g.pin(id, by);
         return id;
@@ -1239,6 +1255,7 @@ pub const Graph = struct {
     pub fn limit(g: *const Graph, b: *const Budget) ?Failure {
         if (g.now() >= b.deadline_ns) return .of(.deadline_passed);
         if (b.queries >= g.cfg.max_queries) return .of(.queries_spent);
+        if (b.starved) return .of(.memory);
         return null;
     }
 
@@ -1298,10 +1315,11 @@ pub const Graph = struct {
         const root = try g.ahead(key, name) orelse return;
         const s = g.cell(root).scratch.ahead;
         if (s.rrset != .none) return;
-        const id = try g.newCell(key, name, g.as_of);
-        try g.pin(id, root);
-        s.rrset = .wrap(id);
+        const id = try g.newInput(key, name, root);
+        // Unsettled, it must still run, or whoever joined it waits for good.
+        errdefer g.enqueue(id);
         try g.settle(id, value, expires_ns);
+        s.rrset = .wrap(id);
     }
 
     pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !?*store.Blob {
@@ -1321,7 +1339,7 @@ pub const Graph = struct {
 
     /// Held for the run: what it publishes may settle and free its own readers
     /// while the rule still has the cell in hand.
-    fn run(g: *Graph, id: CellId) Error!void {
+    fn run(g: *Graph, id: CellId) void {
         const c = g.cell(id);
         if (c.settled()) return;
         c.holds += 1;
@@ -1331,13 +1349,23 @@ pub const Graph = struct {
         }
         g.scratch.reset();
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
-        g.payer = try g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;
         g.as_of = c.as_of;
         defer g.as_of = 0;
+        g.rule(id) catch |err| switch (err) {
+            error.OutOfMemory => {
+                g.payer.starved = true;
+                if (!g.cell(id).settled()) g.fail(id, .of(.memory));
+            },
+        };
+    }
+
+    fn rule(g: *Graph, id: CellId) Error!void {
+        g.payer = &g.unpaid;
+        g.payer = try g.payerOf(id) orelse &g.unpaid;
         if (builtin.is_test) {
             g.runs += 1;
-            g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
+            g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&g.cell(id).key.hash()));
         }
         switch (g.cell(id).key.kind) {
             .cut => try walk.runCut(g, id),
@@ -1421,10 +1449,7 @@ pub const Graph = struct {
             if (g.cfg.trace) log.debug("{f} {f} refused: {s}", .{ qname, dns.tag(qtype), why });
             return null;
         }
-        const id = try g.newCell(.init(.exchange, "", .a), qname, g.as_of);
-        try g.pin(id, by);
-        budget.queries += 1;
-        g.cell(id).holds += 1;
+        const id = try g.newInput(.init(.exchange, "", .a), qname, by);
         const rng = g.edge.rng;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();
@@ -1440,7 +1465,6 @@ pub const Graph = struct {
         const owed_at = g.now() + patience * state.timeout(false, rounds) * std.time.ns_per_ms;
         const timeout_at = g.now() + patience * state.timeout(uncapped, rounds) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
-        if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         sc.* = .{ .id = qid, .sent = query.spelled, .qtype = qtype, .server = addr, .need = need, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at, .outcome = outcome };
         g.cell(id).scratch = .{ .exchange = sc };
         const exposure = try g.edge.send(.{
@@ -1450,7 +1474,11 @@ pub const Graph = struct {
             .wire = query.wire,
             .deadline_ns = deadline_ns,
         });
+        // Counted only once sent, so a refusal above leaves nothing in flight.
+        budget.queries += 1;
+        g.cell(id).holds += 1;
         g.flights += 1;
+        if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         if (need == .datagram) g.stats.resolver.exchanges.datagram += 1 else g.stats.resolver.exchanges.stream += 1;
         return .{ .id = id, .est = state, .rounds = rounds, .exposure = exposure };
     }
@@ -1461,7 +1489,11 @@ const Quiet = struct {
     wall: i64 = 0,
 
     fn graph(q: *Quiet, cfg: Config) !Graph {
-        return .init(std.testing.allocator, std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
+        return q.graphOn(std.testing.allocator, std.testing.allocator, cfg);
+    }
+
+    fn graphOn(q: *Quiet, gpa: Allocator, work: Allocator, cfg: Config) !Graph {
+        return .init(gpa, work, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
     }
 
     fn send(_: *anyopaque, _: Exchange) Error!Exposure {
@@ -1503,9 +1535,37 @@ test "a slot freed while queued takes no tenant until it leaves the queue" {
     try testing.expect(g.alive(gone) == null);
     const tenant = g.cell(@intCast(g.cells.items.len - 1));
     try testing.expectEqual(.refresh, tenant.key.kind);
-    try g.drain();
+    g.drain();
     try testing.expect(!tenant.settled());
     try testing.expectEqual(gone, try g.newCell(.init(.exchange, "", .a), name, 0));
+}
+
+test "a published cell that cannot settle is queued, never left waiting on nothing" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const zone = try dns.parseDottedName(arena.allocator(), "example.");
+    const key: Key = .of(.rrset, zone, .ds);
+    var refused: usize = 0;
+    var nth: usize = 0;
+    while (true) : (nth += 1) {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        var q: Quiet = .{};
+        var g = try q.graphOn(failing.allocator(), failing.allocator(), .{ .root_hints = &.{}, .trust_anchors = &.{} });
+        defer g.deinit();
+        const root = try g.demandRoot(zone, .a, .new);
+        g.payer = g.cell(root).scratch.answer.budget;
+        failing.fail_index = failing.alloc_index + nth;
+        const published = g.publish(key, zone, root, .{ .rrset = .{ .kind = .nodata, .aa = true, .target = zone, .zone = zone, .stored_ns = q.now } }, q.now + std.time.ns_per_s);
+        failing.fail_index = std.math.maxInt(usize);
+        published catch {
+            refused += 1;
+            if (g.indexed(key)) |id| if (!g.cell(id).settled()) try testing.expect(g.cells.items[id].next != .none);
+            continue;
+        };
+        break;
+    }
+    try testing.expect(refused > 0);
 }
 
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
@@ -1536,7 +1596,7 @@ test "an evicted root cut is re-derived, not walked" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const root = try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, .new);
-    try g.drain();
+    g.drain();
     try testing.expect(g.store.get(root_cut, q.now) != null);
     g.unhold(root);
 }

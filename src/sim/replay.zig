@@ -66,6 +66,42 @@ const Options = struct {
     tell: bool = false,
 };
 
+/// Never resizes in place, so the calls it sees, and which of them it
+/// refuses, are the same whatever allocator it wraps.
+const Refusing = struct {
+    child: Allocator,
+    chaos: ?*chaos.Chaos,
+    asked: u64 = 0,
+
+    const one_in = 1000;
+
+    fn allocator(r: *Refusing) Allocator {
+        return .{ .ptr = r, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: mem.Alignment, ra: usize) ?[*]u8 {
+        const r: *Refusing = @ptrCast(@alignCast(ctx));
+        r.asked += 1;
+        if (r.chaos) |ch| if (ch.live(.alloc)) {
+            if (ch.rare(.alloc, ch.named(.alloc, r.asked), one_in, .none) catch false) return null;
+        };
+        return r.child.rawAlloc(len, a, ra);
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: mem.Alignment, ra: usize) void {
+        const r: *Refusing = @ptrCast(@alignCast(ctx));
+        r.child.rawFree(m, a, ra);
+    }
+};
+
 fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, opts: Options, report: *Report) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -87,7 +123,9 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         edge.chaos = &ch;
         s.chaos = &ch;
     }
-    var g = try graph.Graph.init(gpa, gpa, .{
+    var refusing: Refusing = .{ .child = gpa, .chaos = null };
+    const hark = refusing.allocator();
+    var g = try graph.Graph.init(hark, hark, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
         .stub_zones = scenario.stub_zones,
@@ -103,6 +141,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     defer {
         report.schedule = g.schedule;
     }
+    if (opts.chaos != 0) refusing.chaos = &ch;
 
     const rb: rebinding.Config = .{
         .enabled = scenario.rebinding_enabled orelse false,
@@ -112,8 +151,8 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     };
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
-    var held: Held = .{};
-    defer held.kept.deinit(g.gpa);
+    var held: Held = .{ .gpa = gpa };
+    defer held.kept.deinit(gpa);
     defer letGoAll(&g, &held);
     var desk: answer.Desk = .{
         .g = &g,
@@ -136,7 +175,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     report.phase = .warm;
     try requery(gpa, run, opts, report);
     letGoAll(&g, &held);
-    while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| g.complete(ev.id, ev.completion);
     if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
         report.msg = "cells, budgets, flights or work bytes outlived the scenario";
         return error.ScenarioFailed;
@@ -198,7 +237,7 @@ fn runStep(gpa: Allocator, r: Run, st: rpl.Step, opts: Options, report: *Report,
         .unsent => s.pending_unsent += 1,
         .time_passes => {
             const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
-            while (s.next(until)) |ev| try g.complete(ev.id, ev.completion);
+            while (s.next(until)) |ev| g.complete(ev.id, ev.completion);
         },
     }
 }
@@ -250,6 +289,7 @@ const Run = struct {
 };
 
 const Held = struct {
+    gpa: Allocator,
     roots: [2]?model.CellId = .{ null, null },
     kept: std.ArrayList(model.CellId) = .empty,
 };
@@ -348,8 +388,15 @@ fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
     return null;
 }
 
-/// The roots stay in `held` until the next question: the answer reads their hops.
 fn resolveClient(r: Run, entry: rpl.Entry) !?Sent {
+    return resolveAsked(r, entry) catch |err| switch (err) {
+        error.OutOfMemory => null,
+        else => |e| e,
+    };
+}
+
+/// The roots stay in `held` until the next question: the answer reads their hops.
+fn resolveAsked(r: Run, entry: rpl.Entry) !?Sent {
     const arena = r.arena;
     const g = r.g;
     const desk = r.desk;
@@ -392,7 +439,7 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
         .max_udp_payload = dns.max_message_len,
         .rebinding = rb,
     };
-    return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, served.reply(), arena) orelse error.OutOfMemory;
+    return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, served.reply(), arena) orelse error.ResponseUnbuilt;
 }
 
 /// What recall serves from the store, the graph must build too, to the byte, asking nobody.
@@ -405,6 +452,7 @@ fn agrees(r: Run, q: dns.Question, client: answer.Client, recalled: answer.Serve
     const built = try shapeClient(r, q, client) orelse return error.RecallDisagrees;
     defer built.release(&g.store);
     if (s.log.items.len != before) return error.RecallDisagrees;
+    for (r.held.roots) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| if (why.name == .memory) return;
     const a = try wireOf(arena, q, client, false, rb, recalled);
     const b = try wireOf(arena, q, client, false, rb, built);
     const ede_eq = if (recalled.ede) |x| if (built.ede) |y| x.code == y.code and mem.eql(u8, x.text, y.text) else false else built.ede == null;
@@ -423,13 +471,13 @@ fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
     const asked = try desk.asked(arena, q, client);
     const root = try g.demandRoot(asked.name, asked.qtype, .new);
     held.roots[0] = root;
-    try g.drain();
+    g.drain();
     const patience = s.now_ns + answer.stale_client_ms * std.time.ns_per_ms;
     if (desk.retention.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
         if (try desk.memory(arena, q, client, .stale)) |served| {
             errdefer served.release(&g.store);
             held.roots[0] = null;
-            if (g.cell(root).holds == 1) try held.kept.append(g.gpa, root) else g.unhold(root);
+            if (g.cell(root).holds == 1) try held.kept.append(held.gpa, root) else g.unhold(root);
             return served;
         }
     }
@@ -438,7 +486,7 @@ fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
     const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
     const a = try g.demandRoot(aq.name, aq.qtype, .new);
     held.roots[1] = a;
-    try g.drain();
+    g.drain();
     if (!try settleBy(g, s, a, deadline)) {
         served.release(&g.store);
         return leave(g, held);
@@ -448,7 +496,7 @@ fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
 
 fn leave(g: *graph.Graph, held: *Held) !?answer.Served {
     for (&held.roots) |*h| if (h.*) |id| {
-        if (g.cell(id).holds == 1) try held.kept.append(g.gpa, id) else g.unhold(id);
+        if (g.cell(id).holds == 1) try held.kept.append(held.gpa, id) else g.unhold(id);
         h.* = null;
     };
     return null;
@@ -457,7 +505,7 @@ fn leave(g: *graph.Graph, held: *Held) !?answer.Served {
 fn settleBy(g: *graph.Graph, s: *sim.Sim, root: model.CellId, until: i64) !bool {
     while (!g.cell(root).settled()) {
         const ev = s.next(until) orelse return false;
-        try g.complete(ev.id, ev.completion);
+        g.complete(ev.id, ev.completion);
     }
     return true;
 }
@@ -1018,10 +1066,10 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     var ns2_ms: ?i64 = null;
     var ns3_ms: ?i64 = null;
     const root = try g.demandRoot(q.name, q.qtype, .new);
-    try g.drain();
+    g.drain();
     while (!g.cell(root).settled()) {
         const ev = s.next(horizon) orelse return error.TestUnexpectedResult;
-        try g.complete(ev.id, ev.completion);
+        g.complete(ev.id, ev.completion);
         const at_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
         for (s.log.items) |row| {
             const key = na.AddressKey.fromAddress(row.server);
@@ -1033,7 +1081,7 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0].set).state.fact.rrset.kind);
     g.unhold(root);
     const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
-    while (s.next(horizon)) |ev| try g.complete(ev.id, ev.completion);
+    while (s.next(horizon)) |ev| g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.live);
     return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns3_ms = ns3_ms, .ns1 = if (g.rtt.get(ns1)) |e| e.* else null, .ns2 = if (g.rtt.get(ns2)) |e| e.* else null };
 }
@@ -1175,12 +1223,12 @@ test "the door counts exchanges in flight" {
     var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
     defer g.deinit();
     const root = try g.demandRoot(q.name, q.qtype, .new);
-    try g.drain();
+    g.drain();
     try testing.expectEqual(1, g.budgets);
     try testing.expectEqual(1, g.flights);
     try testing.expectError(error.Full, g.demandRoot(other, .a, .new));
     try testing.expectEqual(root, try g.demandRoot(q.name, q.qtype, .new));
-    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.flights);
     g.unhold(root);
     g.unhold(root);
@@ -1202,13 +1250,13 @@ test "an exchange that never left the host writes no estimate" {
     defer g.deinit();
     s.pending_unsent = 1;
     const root = try g.demandRoot(q.name, q.qtype, .new);
-    try g.drain();
+    g.drain();
     const unsent = s.next(s.now_ns + 10 * std.time.ns_per_s).?;
-    try g.complete(unsent.id, unsent.completion);
+    g.complete(unsent.id, unsent.completion);
     try testing.expectEqual(1, g.stats.resolver.faults.unsent);
     const server = na.AddressKey.fromAddress(scenario.root_hints[0]);
     try testing.expectEqual(null, g.rtt.get(server));
-    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| g.complete(ev.id, ev.completion);
     try testing.expect(g.cell(root).failure() == null);
     g.unhold(root);
 }

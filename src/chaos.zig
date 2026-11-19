@@ -5,7 +5,7 @@ const dns = @import("dns.zig");
 const model = @import("model.zig");
 const na = @import("net_address.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier, alloc };
 
 pub const Events = std.array_hash_map.Auto(u64, void);
 
@@ -76,6 +76,12 @@ pub const Chaos = struct {
         const v = c.draw(event, n);
         if (v != 0) try c.note(site, event, about);
         return v;
+    }
+
+    pub fn rare(c: *Chaos, site: Site, event: u64, one_in: u64, about: About) !bool {
+        if (c.draw(event, one_in) != 1) return false;
+        try c.note(site, event, about);
+        return true;
     }
 
     fn note(c: *Chaos, site: Site, event: u64, about: About) !void {

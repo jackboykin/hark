@@ -470,7 +470,7 @@ const Server = struct {
             if (reply == .tcp) return s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
             return s.forsake(fate, .{ .reply = reply }, query, s.e.now_ns);
         };
-        try s.g.drain();
+        s.g.drain();
         var p: Pending = .{ .root = root, .query = query, .owes = .{ .reply = reply }, .asked_ns = s.e.now_ns };
         {
             errdefer s.release(p);
@@ -735,7 +735,7 @@ const Server = struct {
         const served = try s.desk.built(arena, p.root, q, client);
         if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (s.g.demandRoot(aq.name, aq.qtype, .new)) |a| {
             p.a = a;
-            try s.g.drain();
+            s.g.drain();
             if (!s.g.cell(a).settled()) {
                 served.release(&s.g.store);
                 return null;
@@ -933,7 +933,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: *slab.Reserve, cfg: *const 
             continue;
         };
         switch (ev) {
-            .exchange => |x| try g.complete(x.id, x.completion),
+            .exchange => |x| g.complete(x.id, x.completion),
             .client => |c| try s.onClient(c.token, c.events),
         }
         try s.settle();
