@@ -70,8 +70,8 @@ func startHark(ctx context.Context, t *testing.T, bin string, sc *scenario, port
 	}
 }
 
-// A Debug build reports leaks at exit without touching the status.
-var allocatorError = regexp.MustCompile(`error\(\w*Allocator\)`)
+// hark reports memory still held at exit in its log, not its status.
+var allocatorError = regexp.MustCompile(`error\(slab\)`)
 
 func (h *hark) stopped(t *testing.T) {
 	<-h.done

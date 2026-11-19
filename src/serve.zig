@@ -863,7 +863,7 @@ const Server = struct {
     }
 };
 
-pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
+pub fn run(gpa: Allocator, work: Allocator, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
     var e = try Edge.init(gpa);
     defer e.deinit();
     e.idle_max = fdShare(16);
@@ -911,7 +911,7 @@ pub fn run(gpa: Allocator, work: Allocator, reserve: ?*slab.Reserve, cfg: *const
         if (e.now_ns >= sweep_at) {
             sweep_at = e.now_ns + std.time.ns_per_s;
             s.sweep();
-            if (reserve) |r| r.tick();
+            reserve.tick();
             e.trim();
         }
         try s.reopen();

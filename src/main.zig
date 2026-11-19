@@ -2,7 +2,6 @@
 //! server.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 const hark = @import("hark");
 const Io = std.Io;
@@ -20,20 +19,24 @@ fn panicked(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 const log = std.log;
+const leaks = std.log.scoped(.slab);
 
 var reserve: hark.slab.Reserve = .{};
-var lasting: hark.slab.Tenant = .init(&reserve);
-var work: hark.slab.Tenant = .init(&reserve);
+var owed: hark.slab.Share = .{};
+var lasting: hark.slab.Tenant = .in(&reserve, &owed);
+var work: hark.slab.Tenant = .in(&reserve, &owed);
 
 pub fn main(init: std.process.Init) u8 {
     defer hark.log.drain();
-    command(init) catch return 1;
-    return 0;
+    const status: u8 = if (command(init)) 0 else |_| 1;
+    reserve.drain();
+    if (owed.held > 0) leaks.err("{d} bytes still held at exit", .{owed.held});
+    return status;
 }
 
 fn command(init: std.process.Init) !void {
-    const allocator = if (builtin.mode == .debug) init.gpa else lasting.allocator();
-    const work_allocator = if (builtin.mode == .debug) init.gpa else work.allocator();
+    const allocator = lasting.allocator();
+    const work_allocator = work.allocator();
     const io = init.io;
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -107,7 +110,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    hark.serve.run(allocator, work_allocator, if (builtin.mode == .debug) null else &reserve, &cfg, trace) catch |err| {
+    hark.serve.run(allocator, work_allocator, &reserve, &cfg, trace) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         return err;
     };
