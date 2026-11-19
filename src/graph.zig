@@ -88,6 +88,7 @@ pub const Completion = union(enum) {
     timeout,
     unsent,
     moved,
+    unheld,
     /// The cell's generation, since ids recycle.
     wake: u32,
 };
@@ -682,6 +683,7 @@ pub const Graph = struct {
         const arena = c.arena.allocator();
         return switch (completion) {
             .wake => unreachable,
+            .unheld => error.OutOfMemory,
             .timeout => .timeout,
             .unsent => .unsent,
             .moved => .moved,

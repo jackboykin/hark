@@ -353,7 +353,7 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
     }
     var held: []const u8 = e.rx[0..rc];
     if (t.got.items.len > 0 or framed(held) == null) {
-        try t.got.appendSlice(e.work, held);
+        t.got.appendSlice(e.work, held) catch return e.finish(id, .unheld);
         held = t.got.items;
     }
     const reply = framed(held) orelse return null;
