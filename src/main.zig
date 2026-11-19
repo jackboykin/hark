@@ -112,8 +112,10 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
+    reserve.limit = cfg.memoryLimit();
     kept.limit = cfg.cache_size;
-    hark.serve.run(allocator, work_allocator, .{ .allocator = facts.allocator(), .share = &kept }, &reserve, &cfg, trace) catch |err| {
+    owed.limit = hark.config.ServerConfig.sharesOf(reserve.limit) - cfg.cache_size;
+    hark.serve.run(allocator, work_allocator, &owed, .{ .allocator = facts.allocator(), .share = &kept }, &reserve, &cfg, trace) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         return err;
     };

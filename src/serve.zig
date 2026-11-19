@@ -919,7 +919,7 @@ const Server = struct {
     }
 };
 
-pub fn run(gpa: Allocator, work: Allocator, facts: store.Facts, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
+pub fn run(gpa: Allocator, work: Allocator, owed: *const slab.Share, facts: store.Facts, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
     var e = try Edge.init(gpa);
     defer e.deinit();
     e.idle_max = fdShare(16);
@@ -950,6 +950,11 @@ pub fn run(gpa: Allocator, work: Allocator, facts: store.Facts, reserve: *slab.R
     var s: Server = .{ .in = in, .out = out, .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = @min(fdShare(4), max_conns), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64 }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
     s.scratch = try .withFloor(gpa, Arena.scratch_floor);
+    log.info("memory: {d} KiB held of {d}, {d} KiB owed of {d}, {d} KiB for the cache", .{ reserve.resident() >> 10, reserve.limit >> 10, owed.held >> 10, owed.limit >> 10, facts.share.limit >> 10 });
+    if (owed.atDoor()) {
+        log.err("memory: hark's own tables fill what the cache leaves to the door; raise [server] memory or lower [cache] size", .{});
+        return error.MemoryTooSmall;
+    }
     for (cfg.listen) |addr| s.listen(addr) catch |err| {
         var ab: [64]u8 = undefined;
         log.err("listening on {s}: {s}", .{ na.format(addr, &ab), @errorName(err) });

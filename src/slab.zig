@@ -161,6 +161,14 @@ pub const Share = struct {
     held: usize = 0,
     limit: usize = std.math.maxInt(usize),
 
+    pub fn crowded(s: *const Share, num: usize, den: usize) bool {
+        return @as(u128, s.held) * den >= @as(u128, s.limit) * num;
+    }
+
+    pub fn atDoor(s: *const Share) bool {
+        return s.crowded(7, 8);
+    }
+
     fn room(s: *const Share, n: usize) bool {
         return s.held + n <= s.limit;
     }
@@ -206,7 +214,7 @@ pub const Reserve = struct {
         r.* = .{};
     }
 
-    fn resident(r: *const Reserve) usize {
+    pub fn resident(r: *const Reserve) usize {
         return (r.held + r.dirty_count + r.regions) * slab_len + r.mapped;
     }
 

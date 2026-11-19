@@ -65,6 +65,7 @@ pub const ServerConfig = struct {
     allow_loopback_upstreams: bool = false,
     stub_zones: []const stub.Zone = &.{},
     cache_size: usize = 12 * 1024 * 1024,
+    memory: ?usize = null,
     prefetch: bool = false,
     encrypted_transport: EncryptedTransport = .off,
     serve_stale_ttl: u32 = 0,
@@ -88,6 +89,15 @@ pub const ServerConfig = struct {
 
     pub fn deinit(self: *ServerConfig) void {
         self.arena.deinit();
+    }
+
+    pub fn memoryLimit(self: ServerConfig) usize {
+        return self.memory orelse 2 * self.cache_size + (8 << 20);
+    }
+
+    /// An eighth of memory is left for the room slabs keep empty.
+    pub fn sharesOf(memory: usize) usize {
+        return memory / 8 * 7;
     }
 
     pub fn rootHints(self: ServerConfig) []const Address {
@@ -128,6 +138,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "clients", .kind = .string_array },
         .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
         .{ .name = "tcp-queries-per-conn", .kind = .integer },
+        .{ .name = "memory", .kind = .integer },
     } },
     .{ .name = "resolver", .keys = &.{
         .{ .name = "root-hints", .kind = .string_array },
@@ -239,6 +250,7 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
         // RFC 7828 §3.1: the keepalive TIMEOUT is a u16 of 100 ms units.
         if (try integer(u32, server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
         if (try integer(u32, server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
+        if (try integer(usize, server, "memory", 1, maxInt(usize))) |v| cfg.memory = v;
     }
 
     if (root.get("resolver", .table)) |resolver| {
@@ -306,6 +318,11 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
     }
 
     cfg.rebinding.nat64 = cfg.dns64;
+
+    if (ServerConfig.sharesOf(cfg.memoryLimit()) <= cfg.cache_size) {
+        errLog("config: [server] memory must hold [cache] size in seven eighths of it, an eighth being kept for slabs' empty room", .{});
+        return error.InvalidValue;
+    }
 
     // Configured servers are not screened when asked, so the policy is applied here.
     for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(.fromAddress(addr))) return error.InvalidRootHintAddress;

@@ -181,6 +181,9 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 	if len(c.clients) > 0 {
 		line("clients = %s", list(c.clients))
 	}
+	if c.memory > 0 {
+		line("memory = %d", c.memory)
+	}
 	line("\n[resolver]")
 	line("qname-minimization = %t", c.qnameMinimization)
 	line("dnssec = %t", anchor != "")
