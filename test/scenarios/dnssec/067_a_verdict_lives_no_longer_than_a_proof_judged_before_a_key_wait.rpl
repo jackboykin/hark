@@ -24,7 +24,7 @@ RANGE_BEGIN 0 100
       a.sub. 3600 IN CNAME foo.
       foo. 3600 IN A 192.0.2.2
     SECTION AUTHORITY
-      c. 300 IN NSEC zz. A RRSIG NSEC
+      c. 300 IN NSEC sub. A RRSIG NSEC
   ENTRY_END
   ENTRY_BEGIN
     MATCH opcode qname qtype

@@ -9,18 +9,19 @@ SCENARIO_BEGIN wildcard-expanded answer is AD only with the no-closer-match proo
 ; if the authority section also proves qname itself does not exist — else a
 ; captured `*.` answer replays as any name in the zone.
 ;
-; Signed root with `*.` A, `a.` A, `zz.` A. Canonical order:
-;   . < *. < a. < foo. < qux. < sub. < z.sub. < zz.
+; Signed root with `*.` A, `a.` A, the cut `sub.`, `*.w.` CNAME, `zz.` A.
+; Canonical order:
+;   . < *. < a. < foo. < sub. < z.sub. < *.w. < bar.w. < zz. < zzz.
 ; Every entry below is signed by the harness as the expansion of `*.`
 ; (WILDCARD); only the authority differs.
 ;
-;   foo.    `a. NSEC zz.` covers foo. and its closest encloser is `.`   → AD
-;   qux.    `z.sub. NSEC sub.` is the signed child sub.'s apex wrap. It
-;           covers qux. in canonical order with closest encloser `.`, but
+;   foo.    `a. NSEC sub.` covers foo. and its closest encloser is `.`   → AD
+;   zzz.    `z.sub. NSEC sub.` is the signed child sub.'s apex wrap. It
+;           covers zzz. past its wrap with closest encloser `.`, but
 ;           sub.'s keys say nothing about names in the parent; the proof
 ;           must verify under the keys that signed the answer            → SERVFAIL
-;   bar.    `*.` CNAME x.sub., NXDOMAIN in the signed child sub. on the
-;           same server: the root's NSEC proves bar.'s expansion, sub.'s
+;   bar.w.  `*.w.` CNAME x.sub., NXDOMAIN in the signed child sub. on the
+;           same server: the root's NSEC proves bar.w.'s expansion, sub.'s
 ;           SOA and NSEC deny x.sub.; each set verifies under its own
 ;           signer                                                        → AD
 ;
@@ -39,7 +40,7 @@ RANGE_BEGIN 0 100
     SECTION ANSWER
       foo. 3600 IN A 192.0.2.1
     SECTION AUTHORITY
-      a. 3600 IN NSEC zz. A RRSIG NSEC
+      a. 3600 IN NSEC sub. A RRSIG NSEC
   ENTRY_END
 
   ENTRY_BEGIN
@@ -48,9 +49,9 @@ RANGE_BEGIN 0 100
     WILDCARD *.
     REPLY QR AA NOERROR
     SECTION QUESTION
-      qux. IN A
+      zzz. IN A
     SECTION ANSWER
-      qux. 3600 IN A 192.0.2.1
+      zzz. 3600 IN A 192.0.2.1
     SECTION AUTHORITY
       z.sub. 3600 IN NSEC sub. A RRSIG NSEC
   ENTRY_END
@@ -58,14 +59,14 @@ RANGE_BEGIN 0 100
   ENTRY_BEGIN
     MATCH opcode qname qtype
     ADJUST copy_id copy_query
-    WILDCARD *.
+    WILDCARD *.w.
     REPLY QR AA NXDOMAIN
     SECTION QUESTION
-      bar. IN A
+      bar.w. IN A
     SECTION ANSWER
-      bar. 3600 IN CNAME x.sub.
+      bar.w. 3600 IN CNAME x.sub.
     SECTION AUTHORITY
-      a. 3600 IN NSEC zz. A RRSIG NSEC
+      *.w. 3600 IN NSEC zz. CNAME RRSIG NSEC
       sub. 3600 IN SOA ns.sub. nobody.invalid. 1 7200 3600 86400 3600
       sub. 3600 IN NSEC z.sub. SOA NS RRSIG NSEC DNSKEY
   ENTRY_END
@@ -104,7 +105,7 @@ STEP 3 QUERY
 ENTRY_BEGIN
   REPLY RD DO
   SECTION QUESTION
-    qux. IN A
+    zzz. IN A
 ENTRY_END
 
 STEP 4 CHECK_ANSWER
@@ -112,14 +113,14 @@ ENTRY_BEGIN
   MATCH flags question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
-    qux. IN A
+    zzz. IN A
 ENTRY_END
 
 STEP 5 QUERY
 ENTRY_BEGIN
   REPLY RD DO
   SECTION QUESTION
-    bar. IN A
+    bar.w. IN A
 ENTRY_END
 
 STEP 6 CHECK_ANSWER
@@ -127,9 +128,9 @@ ENTRY_BEGIN
   MATCH flags question answer
   REPLY QR RD RA AD NXDOMAIN
   SECTION QUESTION
-    bar. IN A
+    bar.w. IN A
   SECTION ANSWER
-    bar. 3600 IN CNAME x.sub.
+    bar.w. 3600 IN CNAME x.sub.
 ENTRY_END
 
 SCENARIO_END

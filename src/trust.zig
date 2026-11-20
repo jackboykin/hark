@@ -414,7 +414,10 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
                     const own = try verifiedProofs(g, r, qtype, s, verified.signer_name);
                     switch (proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
-                        .secure => try absorb(g, r, verified.signer_name, own, kc.expires()),
+                        .secure => {
+                            try absorb(g, r, verified.signer_name, own, kc.expires());
+                            try publishSource(g, r, &c, verified, @min(cap, kc.expires()));
+                        },
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
                     }
@@ -557,6 +560,28 @@ const Probe = struct {
         }
     }
 };
+
+/// RFC 4035 §5.3.2: a verified expansion verified the wildcard's own set.
+fn publishSource(g: *Graph, r: *const model.Reply, c: *const Claims.Claim, verified: dns.RrsigData, until: i64) !void {
+    var buf: dns.Name.Buf = undefined;
+    const source = dns.Name.child(&buf, "*", c.owner.ancestor(verified.labels)) orelse return;
+    var rrs: std.ArrayList(RR) = .empty;
+    var fact: model.Reply = .{ .kind = .answer, .aa = true, .zone = verified.signer_name, .stored_ns = r.stored_ns, .ttl = std.math.maxInt(u32) };
+    for (dnssec.setFrom(r.answers, c.head)) |rr| {
+        if (rr.rtype == .rrsig and !std.mem.eql(u8, rr.rrsig().signature, verified.signature)) continue;
+        var at = rr;
+        at.name = source;
+        try rrs.append(g.scratch.allocator(), at);
+        fact.ttl = @min(fact.ttl, rr.ttl);
+        if (rr.rtype != .cname) continue;
+        fact.kind = .alias;
+        fact.target = rr.cname();
+    }
+    fact.answers = rrs.items;
+    const expires = @min(until, walk.replyExpiry(fact));
+    const blob = try g.fact(model.Key.of(.rrset, source, c.rtype), .{ .rrset = fact }, expires) orelse return;
+    blob.verdict.stamp(.{ .status = .secure, .proven_until_ns = until }, expires, g.now());
+}
 
 const Proofs = struct { rrs: []const RR, until: []const i64 };
 
