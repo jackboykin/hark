@@ -5,7 +5,7 @@ const dns = @import("dns.zig");
 const model = @import("model.zig");
 const na = @import("net_address.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier, alloc };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep, carrier, alloc, read };
 
 pub const Events = std.array_hash_map.Auto(u64, void);
 

@@ -588,7 +588,7 @@ pub const Graph = struct {
         return if (v == 0) ms else @intCast(v);
     }
 
-    fn skips(g: *Graph, site: chaos.Site, key: Key) !bool {
+    pub fn skips(g: *Graph, site: chaos.Site, key: Key) !bool {
         return try g.decide(site, key, 2) == 1;
     }
 

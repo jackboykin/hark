@@ -230,6 +230,7 @@ pub fn denies(g: *const Graph, qtype: dns.RType) bool {
 
 pub fn deny(g: *Graph, id: CellId) !bool {
     if (g.denial.zones.count() == 0 or !denies(g, g.cell(id).key.rtype)) return false;
+    if (try g.skips(.read, g.cell(id).key)) return false;
     const name = g.cell(id).name;
     var up: ?dns.Name = name;
     while (up) |zone| : (up = zone.parent()) {
