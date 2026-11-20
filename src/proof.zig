@@ -58,25 +58,24 @@ pub fn classifyDelegation(
             return if (isInsecureDelegationProof(rr.nsec(&next).type_bit_maps)) .unsigned else .unproven;
     }
 
-    const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
-        .params => |p| .{ p.salt, p.iterations },
+    const chain = switch (nsec3Chain(authorities, zone)) {
+        .chain => |c| c,
         .verdict => |v| return if (v == .bogus) .bogus else .unproven,
     };
-    const child_hash = budgetedNsec3Hash(child_zone, salt, iterations, budget) catch return .bogus;
-    for (authorities) |rr| {
-        const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+    const child_hash = budgetedNsec3Hash(child_zone, chain.salt, chain.iterations, budget) catch return .bogus;
+    for (chain.owners(), chain.records()) |owner_hash, rr| {
         if (mem.eql(u8, &owner_hash, &child_hash))
             return if (isInsecureDelegationProof(rr.nsec3().type_bit_maps)) .unsigned else .unproven;
     }
     // RFC 5155 §8.6: closest encloser, then an Opt-Out span over the next
     // closer. No wildcard step: delegations are never synthesized.
-    const found = switch (nsec3ClosestEncloser(authorities, child_zone, child_hash, salt, iterations, zone, budget)) {
+    const found = switch (nsec3ClosestEncloser(&chain, child_zone, child_hash, zone, budget)) {
         .found => |f| f,
         .verdict => |v| return if (v == .bogus) .bogus else .unproven,
     };
     // An owner match returned above, so the next closer hash is defined.
     std.debug.assert(found.ce.depth() < child_zone.depth());
-    return if (nsec3Cover(authorities, zone, &found.next_closer_hash) == true) .unsigned else .unproven;
+    return if (nsec3Cover(&chain, &found.next_closer_hash) == true) .unsigned else .unproven;
 }
 
 /// The longest suffix of qname shared with either bound of a covering NSEC
@@ -420,26 +419,46 @@ fn validateNsecNegativeProof(
     return .unchecked;
 }
 
-const Nsec3ChainParams = union(enum) {
-    params: struct { salt: []const u8, iterations: u16 },
+const Nsec3Chain = struct {
+    salt: []const u8,
+    iterations: u16,
+    len: usize = 0,
+    hashes: [max_proof_records][Sha1.digest_length]u8 = undefined,
+    rrs: [max_proof_records]dns.ResourceRecord = undefined,
+
+    fn owners(c: *const Nsec3Chain) []const [Sha1.digest_length]u8 {
+        return c.hashes[0..c.len];
+    }
+
+    fn records(c: *const Nsec3Chain) []const dns.ResourceRecord {
+        return c.rrs[0..c.len];
+    }
+};
+
+const Nsec3ChainOr = union(enum) {
+    chain: Nsec3Chain,
     verdict: SecurityStatus,
 };
 
-fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3ChainParams {
+fn nsec3Chain(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3ChainOr {
     if (proofFlood(authorities)) return .{ .verdict = .bogus };
 
     // RFC 5155 §8.2: one parameter set or bogus. Within one chain nothing
     // covers the hash of a name that owns a record; a second chain's spans
     // could, forging next-closer coverage and with it Opt-Out.
-    var first: ?dns.Nsec3Data = null;
+    var chain: ?Nsec3Chain = null;
     for (authorities) |rr| {
         if (!inChain(rr, zone)) continue;
         const n3 = rr.nsec3();
-        if (first == null) first = n3;
-        if (n3.iterations != first.?.iterations or !mem.eql(u8, n3.salt, first.?.salt)) return .{ .verdict = .bogus };
+        if (chain == null) chain = .{ .salt = n3.salt, .iterations = n3.iterations };
+        const c = &chain.?;
+        if (n3.iterations != c.iterations or !mem.eql(u8, n3.salt, c.salt)) return .{ .verdict = .bogus };
+        // An owner that is no hash matches and spans nothing.
+        c.hashes[c.len] = nsec3OwnerHash(rr.name) orelse continue;
+        c.rrs[c.len] = rr;
+        c.len += 1;
     }
-    const f = first orelse return .{ .verdict = .unchecked };
-    return .{ .params = .{ .salt = f.salt, .iterations = f.iterations } };
+    return if (chain) |c| .{ .chain = c } else .{ .verdict = .unchecked };
 }
 
 const ClosestEncloser = union(enum) {
@@ -448,11 +467,9 @@ const ClosestEncloser = union(enum) {
 };
 
 fn nsec3ClosestEncloser(
-    authorities: []const dns.ResourceRecord,
+    chain: *const Nsec3Chain,
     qname: dns.Name,
     qname_hash: [Sha1.digest_length]u8,
-    salt: []const u8,
-    iterations: u16,
     zone: dns.Name,
     budget: *rrsig.ValidationBudget,
 ) ClosestEncloser {
@@ -462,12 +479,11 @@ fn nsec3ClosestEncloser(
         if (ancestor.depth() < zone.depth()) break;
         const ancestor_hash = if (ancestor.depth() == qname.depth()) qname_hash else budgetedNsec3Hash(
             ancestor,
-            salt,
-            iterations,
+            chain.salt,
+            chain.iterations,
             budget,
         ) catch return .{ .verdict = .bogus };
-        for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+        for (chain.owners(), chain.records()) |owner_hash, rr| {
             if (!mem.eql(u8, &owner_hash, &ancestor_hash)) continue;
             if (provesNothingBelowOwner(rr.nsec3().type_bit_maps)) return .{ .verdict = .unchecked };
             return .{ .found = .{ .ce = ancestor, .next_closer_hash = below_hash } };
@@ -479,11 +495,10 @@ fn nsec3ClosestEncloser(
 
 /// Null when no span covers `hash`, else whether any coverer has Opt-Out.
 /// Every coverer is read, not the first: the sender picks the order.
-fn nsec3Cover(authorities: []const dns.ResourceRecord, zone: dns.Name, hash: *const [Sha1.digest_length]u8) ?bool {
+fn nsec3Cover(chain: *const Nsec3Chain, hash: *const [Sha1.digest_length]u8) ?bool {
     var covered = false;
     var optout = false;
-    for (authorities) |rr| {
-        const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+    for (chain.owners(), chain.records()) |owner_hash, rr| {
         if (!nsec3HashInRange(&owner_hash, rr.nsec3().next_hashed_owner, hash)) continue;
         covered = true;
         if (rr.nsec3().flags & nsec3_opt_out != 0) optout = true;
@@ -504,7 +519,11 @@ pub fn proveNoCloserMatch(
     return switch (noCloserMatch(authorities, qname, labels, zone, budget)) {
         .nsec => .secure,
         .nsec3 => |nc| {
-            const optout = nsec3Cover(authorities, zone, &nc) orelse return .bogus;
+            const chain = switch (nsec3Chain(authorities, zone)) {
+                .chain => |c| c,
+                .verdict => return .bogus,
+            };
+            const optout = nsec3Cover(&chain, &nc) orelse return .bogus;
             return if (optout) .insecure else .secure;
         },
         .verdict => |v| v,
@@ -546,13 +565,13 @@ pub fn noCloserMatch(
         if (nsec_ce.eql(ce)) return .{ .nsec = rr.name };
     }
 
-    const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
-        .params => |p| .{ p.salt, p.iterations },
+    const chain = switch (nsec3Chain(authorities, zone)) {
+        .chain => |c| c,
         // This proof is owed, so its absence is bogus, not merely unproven.
         .verdict => |v| return .{ .verdict = if (v == .unchecked) .bogus else v },
     };
     const next_closer = qname.ancestor(labels + 1);
-    return .{ .nsec3 = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .{ .verdict = .bogus } };
+    return .{ .nsec3 = budgetedNsec3Hash(next_closer, chain.salt, chain.iterations, budget) catch return .{ .verdict = .bogus } };
 }
 
 fn validateNsec3NegativeProof(
@@ -563,16 +582,17 @@ fn validateNsec3NegativeProof(
     zone: dns.Name,
     budget: *rrsig.ValidationBudget,
 ) SecurityStatus {
-    const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
-        .params => |p| .{ p.salt, p.iterations },
+    const chain = switch (nsec3Chain(authorities, zone)) {
+        .chain => |c| c,
         .verdict => |v| return v,
     };
+    const salt = chain.salt;
+    const iterations = chain.iterations;
 
     const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch return .bogus;
 
     if (!is_nxdomain) {
-        for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+        for (chain.owners(), chain.records()) |owner_hash, rr| {
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
                 const nsec3 = rr.nsec3();
                 if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
@@ -581,7 +601,7 @@ fn validateNsec3NegativeProof(
         }
     }
 
-    const found = switch (nsec3ClosestEncloser(authorities, qname, qname_hash, salt, iterations, zone, budget)) {
+    const found = switch (nsec3ClosestEncloser(&chain, qname, qname_hash, zone, budget)) {
         .found => |f| f,
         .verdict => |v| return v,
     };
@@ -597,14 +617,13 @@ fn validateNsec3NegativeProof(
     const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
     const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch return .bogus;
 
-    const nc_cover = nsec3Cover(authorities, zone, &nc_hash);
+    const nc_cover = nsec3Cover(&chain, &nc_hash);
     const nc_covered = nc_cover != null;
     const nc_optout = nc_cover orelse false;
     var wc_proven = false;
     var wc_optout = false;
     var wc_contradicted = false;
-    for (authorities) |rr| {
-        const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+    for (chain.owners(), chain.records()) |owner_hash, rr| {
         const nsec3 = rr.nsec3();
 
         if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
