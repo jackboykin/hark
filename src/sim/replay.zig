@@ -483,7 +483,10 @@ fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
     if (!try settleBy(g, s, root, deadline)) return leave(g, held);
     const served = try desk.built(arena, root, q, client);
     const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
-    const a = try g.demandRoot(aq.name, aq.qtype, .new);
+    const a = g.demandRoot(aq.name, aq.qtype, .new) catch |err| {
+        served.release(&g.store);
+        return err;
+    };
     held.roots[1] = a;
     g.drain();
     if (!try settleBy(g, s, a, deadline)) {
