@@ -12,7 +12,9 @@
 //! LATENCY_MS (netem on lo), PERF=1 (counters on the resolver's cores),
 //! PERF_EVENTS (user and kernel instructions and cycles), SIGNED=1 (both
 //! zones signed and every resolver validating), SYNTH=0 (under SIGNED, the
-//! peers answer no miss from cached NSEC, RFC 8198; kresd has no switch).
+//! peers answer no miss from cached NSEC, RFC 8198; kresd has no switch),
+//! NSEC3=1 (under SIGNED, the zones' chains are NSEC3: no salt, no extra
+//! iterations).
 //!
 //! In a config a line led by @KNOB stays only with that knob on, by @!KNOB
 //! only with it off; the rest of the line follows one space.
@@ -184,7 +186,11 @@ fn sign(r: *Rig) !void {
         const unsigned = try r.path("zones/{s}.unsigned", .{z[0]});
         try os.spit(unsigned, try r.arena.print("{s}\n$INCLUDE {s}/{s}.key\n{s}", .{ try std.mem.replaceOwned(u8, r.arena, plain, "$INCLUDE bench.ns", included), dir, key, ds }));
         // -z: the one key signs every set, though flagged a KSK.
-        const said = try os.capture(r.arena, &.{ "dnssec-signzone", "-K", dir, "-d", dir, "-z", "-o", z[1], "-f", try r.path("zones/{s}.zone", .{z[0]}), unsigned });
+        const to = try r.path("zones/{s}.zone", .{z[0]});
+        const said = if (os.knob(bool, "NSEC3", false))
+            try os.capture(r.arena, &.{ "dnssec-signzone", "-3", "-", "-H", "0", "-K", dir, "-d", dir, "-z", "-o", z[1], "-f", to, unsigned })
+        else
+            try os.capture(r.arena, &.{ "dnssec-signzone", "-K", dir, "-d", dir, "-z", "-o", z[1], "-f", to, unsigned });
         ds = os.slurp(r.arena, try r.path("zones/dsset-{s}", .{z[1]})) catch {
             std.debug.print("bench: {s} was not signed\n{s}\n", .{ z[1], said });
             return error.Unsigned;
