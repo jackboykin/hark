@@ -100,6 +100,19 @@ const Proof = union(enum) {
     expanded: Gap,
     wild_nodata: Gap,
     nxdomain: Gap,
+    /// An unsigned cut an Opt-Out chain left out: its closest encloser
+    /// with an NSEC3, and the span over the next closer name (RFC 5155 §7.2.4, §7.2.7).
+    opted_out: Gap,
+
+    /// Whether a validator may call the reply authentic: an Opt-Out span
+    /// shows no name absent (RFC 5155 §9.2).
+    fn holds(p: Proof, z: *const Zone) bool {
+        const opt_out = if (z.nsec3) |n| n.opt_out else false;
+        return switch (p) {
+            .none, .nodata => true,
+            .expanded, .wild_nodata, .nxdomain, .opted_out => !opt_out,
+        };
+    }
 };
 
 const Reply = struct {
@@ -123,7 +136,8 @@ const Hashed = struct {
 const Nsec3 = struct {
     iterations: u16,
     salt: []const u8,
-    /// In hash order.
+    /// Every NSEC3 carries the flag, and no unsigned cut has one.
+    opt_out: bool,
     chain: []const Hashed = &.{},
 
     /// RFC 5155 §5 over the name as it goes on the wire.
@@ -211,6 +225,11 @@ const Zone = struct {
                 all[0] = z.link(name, .at);
                 break :one 1;
             },
+            .opted_out => |gap| two: {
+                all[0] = z.link(gap.encloser, .at);
+                all[1] = z.link(gap.closer(), .spans);
+                break :two 2;
+            },
             .expanded, .wild_nodata, .nxdomain => |gap| some: {
                 const wildcard = try child(arena, gap.encloser, "*");
                 all[0] = if (z.nsec3 != null) z.link(gap.closer(), .spans) else z.link(gap.name, .spans);
@@ -231,7 +250,7 @@ const Zone = struct {
             // Only its DS is the parent's to answer at a cut (RFC 4035 §3.1.4.1).
             if (t != .ds or name.len != o.name.len) return .{ .referral = o };
             if (below.signed) return .{ .answer = .{ .from = o, .type = .ds } };
-            return .{ .soa = true, .proof = .{ .nodata = name } };
+            return .{ .soa = true, .proof = z.unsigned(o) };
         };
         if (z.at(name)) |o| if (o.answers(z, t)) |set| return .{ .answer = .{ .from = o, .type = set } };
         if (z.exists(name)) return .{ .soa = true, .proof = .{ .nodata = name } };
@@ -243,11 +262,17 @@ const Zone = struct {
         return .{ .nxdomain = true, .soa = true, .proof = .{ .nxdomain = gap } };
     }
 
+    fn unsigned(z: *const Zone, cut: *const Owner) Proof {
+        const opt_out = if (z.nsec3) |n| n.opt_out else false;
+        return if (opt_out) .{ .opted_out = .{ .name = cut.name, .encloser = z.apex } } else .{ .nodata = cut.name };
+    }
+
     /// Every name that exists gets its NSEC3, the empty ones too.
     fn hashAll(z: *Zone, arena: Allocator) !void {
         const p = &(z.nsec3 orelse return);
         var chain: std.ArrayList(Hashed) = .empty;
         for (z.owners) |*o| {
+            if (o.cut) |below| if (p.opt_out and !below.signed) continue;
             try chain.append(arena, .{ .hash = p.hash(o.name), .owner = o });
             var above = o.name[0..o.name.len -| 1];
             while (above.len > z.apex.len and z.at(above) == null) : (above = above[0 .. above.len - 1]) {
@@ -286,7 +311,14 @@ const World = struct {
             zones.appendAssumeCapacity(.{ .apex = apex, .signed = random.boolean(), .address = @intCast(1 + zones.items.len) });
         }
         for (zones.items) |*z| if (z.signed and random.boolean()) {
-            z.nsec3 = .{ .iterations = random.uintAtMost(u16, 2), .salt = if (random.boolean()) "" else "\xab\xcd" };
+            // 70 is past what a read from memory may hash, never past a fetch.
+            const iterations = [_]u16{ 0, 0, 1, 2, 70 };
+            z.nsec3 = .{ .iterations = iterations[random.uintLessThan(usize, iterations.len)], .salt = if (random.boolean()) "" else "\xab\xcd", .opt_out = random.boolean() };
+            // A name that exists only above an unsigned cut has no NSEC3
+            // under Opt-Out, and what proves a name beside it is not drawn.
+            if (z.apex.len == 0 and z.nsec3.?.opt_out) for (zones.items[1..]) |*below| {
+                below.signed = below.signed or below.apex.len > 1;
+            };
         };
         const sparse = 4 + random.uintLessThan(u8, 28);
         for (zones.items) |*z| {
@@ -369,7 +401,7 @@ const Writer = struct {
         const apex = try w.dotted(z.apex);
         const hex = if (p.salt.len == 0) "-" else try w.arena.print("{x}", .{p.salt});
         const of = if (p.chain[i].owner) |o| try w.types(z, o) else "";
-        try w.line("{s}.{s} 3600 IN NSEC3 1 0 {d} {s} {s}{s}", .{ spelled(p.chain[i].hash), if (z.apex.len == 0) "" else apex, p.iterations, hex, spelled(p.chain[(i + 1) % p.chain.len].hash), of });
+        try w.line("{s}.{s} 3600 IN NSEC3 1 {d} {d} {s} {s}{s}", .{ spelled(p.chain[i].hash), if (z.apex.len == 0) "" else apex, @intFromBool(p.opt_out), p.iterations, hex, spelled(p.chain[(i + 1) % p.chain.len].hash), of });
     }
 
     fn question(w: *Writer, name: Name, t: Type) !void {
@@ -381,7 +413,7 @@ const Writer = struct {
         const below = cut.cut.?;
         try w.line("SECTION AUTHORITY", .{});
         try w.record(below, cut.name, &below.owners[0], .ns);
-        if (below.signed) try w.record(z, cut.name, cut, .ds) else try w.chained(z, z.link(cut.name, .at));
+        if (below.signed) try w.record(z, cut.name, cut, .ds) else for (try z.links(w.arena, z.unsigned(cut))) |i| try w.chained(z, i);
         try w.line("SECTION ADDITIONAL", .{});
         try w.record(below, below.owners[below.host].name, &below.owners[below.host], .a);
     }
@@ -433,8 +465,8 @@ const Writer = struct {
         var authentic = true;
         const last = while (true) : (hops += 1) {
             const z = World.holder(w.w.zones, hop);
-            authentic = authentic and z.signed;
             const r = try z.reply(w.arena, hop, t);
+            authentic = authentic and z.signed and r.proof.holds(z);
             const a = r.answer orelse break r;
             try w.record(z, hop, a.from, a.type);
             if (a.type == t) break r;
