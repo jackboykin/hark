@@ -9,6 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
 const sign = @import("sign.zig");
+const zone = @import("zone.zig");
 const graph = @import("../graph.zig");
 const model = @import("../model.zig");
 const answer = @import("../answer.zig");
@@ -33,6 +34,8 @@ const Report = struct {
     heard: sim.Sim.Heard = .empty,
     departed: u32 = 0,
     compared: u32 = 0,
+    /// Answers read from the denial index.
+    read: u32 = 0,
     fired: Fired = .initFill(0),
     left: chaos.Events = .empty,
     told: std.ArrayList([]const u8) = .empty,
@@ -324,6 +327,7 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *sim.Sim, phase: 
         errdefer gpa.free(wire);
         try report.answers.append(gpa, .{ .phase = phase, .step = step, .wire = wire, .limited = limited });
     }
+    if (sent) |x| report.read += @intFromBool(phase == .steps and says(x.msg, .synthesized));
     if (opts.chaos == 0) return;
     const ref = find(opts.reference, phase, step) orelse {
         report.msg = "chaos asked what the reference did not";
@@ -657,7 +661,7 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
     return null;
 }
 
-const Replayed = struct { parsed: usize, failed: usize, compared: usize = 0, departed: usize = 0, fired: Fired = .initFill(0) };
+const Replayed = struct { parsed: usize, failed: usize, compared: usize = 0, departed: usize = 0, read: usize = 0, fired: Fired = .initFill(0) };
 
 const Job = struct {
     path: []const u8,
@@ -666,7 +670,11 @@ const Job = struct {
     failed: bool = false,
     compared: u32 = 0,
     departed: u32 = 0,
+    read: u32 = 0,
     fired: Fired = .initFill(0),
+    /// Every question has its one answer at every step, so no run can
+    /// leave the reference's world.
+    total: bool = false,
 };
 
 fn replayDir(root: []const u8, seeds: u64) !Replayed {
@@ -678,7 +686,6 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
     defer dir.close(io);
     var walker = try dir.walk(testing.allocator);
     defer walker.deinit();
-    var r: Replayed = .{ .parsed = 0, .failed = 0 };
     var jobs: std.ArrayList(Job) = .empty;
     while (try walker.next(io)) |ent| {
         if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
@@ -688,22 +695,27 @@ fn replayDir(root: []const u8, seeds: u64) !Replayed {
             std.debug.print("{s}/{s}:{d}: {s}\n", .{ root, ent.path, diag.line, diag.msg });
             return err;
         };
-        r.parsed += 1;
         const path = try arena.dupe(u8, ent.path);
         try jobs.append(arena, .{ .path = path, .scenario = scenario, .seeds = seeds });
     }
+    return replayAll(arena, jobs.items);
+}
+
+fn replayAll(arena: Allocator, jobs: []Job) !Replayed {
+    var r: Replayed = .{ .parsed = jobs.len, .failed = 0 };
     var next: std.atomic.Value(usize) = .init(0);
     var leaked: std.atomic.Value(bool) = .init(false);
     // Release runs time the model: one thread, so the numbers compare.
     const cpus = if (@import("builtin").mode == .debug) std.Thread.getCpuCount() catch 1 else 1;
-    const threads = try arena.alloc(std.Thread, @min(jobs.items.len, cpus) -| 1);
-    for (threads) |*t| t.* = try std.Thread.spawn(.{}, replayJobs, .{ jobs.items, &next, &leaked });
-    replayJobs(jobs.items, &next, &leaked);
+    const threads = try arena.alloc(std.Thread, @min(jobs.len, cpus) -| 1);
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, replayJobs, .{ jobs, &next, &leaked });
+    replayJobs(jobs, &next, &leaked);
     for (threads) |t| t.join();
-    for (jobs.items) |j| {
+    for (jobs) |j| {
         r.failed += @intFromBool(j.failed);
         r.compared += j.compared;
         r.departed += j.departed;
+        r.read += j.read;
         for (&r.fired.values, j.fired.values) |*a, b| a.* += b;
     }
     if (leaked.load(.monotonic)) r.failed += 1;
@@ -757,6 +769,7 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
         std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
         return;
     };
+    j.read += first.read;
     var second: Report = .{};
     defer second.deinit(gpa);
     runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &second) catch {};
@@ -771,7 +784,7 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
         j.departed += chaotic.departed;
         for (&j.fired.values, chaotic.fired.values) |*a, b| a.* += b;
     }
-    const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items, .known = &first.heard };
+    const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items, .known = if (j.total) null else &first.heard };
     runScenario(gpa, &j.scenario, mint, held, &chaotic) catch |err| {
         j.failed = true;
         std.debug.print("{s} (seed {d}, chaos): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, chaotic.phase, chaotic.step, chaotic.msg, @errorName(err), chaotic.log });
@@ -852,7 +865,8 @@ test "trace one scenario" {
     const path = env.getPosix("HARK_SCENARIO") orelse return error.SkipZigTest;
     const seed = if (env.getPosix("HARK_SEED")) |v| try std.fmt.parseInt(u64, v, 10) else 1;
     const chaotic = env.getPosix("HARK_CHAOS") != null;
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    const text = if (mem.startsWith(u8, path, drawn)) try zone.scenario(arena, try std.fmt.parseInt(u64, path[drawn.len..], 10)) else try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    if (mem.startsWith(u8, path, drawn)) std.debug.print("{s}", .{text});
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, text, &diag);
     var report: Report = .{};
@@ -862,7 +876,7 @@ test "trace one scenario" {
     defer reference.deinit(testing.allocator);
     if (chaotic) try runScenario(testing.allocator, &scenario, &mint, .{ .seed = seed }, &reference);
     const opts: Options = if (chaotic)
-        .{ .seed = seed, .trace = true, .chaos = seed, .reference = reference.answers.items, .known = &reference.heard }
+        .{ .seed = seed, .trace = true, .chaos = seed, .reference = reference.answers.items, .known = if (mem.startsWith(u8, path, drawn)) null else &reference.heard }
     else
         .{ .seed = seed, .trace = true };
     const result = runScenario(testing.allocator, &scenario, &mint, opts, &report);
@@ -880,6 +894,28 @@ test "hark walk scenarios settle to today's answers" {
         std.debug.print("chaos site {t} never fired\n", .{e.key});
         return error.TestUnexpectedResult;
     };
+}
+
+/// `-Dscenario=zone:<n>` replays the nth drawn zone.
+const drawn = "zone:";
+
+test "a drawn zone is answered as its authority answers, whatever was asked before" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const jobs = try arena.alloc(Job, 64);
+    for (jobs, 1..) |*j, n| {
+        var diag: rpl.Diag = .{};
+        const scenario = rpl.parse(arena, try zone.scenario(arena, n), &diag) catch |err| {
+            std.debug.print("{s}{d}:{d}: {s}\n", .{ drawn, n, diag.line, diag.msg });
+            return err;
+        };
+        j.* = .{ .path = try arena.print("{s}{d}", .{ drawn, n }), .scenario = scenario, .seeds = 2, .total = true };
+    }
+    const r = try replayAll(arena, jobs);
+    try testing.expectEqual(0, r.failed);
+    // Else the zones came to be drawn so that nothing is read from memory.
+    try testing.expect(r.read != 0);
 }
 
 /// ns1 (127.0.10.3) listens nowhere, ns2 (127.0.10.4) answers.

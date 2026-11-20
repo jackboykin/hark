@@ -47,6 +47,7 @@ test {
     _ = @import("sim/rpl.zig");
     _ = @import("sim/sign.zig");
     _ = @import("sim/sim.zig");
+    _ = @import("sim/zone.zig");
     _ = @import("slab.zig");
     _ = @import("special_use.zig");
     _ = @import("store.zig");
