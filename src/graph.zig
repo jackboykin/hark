@@ -359,6 +359,8 @@ pub const Graph = struct {
     rtt: *ns_rtt.Table,
     schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     runs: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Hops recall read from the denial index.
+    reads: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     denial: denial.Index = .{},
     verify_memo: rrsig.VerifyMemo = .{},
     store: store.Store,
@@ -1080,33 +1082,59 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?model.Chain };
+    /// `read` marks a hop read from the denial index for this recall: its
+    /// blob is the caller's to let go.
+    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?model.Chain, read: bool = false };
 
-    /// The blobs are the store's; the caller refs what it keeps.
+    fn readHop(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType) !?*store.Blob {
+        const r = try denial.read(g, arena, name, qtype) orelse return null;
+        if (builtin.is_test) g.reads += 1;
+        const key: Key = .of(.rrset, name, qtype);
+        const blob = try g.store.build(key, .{ .rrset = r.reply }, r.expires_ns);
+        blob.verdict.stamp(.{ .status = .secure, .proven_until_ns = r.proven_until_ns }, r.proven_until_ns, g.now());
+        if (g.forgets(.keep, key) catch false) return blob;
+        g.store.put(blob.ref()) catch g.store.unref(blob);
+        return blob;
+    }
+
+    fn lost(g: *Graph, hops: []const Recalled) ?[]const Recalled {
+        g.letGo(hops);
+        return null;
+    }
+
+    pub fn letGo(g: *Graph, hops: []const Recalled) void {
+        for (hops) |h| if (h.read) g.store.unref(h.blob);
+    }
+
+    /// The caller refs what it keeps, then lets the hops go.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: Age) !?[]const Recalled {
         var hops: std.ArrayList(Recalled) = .empty;
         var links: walk.Links = .{};
         var next = name;
         var kind: ?Kind = null;
+        errdefer g.letGo(hops.items);
         while (true) {
-            kind = g.hopKind(kind, next, qtype) orelse return null;
-            const e = g.storedHop(kind.?, next, qtype, age) orelse return null;
-            var standing: ?model.Chain = null;
+            kind = g.hopKind(kind, next, qtype) orelse return g.lost(hops.items);
+            const kept = g.storedHop(kind.?, next, qtype, age);
+            const drawn = if (kept == null and age == .fresh and g.awaitsVerdict(kind.?)) try g.readHop(arena, next, qtype) else null;
+            const e = kept orelse drawn orelse return g.lost(hops.items);
+            // Listed before any return, so every way out lets it go.
+            try hops.append(arena, .{ .blob = e, .rrset = .of(e), .standing = null, .read = drawn != null });
+            const hop = &hops.items[hops.items.len - 1];
             if (g.awaitsVerdict(kind.?)) {
-                standing = e.verdict.standing(g.now());
-                if (if (age == .fresh) standing == null else !e.verdict.judged()) return null;
+                hop.standing = e.verdict.standing(g.now());
+                if (if (age == .fresh) hop.standing == null else !e.verdict.judged()) return g.lost(hops.items);
             }
-            const r: store.Rrset = .of(e);
-            try hops.append(arena, .{ .blob = e, .rrset = r, .standing = standing });
+            const r = hop.rrset;
             const target: dns.Name = if (r.kind == .alias) .of(r.target) else .root;
             var it = r.sections[0].iterator();
             while (it.next()) |rr| if (rr.rtype == .cname) {
-                if (links.pass(rr.name) != null) return null;
+                if (links.pass(rr.name) != null) return g.lost(hops.items);
             };
             switch (links.end(r.kind, target, qtype)) {
                 .done => return hops.items,
                 .next => |nx| next = nx,
-                .broken => return null,
+                .broken => return g.lost(hops.items),
             }
         }
     }

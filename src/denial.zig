@@ -387,118 +387,123 @@ pub fn denies(g: *const Graph, qtype: dns.RType) bool {
     return g.cfg.trust_anchors != null and qtype != .ds and qtype != .dnskey;
 }
 
+pub const Read = struct { reply: model.Reply, expires_ns: i64, proven_until_ns: i64 };
+
+const Asked = struct {
+    g: *Graph,
+    arena: std.mem.Allocator,
+    name: dns.Name,
+    qtype: dns.RType,
+    allowance: *rrsig.ValidationBudget,
+};
+
 pub fn deny(g: *Graph, id: CellId) !bool {
-    if (g.denial.zones.count() == 0 or !denies(g, g.cell(id).key.rtype)) return false;
-    if (try g.skips(.read, g.cell(id).key)) return false;
-    const name = g.cell(id).name;
-    // A read hashes on its own account: what it spends is never the
-    // question's, so the fetch after a miss has its whole budget.
+    const r = try read(g, g.scratch.allocator(), g.cell(id).name, g.cell(id).key.rtype) orelse return false;
+    try g.settle(id, .{ .rrset = r.reply }, r.expires_ns);
+    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = r.proven_until_ns }, r.proven_until_ns, g.now());
+    g.keep(id);
+    return true;
+}
+
+pub fn read(g: *Graph, arena: std.mem.Allocator, name: dns.Name, qtype: dns.RType) !?Read {
+    if (g.denial.zones.count() == 0 or !denies(g, qtype)) return null;
+    if (try g.skips(.read, .of(.rrset, name, qtype))) return null;
+    // Never the question's budget: a miss leaves the fetch all of it.
     var hashes: rrsig.Hashes = .{};
     var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks, .hashes = &hashes };
+    const q: Asked = .{ .g = g, .arena = arena, .name = name, .qtype = qtype, .allowance = &allowance };
     var up: ?dns.Name = name;
     while (up) |zone| : (up = zone.parent()) {
         const z = g.denial.zones.getPtr(zone.wire) orelse continue;
-        if (try denyUnder(g, z, id, zone, &allowance)) return true;
-        if (try expand(g, z, id, zone, &allowance)) return true;
+        if (try denyUnder(&q, z, zone)) |r| return r;
+        if (try expand(&q, z, zone)) |r| return r;
     }
-    return false;
+    return null;
 }
 
 /// A denial carries its zone's SOA (RFC 2308 §3), so none is read without one held.
-fn denyUnder(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name, allowance: *rrsig.ValidationBudget) !bool {
-    const soa = z.soa orelse return false;
-    if (soa.expires_ns <= g.instant()) return false;
-    if (try denyIn(g, z, soa, id, zone, allowance)) return true;
-    for (z.chains.items) |*c| if (try denyHashed(g, c, soa, id, zone, allowance)) return true;
-    return false;
+fn denyUnder(q: *const Asked, z: *const Zone, zone: dns.Name) !?Read {
+    const soa = z.soa orelse return null;
+    if (soa.expires_ns <= q.g.instant()) return null;
+    if (try denyIn(q, z, soa, zone)) |r| return r;
+    for (z.chains.items) |*c| if (try denyHashed(q, c, soa, zone)) |r| return r;
+    return null;
 }
 
 /// RFC 8198 §5.3: a wildcard's own set, held judged under its own name,
-/// answers a name nothing closer matches. Each name above the one asked
-/// may be the closest encloser; a held source says which to try.
-fn expand(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name, allowance: *rrsig.ValidationBudget) !bool {
-    const name = g.cell(id).name;
-    const qtype = g.cell(id).key.rtype;
-    var up = name.parent();
+/// answers a name that nothing closer matches.
+fn expand(q: *const Asked, z: *const Zone, zone: dns.Name) !?Read {
+    const g = q.g;
+    var up = q.name.parent();
     while (up) |encloser| : (up = encloser.parent()) {
         if (encloser.depth() < zone.depth()) break;
         var buf: dns.Name.Buf = undefined;
         const wildcard = dns.Name.child(&buf, "*", encloser) orelse continue;
-        const alias = if (walk.cnameAnswers(qtype)) g.proven(.of(.rrset, wildcard, .cname)) else null;
-        const source = g.proven(.of(.rrset, wildcard, qtype)) orelse alias orelse continue;
-        if (z.span(g, name)) |cover| {
-            if (try expandOver(g, id, zone, source, encloser, .{ .judged = cover.judged, .expires_ns = cover.expires_ns }, allowance)) return true;
+        const alias = if (walk.cnameAnswers(q.qtype)) g.proven(.of(.rrset, wildcard, .cname)) else null;
+        const source = g.proven(.of(.rrset, wildcard, q.qtype)) orelse alias orelse continue;
+        if (z.span(g, q.name)) |cover| {
+            if (try expandOver(q, zone, source, encloser, .{ .judged = cover.judged, .expires_ns = cover.expires_ns })) |r| return r;
         }
         for (z.chains.items) |*c| {
-            const hash = c.hashOf(name.ancestor(encloser.depth() + 1), allowance) orelse return false;
+            const hash = c.hashOf(q.name.ancestor(encloser.depth() + 1), q.allowance) orelse return null;
             const cover = c.cover(g, &hash) orelse continue;
-            if (try expandOver(g, id, zone, source, encloser, .{ .judged = cover.judged, .expires_ns = cover.expires_ns }, allowance)) return true;
+            if (try expandOver(q, zone, source, encloser, .{ .judged = cover.judged, .expires_ns = cover.expires_ns })) |r| return r;
         }
     }
-    return false;
+    return null;
 }
 
-/// The source's records under the name asked, with the span that shows
-/// nothing closer: what its authority would send (RFC 4035 §3.1.3.3). The
-/// source counts only as its zone signed it at that wildcard, by the
-/// signature kept with it.
-fn expandOver(g: *Graph, id: CellId, zone: dns.Name, source: *store.Blob, encloser: dns.Name, cover: Held, allowance: *rrsig.ValidationBudget) !bool {
-    const a = g.scratch.allocator();
-    const name = g.cell(id).name;
-    const now = g.now();
-    const held = (try store.Store.parse(a, source)).rrset;
-    if (held.kind != .answer and held.kind != .alias) return false;
+fn expandOver(q: *const Asked, zone: dns.Name, source: *store.Blob, encloser: dns.Name, cover: Held) !?Read {
+    const now = q.g.now();
+    const held = (try store.Store.parse(q.arena, source)).rrset;
+    if (held.kind != .answer and held.kind != .alias) return null;
     var signed = false;
     var answers: std.ArrayList(RR) = .empty;
     for (held.answers) |rr| {
-        if (rr.name.depth() != encloser.depth() + 1 or !rr.name.isSubdomainOf(encloser)) return false;
+        if (rr.name.depth() != encloser.depth() + 1 or !rr.name.isSubdomainOf(encloser)) return null;
         if (rr.rtype == .rrsig) {
-            if (!rr.rrsig().signer_name.eql(zone) or rr.rrsig().labels != encloser.depth()) return false;
+            // A source counts only as this zone signed it at this wildcard.
+            if (!rr.rrsig().signer_name.eql(zone) or rr.rrsig().labels != encloser.depth()) return null;
             signed = true;
         }
         var at = rr;
-        at.name = name;
+        at.name = q.name;
         at.ttl = rr.ttl -| walk.ageOf(held.stored_ns, now);
-        try answers.append(a, at);
+        try answers.append(q.arena, at);
     }
-    if (!signed) return false;
+    if (!signed) return null;
     var authorities: std.ArrayList(RR) = .empty;
-    const spans = (try store.Store.parse(a, cover.judged)).rrset;
-    try aged(g, &authorities, spans.answers, spans.stored_ns);
-    if (proof.proveNoCloserMatch(authorities.items, name, encloser.depth(), zone, allowance) != .secure) return false;
+    const spans = (try store.Store.parse(q.arena, cover.judged)).rrset;
+    try aged(q, &authorities, spans.answers, spans.stored_ns);
+    if (proof.proveNoCloserMatch(authorities.items, q.name, encloser.depth(), zone, q.allowance) != .secure) return null;
 
     const expires = @min(source.end(), cover.expires_ns);
     var reply: model.Reply = .{ .kind = held.kind, .aa = true, .answers = answers.items, .authorities = authorities.items, .target = held.target, .zone = zone, .ede = .synthesized, .stored_ns = now };
     reply.ttl = @min(walk.replyTtl(reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
-    try g.settle(id, .{ .rrset = reply }, expires);
-    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);
-    g.keep(id);
-    return true;
+    return .{ .reply = reply, .expires_ns = expires, .proven_until_ns = expires };
 }
 
 /// SHA-1 blocks one read may hash.
 const read_blocks = 128;
 
-/// RFC 5155 §8.4 to §8.7 over one chain: the name's own NSEC3, or its
-/// closest encloser's with the spans over the next closer name and over
-/// the wildcard, or the wildcard's own.
-fn denyHashed(g: *Graph, c: *const Chain, soa: Held, id: CellId, zone: dns.Name, allowance: *rrsig.ValidationBudget) !bool {
-    const name = g.cell(id).name;
-    var closer = c.hashOf(name, allowance) orelse return false;
-    if (c.exact(g, &closer)) |at| return settleRead(g, id, zone, soa, &.{.{ .judged = at.judged, .expires_ns = at.expires_ns }}, false, allowance);
-    var up = name.parent();
+/// RFC 5155 §8.4 to §8.7 over one chain.
+fn denyHashed(q: *const Asked, c: *const Chain, soa: Held, zone: dns.Name) !?Read {
+    const g = q.g;
+    var closer = c.hashOf(q.name, q.allowance) orelse return null;
+    if (c.exact(g, &closer)) |at| return weigh(q, zone, soa, &.{.{ .judged = at.judged, .expires_ns = at.expires_ns }}, false);
+    var up = q.name.parent();
     const encloser, const exists = while (up) |a| : (up = a.parent()) {
-        if (a.depth() < zone.depth()) return false;
-        const hash = c.hashOf(a, allowance) orelse return false;
+        if (a.depth() < zone.depth()) return null;
+        const hash = c.hashOf(a, q.allowance) orelse return null;
         if (c.exact(g, &hash)) |at| break .{ a, at };
         closer = hash;
-    } else return false;
-    const gap = c.cover(g, &closer) orelse return false;
+    } else return null;
+    const gap = c.cover(g, &closer) orelse return null;
     var wc_buf: dns.Name.Buf = undefined;
-    const wildcard = dns.Name.child(&wc_buf, "*", encloser) orelse return false;
-    const hash = c.hashOf(wildcard, allowance) orelse return false;
+    const wildcard = dns.Name.child(&wc_buf, "*", encloser) orelse return null;
+    const hash = c.hashOf(wildcard, q.allowance) orelse return null;
     const nxdomain = c.exact(g, &hash) == null;
-    const wild = c.exact(g, &hash) orelse c.cover(g, &hash) orelse return false;
+    const wild = c.exact(g, &hash) orelse c.cover(g, &hash) orelse return null;
     var proofs: [3]Held = undefined;
     var n: usize = 0;
     for ([_]*const Hashed{ exists, gap, wild }, 0..) |sp, i| {
@@ -506,56 +511,52 @@ fn denyHashed(g: *Graph, c: *const Chain, soa: Held, id: CellId, zone: dns.Name,
         proofs[n] = .{ .judged = sp.judged, .expires_ns = sp.expires_ns };
         n += 1;
     }
-    return settleRead(g, id, zone, soa, proofs[0..n], nxdomain, allowance);
+    return weigh(q, zone, soa, proofs[0..n], nxdomain);
 }
 
-fn denyIn(g: *Graph, z: *const Zone, soa: Held, id: CellId, zone: dns.Name, allowance: *rrsig.ValidationBudget) !bool {
-    const name = g.cell(id).name;
+fn denyIn(q: *const Asked, z: *const Zone, soa: Held, zone: dns.Name) !?Read {
+    const g = q.g;
     var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
-    if (z.span(g, name)) |cover| {
+    if (z.span(g, q.name)) |cover| {
         proofs[0] = cover;
-        if (proof.nsecProvesNameNonexistence(cover.owner, cover.nsec, name)) {
-            const ce = proof.closestEncloser(name, cover.owner, cover.nsec.next_domain_name) orelse return false;
+        if (proof.nsecProvesNameNonexistence(cover.owner, cover.nsec, q.name)) {
+            const ce = proof.closestEncloser(q.name, cover.owner, cover.nsec.next_domain_name) orelse return null;
             var wc_buf: dns.Name.Buf = undefined;
-            const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return false;
+            const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return null;
             if (z.exact(g, wildcard)) |wc| {
                 proofs[1] = wc;
             } else if (z.span(g, wildcard)) |wc| {
                 proofs[1] = wc;
                 nxdomain = true;
-            } else return false;
+            } else return null;
             n += @intFromBool(proofs[1] != cover);
         }
-    } else proofs[0] = z.exact(g, name) orelse return false;
+    } else proofs[0] = z.exact(g, q.name) orelse return null;
     var held: [2]Held = undefined;
     for (held[0..n], proofs[0..n]) |*h, p| h.* = .{ .judged = p.judged, .expires_ns = p.expires_ns };
-    return settleRead(g, id, zone, soa, held[0..n], nxdomain, allowance);
+    return weigh(q, zone, soa, held[0..n], nxdomain);
 }
 
-/// The candidates go to the judge that weighs a reply off the wire, and
-/// only its secure verdict answers.
-fn settleRead(g: *Graph, id: CellId, zone: dns.Name, held: Held, proofs: []const Held, nxdomain: bool, allowance: *rrsig.ValidationBudget) !bool {
-    const name = g.cell(id).name;
-    const qtype = g.cell(id).key.rtype;
-    const now = g.now();
+fn weigh(q: *const Asked, zone: dns.Name, held: Held, proofs: []const Held, nxdomain: bool) !?Read {
+    const now = q.g.now();
     var expires = held.expires_ns;
     var authorities: std.ArrayList(RR) = .empty;
-    const soa = (try store.Store.parse(g.scratch.allocator(), held.judged)).rrset;
-    try aged(g, &authorities, soa.answers, soa.stored_ns);
+    const soa = (try store.Store.parse(q.arena, held.judged)).rrset;
+    try aged(q, &authorities, soa.answers, soa.stored_ns);
     for (proofs) |p| {
         expires = @min(expires, p.expires_ns);
-        const fact = (try store.Store.parse(g.scratch.allocator(), p.judged)).rrset;
-        try aged(g, &authorities, fact.answers, fact.stored_ns);
+        const fact = (try store.Store.parse(q.arena, p.judged)).rrset;
+        try aged(q, &authorities, fact.answers, fact.stored_ns);
     }
-    if (proof.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, allowance) != .secure) return false;
+    if (proof.validateNegativeProof(authorities.items, q.name, q.qtype, nxdomain, zone, q.allowance) != .secure) return null;
 
     var reply: model.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,
         .aa = true,
         .authorities = authorities.items,
-        .target = name,
+        .target = q.name,
         .zone = zone,
         .ede = .synthesized,
         .stored_ns = now,
@@ -565,18 +566,15 @@ fn settleRead(g: *Graph, id: CellId, zone: dns.Name, held: Held, proofs: []const
     const minimum = for (soa.answers) |rr| {
         if (rr.rtype == .soa) break rr.soa().minimum;
     } else 0;
-    try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
-    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);
-    g.keep(id);
-    return true;
+    return .{ .reply = reply, .expires_ns = @min(expires, now + @as(i64, minimum) * std.time.ns_per_s), .proven_until_ns = expires };
 }
 
-fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !void {
-    const age = walk.ageOf(stored_ns, g.now());
+fn aged(q: *const Asked, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !void {
+    const age = walk.ageOf(stored_ns, q.g.now());
     for (rrs) |rr| {
         var a = rr;
         a.ttl = rr.ttl -| age;
-        try out.append(g.scratch.allocator(), a);
+        try out.append(q.arena, a);
     }
 }
 

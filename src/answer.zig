@@ -342,6 +342,7 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
 fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_last_tenth: bool) !?Served {
     const g = d.g;
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
+    defer g.letGo(chain);
     var secure = true;
     var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
