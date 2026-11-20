@@ -1,13 +1,14 @@
 //! A model authority. A small signed root zone drawn from a seed, with up
-//! to two zones delegated from it, signed or not, written out as a
-//! scenario: each question of a small universe with the reply RFC 4035
-//! §3.1 has each zone's server give, then questions in a drawn order, each
-//! checked against the answer a client is owed. Names, their order and the
-//! replies are worked out here from labels alone, sharing nothing with the
-//! code they test.
+//! to two zones delegated from it, signed or not, each signed zone denying
+//! by NSEC or by NSEC3, written out as a scenario: each question of a
+//! small universe with the reply RFC 4035 §3.1 has its zone's server give,
+//! then questions in a drawn order, each checked against the answer a
+//! client is owed. Names, their order and the replies are worked out here
+//! from labels alone, sharing nothing with the code they test.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const Sha1 = std.crypto.hash.Sha1;
 
 /// Labels from the root down. The root has none.
 const Name = []const []const u8;
@@ -82,20 +83,80 @@ fn child(arena: Allocator, name: Name, label: []const u8) !Name {
     return mem.concat(arena, []const u8, &.{ name, &.{label} });
 }
 
+/// A name that does not exist, and the deepest name above it that does.
+const Gap = struct {
+    name: Name,
+    encloser: Name,
+
+    fn closer(g: Gap) Name {
+        return g.name[0 .. g.encloser.len + 1];
+    }
+};
+
+/// What a reply's NSEC or NSEC3 records show (RFC 4035 §3.1.3, RFC 5155 §7.2).
+const Proof = union(enum) {
+    none,
+    nodata: Name,
+    expanded: Gap,
+    wild_nodata: Gap,
+    nxdomain: Gap,
+};
+
 const Reply = struct {
     nxdomain: bool = false,
     answer: ?struct { from: *const Owner, type: Type } = null,
     soa: bool = false,
-    /// The owners whose NSEC the reply carries.
-    proofs: [2]?*const Owner = .{ null, null },
-    /// The wildcard the answer was expanded from.
+    proof: Proof = .none,
     wildcard: ?Name = null,
     referral: ?*const Owner = null,
+};
 
-    fn both(x: *const Owner, y: *const Owner) [2]?*const Owner {
-        return .{ x, if (x == y) null else y };
+const Hashed = struct {
+    hash: [Sha1.digest_length]u8,
+    owner: ?*const Owner,
+
+    fn before(_: void, x: Hashed, y: Hashed) bool {
+        return mem.order(u8, &x.hash, &y.hash) == .lt;
     }
 };
+
+const Nsec3 = struct {
+    iterations: u16,
+    salt: []const u8,
+    /// In hash order.
+    chain: []const Hashed = &.{},
+
+    /// RFC 5155 §5 over the name as it goes on the wire.
+    fn hash(p: Nsec3, name: Name) [Sha1.digest_length]u8 {
+        var h = Sha1.init(.{});
+        var i = name.len;
+        while (i > 0) : (i -= 1) {
+            h.update(&.{@intCast(name[i - 1].len)});
+            h.update(name[i - 1]);
+        }
+        h.update(&.{0});
+        h.update(p.salt);
+        var digest = h.finalResult();
+        for (0..p.iterations) |_| {
+            h = Sha1.init(.{});
+            h.update(&digest);
+            h.update(p.salt);
+            digest = h.finalResult();
+        }
+        return digest;
+    }
+};
+
+/// Base32hex (RFC 4648 §7) of a hash, as an owner's label spells it.
+fn spelled(hash: [Sha1.digest_length]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    for (&out, 0..) |*c, i| {
+        const bit = i * 5;
+        const pair = @as(u16, hash[bit / 8]) << 8 | (if (bit / 8 + 1 < hash.len) hash[bit / 8 + 1] else 0);
+        c.* = "0123456789abcdefghijklmnopqrstuv"[(pair >> @intCast(11 - bit % 8)) & 31];
+    }
+    return out;
+}
 
 const Zone = struct {
     apex: Name,
@@ -106,6 +167,7 @@ const Zone = struct {
     owners: []Owner = &.{},
     /// Which owner is its server's name.
     host: usize = 0,
+    nsec3: ?Nsec3 = null,
 
     fn at(z: *const Zone, name: Name) ?*const Owner {
         for (z.owners) |*o| if (order(o.name, name) == .eq) return o;
@@ -126,8 +188,42 @@ const Zone = struct {
         return last;
     }
 
-    fn next(z: *const Zone, o: *const Owner) *const Owner {
-        return &z.owners[(o.n + 1) % z.owners.len];
+    /// Which record of the zone's chain is at `name`, or spans it. In an
+    /// NSEC chain an empty non-terminal has none of its own, and the one
+    /// that spans it shows it (RFC 4035 §3.1.3.1).
+    fn link(z: *const Zone, name: Name, how: enum { at, spans }) usize {
+        const p = z.nsec3 orelse return if (how == .at) (z.at(name) orelse z.covers(name)).n else z.covers(name).n;
+        const hash = p.hash(name);
+        var last = p.chain.len - 1;
+        for (p.chain, 0..) |x, i| switch (mem.order(u8, &x.hash, &hash)) {
+            .lt => last = i,
+            .eq => return i,
+            .gt => {},
+        };
+        return last;
+    }
+
+    fn links(z: *const Zone, arena: Allocator, proof: Proof) ![]const usize {
+        var all: [3]usize = undefined;
+        const n: usize = switch (proof) {
+            .none => 0,
+            .nodata => |name| one: {
+                all[0] = z.link(name, .at);
+                break :one 1;
+            },
+            .expanded, .wild_nodata, .nxdomain => |gap| some: {
+                const wildcard = try child(arena, gap.encloser, "*");
+                all[0] = if (z.nsec3 != null) z.link(gap.closer(), .spans) else z.link(gap.name, .spans);
+                if (proof == .expanded) break :some 1;
+                all[1] = z.link(wildcard, if (proof == .wild_nodata) .at else .spans);
+                if (z.nsec3 == null) break :some 2;
+                all[2] = z.link(gap.encloser, .at);
+                break :some 3;
+            },
+        };
+        var once: std.ArrayList(usize) = .empty;
+        for (all[0..n], 0..) |x, i| if (mem.findScalar(usize, all[0..i], x) == null) try once.append(arena, x);
+        return once.items;
     }
 
     fn reply(z: *const Zone, arena: Allocator, name: Name, t: Type) !Reply {
@@ -135,22 +231,34 @@ const Zone = struct {
             // Only its DS is the parent's to answer at a cut (RFC 4035 §3.1.4.1).
             if (t != .ds or name.len != o.name.len) return .{ .referral = o };
             if (below.signed) return .{ .answer = .{ .from = o, .type = .ds } };
-            return .{ .soa = true, .proofs = .{ o, null } };
+            return .{ .soa = true, .proof = .{ .nodata = name } };
         };
-        if (z.at(name)) |o| {
-            if (o.answers(z, t)) |set| return .{ .answer = .{ .from = o, .type = set } };
-            return .{ .soa = true, .proofs = .{ o, null } };
+        if (z.at(name)) |o| if (o.answers(z, t)) |set| return .{ .answer = .{ .from = o, .type = set } };
+        if (z.exists(name)) return .{ .soa = true, .proof = .{ .nodata = name } };
+        var gap: Gap = .{ .name = name, .encloser = name };
+        while (!z.exists(gap.encloser)) gap.encloser = gap.encloser[0 .. gap.encloser.len - 1];
+        const wildcard = try child(arena, gap.encloser, "*");
+        if (z.at(wildcard)) |o| if (o.answers(z, t)) |set| return .{ .answer = .{ .from = o, .type = set }, .proof = .{ .expanded = gap }, .wildcard = wildcard };
+        if (z.exists(wildcard)) return .{ .soa = true, .proof = .{ .wild_nodata = gap } };
+        return .{ .nxdomain = true, .soa = true, .proof = .{ .nxdomain = gap } };
+    }
+
+    /// Every name that exists gets its NSEC3, the empty ones too.
+    fn hashAll(z: *Zone, arena: Allocator) !void {
+        const p = &(z.nsec3 orelse return);
+        var chain: std.ArrayList(Hashed) = .empty;
+        for (z.owners) |*o| {
+            try chain.append(arena, .{ .hash = p.hash(o.name), .owner = o });
+            var above = o.name[0..o.name.len -| 1];
+            while (above.len > z.apex.len and z.at(above) == null) : (above = above[0 .. above.len - 1]) {
+                const hash = p.hash(above);
+                for (chain.items) |x| {
+                    if (mem.eql(u8, &x.hash, &hash)) break;
+                } else try chain.append(arena, .{ .hash = hash, .owner = null });
+            }
         }
-        const cover = z.covers(name);
-        if (z.exists(name)) return .{ .soa = true, .proofs = .{ cover, null } };
-        var encloser = name;
-        while (!z.exists(encloser)) encloser = encloser[0 .. encloser.len - 1];
-        const wildcard = try child(arena, encloser, "*");
-        if (z.at(wildcard)) |o| {
-            if (o.answers(z, t)) |set| return .{ .answer = .{ .from = o, .type = set }, .proofs = .{ cover, null }, .wildcard = wildcard };
-            return .{ .soa = true, .proofs = Reply.both(o, cover) };
-        }
-        return .{ .nxdomain = !z.exists(wildcard), .soa = true, .proofs = Reply.both(cover, z.covers(wildcard)) };
+        mem.sort(Hashed, chain.items, {}, Hashed.before);
+        p.chain = chain.items;
     }
 };
 
@@ -177,6 +285,9 @@ const World = struct {
             for (zones.items[1..]) |z| if (under(apex, z.apex) or under(z.apex, apex)) continue :cuts;
             zones.appendAssumeCapacity(.{ .apex = apex, .signed = random.boolean(), .address = @intCast(1 + zones.items.len) });
         }
+        for (zones.items) |*z| if (z.signed and random.boolean()) {
+            z.nsec3 = .{ .iterations = random.uintAtMost(u16, 2), .salt = if (random.boolean()) "" else "\xab\xcd" };
+        };
         const sparse = 4 + random.uintLessThan(u8, 28);
         for (zones.items) |*z| {
             var owners: std.ArrayList(Owner) = .empty;
@@ -199,6 +310,7 @@ const World = struct {
                 if (o.name.len == z.apex.len + 1 and mem.eql(u8, o.name[z.apex.len], "ns")) z.host = i;
             }
             z.owners = owners.items;
+            try z.hashAll(arena);
         }
         for (zones.items) |z| try names.append(arena, try child(arena, z.apex, "ns"));
         return .{ .zones = zones.items, .asked = names.items };
@@ -242,12 +354,22 @@ const Writer = struct {
         }
     }
 
-    fn nsec(w: *Writer, z: *const Zone, o: *const Owner) !void {
-        const owner = try w.dotted(o.name);
-        const after = try w.dotted(z.next(o).name);
-        if (o.n == 0) return w.line("{s} 3600 IN NSEC {s} NS SOA RRSIG NSEC DNSKEY", .{ owner, after });
-        if (o.cut) |below| return w.line("{s} 3600 IN NSEC {s} NS{s} RRSIG NSEC", .{ owner, after, if (below.signed) " DS" else "" });
-        try w.line("{s} 3600 IN NSEC {s}{s}{s}{s} RRSIG NSEC", .{ owner, after, if (o.a) " A" else "", if (o.txt) " TXT" else "", if (o.cname != null) " CNAME" else "" });
+    fn types(w: *Writer, z: *const Zone, o: *const Owner) ![]const u8 {
+        if (o.n == 0) return " NS SOA RRSIG DNSKEY";
+        if (o.cut) |below| return if (below.signed) " NS DS RRSIG" else if (z.nsec3 == null) " NS RRSIG" else " NS";
+        return w.arena.print("{s}{s}{s} RRSIG", .{ if (o.a) " A" else "", if (o.txt) " TXT" else "", if (o.cname != null) " CNAME" else "" });
+    }
+
+    fn chained(w: *Writer, z: *const Zone, i: usize) !void {
+        const p = z.nsec3 orelse {
+            const o = &z.owners[i];
+            const after = z.owners[(i + 1) % z.owners.len].name;
+            return w.line("{s} 3600 IN NSEC {s}{s} NSEC", .{ try w.dotted(o.name), try w.dotted(after), try w.types(z, o) });
+        };
+        const apex = try w.dotted(z.apex);
+        const hex = if (p.salt.len == 0) "-" else try w.arena.print("{x}", .{p.salt});
+        const of = if (p.chain[i].owner) |o| try w.types(z, o) else "";
+        try w.line("{s}.{s} 3600 IN NSEC3 1 0 {d} {s} {s}{s}", .{ spelled(p.chain[i].hash), if (z.apex.len == 0) "" else apex, p.iterations, hex, spelled(p.chain[(i + 1) % p.chain.len].hash), of });
     }
 
     fn question(w: *Writer, name: Name, t: Type) !void {
@@ -259,7 +381,7 @@ const Writer = struct {
         const below = cut.cut.?;
         try w.line("SECTION AUTHORITY", .{});
         try w.record(below, cut.name, &below.owners[0], .ns);
-        if (below.signed) try w.record(z, cut.name, cut, .ds) else try w.nsec(z, cut);
+        if (below.signed) try w.record(z, cut.name, cut, .ds) else try w.chained(z, z.link(cut.name, .at));
         try w.line("SECTION ADDITIONAL", .{});
         try w.record(below, below.owners[below.host].name, &below.owners[below.host], .a);
     }
@@ -271,9 +393,10 @@ const Writer = struct {
         try w.line("ADJUST copy_id copy_query{s}", .{if (z.signed) "" else " unsigned"});
         try w.line("REPLY QR{s} {s}", .{ if (r.referral == null) " AA" else "", if (r.nxdomain) "NXDOMAIN" else "NOERROR" });
         if (r.wildcard) |wildcard| try w.line("WILDCARD {s}", .{try w.dotted(wildcard)});
+        const links = try z.links(w.arena, r.proof);
         // A signed cut's NSEC is its parent's to sign, which the signer
         // only knows of a referral.
-        for (r.proofs) |proof| if (proof) |o| if (o.cut) |below| if (below.signed) try w.line("SIGN_AS {s}", .{try w.dotted(z.apex)});
+        if (z.nsec3 == null) for (links) |i| if (z.owners[i].cut) |below| if (below.signed) try w.line("SIGN_AS {s}", .{try w.dotted(z.apex)});
         try w.question(name, t);
         if (r.referral) |cut| {
             try w.referral(z, cut);
@@ -285,7 +408,7 @@ const Writer = struct {
         }
         try w.line("SECTION AUTHORITY", .{});
         if (r.soa) try w.line("{s} 3600 IN SOA {s} nobody.invalid. 1 7200 3600 86400 3600", .{ try w.dotted(z.apex), try w.dotted(z.owners[z.host].name) });
-        if (z.signed) for (r.proofs) |proof| if (proof) |o| try w.nsec(z, o);
+        if (z.signed) for (links) |i| try w.chained(z, i);
         try w.line("ENTRY_END", .{});
     }
 
