@@ -300,8 +300,11 @@ pub fn budgetedNsec3Hash(
     iterations: u16,
     budget: *rrsig.ValidationBudget,
 ) error{ValidationBudgetExhausted}![Sha1.digest_length]u8 {
+    if (budget.hashes) |made| if (made.of(name.wire, salt, iterations)) |hash| return hash;
     try budget.consumeNsec3(nsec3HashBlocks(name, salt.len, iterations));
-    return nsec3Hash(name, salt, iterations);
+    const hash = nsec3Hash(name, salt, iterations);
+    if (budget.hashes) |made| made.hold(name.wire, salt, iterations, hash);
+    return hash;
 }
 
 fn nsec3HashBlocks(name: dns.Name, salt_len: usize, iterations: u16) u32 {

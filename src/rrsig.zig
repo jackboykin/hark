@@ -34,6 +34,33 @@ const max_sig_verify_per_resolution: u32 = 96;
 
 const max_nsec3_blocks_per_resolution: u32 = 8192;
 
+/// NSEC3 hashes one read from memory has made.
+pub const Hashes = struct {
+    len: usize = 0,
+    held: [8]Hash = undefined,
+
+    const Hash = struct { name: [64]u8, name_len: u8, iterations: u16, salt: []const u8, hash: [20]u8 };
+
+    pub fn of(h: *const Hashes, name: []const u8, salt: []const u8, iterations: u16) ?[20]u8 {
+        for (h.held[0..h.len]) |*x| {
+            if (x.iterations == iterations and std.mem.eql(u8, x.name[0..x.name_len], name) and std.mem.eql(u8, x.salt, salt)) return x.hash;
+        }
+        return null;
+    }
+
+    /// `salt` must outlive the read.
+    pub fn hold(h: *Hashes, name: []const u8, salt: []const u8, iterations: u16, hash: [20]u8) void {
+        if (h.len == h.held.len or name.len > h.held[0].name.len) return;
+        const x = &h.held[h.len];
+        @memcpy(x.name[0..name.len], name);
+        x.name_len = @intCast(name.len);
+        x.iterations = iterations;
+        x.salt = salt;
+        x.hash = hash;
+        h.len += 1;
+    }
+};
+
 pub const ValidationBudget = struct {
     sig_verify_spent: u32 = 0,
     max_sig_verify: u32 = max_sig_verify_per_resolution,
@@ -42,6 +69,7 @@ pub const ValidationBudget = struct {
     /// Set only when a draw was refused. A budget filled exactly refused
     /// none, so the data, not the limit, decided.
     stopped: ?enum { verify, nsec3 } = null,
+    hashes: ?*Hashes = null,
 
     fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.sig_verify_spent >= self.max_sig_verify) {

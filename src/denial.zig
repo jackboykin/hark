@@ -393,7 +393,8 @@ pub fn deny(g: *Graph, id: CellId) !bool {
     const name = g.cell(id).name;
     // A read hashes on its own account: what it spends is never the
     // question's, so the fetch after a miss has its whole budget.
-    var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks };
+    var hashes: rrsig.Hashes = .{};
+    var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks, .hashes = &hashes };
     var up: ?dns.Name = name;
     while (up) |zone| : (up = zone.parent()) {
         const z = g.denial.zones.getPtr(zone.wire) orelse continue;
@@ -475,8 +476,7 @@ fn expandOver(g: *Graph, id: CellId, zone: dns.Name, source: *store.Blob, enclos
     return true;
 }
 
-/// SHA-1 blocks one read may hash, the finder's and the judge's together:
-/// a chain dearer than that is fetched from, as every chain was.
+/// SHA-1 blocks one read may hash.
 const read_blocks = 128;
 
 /// RFC 5155 §8.4 to §8.7 over one chain: the name's own NSEC3, or its
@@ -581,6 +581,19 @@ fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !vo
 }
 
 const testing = std.testing;
+
+test "a read pays for a name's hash once" {
+    var hashes: rrsig.Hashes = .{};
+    var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks, .hashes = &hashes };
+    const c: Chain = .{ .iterations = 10, .salt = "s" };
+    const first = c.hashOf(.lit("a.example"), &allowance).?;
+    const spent = allowance.nsec3_blocks_spent;
+    const judged = try proof.budgetedNsec3Hash(.lit("a.example"), "s", 10, &allowance);
+    try testing.expectEqualSlices(u8, &first, &judged);
+    try testing.expectEqual(spent, allowance.nsec3_blocks_spent);
+    _ = try proof.budgetedNsec3Hash(.lit("a.example"), "t", 10, &allowance);
+    try testing.expect(allowance.nsec3_blocks_spent > spent);
+}
 
 test "a chain dearer than a read's allowance goes unhashed" {
     var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks };
