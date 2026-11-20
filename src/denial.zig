@@ -54,7 +54,7 @@ const Span = struct {
 
 const Held = struct { judged: *store.Blob, expires_ns: i64 };
 
-const Hash = [20]u8;
+const Hash = proof.Hash;
 
 const Hashed = struct {
     owner: Hash,
@@ -78,8 +78,7 @@ const Hashed = struct {
 /// The NSEC3 of one parameter set (RFC 5155 §8.2): nothing of another
 /// may stand in a proof beside them.
 const Chain = struct {
-    iterations: u16,
-    salt: []const u8,
+    params: proof.Nsec3Params,
     spans: std.ArrayList(Hashed) = .empty,
 
     /// A zone of fewer names is held whole. Past it, hashes scatter too
@@ -89,7 +88,7 @@ const Chain = struct {
     fn deinit(c: *Chain, gpa: std.mem.Allocator, st: *store.Store) void {
         for (c.spans.items) |sp| st.unref(sp.judged);
         c.spans.deinit(gpa);
-        gpa.free(c.salt);
+        gpa.free(c.params.salt);
     }
 
     fn position(c: *const Chain, hash: *const Hash) usize {
@@ -122,7 +121,7 @@ const Chain = struct {
     }
 
     fn hashOf(c: *const Chain, name: dns.Name, allowance: *rrsig.ValidationBudget) ?Hash {
-        return proof.budgetedNsec3Hash(name, c.salt, c.iterations, allowance) catch null;
+        return c.params.hash(name, allowance) catch null;
     }
 
     fn thinnest(c: *const Chain) usize {
@@ -183,11 +182,11 @@ const Zone = struct {
         };
     }
 
-    fn chain(z: *Zone, gpa: std.mem.Allocator, iterations: u16, salt: []const u8) !*Chain {
-        for (z.chains.items) |*c| if (c.iterations == iterations and std.mem.eql(u8, c.salt, salt)) return c;
-        const owned = try gpa.dupe(u8, salt);
+    fn chain(z: *Zone, gpa: std.mem.Allocator, params: proof.Nsec3Params) !*Chain {
+        for (z.chains.items) |*c| if (c.params.eql(params)) return c;
+        const owned = try gpa.dupe(u8, params.salt);
         errdefer gpa.free(owned);
-        try z.chains.append(gpa, .{ .iterations = iterations, .salt = owned });
+        try z.chains.append(gpa, .{ .params = .{ .salt = owned, .iterations = params.iterations } });
         return &z.chains.items[z.chains.items.len - 1];
     }
 
@@ -339,11 +338,11 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
         }
         if (hashed) |owner| {
             const n3 = rr.nsec3();
-            const c = z.chain(g.store.gpa, n3.iterations, n3.salt) catch |e| {
+            const c = z.chain(g.store.gpa, .{ .salt = n3.salt, .iterations = n3.iterations }) catch |e| {
                 g.store.unref(judged);
                 return e;
             };
-            c.hold(g.store.gpa, &g.store, .{ .owner = owner, .next = n3.next_hashed_owner[0..20].*, .expires_ns = expires, .judged = judged });
+            c.hold(g.store.gpa, &g.store, .{ .owner = owner, .next = n3.next_hashed_owner[0..@sizeOf(Hash)].*, .expires_ns = expires, .judged = judged });
             continue;
         }
         const sp = Span.init(g.store.gpa, rr, expires, judged) catch |e| {
@@ -362,7 +361,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
 }
 
 fn chained(rr: RR, zone: dns.Name) ?Hash {
-    if (!(rr.name.parent() orelse return null).eql(zone) or rr.nsec3().next_hashed_owner.len != 20) return null;
+    if (!(rr.name.parent() orelse return null).eql(zone) or rr.nsec3().next_hashed_owner.len != @sizeOf(Hash)) return null;
     return proof.supportedNsec3OwnerHash(rr, zone);
 }
 
@@ -583,27 +582,28 @@ const testing = std.testing;
 test "a read pays for a name's hash once" {
     var hashes: rrsig.Hashes = .{};
     var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks, .hashes = &hashes };
-    const c: Chain = .{ .iterations = 10, .salt = "s" };
+    const c: Chain = .{ .params = .{ .salt = "s", .iterations = 10 } };
     const first = c.hashOf(.lit("a.example"), &allowance).?;
     const spent = allowance.nsec3_blocks_spent;
-    const judged = try proof.budgetedNsec3Hash(.lit("a.example"), "s", 10, &allowance);
-    try testing.expectEqualSlices(u8, &first, &judged);
+    const again = try c.params.hash(.lit("a.example"), &allowance);
+    try testing.expectEqualSlices(u8, &first, &again);
     try testing.expectEqual(spent, allowance.nsec3_blocks_spent);
-    _ = try proof.budgetedNsec3Hash(.lit("a.example"), "t", 10, &allowance);
+    const salted: proof.Nsec3Params = .{ .salt = "t", .iterations = 10 };
+    _ = try salted.hash(.lit("a.example"), &allowance);
     try testing.expect(allowance.nsec3_blocks_spent > spent);
 }
 
 test "a chain dearer than a read's allowance goes unhashed" {
     var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks };
-    const cheap: Chain = .{ .iterations = 10, .salt = "" };
-    const dear: Chain = .{ .iterations = 200, .salt = "" };
+    const cheap: Chain = .{ .params = .{ .salt = "", .iterations = 10 } };
+    const dear: Chain = .{ .params = .{ .salt = "", .iterations = 200 } };
     try testing.expect(cheap.hashOf(.lit("a.example"), &allowance) != null);
     try testing.expectEqual(null, dear.hashOf(.lit("a.example"), &allowance));
 }
 
 test "a span is as wide as it reaches round the ring, and the narrowest is found by that" {
     const blob: *store.Blob = undefined;
-    var c: Chain = .{ .iterations = 0, .salt = "" };
+    var c: Chain = .{ .params = .{ .salt = "", .iterations = 0 } };
     defer c.spans.deinit(testing.allocator);
     const ends = [_][2]u8{ .{ 0x10, 0x40 }, .{ 0x40, 0x48 }, .{ 0x48, 0xf0 }, .{ 0xf0, 0x10 } };
     for (ends) |e| {

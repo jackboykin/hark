@@ -10,6 +10,22 @@ const rrsig = @import("rrsig.zig");
 
 const Sha1 = std.crypto.hash.Sha1;
 
+pub const Hash = [Sha1.digest_length]u8;
+
+/// An NSEC3 chain's salt and extra iterations (RFC 5155 §3.1).
+pub const Nsec3Params = struct {
+    salt: []const u8,
+    iterations: u16,
+
+    pub fn eql(a: Nsec3Params, b: Nsec3Params) bool {
+        return a.iterations == b.iterations and mem.eql(u8, a.salt, b.salt);
+    }
+
+    pub fn hash(p: Nsec3Params, name: dns.Name, budget: *rrsig.ValidationBudget) error{ValidationBudgetExhausted}!Hash {
+        return budgetedNsec3Hash(name, p.salt, p.iterations, budget);
+    }
+};
+
 const SecurityStatus = enum {
     /// Proves nothing: incomplete, or spoken from the wrong side of a cut.
     unchecked,
@@ -62,7 +78,7 @@ pub fn classifyDelegation(
         .chain => |c| c,
         .verdict => |v| return if (v == .bogus) .bogus else .unproven,
     };
-    const child_hash = budgetedNsec3Hash(child_zone, chain.salt, chain.iterations, budget) catch return .bogus;
+    const child_hash = chain.params.hash(child_zone, budget) catch return .bogus;
     for (chain.owners(), chain.records()) |owner_hash, rr| {
         if (mem.eql(u8, &owner_hash, &child_hash))
             return if (isInsecureDelegationProof(rr.nsec3().type_bit_maps)) .unsigned else .unproven;
@@ -203,8 +219,8 @@ pub fn proofFlood(authorities: []const dns.ResourceRecord) bool {
     return n > max_proof_records;
 }
 
-pub fn nsec3Hash(name: dns.Name, salt: []const u8, iterations: u16) [Sha1.digest_length]u8 {
-    var hash: [Sha1.digest_length]u8 = undefined;
+pub fn nsec3Hash(name: dns.Name, salt: []const u8, iterations: u16) Hash {
+    var hash: Hash = undefined;
     var hasher = Sha1.init(.{});
     hasher.update(name.wire);
     hasher.update(salt);
@@ -278,28 +294,28 @@ fn nsec3HashInRange(
     );
 }
 
-pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
+pub fn nsec3OwnerHash(name: dns.Name) ?Hash {
     if (name.isRoot()) return null;
     const label = name.leaf();
     if (label.len != Sha1.digest_length * 8 / 5) return null;
-    var result: [Sha1.digest_length]u8 = undefined;
+    var result: Hash = undefined;
     const n = base32HexDecode(&result, label) catch return null;
     if (n != Sha1.digest_length) return null;
     return result;
 }
 
-pub fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest_length]u8 {
+pub fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?Hash {
     return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
 }
 
 /// Callers fail closed to `.bogus` when the budget is spent: an exhausted
 /// hash budget is the attack itself (CVE-2023-50868).
-pub fn budgetedNsec3Hash(
+fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
     budget: *rrsig.ValidationBudget,
-) error{ValidationBudgetExhausted}![Sha1.digest_length]u8 {
+) error{ValidationBudgetExhausted}!Hash {
     if (budget.hashes) |made| if (made.of(name.wire, salt, iterations)) |hash| return hash;
     try budget.consumeNsec3(nsec3HashBlocks(name, salt.len, iterations));
     const hash = nsec3Hash(name, salt, iterations);
@@ -423,13 +439,12 @@ fn validateNsecNegativeProof(
 }
 
 const Nsec3Chain = struct {
-    salt: []const u8,
-    iterations: u16,
+    params: Nsec3Params,
     len: usize = 0,
-    hashes: [max_proof_records][Sha1.digest_length]u8 = undefined,
+    hashes: [max_proof_records]Hash = undefined,
     rrs: [max_proof_records]dns.ResourceRecord = undefined,
 
-    fn owners(c: *const Nsec3Chain) []const [Sha1.digest_length]u8 {
+    fn owners(c: *const Nsec3Chain) []const Hash {
         return c.hashes[0..c.len];
     }
 
@@ -453,9 +468,10 @@ fn nsec3Chain(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3Chai
     for (authorities) |rr| {
         if (!inChain(rr, zone)) continue;
         const n3 = rr.nsec3();
-        if (chain == null) chain = .{ .salt = n3.salt, .iterations = n3.iterations };
+        const params: Nsec3Params = .{ .salt = n3.salt, .iterations = n3.iterations };
+        if (chain == null) chain = .{ .params = params };
         const c = &chain.?;
-        if (n3.iterations != c.iterations or !mem.eql(u8, n3.salt, c.salt)) return .{ .verdict = .bogus };
+        if (!c.params.eql(params)) return .{ .verdict = .bogus };
         // An owner that is no hash matches and spans nothing.
         c.hashes[c.len] = nsec3OwnerHash(rr.name) orelse continue;
         c.rrs[c.len] = rr;
@@ -465,27 +481,22 @@ fn nsec3Chain(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3Chai
 }
 
 const ClosestEncloser = union(enum) {
-    found: struct { ce: dns.Name, next_closer_hash: [Sha1.digest_length]u8 },
+    found: struct { ce: dns.Name, next_closer_hash: Hash },
     verdict: SecurityStatus,
 };
 
 fn nsec3ClosestEncloser(
     chain: *const Nsec3Chain,
     qname: dns.Name,
-    qname_hash: [Sha1.digest_length]u8,
+    qname_hash: Hash,
     zone: dns.Name,
     budget: *rrsig.ValidationBudget,
 ) ClosestEncloser {
-    var below_hash: [Sha1.digest_length]u8 = undefined;
+    var below_hash: Hash = undefined;
     var up: ?dns.Name = qname;
     while (up) |ancestor| : (up = ancestor.parent()) {
         if (ancestor.depth() < zone.depth()) break;
-        const ancestor_hash = if (ancestor.depth() == qname.depth()) qname_hash else budgetedNsec3Hash(
-            ancestor,
-            chain.salt,
-            chain.iterations,
-            budget,
-        ) catch return .{ .verdict = .bogus };
+        const ancestor_hash = if (ancestor.depth() == qname.depth()) qname_hash else chain.params.hash(ancestor, budget) catch return .{ .verdict = .bogus };
         for (chain.owners(), chain.records()) |owner_hash, rr| {
             if (!mem.eql(u8, &owner_hash, &ancestor_hash)) continue;
             if (provesNothingBelowOwner(rr.nsec3().type_bit_maps)) return .{ .verdict = .unchecked };
@@ -498,7 +509,7 @@ fn nsec3ClosestEncloser(
 
 /// Null when no span covers `hash`, else whether any coverer has Opt-Out.
 /// Every coverer is read, not the first: the sender picks the order.
-fn nsec3Cover(chain: *const Nsec3Chain, hash: *const [Sha1.digest_length]u8) ?bool {
+fn nsec3Cover(chain: *const Nsec3Chain, hash: *const Hash) ?bool {
     var covered = false;
     var optout = false;
     for (chain.owners(), chain.records()) |owner_hash, rr| {
@@ -521,12 +532,8 @@ pub fn proveNoCloserMatch(
 ) SecurityStatus {
     return switch (noCloserMatch(authorities, qname, labels, zone, budget)) {
         .nsec => .secure,
-        .nsec3 => |nc| {
-            const chain = switch (nsec3Chain(authorities, zone)) {
-                .chain => |c| c,
-                .verdict => return .bogus,
-            };
-            const optout = nsec3Cover(&chain, &nc) orelse return .bogus;
+        .nsec3 => |n| {
+            const optout = nsec3Cover(&n.chain, &n.closer) orelse return .bogus;
             return if (optout) .insecure else .secure;
         },
         .verdict => |v| v,
@@ -535,13 +542,13 @@ pub fn proveNoCloserMatch(
 
 pub const NoCloserMatch = union(enum) {
     nsec: dns.Name,
-    nsec3: [Sha1.digest_length]u8,
+    nsec3: struct { closer: Hash, chain: Nsec3Chain },
     verdict: SecurityStatus,
 
     pub fn restsOn(p: NoCloserMatch, rr: dns.ResourceRecord, zone: dns.Name) bool {
         return switch (p) {
             .nsec => |owner| rr.rtype == .nsec and rr.name.eql(owner),
-            .nsec3 => |nc| if (supportedNsec3OwnerHash(rr, zone)) |h| nsec3HashInRange(&h, rr.nsec3().next_hashed_owner, &nc) else false,
+            .nsec3 => |n| if (supportedNsec3OwnerHash(rr, zone)) |h| nsec3HashInRange(&h, rr.nsec3().next_hashed_owner, &n.closer) else false,
             .verdict => false,
         };
     }
@@ -574,7 +581,8 @@ pub fn noCloserMatch(
         .verdict => |v| return .{ .verdict = if (v == .unchecked) .bogus else v },
     };
     const next_closer = qname.ancestor(labels + 1);
-    return .{ .nsec3 = budgetedNsec3Hash(next_closer, chain.salt, chain.iterations, budget) catch return .{ .verdict = .bogus } };
+    const closer = chain.params.hash(next_closer, budget) catch return .{ .verdict = .bogus };
+    return .{ .nsec3 = .{ .closer = closer, .chain = chain } };
 }
 
 fn validateNsec3NegativeProof(
@@ -589,10 +597,7 @@ fn validateNsec3NegativeProof(
         .chain => |c| c,
         .verdict => |v| return v,
     };
-    const salt = chain.salt;
-    const iterations = chain.iterations;
-
-    const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch return .bogus;
+    const qname_hash = chain.params.hash(qname, budget) catch return .bogus;
 
     if (!is_nxdomain) {
         for (chain.owners(), chain.records()) |owner_hash, rr| {
@@ -618,7 +623,7 @@ fn validateNsec3NegativeProof(
 
     var wc_buf: dns.Name.Buf = undefined;
     const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
-    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch return .bogus;
+    const wc_hash = chain.params.hash(wildcard, budget) catch return .bogus;
 
     const nc_cover = nsec3Cover(&chain, &nc_hash);
     const nc_covered = nc_cover != null;
@@ -1024,15 +1029,15 @@ test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unche
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
-pub fn makeNsec3OwnerName(hash: [Sha1.digest_length]u8, zone: dns.Name, bufs: *Nsec3OwnerBufs) dns.Name {
+pub fn makeNsec3OwnerName(hash: Hash, zone: dns.Name, bufs: *Nsec3OwnerBufs) dns.Name {
     return dns.Name.child(&bufs.name, base32HexEncode(&bufs.enc, &hash), zone).?;
 }
 
 pub const Nsec3OwnerBufs = struct {
     enc: [32]u8 = undefined,
     name: dns.Name.Buf = undefined,
-    low: [Sha1.digest_length]u8 = undefined,
-    high: [Sha1.digest_length]u8 = undefined,
+    low: Hash = undefined,
+    high: Hash = undefined,
 };
 
 pub fn makeNsec3Rr(
@@ -1058,7 +1063,7 @@ pub fn makeNsec3Rr(
 }
 
 fn makeCoveringNsec3(
-    target_hash: [Sha1.digest_length]u8,
+    target_hash: Hash,
     zone: dns.Name,
     salt: []const u8,
     bufs: *Nsec3OwnerBufs,
@@ -1203,7 +1208,7 @@ const OptOutProof = struct {
     ce_bufs: Nsec3OwnerBufs = .{},
     nc_bufs: Nsec3OwnerBufs = .{},
     wc_bufs: Nsec3OwnerBufs = .{},
-    ce_next: [Sha1.digest_length]u8 = undefined,
+    ce_next: Hash = undefined,
     rrs: [3]dns.ResourceRecord = undefined,
 
     fn init(self: *@This(), qname: dns.Name, opt_out: bool) !void {
@@ -1589,7 +1594,7 @@ test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
     const salt = [_]u8{ 0xA3, 0xB6, 0xC3, 0xF4, 0x96, 0x50, 0x04, 0xE9 };
     const computed = nsec3Hash(child_zone, &salt, 10);
 
-    var expected: [Sha1.digest_length]u8 = undefined;
+    var expected: Hash = undefined;
     _ = try base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
     try testing.expectEqualSlices(u8, &expected, &computed);
 }
