@@ -82,7 +82,7 @@ pub const Blob = extern struct {
 
 fn isReply(b: *Blob) bool {
     const kind: Kind = @fromBackingInt(b.kind);
-    return kind == .rrset or kind == .stub or kind == .parental;
+    return kind == .rrset or kind == .stub or kind == .span;
 }
 
 pub const Life = struct {
@@ -282,7 +282,7 @@ pub const Store = struct {
     /// Rdata names arrive compressed and are stored whole, so no message size
     /// bounds a blob: it is measured, then written.
     pub fn build(s: *Store, key: Key, value: Value, expires_ns: i64) Allocator.Error!*Blob {
-        std.debug.assert(std.meta.activeTag(value) == if (key.kind == .parental) .rrset else key.kind);
+        std.debug.assert(std.meta.activeTag(value) == if (key.kind == .span) .rrset else key.kind);
         var measure: Writer(true) = .{ .buf = {} };
         encode(true, &measure, key, value);
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), measure.pos);
@@ -332,7 +332,7 @@ pub const Store = struct {
                 w.int(u16, @intCast(c.records.len));
                 w.records(c.records);
             },
-            .addr, .answer, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
+            .addr, .answer, .secure, .exchange, .refresh, .ahead, .span => unreachable,
         }
     }
 
@@ -359,7 +359,7 @@ pub const Store = struct {
                 for (glue) |*gl| gl.* = r.addr();
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
-            .rrset, .stub, .parental => |kind| blk: {
+            .rrset, .stub, .span => |kind| blk: {
                 var reply: model.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
                     .aa = undefined,

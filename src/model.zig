@@ -28,8 +28,9 @@ pub const OptionalCellId = enum(CellId) {
     }
 };
 
-/// `parental` is held for the denial index alone and is never a cell.
-pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
+/// `span` is a set that proves and never answers at its owner: a zone's NSEC
+/// where it delegates the owner. The denial index holds it; it is never a cell.
+pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, span };
 
 pub const Key = struct {
     kind: Kind,
@@ -225,12 +226,12 @@ pub const Value = union(Kind) {
     exchange: Outcome,
     refresh: void,
     ahead: void,
-    parental: void,
+    span: void,
 
     pub fn reply(v: Value) Reply {
         return switch (v) {
             .rrset, .stub => |r| r,
-            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .parental => unreachable,
+            .cut, .addr, .answer, .ds, .dnskey, .secure, .exchange, .refresh, .ahead, .span => unreachable,
         };
     }
 };

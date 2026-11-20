@@ -1,5 +1,5 @@
 //! RFC 8198 aggressive use, NSEC only. Every NSEC a secure negative
-//! carried is the fact `rrset(owner, NSEC)`, or `parental(owner, NSEC)`
+//! carried is the fact `rrset(owner, NSEC)`, or `span(owner, NSEC)`
 //! where its zone delegates the owner; its SOA the fact
 //! `rrset(zone, SOA)`. This index orders the spans by owner within their
 //! signing zone, to find the candidates that deny a later question from
@@ -180,7 +180,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         const expires = @min(proven_until[sets.at], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
         const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        const kind: model.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
+        const kind: model.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .span else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up only after.
         const judged = (try g.fact(model.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {

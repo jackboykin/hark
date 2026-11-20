@@ -220,7 +220,7 @@ pub const Scratch = union(enum) {
         return switch (kind) {
             .exchange => .none,
             .refresh => init(.answer, arena),
-            .parental => unreachable,
+            .span => unreachable,
             inline else => |k| blk: {
                 const p = try arena.create(@typeInfo(@FieldType(Scratch, @tagName(k))).pointer.child);
                 p.* = .{};
@@ -834,7 +834,7 @@ pub const Graph = struct {
         std.debug.assert(!c.settled());
         if (g.cfg.trace) switch (value) {
             .ds, .dnskey, .secure => |chain| log.debug("{t}({f}) -> {t} for {d} s", .{ std.meta.activeTag(value), c.name, chain.status, @divTrunc(expires_ns - g.now(), std.time.ns_per_s) }),
-            .cut, .addr, .rrset, .stub, .answer, .exchange, .refresh, .ahead, .parental => {},
+            .cut, .addr, .rrset, .stub, .answer, .exchange, .refresh, .ahead, .span => {},
         };
         switch (value) {
             .cut, .rrset, .stub, .ds, .dnskey => {
@@ -848,7 +848,7 @@ pub const Graph = struct {
                 if (!g.awaitsVerdict(c.key.kind)) g.keep(id);
             },
             .exchange => |o| return g.settleExchange(id, o),
-            .addr, .answer, .refresh, .ahead, .parental => {
+            .addr, .answer, .refresh, .ahead, .span => {
                 const owned = try c.own(value);
                 c.bare_expires_ns = expires_ns;
                 c.state = .{ .fact = owned };
@@ -1344,7 +1344,7 @@ pub const Graph = struct {
             .secure => try trust.runSecure(g, id),
             .ahead => try trust.runAhead(g, id),
             .exchange => {},
-            .parental => unreachable,
+            .span => unreachable,
         }
     }
 
