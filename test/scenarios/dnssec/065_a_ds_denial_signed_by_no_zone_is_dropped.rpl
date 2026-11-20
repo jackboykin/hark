@@ -39,7 +39,7 @@ RANGE_BEGIN 0 100
       x.example. IN DS
     SECTION AUTHORITY
       example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
-      x.example. 3600 IN NSEC y.example. A RRSIG NSEC
+      x.example. 3600 IN NSEC c.x.example. A RRSIG NSEC
   ENTRY_END
 RANGE_END
 

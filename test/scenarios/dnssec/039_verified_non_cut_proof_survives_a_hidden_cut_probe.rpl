@@ -48,7 +48,7 @@ RANGE_BEGIN 0 100
       b.a.example. IN DS
     SECTION AUTHORITY
       example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
-      b.a.example. 3600 IN NSEC z.example. NS RRSIG NSEC
+      b.a.example. 3600 IN NSEC c.a.example. NS RRSIG NSEC
   ENTRY_END
   ENTRY_BEGIN
     MATCH opcode subdomain
