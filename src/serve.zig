@@ -505,7 +505,7 @@ const Server = struct {
             errdefer s.release(p);
             if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
                 c.cache.hit += 1;
-                try s.answered(reply, query, served, p.asked_ns);
+                s.answered(reply, query, served, p.asked_ns);
                 return s.release(p);
             };
             const canonical = q.name.wire;
@@ -619,7 +619,7 @@ const Server = struct {
             return;
         }
         s.clients.cache.miss += 1;
-        try s.answered(reply, query, served, p.asked_ns);
+        s.answered(reply, query, served, p.asked_ns);
         s.vacate(i);
     }
 
@@ -715,7 +715,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return;
         s.clients.cache.miss += 1;
-        try s.answered(reply, query, served, p.asked_ns);
+        s.answered(reply, query, served, p.asked_ns);
         p.owes = .nothing;
         s.holding += 1;
     }
@@ -760,12 +760,8 @@ const Server = struct {
         return t.at_ns;
     }
 
-    fn answered(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) !void {
-        const q = query.question.?;
-        _ = s.desk.derived(q, answer.Client.fromQuery(query), served) catch |err| {
-            served.release(&s.g.store);
-            return err;
-        };
+    fn answered(s: *Server, reply: Reply, query: dns.Query, served: answer.Served, asked_ns: i64) void {
+        _ = s.desk.derived(query.question.?, answer.Client.fromQuery(query), served);
         if (reply != .tcp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
             s.forsake(.late, .{ .reply = reply }, query, asked_ns);
             return served.release(&s.g.store);

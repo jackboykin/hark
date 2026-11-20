@@ -418,7 +418,7 @@ fn resolveAsked(r: Run, entry: rpl.Entry) !?Sent {
             for (r.held.roots) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
                 limited = limited or why.cause() == .asker or why.remembered;
             };
-            break :blk try desk.derived(q, client, built);
+            break :blk desk.derived(q, client, built);
         },
     };
     defer served.release(&g.store);
