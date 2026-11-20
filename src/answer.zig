@@ -247,9 +247,12 @@ pub const Desk = struct {
         return .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
     }
 
+    /// Owns `served`: if it fails, it releases it.
     pub fn finish(d: *Desk, arena: Allocator, q: dns.Question, c: Client, served: Served, a: ?model.CellId) !Served {
         const x = Dns64.on(d.dns64, c) orelse return served;
+        errdefer served.release(&d.g.store);
         const from = if (a) |id| try build(d, arena, id, aOf(q), c) else null;
+        errdefer if (from) |f| f.release(&d.g.store);
         return try x.shape(arena, q, served, from);
     }
 
@@ -687,4 +690,41 @@ test "a failure is remembered, backs off while it persists, and an answer forget
         noteFailure(&f, testing.allocator, other, false, failed, 5, 0);
     }
     try testing.expectEqual(Failures.max_entries, f.map.count());
+}
+
+test "an answer finished short of memory holds no blob" {
+    const testing = std.testing;
+    const Quiet = struct {
+        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
+            return .none;
+        }
+        fn wake(_: *anyopaque, _: model.CellId, _: u32, _: i64) graph.Error!void {}
+    };
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    defer g.deinit();
+    var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = .well_known };
+    defer d.deinit();
+    const name: dns.Name = .lit("example");
+    const q: dns.Question = .{ .name = name, .qtype = .aaaa, .qclass = .in };
+    const blob = (try g.fact(.of(.rrset, name, .aaaa), .{ .rrset = .{ .kind = .nodata, .aa = true, .stored_ns = now, .zone = name } }, now + 60 * std.time.ns_per_s)).?;
+    const a = try g.demandRoot(name, .a, .new);
+    defer g.unhold(a);
+    g.fail(a, .{ .name = .unreachable_authority });
+    var refused: usize = 0;
+    while (true) : (refused += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const served = (try fresh(&d, arena.allocator(), q, .{}, false)).?;
+        var failing: testing.FailingAllocator = .init(arena.allocator(), .{ .fail_index = refused });
+        const finished = d.finish(failing.allocator(), q, .{}, served, a) catch {
+            try testing.expectEqual(1, blob.refs);
+            continue;
+        };
+        finished.release(&g.store);
+        break;
+    }
+    try testing.expect(refused > 0);
 }
