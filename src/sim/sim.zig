@@ -62,9 +62,14 @@ pub const Sim = struct {
     log: std.ArrayList(LogRow) = .empty,
     heard: Heard = .empty,
     /// A chaos run's reference. Once this run hears what that one never did, or
-    /// at another step, the two no longer share a world and answers may differ.
+    /// at another step, or a limit ends an answer of one alone where the world
+    /// changes by step, the two no longer share a world and answers may differ.
     known: ?*const Heard = null,
     departed: bool = false,
+    /// Some server serves only at some steps, or some step refuses sends, so
+    /// what a run holds from an earlier step is part of the world it answers
+    /// from.
+    shifts: bool = false,
     chaos: ?*chaos.Chaos = null,
     reply_buf: [65535]u8 = undefined,
 
@@ -82,6 +87,10 @@ pub const Sim = struct {
         };
         s.signer = try sign.Signer.init(arena, scenario, mint, s.wall_sec);
         s.ranges = try s.signer.bake(scenario.ranges);
+        for (scenario.steps) |st| {
+            s.shifts = s.shifts or st.kind == .unsent;
+            for (s.ranges) |r| s.shifts = s.shifts or st.n < r.start or st.n > r.end;
+        }
         return s;
     }
 

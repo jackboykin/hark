@@ -33,7 +33,6 @@ const Report = struct {
     heard: sim.Sim.Heard = .empty,
     departed: u32 = 0,
     compared: u32 = 0,
-    starved: bool = false,
     fired: Fired = .initFill(0),
     left: chaos.Events = .empty,
     told: std.ArrayList([]const u8) = .empty,
@@ -318,7 +317,7 @@ fn letGoAll(g: *graph.Graph, held: *Held) void {
 
 const Sent = struct { msg: dns.Message, wire: []const u8, cacheable: bool, limited: bool };
 
-fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, phase: Phase, step: u32, sent: ?Sent) !void {
+fn answered(gpa: Allocator, report: *Report, opts: Options, s: *sim.Sim, phase: Phase, step: u32, sent: ?Sent) !void {
     const limited = if (sent) |x| x.limited else true;
     const wire = try gpa.dupe(u8, if (sent) |x| x.wire else "");
     {
@@ -330,9 +329,11 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
         report.msg = "chaos asked what the reference did not";
         return error.ScenarioFailed;
     };
-    // A limit may only make its own answer fail.
+    // A limit may only make its own answer fail. Where the world changes by
+    // step, it also leaves one run holding what the other does not, to answer
+    // from later.
     if (limited or ref.limited) {
-        report.starved = report.starved or (limited and !ref.limited);
+        s.departed = s.departed or (limited != ref.limited and s.shifts);
         return;
     }
     if (s.departed) {
@@ -345,8 +346,6 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
     const actual = sent.?.msg;
     // What chaos forgot may fail any later answer of its own.
     if (s.chaos.?.forgot and actual.header.flags.rcode == .server_failure) return;
-    // Nor is there anything stale of what a limit kept chaos from hearing.
-    if (report.starved and actual.header.flags.rcode == .server_failure and says(want, .stale_answer)) return;
     report.compared += 1;
     if (messageMismatch(actual, want)) |why| {
         std.debug.print("  chaos's answer, then the reference's:\n", .{});
