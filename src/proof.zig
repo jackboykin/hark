@@ -279,7 +279,7 @@ fn nsec3HashInRange(
     );
 }
 
-fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
+pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     if (name.isRoot()) return null;
     const label = name.leaf();
     if (label.len != Sha1.digest_length * 8 / 5) return null;
@@ -289,13 +289,13 @@ fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     return result;
 }
 
-fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest_length]u8 {
+pub fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest_length]u8 {
     return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
 }
 
 /// Callers fail closed to `.bogus` when the budget is spent: an exhausted
 /// hash budget is the attack itself (CVE-2023-50868).
-fn budgetedNsec3Hash(
+pub fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
