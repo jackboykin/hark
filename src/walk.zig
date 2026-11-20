@@ -1033,25 +1033,23 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
             return error.OutOfMemory;
         }
         const at = a.end(i);
-        const again: ?Way = heard: switch (ex.state.fact.exchange) {
-            // The deadline cut the wait before the server was due: it was asked
-            // nothing, and may be tried again.
-            .timeout => way: {
-                if (ex.scratch.exchange.cut_short) a.tried &= ~Ask.bit(at.server);
-                break :way null;
-            },
-            .unsent => way: {
+        // An outcome either leaves its server asked and moves on, or names the
+        // send the answer is still owed: none when the server was asked nothing.
+        const owed: ?Way = heard: switch (ex.state.fact.exchange) {
+            // The deadline cut the wait before the server was due.
+            .timeout => if (ex.scratch.exchange.cut_short) null else continue,
+            .unsent => {
                 a.local = true;
-                break :way null;
+                continue;
             },
             .moved => .{ .need = at.need, .case = at.case },
             // The server's breach: no stream retry, only a sibling.
-            .oversized => null,
+            .oversized => continue,
             // Once more over a stream with plain case: a forger cannot follow there,
             // and a server that normalises 0x20 case answers.
-            .mismatch, .malformed => if (at.case == .random) .{ .need = .stream, .case = .plain } else null,
+            .mismatch, .malformed => if (at.case == .random) .{ .need = .stream, .case = .plain } else continue,
             // TC over a stream is a broken server, as good as a timeout.
-            .reply => |r| if (dns.Header.parse(r.wire[0..12]).flags.tc) (if (r.stream) null else Way{ .need = .stream, .case = .random }) else way: {
+            .reply => |r| if (dns.Header.parse(r.wire[0..12]).flags.tc) (if (r.stream) continue else Way{ .need = .stream, .case = .random }) else {
                 const msg = try g.read(at.exchange) orelse continue :heard .malformed;
                 const kept = if (delegation.shouldTrySibling(msg, a.zone)) null else try judge(g, msg, a.zone, qname, qtype);
                 if (kept) |k| {
@@ -1059,12 +1057,17 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
                     return k;
                 }
                 if (a.held == .none) a.held = .wrap(at.exchange);
-                break :way null;
+                continue;
             },
         };
-        const way = again orelse continue;
-        const q: Graph.Query = .{ .name = qname, .qtype = qtype, .need = way.need, .case = way.case };
-        if (try sendTo(g, id, a, at.server, a.noneLive(g), q) == null) refused.* = true;
+        if (owed) |way| {
+            const q: Graph.Query = .{ .name = qname, .qtype = qtype, .need = way.need, .case = way.case };
+            if (try sendTo(g, id, a, at.server, a.noneLive(g), q) != null) continue;
+            refused.* = true;
+        }
+        // Untried until a send carries what it is owed, so a send the budget
+        // refuses leaves it for the next asker.
+        a.tried &= ~Ask.bit(at.server);
     }
     return null;
 }
