@@ -305,12 +305,15 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
     return gop.value_ptr;
 }
 
-pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const i64, keys_until: i64) !void {
-    std.debug.assert(!proof.proofFlood(r.authorities));
+/// Verified sets, and how long each one's proof holds.
+pub const Proofs = struct { rrs: []const RR, until: []const i64 };
+
+pub fn absorb(g: *Graph, signer: dns.Name, stored_ns: i64, proofs: Proofs, keys_until: i64) !void {
+    std.debug.assert(!proof.proofFlood(proofs.rrs));
     const zkey = signer.wire;
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
-    var sets: dnssec.Sets = .{ .rrs = r.authorities };
+    var sets: dnssec.Sets = .{ .rrs = proofs.rrs };
     while (sets.next()) |rrs| {
         // A set is one fact. The index holds one span an owner, so of a set
         // of several NSEC the last stands.
@@ -322,8 +325,8 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: model.Reply, proven_until: []const
         if ((rr.rtype != .nsec and rr.rtype != .soa and rr.rtype != .nsec3) or !rr.name.isSubdomainOf(signer)) continue;
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         const hashed: ?Hash = if (rr.rtype == .nsec3) chained(rr, signer) orelse continue else null;
-        const expires = @min(proven_until[sets.at], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
-        const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
+        const expires = @min(proofs.until[sets.at], keys_until, stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
+        const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = stored_ns, .ttl = rr.ttl };
         const kind: model.Kind = if (hashed != null or (rr.rtype == .nsec and delegated(rr, signer))) .span else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up only after.
         const judged = (try g.fact(model.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
@@ -638,10 +641,10 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
     const soa: RR = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
     const reply: model.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
-    try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
 
-    try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
     try testing.expect(g.denial.zones.getPtr(zone.wire).?.soa != null);
 }

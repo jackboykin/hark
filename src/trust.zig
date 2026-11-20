@@ -193,24 +193,17 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             const until = @min(rs.expires(), keys.expires());
             const proven = try g.scratch.allocator().alloc(i64, r.authorities.len);
             @memset(proven, capExpiry(g, cap, r.stored_ns));
-            const own: Proofs = .{ .rrs = r.authorities, .until = proven };
-            switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
-                .unsigned => {
-                    try absorb(g, &r, signer, own, keys.expires());
-                    g.keep(s.rrset.unwrap().?);
-                    try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
-                },
+            const shown: ?Chain = switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
+                .unsigned => .{ .status = .insecure },
                 // A signed denial of the DS that shows no delegation either: no zone.
-                .unproven => switch (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget)) {
-                    .secure => {
-                        try absorb(g, &r, signer, own, keys.expires());
-                        g.keep(s.rrset.unwrap().?);
-                        try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
-                    },
-                    .unchecked, .insecure, .bogus => g.fail(id, g.payer.validationStop() orelse no_cut),
-                },
-                .bogus => g.fail(id, g.payer.validationStop() orelse no_cut),
-            }
+                .unproven => if (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget) == .secure) .{ .status = .absent, .records = r.authorities } else null,
+                .bogus => null,
+            };
+            if (shown) |ds| {
+                try denial.absorb(g, signer, r.stored_ns, .{ .rrs = r.authorities, .until = proven }, keys.expires());
+                g.keep(s.rrset.unwrap().?);
+                try g.settle(id, .{ .ds = ds }, until);
+            } else g.fail(id, g.payer.validationStop() orelse no_cut);
         },
         .alias, .yxdomain => unreachable,
     }
@@ -392,7 +385,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (c.is == .denial) {
                     const own = try verifiedProofs(g, r, qtype, s, signer);
                     switch (proof.validateNegativeProof(own.rrs, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
-                        .secure => try absorb(g, r, signer, own, kc.expires()),
+                        .secure => try denial.absorb(g, signer, r.stored_ns, own, kc.expires()),
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
                     }
@@ -415,7 +408,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     const own = try verifiedProofs(g, r, qtype, s, verified.signer_name);
                     switch (proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {
-                            try absorb(g, r, verified.signer_name, own, kc.expires());
+                            try denial.absorb(g, verified.signer_name, r.stored_ns, own, kc.expires());
                             try publishSource(g, r, &c, verified, @min(cap, kc.expires()));
                         },
                         .insecure => s.status = .insecure,
@@ -583,15 +576,7 @@ fn publishSource(g: *Graph, r: *const model.Reply, c: *const Claims.Claim, verif
     blob.verdict.stamp(.{ .status = .secure, .proven_until_ns = until }, expires, g.now());
 }
 
-const Proofs = struct { rrs: []const RR, until: []const i64 };
-
-fn absorb(g: *Graph, r: *const model.Reply, signer: dns.Name, own: Proofs, keys_until: i64) !void {
-    var only = r.*;
-    only.authorities = own.rrs;
-    try denial.absorb(g, signer, only, own.until, keys_until);
-}
-
-fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !Proofs {
+fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !denial.Proofs {
     const a = g.scratch.allocator();
     var keep: std.ArrayList(RR) = .empty;
     var until: std.ArrayList(i64) = .empty;
