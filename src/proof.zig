@@ -282,7 +282,7 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
     return dest[0..out];
 }
 
-fn nsec3HashInRange(
+pub fn nsec3HashInRange(
     owner_hash: []const u8,
     next_hash: []const u8,
     target_hash: []const u8,

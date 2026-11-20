@@ -1091,7 +1091,7 @@ pub const Graph = struct {
         if (builtin.is_test) g.reads += 1;
         const key: Key = .of(.rrset, name, qtype);
         const blob = try g.store.build(key, .{ .rrset = r.reply }, r.expires_ns);
-        blob.verdict.stamp(.{ .status = .secure, .proven_until_ns = r.proven_until_ns }, r.proven_until_ns, g.now());
+        r.stamp(blob, g.now());
         if (g.forgets(.keep, key) catch false) return blob;
         g.store.put(blob.ref()) catch g.store.unref(blob);
         return blob;
