@@ -1,11 +1,15 @@
 # hark
 
-hark is a modern recursive resolver.
+hark is a fast, validating, recursive DNS resolver
 
-Distinctive features:
-- Post-quantum DNSSEC with downgrade refusal (ML-DSA-44)
+Things:
+- Opportunistic encryption over TLS and QUIC
+- Extreme memory efficiency and discipline
+- Post-quantum DNSSEC with downgrade refusal
 - One-shot TCP for zones signed with large algorithms
 - Hedged queries across nameservers
+- Deterministic simulation testing under seeded chaos
+- Zero dependencies
 
 ## Building
 
