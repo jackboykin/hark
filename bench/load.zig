@@ -6,9 +6,13 @@
 //!   bench load -s ADDR -p PORT -d FILE [-l SECS] [-c SOCKETS] [-T THREADS] [-q INFLIGHT] [-Q QPS] [-t TIMEOUT]
 //! FILE holds "name type" lines. Prints "key value" lines: sent completed
 //! lost qps, rcodes, p50 p99 p999 µs.
+//!
+//! Knobs: REPEAT=n (a miss workload asks the same n names over and over).
 const std = @import("std");
 const linux = std.os.linux;
 const os = @import("os.zig");
+
+var repeat: u64 = 0;
 
 const batch = 64;
 const max_query = 512;
@@ -40,7 +44,7 @@ const Source = union(enum) {
                 return q.len;
             },
             .hit => return host(buf, i),
-            .miss => |seed| return fresh(buf, seed, i),
+            .miss => |seed| return fresh(buf, seed, if (repeat == 0) i else i % repeat),
             .mix => |seed| return if (scramble(seed ^ i) & 1 == 0) host(buf, i >> 1) else fresh(buf, seed, i),
         }
     }
@@ -354,6 +358,7 @@ fn parse(gpa: std.mem.Allocator, text: []const u8) !Table {
 }
 
 pub fn run(gpa: std.mem.Allocator, o: Opts) !Result {
+    repeat = os.knob(u64, "REPEAT", 0);
     if (o.threads == 0 or o.sockets < o.threads or o.sockets / o.threads > 256) return error.BadSockets;
     const addr: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, o.port), .addr = @bitCast(o.addr) };
     const socks = try gpa.alloc(Sock, o.sockets);
