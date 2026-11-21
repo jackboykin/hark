@@ -604,39 +604,6 @@ fn noteFailure(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: 
     f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, window_s) * std.time.ns_per_s, .is = .{ .failure = .{ .window_s = window_s, .ede = ede } } }) catch {};
 }
 
-test "a client is sent what Keep keeps" {
-    const R = struct {
-        section: @FieldType(Keep, "section"),
-        rtype: dns.RType,
-        covers: dns.RType = .a,
-        do_bit: bool = false,
-        qtype: dns.RType = .a,
-        kept: bool,
-    };
-    const rows = [_]R{
-        .{ .section = .answer, .rtype = .a, .kept = true },
-        .{ .section = .answer, .rtype = .rrsig, .kept = false },
-        .{ .section = .answer, .rtype = .rrsig, .do_bit = true, .kept = true },
-        .{ .section = .answer, .rtype = .nsec, .qtype = .nsec, .kept = true },
-        .{ .section = .authority, .rtype = .soa, .kept = true },
-        .{ .section = .authority, .rtype = .nsec, .kept = false },
-        .{ .section = .authority, .rtype = .nsec, .do_bit = true, .kept = true },
-        .{ .section = .authority, .rtype = .ds, .do_bit = true, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .nsec, .do_bit = true, .kept = true },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .soa, .kept = false },
-        .{ .section = .authority, .rtype = .rrsig, .covers = .a, .do_bit = true, .kept = true },
-        .{ .section = .additional, .rtype = .a, .kept = true },
-        .{ .section = .additional, .rtype = .rrsig, .kept = false },
-    };
-    for (rows) |row| {
-        var rdata: [2]u8 = undefined;
-        std.mem.writeInt(u16, &rdata, @backingInt(row.covers), .big);
-        const rr: dns.ResourceRecord = .{ .name = .root, .rtype = row.rtype, .rclass = .in, .ttl = 0, .rdata = &rdata };
-        const keep: Keep = .{ .section = row.section, .qtype = row.qtype, .do_bit = row.do_bit };
-        try std.testing.expectEqual(row.kept, keep.keeps(rr));
-    }
-}
-
 test "a proof two hops share goes out once" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

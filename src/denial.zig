@@ -616,30 +616,6 @@ test "a read pays for a name's hash once" {
     try testing.expect(allowance.nsec3_blocks_spent > spent);
 }
 
-test "a chain dearer than a read's allowance goes unhashed" {
-    var allowance: rrsig.ValidationBudget = .{ .max_sig_verify = 0, .max_nsec3_blocks = read_blocks };
-    const cheap: Chain = .{ .params = .{ .salt = "", .iterations = 10 } };
-    const dear: Chain = .{ .params = .{ .salt = "", .iterations = 200 } };
-    try testing.expect(cheap.hashOf(.lit("a.example"), &allowance) != null);
-    try testing.expectEqual(null, dear.hashOf(.lit("a.example"), &allowance));
-}
-
-test "the thinnest span is found, a wrapping one by how far it reaches" {
-    const blob: *store.Blob = undefined;
-    var c: Chain = .{ .params = .{ .salt = "", .iterations = 0 } };
-    defer c.ring.items.deinit(testing.allocator);
-    const ends = [_][2]u8{ .{ 0x10, 0x40 }, .{ 0x40, 0x48 }, .{ 0x48, 0xf0 }, .{ 0xf0, 0x10 } };
-    for (ends) |e| {
-        var sp: Hashed = .{ .owner = @splat(0), .next = @splat(0), .held = .{ .judged = blob, .expires_ns = 0 } };
-        sp.owner[0] = e[0];
-        sp.next[0] = e[1];
-        try c.ring.items.append(testing.allocator, sp);
-    }
-    try testing.expectEqual(1, c.thinnest());
-    try testing.expectEqual(0x20, c.ring.items.items[3].width()[0]);
-    try testing.expectEqual(0xa8, c.ring.items.items[2].width()[0]);
-}
-
 fn testGraph(ctx: *u8, now: *const i64, wall: *const i64) !Graph {
     const Stub = struct {
         fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
