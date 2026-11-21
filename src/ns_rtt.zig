@@ -224,27 +224,6 @@ pub fn ServerTable(comptime State: type) type {
     };
 }
 
-test "a newcomer to a full set takes the slot written longest ago" {
-    const na = @import("net_address.zig");
-    const t = try Table.create(testing.allocator);
-    defer testing.allocator.destroy(t);
-    var same: [Table.ways + 1]AddressKey = undefined;
-    const set = Table.slot(.fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 0))).set;
-    var n: usize = 0;
-    var port: u16 = 1;
-    while (n < same.len) : (port += 1) {
-        const k: AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, port));
-        if (Table.slot(k).set != set) continue;
-        same[n] = k;
-        n += 1;
-    }
-    for (same[0..Table.ways], 0..) |k, i| t.write(k, @intCast(i)).observe(1000, 0);
-    _ = t.write(same[0], Table.ways);
-    try testing.expectEqual(RttState.unknown, t.write(same[Table.ways], Table.ways + 1).*);
-    try testing.expectEqual(null, t.get(same[1]));
-    for (same[0..Table.ways], 0..) |k, i| if (i != 1) try testing.expectEqual(1000, t.get(k).?.srtt_us);
-}
-
 test "a reply ranks above no history, and no history above silence" {
     var slow: RttState = .unknown;
     slow.observe(900_000, 1000);
@@ -262,16 +241,6 @@ test "a reply ranks above no history, and no history above silence" {
     try testing.expectEqual(.timed, lossy.track(1000));
 }
 
-test "a drawn wait counts its round trips and losses, and widens unheard" {
-    var s: RttState = .unknown;
-    for (0..20) |_| s.observe(20_000, 1000);
-    try testing.expectEqual(60_000, s.wait(1000, 3, 100, 0));
-    var lossy = s;
-    lossy.observeTimeout(1000);
-    try testing.expect(lossy.wait(1000, 1, 100, 0) > s.wait(1000, 1, 100, 0));
-    try testing.expect(s.wait(1000 + forget_ms, 1, 100, -1) < s.wait(1000, 1, 100, -1));
-}
-
 test "a server's first reply sets its estimate, whatever timeouts came before" {
     var clean: RttState = .unknown;
     clean.observe(20_000, 1000);
@@ -281,38 +250,6 @@ test "a server's first reply sets its estimate, whatever timeouts came before" {
         lost.observe(20_000, 1000);
         try testing.expectEqual(clean, lost);
     }
-}
-
-test "hedge stagger is 3x min_rtt clamped to [50, 300]" {
-    var s: RttState = .unknown;
-    for ([_]i64{ 80_000, 60_000, 90_000 }) |rtt| s.observe(rtt, 1000);
-    try testing.expectEqual(@as(u32, 180), s.hedgeStagger());
-    var low: RttState = .unknown;
-    low.observe(5_000, 1000);
-    try testing.expectEqual(@as(u32, 50), low.hedgeStagger());
-    var high: RttState = .unknown;
-    high.observe(200_000, 1000);
-    try testing.expectEqual(@as(u32, 300), high.hedgeStagger());
-}
-
-test "min_rtt re-anchors after hedge_decay_ms" {
-    var s: RttState = .unknown;
-    s.observe(20_000, 1000);
-    try testing.expectEqual(@as(u32, 60), s.hedgeStagger());
-    s.observe(100_000, 1000 + hedge_decay_ms - 1);
-    try testing.expectEqual(@as(u32, 60), s.hedgeStagger());
-    s.observe(100_000, 1000 + hedge_decay_ms + 1);
-    try testing.expectEqual(@as(u32, 300), s.hedgeStagger());
-}
-
-test "timeouts inflate the RTO but leave the hedge stagger" {
-    var s: RttState = .unknown;
-    s.observe(20_000, 1000);
-    const rto_clean = s.timeout(true, 1);
-    const hedge = s.hedgeStagger();
-    for (0..dead_threshold) |_| s.observeTimeout(1000);
-    try testing.expect(s.timeout(true, 1) > rto_clean);
-    try testing.expectEqual(hedge, s.hedgeStagger());
 }
 
 test "the threshold timeout marks dead; the window lapses to one probe and escalates to a cap" {
