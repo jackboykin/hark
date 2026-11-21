@@ -974,11 +974,12 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(testing.io);
     var sig_bytes: [64]u8 = undefined;
-    var pub_bytes: [32]u8 = undefined;
+    var pub_bytes = kp.public_key.toBytes();
     var recs: [2]dns.ResourceRecord = undefined;
     recs[0] = dnskeyRr(rrsig.test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &pub_bytes });
-    const signed = try rrsig.testSignRrset(recs[0..1], .dnskey, rrsig.test_owner, .rsasha256, &sig_bytes, &pub_bytes);
+    const signed = try rrsig.testSignRrsetBy(kp, recs[0..1], .dnskey, rrsig.test_owner, .rsasha256, &sig_bytes, &pub_bytes);
     recs[1] = .fixture(.{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } });
 
     var digest = dsDigest(Sha256, rrsig.test_owner, signed.dnskey);
