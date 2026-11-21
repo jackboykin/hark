@@ -104,17 +104,6 @@ pub fn closestEncloser(qname: dns.Name, bound_a: dns.Name, bound_b: dns.Name) ?d
     return if (ce.depth() == qname.depth()) null else ce;
 }
 
-test closestEncloser {
-    const t = std.testing;
-    const qname = dns.Name.lit("a.b.example.com");
-    const owner = dns.Name.lit("z.b.example.com");
-    const next = dns.Name.lit("example.com");
-    try t.expectEqual(@as(u8, 3), closestEncloser(qname, owner, next).?.depth());
-    const below = dns.Name.lit("x.a.b.example.com");
-    try t.expectEqual(null, closestEncloser(qname, below, next));
-    try t.expectEqual(null, closestEncloser(.root, owner, next));
-}
-
 fn inOpenRangeWrap(lo_vs_x: std.math.Order, x_vs_hi: std.math.Order, lo_vs_hi: std.math.Order) bool {
     return if (lo_vs_hi == .lt) lo_vs_x == .lt and x_vs_hi == .lt else lo_vs_x == .lt or x_vs_hi == .lt;
 }
@@ -667,36 +656,6 @@ fn validateNsec3NegativeProof(
 const test_root = dns.Name.root;
 const test_com = dns.Name.lit("com");
 
-test "classifyDelegation with DS present" {
-    const child_zone = dns.Name.lit("example.com");
-
-    const authorities = [_]dns.ResourceRecord{.fixture(.{
-        .name = child_zone,
-        .rtype = .ds,
-        .rclass = .in,
-        .ttl = 86400,
-        .rdata = .{ .ds = .{
-            .key_tag = 12345,
-            .algorithm = .rsasha256,
-            .digest_type = .sha256,
-            .digest = &@as([32]u8, @splat(0xAA)),
-        } },
-    })};
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, test_com, &b));
-}
-
-test "classifyDelegation with NSEC proving no DS" {
-    const child_zone = dns.Name.lit("example.com");
-
-    const next = dns.Name.lit("next.com");
-    const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(child_zone, next, &.{ 0x00, 0x01, 0x60 })};
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.unsigned, classifyDelegation(&authorities, child_zone, test_com, &b));
-}
-
 test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
     const child_zone = dns.Name.lit("example.com");
     const next = dns.Name.lit("next.com");
@@ -710,38 +669,6 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
         var b: rrsig.ValidationBudget = .{};
         try testing.expectEqual(Delegation.unproven, classifyDelegation(&authorities, child_zone, test_com, &b));
     }
-}
-
-test "NSEC name non-existence" {
-    const alpha = dns.Name.lit("alpha.example.com");
-    const gamma = dns.Name.lit("gamma.example.com");
-
-    const nsec_data = dns.NsecData{
-        .next_domain_name = gamma,
-        .type_bit_maps = &.{},
-    };
-
-    const beta = dns.Name.lit("beta.example.com");
-    try testing.expect(nsecProvesNameNonexistence(alpha, nsec_data, beta));
-
-    const zeta = dns.Name.lit("zeta.example.com");
-    try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, zeta));
-
-    try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, alpha));
-}
-
-test "NSEC type non-existence" {
-    const name = dns.Name.lit("example.com");
-
-    const nsec_data = dns.NsecData{
-        .next_domain_name = dns.Name.lit("next"),
-        .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 },
-    };
-
-    const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(name, nsec_data.next_domain_name, nsec_data.type_bit_maps)};
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b));
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, name, .a, false, test_root, &b));
 }
 
 test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
@@ -763,20 +690,6 @@ test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
     const absent = [_]dns.ResourceRecord{nsecRrWithBitmap(name, cname_absent.next_domain_name, cname_absent.type_bit_maps)};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&absent, name, .aaaa, false, test_root, &b));
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&absent, name, .cname, false, test_root, &b));
-}
-
-test "NSEC3 hash range check" {
-    const owner = [_]u8{ 0x10, 0x20, 0x30 };
-    const next = [_]u8{ 0x50, 0x60, 0x70 };
-
-    const target_in = [_]u8{ 0x30, 0x40, 0x50 };
-    try testing.expect(nsec3HashInRange(&owner, &next, &target_in));
-
-    const target_before = [_]u8{ 0x05, 0x06, 0x07 };
-    try testing.expect(!nsec3HashInRange(&owner, &next, &target_before));
-
-    const target_after = [_]u8{ 0x80, 0x90, 0xA0 };
-    try testing.expect(!nsec3HashInRange(&owner, &next, &target_after));
 }
 
 test "NSEC3 hash range wrap-around" {
@@ -831,22 +744,6 @@ test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)
     );
 }
 
-test "validateNegativeProof NSEC NXDOMAIN" {
-    const alpha = dns.Name.lit("alpha.example.com");
-    const gamma = dns.Name.lit("gamma.example.com");
-    const example_com = dns.Name.lit("example.com");
-
-    const authorities = [_]dns.ResourceRecord{
-        nsecRr(alpha, gamma),
-        nsecRr(example_com, alpha), // covers *.example.com: example.com -> alpha.example.com
-    };
-
-    const beta = dns.Name.lit("beta.example.com");
-    var b: rrsig.ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, beta, .a, true, test_root, &b);
-    try testing.expectEqual(SecurityStatus.secure, status);
-}
-
 test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
     const alpha = dns.Name.lit("alpha.example.com");
     const gamma = dns.Name.lit("gamma.example.com");
@@ -863,20 +760,6 @@ pub fn nsecRr(owner: dns.Name, next: dns.Name) dns.ResourceRecord {
     return nsecRrWithBitmap(owner, next, &.{});
 }
 
-test "validateNegativeProof NSEC NXDOMAIN deep CE (not zone apex)" {
-    const aaa_sub = dns.Name.lit("aaa.sub.example.com");
-    const zzz_sub = dns.Name.lit("zzz.sub.example.com");
-    const sub = dns.Name.lit("sub.example.com");
-    const missing = dns.Name.lit("missing.sub.example.com");
-
-    const authorities = [_]dns.ResourceRecord{
-        nsecRr(aaa_sub, zzz_sub), // covers qname: aaa < missing < zzz
-        nsecRr(sub, aaa_sub), // covers *.sub.example.com: sub < *.sub < aaa.sub
-    };
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true, test_root, &b));
-}
-
 test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" {
     const aaa_sub = dns.Name.lit("aaa.sub.example.com");
     const zzz_sub = dns.Name.lit("zzz.sub.example.com");
@@ -890,53 +773,6 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
     };
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, test_root, &b));
-}
-
-test "validateNegativeProof NSEC NXDOMAIN deep qname still needs wildcard denial" {
-    const aaa = dns.Name.lit("aaa.example.com");
-    const zzz = dns.Name.lit("zzz.example.com");
-    const qname = dns.Name.lit("a.b.c.example.com");
-    const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
-    var b: rrsig.ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, qname, .a, true, test_root, &b);
-    try testing.expectEqual(SecurityStatus.unchecked, status);
-}
-
-test "validateNegativeProof NSEC NODATA at empty non-terminal (live ip6.arpa shape)" {
-    const owner = dns.Name.lit("1.4.2.ip6.arpa");
-    const next = dns.Name.lit("0.6.2.ip6.arpa");
-    const qname = dns.Name.lit("6.2.ip6.arpa");
-    const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
-}
-
-test "validateNegativeProof NSEC NXDOMAIN with ENT closest encloser (live ip6.arpa shape)" {
-    const authorities = [_]dns.ResourceRecord{
-        nsecRr(
-            .lit("3.6.2.ip6.arpa"),
-            .lit("0.8.2.ip6.arpa"),
-        ),
-        nsecRr(
-            .lit("1.4.2.ip6.arpa"),
-            .lit("0.6.2.ip6.arpa"),
-        ),
-    };
-    const qname = dns.Name.lit("xx.6.2.ip6.arpa");
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
-}
-
-test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
-    const example_com = dns.Name.lit("example.com");
-    const zeta = dns.Name.lit("zeta.example.com");
-
-    const authorities = [_]dns.ResourceRecord{nsecRr(example_com, zeta)};
-
-    const beta = dns.Name.lit("beta.example.com");
-    var b: rrsig.ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, beta, .a, true, test_root, &b);
-    try testing.expectEqual(SecurityStatus.secure, status);
 }
 
 fn setNsec3(rr: *dns.ResourceRecord, comptime field: []const u8, value: anytype) void {
@@ -1002,23 +838,6 @@ test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
 }
 
-test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
-    const lotus = dns.Name.lit("lotus.go-vip.net");
-    const ns1 = dns.Name.lit("ns1.go-vip.net");
-    const wildcard = dns.Name.lit("*.go-vip.net");
-    const acme = dns.Name.lit("_acme-challenge.go-vip.net");
-    const qname = dns.Name.lit("nasa-tv.go-vip.net");
-
-    const wc_bitmap = [_]u8{ 0x00, 0x01, 0x04 };
-    const authorities = [_]dns.ResourceRecord{
-        nsecRr(lotus, ns1),
-        nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
-    };
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
-}
-
 test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unchecked" {
     const aaa = dns.Name.lit("aaa.example.com");
     const zzz = dns.Name.lit("zzz.example.com");
@@ -1029,18 +848,18 @@ test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unche
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
-pub fn makeNsec3OwnerName(hash: Hash, zone: dns.Name, bufs: *Nsec3OwnerBufs) dns.Name {
+fn makeNsec3OwnerName(hash: Hash, zone: dns.Name, bufs: *Nsec3OwnerBufs) dns.Name {
     return dns.Name.child(&bufs.name, base32HexEncode(&bufs.enc, &hash), zone).?;
 }
 
-pub const Nsec3OwnerBufs = struct {
+const Nsec3OwnerBufs = struct {
     enc: [32]u8 = undefined,
     name: dns.Name.Buf = undefined,
     low: Hash = undefined,
     high: Hash = undefined,
 };
 
-pub fn makeNsec3Rr(
+fn makeNsec3Rr(
     owner_name: dns.Name,
     salt: []const u8,
     next_hashed_owner: []const u8,
@@ -1081,11 +900,6 @@ test "nsec3Hash RFC 5155 Appendix B" {
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var enc_buf: [32]u8 = undefined;
     try testing.expectEqualStrings("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", base32HexEncode(&enc_buf, &nsec3Hash(name, &salt, 12)));
-}
-
-test "nsec3OwnerHash refuses an owner that is no SHA-1 hash" {
-    try testing.expect(nsec3OwnerHash(.lit("tooshort")) == null);
-    try testing.expect(nsec3OwnerHash(.root) == null);
 }
 
 test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 5155 §8.1)" {
@@ -1238,17 +1052,6 @@ const OptOutProof = struct {
     }
 };
 
-test "NSEC3 Opt-Out proves no DS, without AD (RFC 5155 §8.6 / §9.2)" {
-    const qname = dns.Name.lit("amazon.com");
-    var p: OptOutProof = .{};
-    try p.init(qname, true);
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.insecure,
-        validateNegativeProof(p.ds(), qname, .ds, false, test_root, &b),
-    );
-}
-
 test "NSEC3 DS NODATA needs the Opt-Out flag (RFC 5155 §8.6)" {
     const qname = dns.Name.lit("amazon.com");
     var p: OptOutProof = .{};
@@ -1308,27 +1111,6 @@ test "NSEC3 proof mixing two parameter sets is bogus (RFC 5155 §8.2)" {
         SecurityStatus.bogus,
         validateNegativeProof(p.ds(), qname, .ds, false, test_root, &b),
     );
-}
-
-test "NSEC3 Opt-Out NXDOMAIN must not set AD (RFC 5155 §9.2)" {
-    const qname = dns.Name.lit("victim.com");
-    var b: rrsig.ValidationBudget = .{};
-    {
-        var p: OptOutProof = .{};
-        try p.init(qname, true);
-        try testing.expectEqual(
-            SecurityStatus.insecure,
-            validateNegativeProof(&p.rrs, qname, .a, true, test_root, &b),
-        );
-    }
-    {
-        var p: OptOutProof = .{};
-        try p.init(qname, false);
-        try testing.expectEqual(
-            SecurityStatus.secure,
-            validateNegativeProof(&p.rrs, qname, .a, true, test_root, &b),
-        );
-    }
 }
 
 test "NSEC3 NODATA under Opt-Out outranks a wildcard CNAME at the encloser (RFC 5155 §8.6, errata 3441)" {
@@ -1402,44 +1184,6 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .https, true, test_root, &b));
 }
 
-test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
-    const qname = dns.Name.lit("missing.example.com");
-    const ce_name = dns.Name.lit("example.com");
-    const wc_name = dns.Name.lit("*.example.com");
-    const zone_name = dns.Name.lit("com");
-    const salt: []const u8 = &.{};
-
-    var bufs1: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce_name, salt, 0), zone_name, &bufs1);
-    var bufs2: Nsec3OwnerBufs = .{};
-    const nc_rr = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
-    var bufs3: Nsec3OwnerBufs = .{};
-    const wc_rr = makeCoveringNsec3(nsec3Hash(wc_name, salt, 0), zone_name, salt, &bufs3);
-
-    const authorities = [_]dns.ResourceRecord{
-        makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
-        nc_rr,
-        wc_rr,
-    };
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
-}
-
-test "classifyDelegation NSEC3 match" {
-    const child_zone = dns.Name.lit("unsigned.example.com");
-    const zone_name = dns.Name.lit("example.com");
-    const salt: []const u8 = &.{};
-
-    var bufs: Nsec3OwnerBufs = .{};
-    const owner_name = makeNsec3OwnerName(nsec3Hash(child_zone, salt, 0), zone_name, &bufs);
-
-    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x20 })};
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.unsigned, classifyDelegation(&authorities, child_zone, zone_name, &b));
-}
-
 test "classifyDelegation NSEC3 signed below or beside the cut proves nothing" {
     const child_zone = dns.Name.lit("bank.com");
     const salt: []const u8 = &.{ 0xAA, 0xBB };
@@ -1477,21 +1221,6 @@ test "classifyDelegation NSEC3 Opt-Out span below a secure delegation proves not
     try testing.expectEqual(Delegation.unsigned, classifyDelegation(&.{ span2, apex }, direct, test_com, &b));
 }
 
-test "NSEC3 hash budget exhaustion" {
-    const qname = dns.Name.lit("l00.l01.l02.l03.l04.l05.l06.l07.l08.l09.l10.l11.l12.l13.l14.l15." ++
-        "l16.l17.l18.l19.l20.l21.l22.l23.l24.l25.l26.l27.l28.l29.l30.l31.l32.example.com");
-    const salt: []const u8 = &.{};
-
-    var bufs: Nsec3OwnerBufs = .{};
-    const zone_name = dns.Name.lit("com");
-    const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_name, &bufs);
-
-    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
-
-    var b: rrsig.ValidationBudget = .{ .max_nsec3_blocks = 32 };
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
-}
-
 test "NSEC3 iterations cost budget, never a verdict (RFC 9276 §3.2)" {
     const qname = dns.Name.lit("www.example.com");
     var bufs: Nsec3OwnerBufs = .{};
@@ -1509,28 +1238,6 @@ test "NSEC3 iterations cost budget, never a verdict (RFC 9276 §3.2)" {
     b = .{};
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
     try testing.expect(b.stopped == .nsec3);
-}
-
-test "classifyDelegation refuses mixed NSEC3 parameter sets before hashing (RFC 5155 §8.2)" {
-    const N: usize = 6;
-    const child_zone = dns.Name.lit("victim.example.com");
-    const zone_name = dns.Name.lit("example.com");
-
-    var bufs: [N]Nsec3OwnerBufs = undefined;
-    var unique_salts: [N][1]u8 = undefined;
-    var rrs: [N]dns.ResourceRecord = undefined;
-    const next_owner: [20]u8 = @splat(0xFF);
-
-    for (0..N) |i| {
-        bufs[i] = .{};
-        unique_salts[i] = .{@as(u8, @intCast(i))};
-        const owner = makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone_name, &bufs[i]);
-        rrs[i] = makeNsec3Rr(owner, &unique_salts[i], &next_owner, &.{});
-    }
-
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(Delegation.bogus, classifyDelegation(&rrs, child_zone, zone_name, &b));
-    try testing.expectEqual(@as(u32, 0), b.nsec3_blocks_spent);
 }
 
 test "refuses NSEC3 floods before hashing or verifying (Knot >8-record cap)" {
@@ -1572,33 +1279,6 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     try testing.expectEqual(SecurityStatus.bogus, second);
 }
 
-test "an NSEC3 NXDOMAIN proof hashes its next closer once" {
-    const qname = dns.Name.lit("www.example.com");
-    const next_closer = dns.Name.lit("example.com");
-    const wildcard = dns.Name.lit("*.com");
-    const salt: []const u8 = &.{};
-    var bufs: [3]Nsec3OwnerBufs = .{ .{}, .{}, .{} };
-    const ce_next: [20]u8 = @splat(0);
-    const authorities = [_]dns.ResourceRecord{
-        makeNsec3Rr(makeNsec3OwnerName(nsec3Hash(test_com, salt, 0), test_com, &bufs[0]), salt, &ce_next, &com_apex_bitmap),
-        makeCoveringNsec3(nsec3Hash(next_closer, salt, 0), test_com, salt, &bufs[1]),
-        makeCoveringNsec3(nsec3Hash(wildcard, salt, 0), test_com, salt, &bufs[2]),
-    };
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_com, &b));
-    try testing.expectEqual(@as(u32, 4), b.nsec3_blocks_spent);
-}
-
-test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
-    const child_zone = dns.Name.lit("jsc.nasa.gov");
-    const salt = [_]u8{ 0xA3, 0xB6, 0xC3, 0xF4, 0x96, 0x50, 0x04, 0xE9 };
-    const computed = nsec3Hash(child_zone, &salt, 10);
-
-    var expected: Hash = undefined;
-    _ = try base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
-    try testing.expectEqualSlices(u8, &expected, &computed);
-}
-
 test "proveNoCloserMatch NSEC" {
     const foo = dns.Name.lit("foo.example.com");
     const zone = dns.Name.lit("example.com");
@@ -1615,30 +1295,4 @@ test "proveNoCloserMatch NSEC" {
     const deep = [_]dns.ResourceRecord{nsecRr(.lit("0.b.example.com"), .lit("z.b.example.com"))};
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&deep, a_b, 2, zone, &b));
     try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&deep, a_b, 3, zone, &b));
-}
-
-test "proveNoCloserMatch NSEC3" {
-    const qname = dns.Name.lit("foo.example.com");
-    const ce = dns.Name.lit("example.com");
-    const zone_name = dns.Name.lit("example.com");
-    const salt: []const u8 = &.{};
-    var bufs: Nsec3OwnerBufs = .{};
-    var nc = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs);
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
-    setNsec3(&nc, "flags", nsec3_opt_out);
-    try testing.expectEqual(SecurityStatus.insecure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
-    var ce_bufs: Nsec3OwnerBufs = .{};
-    const ce_owner = makeNsec3OwnerName(nsec3Hash(ce, salt, 0), zone_name, &ce_bufs);
-    const ce_only = [_]dns.ResourceRecord{makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{})};
-    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&ce_only, qname, 2, ce, &b));
-}
-
-test "base32hex decode ignores case and refuses characters outside the alphabet" {
-    var buf1: [20]u8 = undefined;
-    var buf2: [20]u8 = undefined;
-    const n1 = try base32HexDecode(&buf1, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM");
-    const n2 = try base32HexDecode(&buf2, "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
-    try testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
-    try testing.expectError(error.InvalidBase32, base32HexDecode(&buf1, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
 }

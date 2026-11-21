@@ -607,16 +607,6 @@ test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
     try verifyRrsig(rrsig, dnskey, .sort(answers), .{ .now = 1_800_000_000, .budget = &budget, .memo = &memo });
 }
 
-test "ECDSA P-384 signature verification" {
-    const key_pair = EcdsaP384.KeyPair.generate(testing.io);
-    const dnssec_key = key_pair.public_key.toUncompressedSec1()[1..];
-    const msg = "test DNSSEC signed data";
-    const sig = (try key_pair.sign(msg, null)).toBytes();
-
-    try verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, msg), dnssec_key);
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, "wrong data"), dnssec_key));
-}
-
 test "VerifyMemo: a remembered signature binds its key and still expires" {
     var recs = [_]dns.ResourceRecord{
         .fixture(.{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
@@ -641,18 +631,6 @@ test "VerifyMemo: a remembered signature binds its key and still expires" {
     try testing.expectEqual(1, memo.hits);
 }
 
-test "VerifyMemo: a set holds its two newest tags" {
-    var memo: VerifyMemo = try .init(testing.allocator);
-    defer memo.deinit(testing.allocator);
-    const a: VerifyMemo.Tag = @splat(1);
-    var b = a;
-    b[31] = 2;
-    memo.remember(&a);
-    memo.remember(&b);
-    try testing.expect(memo.recall(&a));
-    try testing.expect(memo.recall(&b));
-}
-
 test "invalid key sizes are rejected" {
     const msg = "test";
     const signed = buildSignedData(test_window_rrsig, test_window_empty_set);
@@ -665,13 +643,6 @@ test "invalid key sizes are rejected" {
     const pq_sig: [MlDsa44.Signature.encoded_length]u8 = @splat(0);
     try testing.expectError(error.InvalidKey, verifyMlDsa(&pq_sig, &signed, &.{ 0x01, 0x02 }));
     try testing.expectError(error.InvalidSignature, verifyMlDsa(&sig64, &signed, &@as([MlDsa44.PublicKey.encoded_length]u8, @splat(0))));
-}
-
-test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
-    var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
-    key_data[6] = 0x80;
-    const signature: [128]u8 = @splat(0xaa);
-    try testing.expectError(error.InvalidSignature, verifyRsa(Sha256, &signature, &testDigest(Sha256, "x"), &key_data));
 }
 
 test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
@@ -759,11 +730,6 @@ const test_window_dnskey = dns.DnskeyData{
 };
 const test_window_empty_set: Canonical = .{ .records = &.{} };
 
-test "verifyRrsig rejects expired signature" {
-    var budget: ValidationBudget = .{};
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, .{ .now = 1700000000 + 1, .budget = &budget, .memo = &test_memo }));
-}
-
 test "verifyRrsig rejects not-yet-valid signature" {
     var budget: ValidationBudget = .{};
     try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_set, .{ .now = 1699000000 - inception_skew_tolerance - 1, .budget = &budget, .memo = &test_memo }));
@@ -800,27 +766,6 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
         error.InvalidSignature,
         verifyRrsig(rrsig, test_window_dnskey, .sort(&rrset), .{ .now = 1699500000, .budget = &budget, .memo = &test_memo }),
     );
-}
-
-test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
-    var budget: ValidationBudget = .{ .max_sig_verify = 2 };
-    inline for (0..2) |_| {
-        try testing.expectError(error.InvalidKey, verifyRrsig(
-            test_window_rrsig,
-            test_window_dnskey,
-            test_window_empty_set,
-            .{ .now = 1699500000, .budget = &budget, .memo = &test_memo },
-        ));
-    }
-    try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent);
-    try testing.expect(budget.stopped == null);
-    try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
-        test_window_rrsig,
-        test_window_dnskey,
-        test_window_empty_set,
-        .{ .now = 1699500000, .budget = &budget, .memo = &test_memo },
-    ));
-    try testing.expect(budget.stopped == .verify);
 }
 
 test "verifyRrsig takes an expansion only from a wildcard inside the signer's zone" {

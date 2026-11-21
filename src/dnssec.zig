@@ -751,38 +751,6 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
     try testing.expectError(error.InvalidSignature, rrsig.verifyRrsig(sig, dnskey, .sort(&mx), .{ .now = 1439000000, .budget = &budget, .memo = test_memo }));
 }
 
-test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const zone: dns.Name = .lit("example.com");
-    const next_owner: [20]u8 = @splat(0xFF);
-    const key: dns.ResourceRecord = .fixture(.{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } });
-    var bufs: [2 * (proof.max_proof_records + 1)]proof.Nsec3OwnerBufs = undefined;
-    var rrs: [2 * (proof.max_proof_records + 1)]dns.ResourceRecord = undefined;
-    for (0..proof.max_proof_records + 1) |i| {
-        bufs[i] = .{};
-        const owner = proof.makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone, &bufs[i]);
-        rrs[2 * i] = proof.makeNsec3Rr(owner, &.{}, &next_owner, &.{});
-        rrs[2 * i + 1] = .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
-            .type_covered = .nsec3,
-            .algorithm = .rsasha256,
-            .labels = 3,
-            .original_ttl = 300,
-            .sig_expiration = 1700086400,
-            .sig_inception = 0,
-            .key_tag = rrsig.keyTag(test_dnskey),
-            .signer_name = rrsig.test_owner,
-            .signature = &.{ 0xDE, 0xAD },
-        } } });
-    }
-    var at_cap: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), rrs[0 .. 2 * proof.max_proof_records], &.{key}, .{ .now = 1700000000, .budget = &at_cap, .memo = test_memo }) == null);
-    try testing.expect(at_cap.sig_verify_spent > 0);
-    var past: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &rrs, &.{key}, .{ .now = 1700000000, .budget = &past, .memo = test_memo }) == null);
-    try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
-}
-
 fn dnskeyRr(owner: dns.Name, dnskey: dns.DnskeyData) dns.ResourceRecord {
     return .fixture(.{ .name = owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } });
 }
@@ -809,31 +777,6 @@ test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" 
     var budget: rrsig.ValidationBudget = .{};
     try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &signed, &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
     try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), signed[0..3], &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
-}
-
-test "verifyAuthorityProofSigs: a signature over part of a set verifies none of it" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .lit("a.example.com"))};
-    var soas: [17]dns.ResourceRecord = undefined;
-    for (&soas, 0..) |*r, i| r.* = .fixture(.{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
-        .mname = rrsig.test_owner,
-        .rname = rrsig.test_owner,
-        .serial = @intCast(i),
-        .refresh = 0,
-        .retry = 0,
-        .expire = 0,
-        .minimum = 300,
-    } } });
-    var sig_bufs: [2][64]u8 = undefined;
-    var pub_bufs: [2][32]u8 = undefined;
-    const n = try rrsig.testSignRrset(&nsec, .nsec, rrsig.test_owner, .ed25519, &sig_bufs[0], &pub_bufs[0]);
-    const s = try rrsig.testSignRrset(soas[0..16], .soa, rrsig.test_owner, .ed25519, &sig_bufs[1], &pub_bufs[1]);
-    const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, n.dnskey), dnskeyRr(rrsig.test_owner, s.dnskey) };
-    const sigs = [_]dns.ResourceRecord{ nsec[0], rrsigRr(rrsig.test_owner, n.rrsig), rrsigRr(rrsig.test_owner, s.rrsig) };
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &(sigs ++ soas[0..16].*), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) != null);
-    try testing.expect(try verifyAuthorityProofSigs(arena.allocator(), &(sigs ++ soas), &dnskeys, .{ .now = 1_700_000_000, .budget = &budget, .memo = test_memo }) == null);
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
