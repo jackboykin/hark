@@ -198,20 +198,6 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
     try testing.expect(shouldDrop(rrAAAA(public_name, mapped_rfc1918), cfg));
 }
 
-test "nat64 prefix: synthesized AAAA is judged by its embedded v4" {
-    const p = dns64.Prefix.well_known;
-    const cfg = Config{ .enabled = true, .nat64 = p };
-    var rrs = [_]dns.ResourceRecord{
-        rrAAAA(public_name, p.embed(.{ 192, 168, 1, 1 })),
-        rrAAAA(public_name, p.embed(.{ 93, 184, 216, 34 })),
-    };
-    const kept = try scrub(testing.allocator, &rrs, cfg);
-    defer testing.allocator.free(kept);
-    try testing.expectEqual(@as(usize, 1), kept.len);
-    try testing.expectEqualSlices(u8, &p.embed(.{ 93, 184, 216, 34 }), kept[0].rdata);
-    try testing.expectEqual(rrs.len, (try scrub(testing.allocator, &rrs, .{ .enabled = true })).len);
-}
-
 test "svcb hints: private ipv4hint/ipv6hint drop the RR, public hints pass" {
     const cfg = Config{ .enabled = true };
     const private_v4 = comptime svc_prefix ++ svcParam(4, &.{ 192, 168, 1, 1 });

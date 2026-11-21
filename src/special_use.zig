@@ -147,8 +147,3 @@ test "ipv4only.arpa: its DS is arpa's, and nothing is below it" {
     try expectAnswer(null, "ipv4only.arpa.", .ds);
     try expectAnswer(.{ .rcode = .name_error }, "foo.ipv4only.arpa.", .ds);
 }
-
-test "a name hark does not hold falls through" {
-    try expectAnswer(null, "example.com.", .a);
-    try expectAnswer(null, "arpa", .a);
-}

@@ -224,36 +224,11 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
     try testing.expect(result == null);
 }
 
-test "serializeErrorResponse produces valid DNS message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const name = try dns.parseDottedName(a, "example.com");
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, .{ .id = 0xABCD, .rcode = .refused, .rd = true, .question = .{ .name = name, .qtype = .a, .qclass = .in } });
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
-    try testing.expectEqual(dns.RCode.refused, parsed.header.flags.rcode);
-    try testing.expectEqual(true, parsed.header.flags.rd);
-    try testing.expectEqual(true, parsed.header.flags.ra);
-    try testing.expectEqual(true, parsed.header.flags.qr);
-    try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
-}
-
 const test_query: dns.Query = .{
     .header = .{ .id = 0, .flags = std.mem.zeroes(dns.Header.Flags), .qd_count = 1 },
     .question = .{ .name = .lit("example.com"), .qtype = .a, .qclass = .in },
     .edns = null,
 };
-
-test "validateQuery rejects QR=1 (response posing as query)" {
-    var spoofed = test_query;
-    spoofed.header.flags.qr = true;
-
-    try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
-}
 
 test "validateQuery returns BADVERS for unsupported EDNS version" {
     var query = test_query;

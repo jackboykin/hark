@@ -33,7 +33,7 @@ pub const Prefix = struct {
         return if (p.len < 96 and k >= 8) k + 1 else k;
     }
 
-    pub fn embed(p: Prefix, v4: [4]u8) [16]u8 {
+    fn embed(p: Prefix, v4: [4]u8) [16]u8 {
         var out = p.bytes;
         for (v4, 0..) |b, i| out[p.slot(i)] = b;
         return out;

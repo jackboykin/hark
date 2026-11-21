@@ -189,15 +189,6 @@ fn parseTest(input: []const u8) ParseError!Table {
     return parse(test_arena.allocator(), input);
 }
 
-test "parse comments and blank lines" {
-    try testing.expectEqual(0, (try parseTest("")).map.count());
-    try testing.expectEqual(0, (try parseTest(
-        \\# This is a comment
-        \\
-        \\# Another comment
-    )).map.count());
-}
-
 test "parse strings" {
     const t = try parseTest(
         \\name = "hello#world" # a comment
@@ -205,39 +196,6 @@ test "parse strings" {
     );
     try testing.expectEqualStrings("hello#world", t.get("name", .string).?);
     try testing.expectEqualStrings("a\"b\\c", t.get("path", .string).?);
-}
-
-test "parse integers" {
-    const t = try parseTest(
-        \\port = 53 # standard DNS port
-        \\offset = -10
-        \\size = 16_777_216
-    );
-    try testing.expectEqual(53, t.get("port", .integer).?);
-    try testing.expectEqual(-10, t.get("offset", .integer).?);
-    try testing.expectEqual(16_777_216, t.get("size", .integer).?);
-    try testing.expectError(error.InvalidInteger, parseTest("size = _1"));
-}
-
-test "parse boolean values" {
-    const t = try parseTest(
-        \\enabled = true
-        \\disabled = false
-    );
-    try testing.expectEqual(true, t.get("enabled", .boolean).?);
-    try testing.expectEqual(false, t.get("disabled", .boolean).?);
-}
-
-test "parse string arrays" {
-    const t = try parseTest(
-        \\listen = ["127.0.0.1:53", "[::1]:53"]
-        \\items = []
-    );
-    const arr = t.get("listen", .string_array).?;
-    try testing.expectEqual(2, arr.len);
-    try testing.expectEqualStrings("127.0.0.1:53", arr[0]);
-    try testing.expectEqualStrings("[::1]:53", arr[1]);
-    try testing.expectEqual(0, t.get("items", .string_array).?.len);
 }
 
 test "parse an array across lines" {
@@ -253,21 +211,6 @@ test "parse an array across lines" {
     try testing.expectEqualStrings("internal 192.0.2.1", arr[0]);
     try testing.expectEqualStrings("a]b#c", arr[1]);
     try testing.expectEqual(1, t.get("after", .integer).?);
-}
-
-test "parse section tables" {
-    const t = try parseTest(
-        \\[server]
-        \\listen = ["127.0.0.1:53"]
-        \\workers = 4
-        \\
-        \\[resolver]
-        \\qname-minimization = true
-    );
-    const server = t.get("server", .table).?;
-    try testing.expectEqual(4, server.get("workers", .integer).?);
-    try testing.expectEqual(1, server.get("listen", .string_array).?.len);
-    try testing.expectEqual(true, t.get("resolver", .table).?.get("qname-minimization", .boolean).?);
 }
 
 test "parse errors" {

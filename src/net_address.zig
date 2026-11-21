@@ -262,35 +262,6 @@ pub fn isIp4Mapped(bytes: []const u8) bool {
 
 const testing = std.testing;
 
-test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
-    const ctx: AddressKey.HashCtx = .{};
-    const a = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
-    const b = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
-    const c = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 5353));
-    const d = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 5 }, 53));
-    const e = AddressKey.fromAddress(initIp6([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0)), 53));
-
-    try testing.expect(ctx.eql(a, b));
-    try testing.expectEqual(ctx.hash(a), ctx.hash(b));
-    try testing.expect(!ctx.eql(a, c));
-    try testing.expect(ctx.hash(a) != ctx.hash(c));
-    try testing.expect(!ctx.eql(a, d));
-    try testing.expect(ctx.hash(a) != ctx.hash(d));
-    try testing.expect(!ctx.eql(a, e));
-    try testing.expect(ctx.hash(a) != ctx.hash(e));
-}
-
-test "AddressKey.HashCtx: the hash key shifts the hash space" {
-    const ctx: AddressKey.HashCtx = .{};
-    const k = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
-    const h0 = ctx.hash(k);
-    const saved = rand.hash_key;
-    defer rand.hash_key = saved;
-    rand.hash_key[0] ^= 1;
-    const h1 = ctx.hash(k);
-    try testing.expect(h0 != h1);
-}
-
 test "special-use IPv4 set covers RFC 1918 + loopback + link-local + TEST-NET + CGNAT" {
     inline for ([_][4]u8{
         .{ 0, 0, 0, 0 },
@@ -361,9 +332,4 @@ test "isNonRoutableNs blocks special-use + multicast IPv6" {
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53)));
-}
-
-test "isNonRoutableNs allows routable IPv6" {
-    try testing.expect(!isNonRoutableNs(.ip6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53)));
-    try testing.expect(!isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53)));
 }

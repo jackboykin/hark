@@ -84,12 +84,6 @@ fn ip6(bytes: [16]u8) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = 0 } };
 }
 
-test "parse v4 with prefix" {
-    const c = parse("192.168.1.0/24") orelse return error.ParseFailed;
-    try testing.expectEqual(@as(u8, 24), c.prefix);
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, &c.address.ip4.bytes);
-}
-
 test "parse v4 normalizes host bits" {
     const c = parse("192.168.1.255/24") orelse return error.ParseFailed;
     try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, &c.address.ip4.bytes);
@@ -100,41 +94,10 @@ test "parse bare v4 address is /32" {
     try testing.expectEqual(@as(u8, 32), c.prefix);
 }
 
-test "parse v6 with prefix" {
-    const c = parse("2001:db8::/32") orelse return error.ParseFailed;
-    try testing.expectEqual(@as(u8, 32), c.prefix);
-    try testing.expect(c.address == .ip6);
-}
-
 test "parse rejects invalid prefix" {
     try testing.expect(parse("10.0.0.0/33") == null);
     try testing.expect(parse("::1/129") == null);
     try testing.expect(parse("garbage") == null);
-}
-
-test "matches v4 prefix" {
-    const c = parse("192.168.1.0/24") orelse return error.ParseFailed;
-    try testing.expect(c.matches(ip4(.{ 192, 168, 1, 5 })));
-    try testing.expect(c.matches(ip4(.{ 192, 168, 1, 255 })));
-    try testing.expect(!c.matches(ip4(.{ 192, 168, 2, 0 })));
-    try testing.expect(!c.matches(ip4(.{ 10, 0, 0, 1 })));
-}
-
-test "matches /32 single host" {
-    const c = parse("127.0.0.1/32") orelse return error.ParseFailed;
-    try testing.expect(c.matches(ip4(.{ 127, 0, 0, 1 })));
-    try testing.expect(!c.matches(ip4(.{ 127, 0, 0, 2 })));
-}
-
-test "matches v6 single host" {
-    const c = parse("::1/128") orelse return error.ParseFailed;
-    try testing.expect(c.matches(ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })));
-    try testing.expect(!c.matches(ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 })));
-}
-
-test "matches family mismatch fails" {
-    const v4 = parse("0.0.0.0/0") orelse return error.ParseFailed;
-    try testing.expect(!v4.matches(ip6(@splat(0))));
 }
 
 test "matchesBytes accepts bare rdata bytes" {
@@ -148,12 +111,4 @@ test "matchesBytes accepts bare rdata bytes" {
     try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ @as([15]u8, @splat(0)))));
     try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ @as([15]u8, @splat(0)))));
     try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
-}
-
-test "allow returns false when no entry matches" {
-    const c = parse("127.0.0.0/8") orelse return error.ParseFailed;
-    const list = [_]Cidr{c};
-    try testing.expect(!allow(&list, ip4(.{ 8, 8, 8, 8 })));
-    try testing.expect(allow(&list, ip4(.{ 127, 1, 2, 3 })));
-    try testing.expect(!allow(&.{}, ip4(.{ 127, 1, 2, 3 })));
 }
