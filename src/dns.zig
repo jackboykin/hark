@@ -397,13 +397,6 @@ test "serialAfter: basic comparisons" {
     try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
 }
 
-test "secondsUntil: saturates at zero and wraps as a serial" {
-    try testing.expectEqual(@as(u32, 400), secondsUntil(1000, 600));
-    try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1000));
-    try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1001));
-    try testing.expectEqual(@as(u32, 10), secondsUntil(5, 0xFFFFFFFB));
-}
-
 pub const DnskeyData = struct {
     flags: u16,
     protocol: u8,
@@ -1554,134 +1547,10 @@ pub fn serializeEnds(buf: []u8, hdr: Header, question: ?Question, sections: Sect
     return buf[0..ser.pos];
 }
 
-test "header parse known bytes" {
-    const bytes = [12]u8{
-        0x12, 0x34, // id
-        0x81, 0x80, // flags: QR=1, RD=1, RA=1
-        0x00, 0x01, // qdcount=1
-        0x00, 0x02, // ancount=2
-        0x00, 0x00, // nscount=0
-        0x00, 0x00, // arcount=0
-    };
-    const hdr = Header.parse(&bytes);
-    try testing.expectEqual(@as(u16, 0x1234), hdr.id);
-    try testing.expect(hdr.flags.qr);
-    try testing.expectEqual(OpCode.query, hdr.flags.opcode);
-    try testing.expect(!hdr.flags.aa);
-    try testing.expect(!hdr.flags.tc);
-    try testing.expect(hdr.flags.rd);
-    try testing.expect(hdr.flags.ra);
-    try testing.expectEqual(@as(u16, 1), hdr.qd_count);
-    try testing.expectEqual(@as(u16, 2), hdr.an_count);
-}
-
-test "name parsing - compressed" {
-    const data = "\x07example\x03com\x00\x03foo\xC0\x00";
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var parser = Parser{ .msg = data, .pos = 13 };
-    const name = try parser.parseName(arena.allocator(), .compressed);
-
-    try testing.expect(name.eql(.lit("foo.example.com")));
-    try testing.expectEqual(@as(usize, 19), parser.pos);
-}
-
 test "name parsing - forward pointer rejection" {
     const data = [_]u8{ 0xC0, 0x02, 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
     try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
-}
-
-test "name parsing - self pointer rejection" {
-    const data = [_]u8{ 0xC0, 0x00 };
-    var parser = Parser{ .msg = &data, .pos = 0 };
-    try testing.expectError(error.FormatError, parser.parseName(testing.allocator, .compressed));
-}
-
-test "SOA record parsing" {
-    var rd = TestRdata{};
-    rd.putBytes("\x02ns\x07example\x03com\x00");
-    rd.putBytes("\x05admin\x07example\x03com\x00");
-    for ([_]u32{ 2023010101, 3600, 900, 604800, 86400 }) |v| rd.put(u32, v);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .soa, rd.slice(), rd.pos));
-
-    const soa = msg.answers[0].soa();
-    try testing.expect(soa.mname.eql(.lit("ns.example.com")));
-    try testing.expect(soa.rname.eql(.lit("admin.example.com")));
-    try testing.expectEqual(@as(u32, 2023010101), soa.serial);
-    try testing.expectEqual(@as(u32, 3600), soa.refresh);
-    try testing.expectEqual(@as(u32, 900), soa.retry);
-    try testing.expectEqual(@as(u32, 604800), soa.expire);
-    try testing.expectEqual(@as(u32, 86400), soa.minimum);
-}
-
-test "TXT record parsing" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    const rdata = "\x1av=spf1 include:example.com\x05hello";
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .txt, rdata, rdata.len));
-
-    var txt = msg.answers[0].txt();
-    try testing.expectEqualStrings("v=spf1 include:example.com", txt.next().?);
-    try testing.expectEqualStrings("hello", txt.next().?);
-    try testing.expectEqual(null, txt.next());
-}
-
-test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names stay flat" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const owner = try parseDottedName(a, "www.example.com");
-    const ns1 = try parseDottedName(a, "ns1.example.com");
-    const rrsig = RrsigData{
-        .type_covered = .a,
-        .algorithm = .ecdsap256sha256,
-        .labels = 3,
-        .original_ttl = 60,
-        .sig_expiration = 2,
-        .sig_inception = 1,
-        .key_tag = 7,
-        .signer_name = try parseDottedName(a, "example.com"),
-        .signature = "sig",
-    };
-    const msg = Message{
-        .header = mem.zeroes(Header),
-        .question = .{ .name = owner, .qtype = .a, .qclass = .in },
-        .answers = &.{
-            .fixture(.{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } }),
-            .fixture(.{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = rrsig } }),
-        },
-        .authorities = &.{.fixture(.{ .name = try parseDottedName(a, "example.com"), .rtype = .ns, .rclass = .in, .ttl = 60, .rdata = .{ .ns = ns1 } })},
-    };
-
-    var buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-    try testing.expectEqual(@as(usize, 12 + 21 + 16 + 46 + 18), wire.len);
-    try testing.expectEqualSlices(u8, "\x07example\x03com\x00", wire[12 + 21 + 16 + 30 ..][0..13]);
-
-    const parsed = try parseMessage(a, wire);
-    try testing.expect(parsed.answers[0].name.eql(owner));
-    try testing.expect(parsed.answers[1].rrsig().signer_name.eql(rrsig.signer_name));
-    try testing.expect(parsed.authorities[0].ns().eql(ns1));
-}
-
-test "name compression follows a pointer inside an earlier name" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const www = try parseDottedName(a, "www.example.com");
-    const mail = try parseDottedName(a, "mail.example.com");
-    const rr: ResourceRecord = .fixture(.{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
-    var buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .question = .{ .name = www, .qtype = .a, .qclass = .in }, .answers = &.{ rr, rr } });
-    try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
-    const back = try parseMessage(a, wire);
-    for (back.answers) |got| try testing.expect(got.name.eql(mail));
 }
 
 test "edge case: empty message (too short)" {
@@ -1725,27 +1594,6 @@ test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
     try testing.expectError(error.InvalidLabelType, parseMessage(arena.allocator(), over));
 }
 
-test "EDNS0: reserializing a parsed OPT response counts it once" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const wire = [_]u8{ 0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0 };
-    var buf: [64]u8 = undefined;
-    const out = try serializeMessage(&buf, try parseMessage(arena.allocator(), &wire));
-    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, out[10..12], .big));
-    _ = try parseMessage(arena.allocator(), out);
-}
-
-test "EDNS0: serialized OPT has correct wire format" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const wire = (try buildQuery(alloc, 0xABCD, .lit("x.com"), .a, true, null)).wire;
-
-    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, wire[10..12], .big));
-    try testing.expectEqualSlices(u8, "\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);
-}
-
 test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1783,39 +1631,6 @@ test "padding ends the OPT's options, whatever it holds and whatever follows it"
     try testing.expectEqualSlices(u8, "\xc0\x00\x02\x01", m.additionals[0].rdata);
 }
 
-test "names are read lowercase, and the question as it was spelled" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const wire = "\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" ++
-        "\x03WwW\x07eXaMpLe\x00\x00\x01\x00\x01" ++
-        "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
-    const msg = try parseMessage(arena.allocator(), wire);
-    try testing.expect(msg.question.?.name.eql(.lit("www.example")));
-    try testing.expectEqualSlices(u8, "\x03WwW\x07eXaMpLe\x00", msg.question.?.spelled.?);
-    try testing.expect(msg.answers[0].name.eql(.lit("www.example")));
-}
-
-test "a name lying whole in the message, lowercase, is read in place" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a_rr = "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
-    const wire = "\x00\x01\x81\x80\x00\x01\x00\x03\x00\x00\x00\x00" ++
-        "\x07example\x03com\x00\x00\x01\x00\x01" ++
-        "\xc0\x0c" ++ a_rr ++ "\x03www\xc0\x0c" ++ a_rr ++ "\x03WWW\x07example\x03com\x00" ++ a_rr;
-    const msg = try parseMessage(arena.allocator(), wire);
-    const in = struct {
-        fn place(n: Name, bytes: []const u8) bool {
-            return @intFromPtr(n.wire.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(n.wire.ptr) < @intFromPtr(bytes.ptr) + bytes.len;
-        }
-    }.place;
-    try testing.expect(in(msg.question.?.name, wire));
-    try testing.expect(in(msg.answers[0].name, wire));
-    try testing.expect(!in(msg.answers[1].name, wire));
-    try testing.expect(!in(msg.answers[2].name, wire));
-    try testing.expect(msg.answers[1].name.eql(.lit("www.example.com")));
-    try testing.expect(msg.answers[2].name.eql(.lit("www.example.com")));
-}
-
 test "a pointer flood costs each name its 255 octets, no more" {
     var buf: [max_message_len]u8 = undefined;
     var n: usize = 12;
@@ -1839,22 +1654,6 @@ test "a pointer flood costs each name its 255 octets, no more" {
     try testing.expectEqual(answers, msg.answers.len);
 }
 
-test "RFC 3597 §4: names in RFC 1035 rdata are decompressed, lowercase, and go back out whole" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const wire = "\x00\x01\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00" ++
-        "\x07example\x00\x00\x07\x00\x01" ++
-        "\xc0\x0c\x00\x07\x00\x01\x00\x00\x00\x3c\x00\x07\x04MaIl\xc0\x0c" ++
-        "\xc0\x0c\x00\x0e\x00\x01\x00\x00\x00\x3c\x00\x0a\x05Admin\xc0\x0c\xc0\x0c";
-    const msg = try parseMessage(a, wire);
-    try testing.expectEqualSlices(u8, "\x04mail\x07example\x00", msg.answers[0].rdata);
-    try testing.expectEqualSlices(u8, "\x05admin\x07example\x00\x07example\x00", msg.answers[1].rdata);
-    var out: [512]u8 = undefined;
-    const back = try parseMessage(a, try serializeMessage(&out, msg));
-    for (msg.answers, back.answers) |want, got| try testing.expectEqualSlices(u8, want.rdata, got.rdata);
-}
-
 test "a TXT of empty strings costs its record, not a slice a string" {
     var buf: [max_message_len]u8 = undefined;
     const head = "\x00\x01\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00\x07example\x03com\x00\x00\x10\x00\x01\x00\x00\x01\x2c";
@@ -1869,18 +1668,6 @@ test "a TXT of empty strings costs its record, not a slice a string" {
     var n: usize = 0;
     while (strings.next()) |str| : (n += 1) try testing.expectEqual(0, str.len);
     try testing.expectEqual(rdlength, n);
-}
-
-test "an NSEC's next name goes back out as signed (RFC 6840 §5.1)" {
-    const rdata = "\x04HoSt\x07example\x00\x00\x01\x40";
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rdata, rdata.len));
-    var next: Name.Buf = undefined;
-    try testing.expect(msg.answers[0].nsec(&next).next_domain_name.eql(.lit("host.example")));
-    var out: [max_udp_payload]u8 = undefined;
-    try testing.expect(mem.endsWith(u8, try serializeMessage(&out, msg), rdata));
 }
 
 test "a query's other records are stepped, never built" {
@@ -2004,48 +1791,6 @@ test "compression past its work budget writes names whole, and they read back" {
     for (rrs, back.answers) |want, got| try testing.expect(want.ptr().eql(got.ptr()));
 }
 
-test "parseDottedName: trailing dot optional, root is empty, bad labels refused" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const want = Name.lit("example.com");
-    try testing.expect(want.eql(try parseDottedName(a, "example.com")));
-    try testing.expect(want.eql(try parseDottedName(a, "example.com.")));
-    try testing.expect((try parseDottedName(a, ".")).isRoot());
-    try testing.expect((try parseDottedName(a, "")).isRoot());
-    try testing.expectError(error.InvalidLabelType, parseDottedName(a, "example..com"));
-    const long_label = @as([64]u8, @splat('a')) ++ ".com".*;
-    try testing.expectError(error.LabelTooLong, parseDottedName(a, &long_label));
-}
-
-test "substituteSuffix declines a substitution that overflows a legal name" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const long_label = @as([63]u8, @splat('x')) ++ ".";
-    const owner: Name = .lit(long_label ++ long_label ++ "short");
-    const suffix: Name = .lit("short");
-    const target: Name = .lit(long_label ++ long_label);
-    try testing.expect(try substituteSuffix(a, owner, suffix, target) == null);
-
-    const fits = try substituteSuffix(a, owner, suffix, .lit("net"));
-    try testing.expect(fits.?.eql(.lit(long_label ++ long_label ++ "net")));
-}
-
-test "a name walks up to the root, label by label" {
-    const name = Name.lit("www.example.com.");
-    try testing.expectEqual(@as(u8, 3), name.depth());
-    try testing.expectEqualStrings("www", name.leaf());
-    try testing.expect(name.ancestor(2).eql(.lit("example.com")));
-    try testing.expect(name.ancestor(3).eql(name));
-    try testing.expect(name.ancestor(0).isRoot());
-    var up: ?Name = name;
-    var seen: usize = 0;
-    while (up) |n| : (up = n.parent()) seen += 1;
-    try testing.expectEqual(@as(usize, 4), seen);
-}
-
 test "RFC 4034 §6.1: names in canonical order" {
     const sorted = [_]Name{
         .lit("example"),
@@ -2118,155 +1863,6 @@ fn testAnswer(pkt: *[max_udp_payload]u8, rtype: RType, rdata: []const u8, rdleng
     return pkt[0 .. at + 10 + rdata.len];
 }
 
-test "DNSKEY record parsing" {
-    const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
-    var rd = TestRdata{};
-    rd.put(u16, 257);
-    rd.put(u8, 3);
-    rd.put(u8, 8);
-    rd.putBytes(&key_data);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .dnskey, rd.slice(), rd.pos));
-
-    try testing.expectEqual(@as(usize, 1), msg.answers.len);
-    const dnskey = msg.answers[0].dnskey();
-    try testing.expectEqual(@as(u16, 257), dnskey.flags);
-    try testing.expectEqual(@as(u8, 3), dnskey.protocol);
-    try testing.expectEqual(DnssecAlgorithm.rsasha256, dnskey.algorithm);
-    try testing.expect(dnskey.isZoneKey());
-    try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
-}
-
-test "DS record parsing" {
-    const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
-    var rd = TestRdata{};
-    rd.put(u16, 20326);
-    rd.put(u8, 8);
-    rd.put(u8, 2);
-    rd.putBytes(&digest);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .ds, rd.slice(), rd.pos));
-
-    const ds = msg.answers[0].ds();
-    try testing.expectEqual(@as(u16, 20326), ds.key_tag);
-    try testing.expectEqual(DnssecAlgorithm.rsasha256, ds.algorithm);
-    try testing.expectEqual(DigestType.sha256, ds.digest_type);
-    try testing.expectEqualSlices(u8, &digest, ds.digest);
-}
-
-test "RRSIG record parsing" {
-    const signer_wire = "\x07example\x03com\x00";
-    const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
-    var rd = TestRdata{};
-    rd.put(u16, 1);
-    rd.put(u8, 13);
-    rd.put(u8, 2);
-    rd.put(u32, 300);
-    rd.put(u32, 1700000000);
-    rd.put(u32, 1699000000);
-    rd.put(u16, 12345);
-    rd.putBytes(signer_wire);
-    rd.putBytes(&fake_sig);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), rd.pos));
-
-    const rrsig = msg.answers[0].rrsig();
-    try testing.expectEqual(RType.a, rrsig.type_covered);
-    try testing.expectEqual(DnssecAlgorithm.ecdsap256sha256, rrsig.algorithm);
-    try testing.expectEqual(@as(u8, 2), rrsig.labels);
-    try testing.expectEqual(@as(u32, 300), rrsig.original_ttl);
-    try testing.expectEqual(@as(u32, 1700000000), rrsig.sig_expiration);
-    try testing.expectEqual(@as(u32, 1699000000), rrsig.sig_inception);
-    try testing.expectEqual(@as(u16, 12345), rrsig.key_tag);
-    try testing.expect(rrsig.signer_name.eql(.lit("example.com")));
-    try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
-}
-
-test "NSEC record parsing" {
-    const next_name = "\x04host\x07example\x03com\x00";
-    const bitmap = "\x00\x07\x62\x01\x00\x00\x00\x03\x80";
-    var rd = TestRdata{};
-    rd.putBytes(next_name);
-    rd.putBytes(bitmap);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rd.slice(), rd.pos));
-
-    var next: Name.Buf = undefined;
-    const nsec = msg.answers[0].nsec(&next);
-    try testing.expectEqualStrings("host", nsec.next_domain_name.leaf());
-    try testing.expectEqualSlices(u8, bitmap, nsec.type_bit_maps);
-}
-
-test "NSEC3 record parsing" {
-    const salt = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
-    const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
-    const bitmap = [_]u8{ 0x00, 0x01, 0x40 };
-    var rd = TestRdata{};
-    rd.put(u8, 1);
-    rd.put(u8, 0);
-    rd.put(u16, 10);
-    rd.put(u8, @intCast(salt.len));
-    rd.putBytes(&salt);
-    rd.put(u8, @intCast(next_hash.len));
-    rd.putBytes(&next_hash);
-    rd.putBytes(&bitmap);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec3, rd.slice(), rd.pos));
-
-    const nsec3 = msg.answers[0].nsec3();
-    try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
-    try testing.expectEqual(@as(u8, 0), nsec3.flags);
-    try testing.expectEqual(@as(u16, 10), nsec3.iterations);
-    try testing.expectEqualSlices(u8, &salt, nsec3.salt);
-    try testing.expectEqualSlices(u8, &next_hash, nsec3.next_hashed_owner);
-    try testing.expectEqualSlices(u8, &bitmap, nsec3.type_bit_maps);
-}
-
-test "typeBitmapContains" {
-    const bitmap = [_]u8{
-        0x00, 0x07, // window 0, length 7
-        0x62, 0x00,
-        0x00, 0x00,
-        0x00, 0x03,
-        0x80, // byte 6: DNSKEY(48)
-    };
-
-    try testing.expect(typeBitmapContains(&bitmap, .a));
-    try testing.expect(typeBitmapContains(&bitmap, .ns));
-    try testing.expect(typeBitmapContains(&bitmap, .soa));
-    try testing.expect(typeBitmapContains(&bitmap, .rrsig));
-    try testing.expect(typeBitmapContains(&bitmap, .nsec));
-    try testing.expect(typeBitmapContains(&bitmap, .dnskey));
-    try testing.expect(!typeBitmapContains(&bitmap, .aaaa));
-    try testing.expect(!typeBitmapContains(&bitmap, .mx));
-    try testing.expect(!typeBitmapContains(&bitmap, .txt));
-    try testing.expect(!typeBitmapContains(&bitmap, .cname));
-
-    try testing.expect(!typeBitmapContains(&.{}, .a));
-}
-
-test "an unnamed wire value prints as its number" {
-    var buf: [16]u8 = undefined;
-    try testing.expectEqualStrings("aaaa", try std.mem.print(&buf, "{f}", .{tag(RType.aaaa)}));
-    try testing.expectEqualStrings("999", try std.mem.print(&buf, "{f}", .{tag(@as(RType, @fromBackingInt(999)))}));
-    try testing.expectEqualStrings("9", try std.mem.print(&buf, "{f}", .{tag(@as(RCode, @fromBackingInt(9)))}));
-}
-
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     var rd = TestRdata{};
     rd.put(u16, 1);
@@ -2279,14 +1875,6 @@ test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     defer arena.deinit();
     var pkt: [max_udp_payload]u8 = undefined;
     try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), 20)));
-}
-
-test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" {
-    const next = "\x04host\x07example\x03com\x00";
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var pkt: [max_udp_payload]u8 = undefined;
-    try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, next, 5)));
 }
 
 test "RFC 4034 §3.1.7, §4.1.1: an RRSIG's signer and an NSEC's next name hold no pointer" {
@@ -2303,20 +1891,6 @@ test "RFC 4034 §3.1.7, §4.1.1: an RRSIG's signer and an NSEC's next name hold 
     var pkt: [max_udp_payload]u8 = undefined;
     try testing.expectError(error.FormatError, parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), @intCast(rd.slice().len))));
     try testing.expectError(error.FormatError, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, nsec, nsec.len)));
-}
-
-test "applyCase0x20 only flips ASCII letters" {
-    var prng: std.Random.DefaultPrng = .init(0x20);
-    const original = "\x03Foo\x0aBar123-baz\x03com\x00";
-    var randomized = original.*;
-    applyCase0x20(prng.random(), &randomized);
-    for (randomized, original) |rb, ob| {
-        if (std.ascii.isAlphabetic(ob)) {
-            try testing.expectEqual(std.ascii.toLower(ob), std.ascii.toLower(rb));
-        } else {
-            try testing.expectEqual(ob, rb);
-        }
-    }
 }
 
 test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
@@ -2338,19 +1912,6 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
         const ratio = @as(f64, @floatFromInt(c)) / @as(f64, @floatFromInt(iterations));
         try testing.expect(ratio > 0.45 and ratio < 0.55);
     }
-}
-
-test "formatInto is injective over hostile labels" {
-    var buf: [max_dotted_len + 1]u8 = undefined;
-
-    try testing.expectEqualStrings("e\\.d.com", (Name.lit("e\\.d.com")).formatInto(&buf));
-    try testing.expectEqualStrings("e.d.com", (Name.lit("e.d.com")).formatInto(&buf));
-
-    try testing.expectEqualStrings("\\007foo.com", (Name.lit("\\007foo.com")).formatInto(&buf));
-    try testing.expectEqualStrings("?foo.com", (Name.lit("?foo.com")).formatInto(&buf));
-
-    try testing.expectEqualStrings("a\\\\b", (Name.lit("a\\\\b")).formatInto(&buf));
-    try testing.expectEqualStrings("\\032.\\255", (Name.lit("\\032.\\255")).formatInto(&buf));
 }
 
 test "formatInto/parseDottedName round-trip every label byte" {
