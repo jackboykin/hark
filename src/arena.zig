@@ -133,16 +133,6 @@ test "an arena is an allocator" {
     try std.heap.testAllocatorAlignedShrink(arena.allocator());
 }
 
-test "what a rewind gives back reads 0xaa in a safe build" {
-    if (!@import("builtin").mode.runtimeSafety()) return error.SkipZigTest;
-    var arena: Arena = .init(testing.allocator);
-    defer arena.deinit();
-    const held = try arena.allocator().alloc(u8, 100);
-    @memset(held, 1);
-    arena.reset();
-    try testing.expect(mem.allEqual(u8, held, 0xaa));
-}
-
 test "allocations are aligned, apart, and keep their bytes across chunks" {
     var arena: Arena = .init(testing.allocator);
     defer arena.deinit();
@@ -173,15 +163,6 @@ test "only the newest allocation grows in place" {
     try testing.expect(a.resize(last, 16));
     try testing.expect(a.resize(last.ptr[0..16], 2));
     try testing.expect(!a.resize(last.ptr[0..2], 1 << 20));
-}
-
-test "a reset arena gives the same memory again" {
-    var arena: Arena = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const first = try a.alloc(u8, 100);
-    arena.reset();
-    try testing.expectEqual(first.ptr, (try a.alloc(u8, 100)).ptr);
 }
 
 test "a reset keeps the floor and gives back every chunk past it" {

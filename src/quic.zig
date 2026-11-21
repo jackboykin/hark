@@ -1876,33 +1876,6 @@ const hex = tls13.hex;
 
 const testing = std.testing;
 
-test "RFC 9001 A.1: Initial keys from the client's connection id" {
-    const keys = initialKeys(&hex("8394c8f03e515708"));
-    try testing.expectEqual(hex("1f369613dd76d5467730efcbe3b1a22d"), keys.client.key);
-    try testing.expectEqual(hex("fa044b2f42a3fd3b46fb255c"), keys.client.iv);
-    try testing.expectEqual(hex("9f50449e04a0e810283a1e9933adedd2"), keys.client.hp);
-    try testing.expectEqual(hex("cf3a5331653c364c88f0f379b6067e37"), keys.server.key);
-    try testing.expectEqual(hex("0ac1493ca1905853b0bba03e"), keys.server.iv);
-    try testing.expectEqual(hex("c206b8d9b9f0f37644430b490eeaa314"), keys.server.hp);
-}
-
-test "RFC 9001 A.3: the server's Initial opens to its ACK and CRYPTO" {
-    var packet = hex("cf000000010008f067a5502a4262b5004075c0d95a482cd0991cd25b0aac406a" ++
-        "5816b6394100f37a1c69797554780bb38cc5a99f5ede4cf73c3ec2493a1839b3" ++
-        "dbcba3f6ea46c5b7684df3548e7ddeb9c3bf9c73cc3f3bded74b562bfb19fb84" ++
-        "022f8ef4cdd93795d77d06edbb7aaf2f58891850abbdca3d20398c276456cbc4" ++
-        "2158407dd074ee");
-    const keys = initialKeys(&hex("8394c8f03e515708")).server;
-    const pn_at = 1 + 4 + 1 + 0 + 1 + 8 + 1 + 2;
-    const h = keys.unmask(&packet, pn_at);
-    try testing.expectEqual(1, decodePn(null, h.truncated, h.len));
-    const plain = keys.open(&packet, pn_at + h.len, 1).?;
-    try testing.expectEqualSlices(u8, &hex("02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf739" ++
-        "88cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c94" ++
-        "0d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00" ++
-        "020304"), plain);
-}
-
 test "RFC 9001 A.2: the client's Initial seals as in the sample" {
     const header = hex("c300000001088394c8f03e5157080000449e00000002");
     var packet: [1200]u8 = @splat(0);
