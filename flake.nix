@@ -9,6 +9,10 @@
       forAll = f: lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (s: f nixpkgs.legacyPackages.${s});
     in
     {
+      packages = forAll (pkgs: {
+        default = pkgs.callPackage ./nix/package.nix { };
+      });
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [ pkgs.zig_0_17 pkgs.go_1_27 ];
