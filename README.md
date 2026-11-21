@@ -13,6 +13,8 @@ Things:
 
 ## Running
 
+- **systemd**: `zig build` installs [`hark.service`](systemd/hark.service), which runs hark sandboxed.
+
 hark runs as a server. By default it listens on `127.0.0.1:53` and `[::1]:53`. Only `clients` are answered. See the example config [`hark.toml.example`](hark.toml.example) to tune any value yourself.
 
 ```console

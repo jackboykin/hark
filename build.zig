@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) !void {
         exe.link_function_sections = true;
     }
     b.installArtifact(exe);
+    b.installFile("systemd/hark.service", "lib/systemd/system/hark.service");
     if (testing_enabled) b.installArtifact(b.addExecutable(.{
         .name = "rpl",
         .root_module = b.createModule(.{
