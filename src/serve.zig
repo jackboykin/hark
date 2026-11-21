@@ -42,6 +42,7 @@ const Conn = struct {
     served: u32 = 0,
     last_ns: i64,
     owed: u32 = 0,
+    parked: std.ArrayList(Tenant) = .empty,
     draining: bool = false,
     unsent: stream.Unsent = .{},
     blocked_ns: i64 = 0,
@@ -55,15 +56,18 @@ const Conn = struct {
 const Reply = union(enum) {
     udp: struct { fd: posix.fd_t, addr: na.Address },
     wildcard: struct { fd: posix.fd_t, addr: na.Address, local: Batch.Local },
-    tcp: *Conn,
+    tcp: Tcp,
 
     fn peer(r: Reply) na.Address {
         return switch (r) {
-            inline .udp, .wildcard => |u| u.addr,
-            .tcp => |c| c.addr,
+            inline .udp, .wildcard, .tcp => |u| u.addr,
         };
     }
 };
+
+/// The slot's whole generation, not the token's 12 bits: a reply can
+/// outlive many reuses of its slot.
+const Tcp = struct { slot: u32, gen: u32, addr: na.Address };
 
 const Owes = union(enum) {
     reply: Reply,
@@ -117,16 +121,12 @@ const Pending = struct {
         return p.asked_ns + answer.client_timeout_ms * std.time.ns_per_ms;
     }
 
-    fn lapses(p: Pending) i64 {
-        return switch (p.owes) {
+    fn lapses(p: Pending, owes: Owes) i64 {
+        return switch (owes) {
             .nothing => p.asked_ns,
             .reply => |r| if (r == .tcp) never else p.timeout(),
             .left => p.timeout(),
         };
-    }
-
-    fn tcpOn(p: Pending, c: *const Conn) bool {
-        return p.owes == .reply and p.owes.reply == .tcp and p.owes.reply.tcp == c;
     }
 };
 
@@ -220,6 +220,21 @@ const Server = struct {
         try s.freed.ensureTotalCapacity(s.gpa, s.watched.items.len + 1);
         try s.watched.append(s.gpa, .{ .w = w });
         return @intCast(s.watched.items.len - 1);
+    }
+
+    fn conn(s: *Server, t: Tcp) ?*Conn {
+        const x = s.watched.items[t.slot];
+        return if (x.gen == t.gen and x.w == .conn) x.w.conn else null;
+    }
+
+    fn tcpOf(s: *Server, c: *const Conn) Tcp {
+        const slot = c.token & slot_mask;
+        return .{ .slot = slot, .gen = s.watched.items[slot].gen, .addr = c.addr };
+    }
+
+    fn owing(s: *Server, owes: Owes) Owes {
+        if (owes == .reply and owes.reply == .tcp and s.conn(owes.reply.tcp) == null) return .{ .left = owes.reply.tcp.addr };
+        return owes;
     }
 
     fn onSignal(s: *Server, fd: posix.fd_t) void {
@@ -338,7 +353,7 @@ const Server = struct {
     }
 
     fn frames(s: *Server, c: *Conn, bytes: []u8) !void {
-        const tok = c.token;
+        const t = s.tcpOf(c);
         var rest = bytes;
         while (!c.unsent.owing() and !c.draining) {
             // Judged by its length alone, so a frame too long for a query is
@@ -348,9 +363,9 @@ const Server = struct {
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;
-            try s.ask(query, .{ .tcp = c }, false);
+            try s.ask(query, .{ .tcp = t }, false);
             // `ask` may have dropped the connection; `c` is then freed.
-            if (s.watched.items[tok & slot_mask].w != .conn) return;
+            if (s.conn(t) == null) return;
             rest = rest[2 + query.len ..];
             if (c.served >= s.cfg.tcp_queries_per_conn) return s.drain(c);
         }
@@ -396,14 +411,13 @@ const Server = struct {
     }
 
     fn drop(s: *Server, c: *Conn) void {
-        if (c.owed > 0) for (s.pending.items, 0..) |*p, i| if (p.phase != .vacant and p.tcpOn(c)) {
-            p.owes = .{ .left = c.addr };
-            if (p.at_ns != Pending.never) continue;
+        for (c.parked.items) |t| {
+            const p = &s.pending.items[t.slot];
+            if (p.phase == .vacant or p.gen != t.gen or p.at_ns != Pending.never) continue;
             p.at_ns = @max(p.timeout(), s.e.now_ns);
-            // Only hastens: without the timer the waiter leaves when its
-            // resolution settles, which its deadline bounds.
-            s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = @intCast(i), .gen = p.gen }) catch {};
-        };
+            s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = t.slot, .gen = p.gen }) catch {};
+        }
+        c.parked.deinit(s.gpa);
         sys.close(c.fd);
         s.watched.items[c.token & slot_mask].w = .free;
         s.freed.appendAssumeCapacity(c.token & slot_mask);
@@ -432,7 +446,7 @@ const Server = struct {
     fn ask(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
         // BCP 140: a UDP datagram with QR set is dropped silently, so two servers
         // can't be made to answer each other. Over TCP `validateQuery` answers it.
-        if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
+        if (wire.len < 12 or (reply != .tcp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(s.conn(reply.tcp).?);
         if (reply != .tcp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
         s.question(wire, reply, crowded) catch |err| switch (err) {
             error.OutOfMemory => s.refused(reply, .{ .id = mem.readInt(u16, wire[0..2], .big), .rcode = .server_failure, .rd = wire[2] & 1 != 0 }),
@@ -447,9 +461,10 @@ const Server = struct {
 
     fn refuse(s: *Server, i: u32, linked: bool) void {
         const p = s.pending.items[i];
-        switch (p.owes) {
+        const owes = s.owing(p.owes);
+        switch (owes) {
             .reply => |r| s.refused(r, .{ .id = p.query.header.id, .opcode = p.query.header.flags.opcode, .rcode = .server_failure, .rd = p.query.header.flags.rd, .question = p.query.question, .client = p.query.edns }),
-            .left => s.forsake(.dropped, p.owes, p.query, p.asked_ns),
+            .left => s.forsake(.dropped, owes, p.query, p.asked_ns),
             .nothing => {},
         }
         if (linked) s.unpark(i);
@@ -528,6 +543,8 @@ const Server = struct {
         try s.reach(p.a orelse p.root);
         try s.timers.ensureUnusedCapacity(s.gpa, 1);
         try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
+        const owner = if (p.owes.reply == .tcp) s.conn(p.owes.reply.tcp).? else null;
+        if (owner) |c| try c.parked.ensureUnusedCapacity(s.gpa, 1);
         const i: u32 = s.vacant.pop() orelse blk: {
             try s.pending.append(s.gpa, .{ .root = 0, .query = undefined, .owes = undefined, .asked_ns = 0, .phase = .vacant, .gen = std.math.maxInt(u32) });
             break :blk @intCast(s.pending.items.len - 1);
@@ -536,6 +553,7 @@ const Server = struct {
         s.pending.items[i] = p;
         s.pending.items[i].gen = gen;
         s.parks += 1;
+        if (owner) |c| c.parked.appendAssumeCapacity(.{ .slot = i, .gen = gen });
         s.link(i);
         s.schedule(i) catch unreachable;
     }
@@ -588,10 +606,11 @@ const Server = struct {
 
     fn ready(s: *Server, i: u32, first_ns: i64) !void {
         const p = &s.pending.items[i];
-        const reply = switch (p.owes) {
+        const owes = s.owing(p.owes);
+        const reply = switch (owes) {
             .reply => |r| r,
             .left => {
-                s.forsake(.late, p.owes, p.query, p.asked_ns);
+                s.forsake(.late, owes, p.query, p.asked_ns);
                 return s.vacate(i);
             },
             .nothing => return s.vacate(i),
@@ -653,10 +672,11 @@ const Server = struct {
     fn schedule(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
         const now = s.e.now_ns;
+        const lapses = p.lapses(s.owing(p.owes));
         p.at_ns = if (s.desk.retention.serve_stale_ttl != 0 and now < p.patience())
             p.patience()
-        else if (now < p.lapses())
-            p.lapses()
+        else if (now < lapses)
+            lapses
         else
             Pending.never;
         if (p.at_ns == Pending.never) return;
@@ -674,7 +694,7 @@ const Server = struct {
 
     fn gone(s: *Server, i: u32) !bool {
         const p = s.pending.items[i];
-        if (s.e.now_ns < p.lapses()) return false;
+        if (s.e.now_ns < p.lapses(s.owing(p.owes))) return false;
         if (s.g.cell(p.a orelse p.root).holds == 1) {
             while (s.late.front()) |l| if (s.parkedAs(l) == null) {
                 _ = s.late.popFront();
@@ -704,7 +724,7 @@ const Server = struct {
     }
 
     fn impatient(s: *Server, p: *Pending) !void {
-        const reply = switch (p.owes) {
+        const reply = switch (s.owing(p.owes)) {
             .reply => |r| r,
             .left, .nothing => return,
         };
@@ -862,10 +882,12 @@ const Server = struct {
         switch (reply) {
             .udp => |u| s.out.push(len, &u.addr),
             .wildcard => |u| s.out.pushFrom(len, &u.addr, u.local),
-            .tcp => |c| {
+            .tcp => |t| {
+                const c = s.conn(t).?;
                 const framed = s.frame[0 .. 2 + len];
                 mem.writeInt(u16, framed[0..2], @intCast(len), .big);
                 c.owed -= 1;
+                if (c.owed == 0) c.parked.clearRetainingCapacity();
                 c.last_ns = s.e.now_ns;
                 switch (c.unsent.put(s.gpa, c.fd, framed) catch return s.drop(c)) {
                     .done => _ = s.closeIfDone(c),
