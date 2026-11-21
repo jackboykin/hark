@@ -18,6 +18,7 @@ hark runs as a server. By default it listens on `127.0.0.1:53` and `[::1]:53`. O
 ```console
 hark serve                                 # built-in defaults
 hark serve --config /etc/hark/hark.toml    # serve with a custom config
+hark check --config /etc/hark/hark.toml    # check that a config is valid
 ```
 
 ## Building

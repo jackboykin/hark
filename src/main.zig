@@ -55,8 +55,8 @@ fn command(init: std.process.Init) !void {
         var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
         try stdout_writer.interface.print("hark {s}\n", .{build_options.version});
         try stdout_writer.interface.flush();
-    } else if (std.mem.eql(u8, name, "serve")) {
-        return runServe(allocator, work_allocator, &args, io);
+    } else if (std.mem.eql(u8, name, "serve") or std.mem.eql(u8, name, "check")) {
+        return runServe(allocator, work_allocator, &args, io, std.mem.eql(u8, name, "check"));
     } else {
         log.err("unknown command: {s}", .{name});
         printUsage();
@@ -70,16 +70,17 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  serve [options]     Start DNS server
+        \\  check [options]     Load the config as serve would, then exit
         \\  version             Print version
         \\
-        \\Serve options:
+        \\Serve and check options:
         \\  --config <path>     Path to config file (default: /etc/hark/hark.toml)
         \\  --verbose, -v       Trace each resolution's steps
         \\
     , .{});
 }
 
-fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io) !void {
+fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, args: *std.process.Args.Iterator, io: Io, check: bool) !void {
     hark.rand.randomizeHashKey();
     var config_path: ?[]const u8 = null;
     var trace = false;
@@ -105,6 +106,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
     else
         try loadDefaultConfig(allocator, io);
     defer cfg.deinit();
+    if (check) return;
 
     // A socket per exchange in flight can pass the usual 1024 soft limit.
     if (std.posix.getrlimit(.NOFILE)) |lim| {
