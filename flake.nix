@@ -13,6 +13,12 @@
         default = pkgs.callPackage ./nix/package.nix { };
       });
 
+      nixosModules.default = import ./nix/module.nix self;
+
+      checks = forAll (pkgs: {
+        nixos = pkgs.testers.runNixOSTest (import ./nix/test.nix self);
+      });
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [ pkgs.zig_0_17 pkgs.go_1_27 ];
