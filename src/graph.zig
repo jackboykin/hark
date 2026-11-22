@@ -847,13 +847,7 @@ pub const Graph = struct {
         };
         switch (value) {
             .cut, .rrset, .stub, .ds, .dnskey => {
-                const blob = try g.store.build(c.key, value, expires_ns);
-                const owned = owned: {
-                    errdefer g.store.unref(blob);
-                    break :owned try c.own(try store.Store.parse(c.arena.allocator(), blob));
-                };
-                c.blob = blob;
-                c.state = .{ .fact = owned };
+                try g.attach(c, try g.store.build(c.key, value, expires_ns));
                 if (!g.awaitsVerdict(c.key.kind)) g.keep(id);
             },
             .exchange => |o| return g.settleExchange(id, o),
@@ -891,13 +885,17 @@ pub const Graph = struct {
         std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.verdict.judged());
         const blob = try g.store.build(c.key, try store.Store.parse(g.scratch.allocator(), v), v.end());
         blob.verdict = v.verdict;
-        const owned = owned: {
-            errdefer g.store.unref(blob);
-            break :owned try c.own(try store.Store.parse(c.arena.allocator(), blob));
-        };
-        c.blob = blob;
-        c.state = .{ .fact = owned };
+        try g.attach(c, blob);
         g.woken(id, false);
+    }
+
+    /// Takes `blob`'s reference: from here it is the cell's fact, or released.
+    fn attach(g: *Graph, c: *Cell, blob: *store.Blob) !void {
+        errdefer g.store.unref(blob);
+        // Owned before the cell is touched: a failed parse leaves it unsettled.
+        const owned = try c.own(try store.Store.parse(c.arena.allocator(), blob));
+        c.state = .{ .fact = owned };
+        c.blob = blob;
     }
 
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
@@ -1084,10 +1082,7 @@ pub const Graph = struct {
     fn materialise(g: *Graph, key: Key, name: dns.Name, e: *store.Blob) !CellId {
         const id = try g.newCell(key, name, g.as_of);
         errdefer g.free(id);
-        const c = g.cell(id);
-        const owned = try c.own(try store.Store.parse(c.arena.allocator(), e));
-        c.state = .{ .fact = owned };
-        c.blob = e.ref();
+        try g.attach(g.cell(id), e.ref());
         return id;
     }
 
