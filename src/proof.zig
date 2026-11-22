@@ -96,7 +96,7 @@ pub fn classifyDelegation(
     };
     // An owner match returned above, so the next closer hash is defined.
     std.debug.assert(found.ce.depth() < child_zone.depth());
-    return if (nsec3Cover(&chain, &found.next_closer_hash) == true) .unsigned else .unproven;
+    return if (nsec3Cover(&chain, &found.next_closer_hash) == .insecure) .unsigned else .unproven;
 }
 
 /// The longest suffix of qname shared with either bound of a covering NSEC
@@ -468,17 +468,16 @@ fn nsec3ClosestEncloser(
     return .{ .verdict = .unchecked };
 }
 
-/// Null when no span covers `hash`, else whether any coverer has Opt-Out.
-/// Every coverer is read, not the first: the sender picks the order.
-fn nsec3Cover(chain: *const Nsec3Chain, hash: *const Hash) ?bool {
-    var covered = false;
-    var optout = false;
+/// No cover is `.unchecked`. One Opt-Out coverer anywhere makes it `.insecure`:
+/// the sender picks the order.
+fn nsec3Cover(chain: *const Nsec3Chain, hash: *const Hash) SecurityStatus {
+    var status: SecurityStatus = .unchecked;
     for (chain.owners(), chain.records()) |owner_hash, rr| {
         if (!nsec3HashInRange(&owner_hash, rr.nsec3().next_hashed_owner, hash)) continue;
-        covered = true;
-        if (rr.nsec3().flags & nsec3_opt_out != 0) optout = true;
+        if (rr.nsec3().flags & nsec3_opt_out != 0) return .insecure;
+        status = .secure;
     }
-    return if (covered) optout else null;
+    return status;
 }
 
 /// RFC 4035 §5.3.4: a wildcard-expanded answer whose RRSIG names `labels`
@@ -494,8 +493,8 @@ pub fn proveNoCloserMatch(
     return switch (try noCloserMatch(authorities, qname, labels, zone, budget)) {
         .nsec => .secure,
         .nsec3 => |n| {
-            const optout = nsec3Cover(&n.chain, &n.closer) orelse return .bogus;
-            return if (optout) .insecure else .secure;
+            const s = nsec3Cover(&n.chain, &n.closer);
+            return if (s == .unchecked) .bogus else s;
         },
         .verdict => |v| v,
     };
@@ -578,35 +577,28 @@ fn validateNsec3NegativeProof(
     const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
     const wc_hash = try chain.params.hash(wildcard, budget);
 
-    const nc_cover = nsec3Cover(&chain, &nc_hash);
-    const nc_covered = nc_cover != null;
-    const nc_optout = nc_cover orelse false;
+    const nc = nsec3Cover(&chain, &nc_hash);
     const wc_cover = nsec3Cover(&chain, &wc_hash);
-    const wc_optout = wc_cover orelse false;
-    var wc_proven = wc_cover != null;
-    var wc_contradicted = false;
-    if (chain.match(&wc_hash)) |n3| switch (if (is_nxdomain) SecurityStatus.bogus else nodataAt(n3.type_bit_maps, qname, qtype)) {
-        .bogus => wc_contradicted = true,
-        .secure => wc_proven = true,
-        .unchecked, .insecure => {},
-    };
+    const wc: SecurityStatus = if (chain.match(&wc_hash)) |n3|
+        (if (is_nxdomain or wc_cover != .unchecked) .bogus else nodataAt(n3.type_bit_maps, qname, qtype))
+    else
+        wc_cover;
     // RFC 5155 §8.6: an unsigned delegation under Opt-Out owns no NSEC3, so
     // the Opt-Out span over the next closer is the whole DS proof. It ranks
     // above a wildcard contradiction: the delegation exists, so no wildcard
     // applies to it.
-    if (qtype == .ds and !is_nxdomain and nc_covered and nc_optout) return .insecure;
-
-    // Before the Opt-Out fallthrough below, which would otherwise launder a
-    // NODATA over a signed wildcard that owns the type.
-    if (wc_contradicted) return .bogus;
-
-    if (nc_covered and wc_proven) return if (nc_optout or wc_optout) .insecure else .secure;
-
-    // RFC 5155 errata 3441: with no wildcard proof, a name in an Opt-Out span
-    // may be an unsigned delegation or an omitted empty non-terminal, so
-    // NODATA for any qtype is insecure. NXDOMAIN still owes the wildcard.
-    if (!is_nxdomain and nc_covered and nc_optout) return .insecure;
-    return .unchecked;
+    if (qtype == .ds and !is_nxdomain and nc == .insecure) return .insecure;
+    return switch (wc) {
+        // Before the Opt-Out fallthrough below, which would otherwise launder a
+        // NODATA over a signed wildcard that owns the type.
+        .bogus => .bogus,
+        .secure => nc,
+        .insecure => if (nc == .unchecked) .unchecked else .insecure,
+        // RFC 5155 errata 3441: with no wildcard proof, a name in an Opt-Out span
+        // may be an unsigned delegation or an omitted empty non-terminal, so
+        // NODATA for any qtype is insecure. NXDOMAIN still owes the wildcard.
+        .unchecked => if (!is_nxdomain and nc == .insecure) .insecure else .unchecked,
+    };
 }
 
 const test_root = dns.Name.root;
@@ -1162,6 +1154,39 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
     var b: rrsig.ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
     try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, true, test_root, &b));
+}
+
+test "NSEC3 NODATA wildcard both owned and covered is .bogus in either order" {
+    const qname = dns.Name.lit("missing.example.com");
+    const ce_name = dns.Name.lit("example.com");
+    const wc_name = dns.Name.lit("*.example.com");
+    const zone_name = dns.Name.lit("com");
+    const salt: []const u8 = &.{};
+
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_rr = makeNsec3Rr(
+        makeNsec3OwnerName(nsec3Hash(ce_name, salt, 0), zone_name, &bufs1),
+        salt,
+        &@as([20]u8, @splat(0xFF)),
+        &[_]u8{ 0x00, 0x01, 0x40 },
+    );
+    var bufs2: Nsec3OwnerBufs = .{};
+    const nc_rr = makeCoveringNsec3(nsec3Hash(qname, salt, 0), zone_name, salt, &bufs2);
+    const wc_hash = nsec3Hash(wc_name, salt, 0);
+    var bufs3: Nsec3OwnerBufs = .{};
+    const owns = makeNsec3Rr(
+        makeNsec3OwnerName(wc_hash, zone_name, &bufs3),
+        salt,
+        &@as([20]u8, @splat(0xFF)),
+        &[_]u8{ 0x00, 0x01, 0x40 },
+    );
+    var bufs4: Nsec3OwnerBufs = .{};
+    const covers = makeCoveringNsec3(wc_hash, zone_name, salt, &bufs4);
+
+    var b: rrsig.ValidationBudget = .{};
+    for ([_][4]dns.ResourceRecord{ .{ ce_rr, nc_rr, owns, covers }, .{ ce_rr, nc_rr, covers, owns } }) |authorities| {
+        try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+    }
 }
 
 test "classifyDelegation NSEC3 signed below or beside the cut proves nothing" {
