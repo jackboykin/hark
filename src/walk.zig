@@ -834,8 +834,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .stored_ns = g.now(),
     };
     switch (reply.kind) {
-        .nxdomain => if (!delegation.soaAbove(msg.authorities, cur)) return null,
-        .nodata => if (!delegation.soaAbove(msg.authorities, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
+        .nxdomain => if (!delegation.deniesAt(msg, cur)) return null,
+        .nodata => if (!delegation.deniesAt(msg, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
         .answer, .alias, .yxdomain => {},
     }
     // Only an answer to NS keeps the other authority and additional records. No client

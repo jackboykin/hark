@@ -1,12 +1,15 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: qname-minimisation = no
 
-SCENARIO_BEGIN a negative without its SOA is no answer, NXDOMAIN or NODATA
+SCENARIO_BEGIN a denial stands on its zone's SOA, or on AA alone for no time
 
-; RFC 2308 §3. The SOA must be at or above the name denied. AA speaks for
-; the first owner alone (RFC 1034 §6.2.7), so an NXDOMAIN past an alias
-; without its SOA leaves the alias, and the target is asked itself. An
-; NXDOMAIN carrying a cut is no referral.
+; RFC 2308 §2.2, §3, §5. A denial carries an SOA at or above the name
+; denied. One naming no zone at all, AA set and neither SOA nor NS beside
+; it, is served and never remembered. An SOA of another zone denies
+; nothing, nor does NS without the zone's own on either rcode, nor a reply
+; without AA. AA speaks for the first owner alone (RFC 1034 §6.2.7), so an
+; NXDOMAIN past an alias without its SOA leaves the alias, and the target
+; is asked itself. An NXDOMAIN carrying a cut is no referral.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -69,6 +72,24 @@ RANGE_BEGIN 0 100
       odd.example. IN A
     SECTION AUTHORITY
       other.example. 3600 IN SOA ns.example. root.example. 1 3600 900 604800 300
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      handed.example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      quiet.example. IN A
   ENTRY_END
 
   ENTRY_BEGIN
@@ -143,42 +164,75 @@ RANGE_END
 
 STEP 1 QUERY
 ENTRY_BEGIN
-  REPLY RD EDNS
+  REPLY RD
   SECTION QUESTION
     gone.example. IN A
 ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags question ede=22
-  REPLY QR RD RA SERVFAIL
+  MATCH flags question answer authority
+  REPLY QR RD RA NXDOMAIN
   SECTION QUESTION
     gone.example. IN A
 ENTRY_END
 
-STEP 3 QUERY
+STEP 3 CHECK_OUT_QUERY
 ENTRY_BEGIN
-  REPLY RD EDNS
   SECTION QUESTION
-    empty.example. IN A
+    gone.example. IN A
 ENTRY_END
 
-STEP 4 CHECK_ANSWER
+STEP 4 CHECK_OUT_QUERY
 ENTRY_BEGIN
-  MATCH flags question ede=22
-  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
-    empty.example. IN A
+    gone.example. IN A
 ENTRY_END
 
 STEP 5 QUERY
 ENTRY_BEGIN
   REPLY RD
   SECTION QUESTION
-    denied.example. IN A
+    gone.example. IN A
 ENTRY_END
 
 STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 7 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    empty.example. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    empty.example. IN A
+ENTRY_END
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    denied.example. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH flags question answer authority
   REPLY QR RD RA NXDOMAIN
@@ -188,14 +242,14 @@ ENTRY_BEGIN
     example. 300 IN SOA ns.example. root.example. 1 3600 900 604800 300
 ENTRY_END
 
-STEP 7 QUERY
+STEP 12 QUERY
 ENTRY_BEGIN
   REPLY RD EDNS
   SECTION QUESTION
     www.sub.example. IN A
 ENTRY_END
 
-STEP 8 CHECK_ANSWER
+STEP 13 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH flags question ede=22
   REPLY QR RD RA SERVFAIL
@@ -203,14 +257,14 @@ ENTRY_BEGIN
     www.sub.example. IN A
 ENTRY_END
 
-STEP 9 QUERY
+STEP 14 QUERY
 ENTRY_BEGIN
   REPLY RD EDNS
   SECTION QUESTION
     odd.example. IN A
 ENTRY_END
 
-STEP 10 CHECK_ANSWER
+STEP 15 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH flags question ede=22
   REPLY QR RD RA SERVFAIL
@@ -218,14 +272,44 @@ ENTRY_BEGIN
     odd.example. IN A
 ENTRY_END
 
-STEP 11 QUERY
+STEP 16 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    handed.example. IN A
+ENTRY_END
+
+STEP 17 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    handed.example. IN A
+ENTRY_END
+
+STEP 18 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    quiet.example. IN A
+ENTRY_END
+
+STEP 19 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    quiet.example. IN A
+ENTRY_END
+
+STEP 20 QUERY
 ENTRY_BEGIN
   REPLY RD
   SECTION QUESTION
     chain.example. IN A
 ENTRY_END
 
-STEP 12 CHECK_ANSWER
+STEP 21 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH flags question answer authority
   REPLY QR RD RA NXDOMAIN
@@ -237,14 +321,14 @@ ENTRY_BEGIN
     example. 300 IN SOA ns.example. root.example. 1 3600 900 604800 300
 ENTRY_END
 
-STEP 13 QUERY
+STEP 22 QUERY
 ENTRY_BEGIN
   REPLY RD
   SECTION QUESTION
     hop.sub.example. IN A
 ENTRY_END
 
-STEP 14 CHECK_ANSWER
+STEP 23 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH flags question answer authority
   REPLY QR RD RA NXDOMAIN

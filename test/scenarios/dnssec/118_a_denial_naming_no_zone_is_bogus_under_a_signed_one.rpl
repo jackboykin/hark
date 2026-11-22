@@ -1,0 +1,47 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a denial naming no zone is bogus under a signed one
+
+; The signed root denies gone. with AA and an empty authority section. That
+; stands as a denial (RFC 2308 §2.2) and so meets its judge with no proof.
+; The root's own signed word shows no insecure cut to excuse it: bogus.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone. IN A
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC zz. NS SOA RRSIG NSEC DNSKEY
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    gone. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=6
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    gone. IN A
+ENTRY_END
+
+SCENARIO_END

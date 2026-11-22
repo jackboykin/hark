@@ -74,6 +74,15 @@ pub fn soaAbove(authorities: []const dns.ResourceRecord, name: dns.Name) bool {
     return false;
 }
 
+/// RFC 2308 §2.2. A reply denies `name` if it has an SOA at or above it, or
+/// if AA is set and authority holds no SOA and no NS. Another zone's SOA is
+/// refused. NS without the zone's SOA is a referral.
+pub fn deniesAt(response: dns.Message, name: dns.Name) bool {
+    if (soaAbove(response.authorities, name)) return true;
+    for (response.authorities) |rr| if (rr.rtype == .soa or rr.rtype == .ns) return false;
+    return response.header.flags.aa;
+}
+
 pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     const flags = response.header.flags;
     if (response.opt) |o| if (o.extended_rcode != 0) return true;
