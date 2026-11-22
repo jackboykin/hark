@@ -851,11 +851,12 @@ pub const Graph = struct {
                 if (!g.awaitsVerdict(c.key.kind)) g.keep(id);
             },
             .exchange => |o| return g.settleExchange(id, o),
-            .addr, .answer, .refresh, .ahead, .span => {
+            .addr, .answer, .refresh, .ahead => {
                 const owned = try c.own(value);
                 c.bare_expires_ns = expires_ns;
                 c.state = .{ .fact = owned };
             },
+            .span => unreachable,
             .secure => |v| {
                 const owned = try c.own(value);
                 c.bare_expires_ns = expires_ns;
