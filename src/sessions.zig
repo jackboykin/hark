@@ -122,15 +122,19 @@ const Way = union(enum) {
     session: *Conn,
 };
 
-fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Way {
-    var b: Way = .plain;
+const Best = struct { way: Way, known: u32 };
+
+fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Best {
+    var b: Best = .{ .way = .plain, .known = std.math.maxInt(u32) };
     if (key.port != s.plain_port) return b;
     var fewest: u32 = std.math.maxInt(u32);
     for (std.enums.values(Kind)) |kind| {
         const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
         if (standing.status(s.edge.now_ns) != .capable) continue;
+        const dial_rounds = carrier.dialRounds(kind);
+        b.known = @min(b.known, dial_rounds);
         var way: Way = .{ .dial = kind };
-        var rounds = carrier.dialRounds(kind);
+        var rounds = dial_rounds;
         if (s.find(key, kind)) |c| if (!c.carrier.spent()) {
             if (c.overdue) continue;
             way = .{ .session = c };
@@ -138,23 +142,14 @@ fn best(s: *const Sessions, key: na.AddressKey, standings: ?*const Standings) Wa
         };
         if (rounds < fewest) {
             fewest = rounds;
-            b = way;
+            b.way = way;
         }
     }
     return b;
 }
 
-fn knownRounds(s: *const Sessions, standings: ?*const Standings) u32 {
-    var known: u32 = std.math.maxInt(u32);
-    for (std.enums.values(Kind)) |kind| {
-        const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
-        if (standing.status(s.edge.now_ns) == .capable) known = @min(known, carrier.dialRounds(kind));
-    }
-    return known;
-}
-
 pub fn quote(s: *const Sessions, server: na.AddressKey, need: graph.Need) graph.Quote {
-    return switch (s.best(server, s.standing.get(server))) {
+    return switch (s.best(server, s.standing.get(server)).way) {
         .plain => .{ .rounds = need.plainRounds(), .exposure = .cleartext },
         .dial => |kind| .{ .rounds = carrier.dialRounds(kind), .exposure = .encrypted },
         .session => |c| .{ .rounds = c.carrier.rounds(), .exposure = .encrypted },
@@ -165,17 +160,10 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     const key: na.AddressKey = .fromAddress(ex.server);
     if (key.port != s.plain_port) return false;
     const standings = s.standing.get(key);
-    const known = s.knownRounds(standings);
-    for (std.enums.values(Kind)) |kind| {
-        const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
-        if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= known) continue;
-        // Damped for the dial's length, so no second probe starts while this one
-        // is out, or for as long if it could not start.
-        s.setStanding(key, kind, dial_timeout_ns, false);
-        _ = s.dial(kind, ex.server, key) catch {};
-    }
-    // A probe's dial may evict an idle session, so the way is chosen after.
-    const c = switch (s.best(key, standings)) {
+    const b = s.best(key, standings);
+    // Last, once the exchange is queued: a probe's dial evicts only idle sessions.
+    defer s.probe(ex.server, key, standings, b.known);
+    const c = switch (b.way) {
         .plain => return false,
         .dial => |kind| blk: {
             if (s.find(key, kind)) |old| s.retire(old);
@@ -201,6 +189,16 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     if (!c.carrier.established() or c.queued.items.len > 1) return true;
     s.start(c) catch s.drop(c, .closed);
     return true;
+}
+
+fn probe(s: *Sessions, server: na.Address, key: na.AddressKey, standings: ?*const Standings, known: u32) void {
+    for (std.enums.values(Kind)) |kind| {
+        const standing = if (standings) |st| st.by.get(kind) else Standing.unknown;
+        if (standing.status(s.edge.now_ns) != .unknown or carrier.dialRounds(kind) >= known) continue;
+        // Damped while the dial is out, so no second probe starts beside it.
+        s.setStanding(key, kind, dial_timeout_ns, false);
+        _ = s.dial(kind, server, key) catch {};
+    }
 }
 
 fn start(s: *Sessions, c: *Conn) !void {
@@ -304,7 +302,7 @@ fn byToken(s: *const Sessions, token: u32) ?*Conn {
 fn evictIdle(s: *Sessions) !bool {
     var oldest: ?*Conn = null;
     for (s.conns.items) |c| {
-        if (!c.carrier.established() or c.pending.count() > 0) continue;
+        if (!c.carrier.established() or c.pending.count() > 0 or c.queued.items.len > 0) continue;
         if (oldest == null or c.last_ns < oldest.?.last_ns) oldest = c;
     }
     s.drop(oldest orelse return false, .closed);
