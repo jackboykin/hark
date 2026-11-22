@@ -1594,6 +1594,14 @@ pub const Conn = struct {
                 s.unacked = 0;
                 s.ack_by_ns = null;
             }
+            // RFC 9001 §5.4.2: packet number and payload fill at least 4 bytes,
+            // so the header protection sample lies within the packet.
+            const need = 4 -| p.pn_len;
+            if (w.at < need) {
+                @memset(w.buf[w.at..need], 0);
+                w.at = need;
+                p.in_flight = true;
+            }
             p.len = w.at;
             used += head + w.at + 16;
             if (l == .initial) initial = true;
@@ -1605,11 +1613,12 @@ pub const Conn = struct {
         const last = &plans[nplans - 1];
         // RFC 9000 §14.1 and RFC 9250 §5.4: a datagram with an Initial or a
         // question is padded to the full 1200 bytes.
-        var pad = if (initial or stream_carried) max_datagram - used else 0;
-        if (last.pn_len + last.len + pad < 4) pad = 4 - last.pn_len - last.len;
-        @memset(buf[used - 16 ..][0..pad], 0);
-        last.len += pad;
-        if (pad > 0) last.in_flight = true;
+        const pad = if (initial or stream_carried) max_datagram - used else 0;
+        if (pad > 0) {
+            @memset(buf[used - 16 ..][0..pad], 0);
+            last.len += pad;
+            last.in_flight = true;
+        }
         var at: usize = 0;
         for (plans[0..nplans]) |*p| {
             const n = c.seal(p, buf[at..], now);
@@ -1990,4 +1999,57 @@ test "RFC 9001 A.3: the server's Initial moves the handshake on and is acknowled
     const d = c.output(&buf, std.time.ns_per_ms).?;
     try testing.expectEqual(max_datagram, d.len);
     try testing.expectEqualSlices(u8, &hex("f067a5502a4262b5"), d[6..14]);
+}
+
+test "RFC 9001 5.4.2: a coalesced PING pads for its header protection sample" {
+    var entropy: [tls13.entropy_len + 8]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    var c = try Conn.begin(testing.allocator, &entropy, 0);
+    defer c.deinit();
+    c.discard(.initial);
+    const hs_tx: Keys = .of(&@as(Secret, @splat(1)));
+    const hs_rx: Keys = .of(&@as(Secret, @splat(2)));
+    const app_tx: Keys = .of(&@as(Secret, @splat(3)));
+    const app_rx: Keys = .of(&@as(Secret, @splat(4)));
+    c.space(.handshake).tx = hs_tx;
+    c.space(.handshake).rx = hs_rx;
+    @memcpy(c.finished[0..8], "finished");
+    c.space(.handshake).out.set(c.finished[0..8]);
+    c.space(.application).tx = app_tx;
+    c.space(.application).rx = app_rx;
+    c.next_rx = app_rx.updated();
+    c.phase = .established;
+    c.dropHandshake();
+
+    var buf: [max_datagram]u8 = undefined;
+    try testing.expect(c.output(&buf, 0) != null);
+
+    const t = c.due(0).?;
+    try c.fire(t);
+    try testing.expect(c.output(&buf, t) != null);
+
+    var delivered: std.ArrayList([]u8) = .empty;
+    defer delivered.deinit(testing.allocator);
+    var ping: [21]u8 = .{ 0x40, 0, 0x01 } ++ @as([18]u8, @splat(0));
+    app_rx.seal(&ping, 2, 1, 0);
+    try c.input(&ping, t, &delivered);
+
+    @memset(&buf, 0xaa);
+    const d = c.output(&buf, t + max_ack_delay_ns).?;
+    try testing.expectEqual(0xe0, d[0] & 0xf0);
+    const hs_pn_at = 1 + 4 + 1 + c.dcid.len + 1 + 2;
+    var r: ConstReader = .{ .rest = d[hs_pn_at - 2 ..] };
+    const hs_end = hs_pn_at + @as(usize, @intCast(try r.varint()));
+    try testing.expect(hs_end < d.len);
+    const hs_pkt = d[0..hs_end];
+    const hh = hs_tx.unmask(hs_pkt, hs_pn_at);
+    const hs_plain = hs_tx.open(hs_pkt, hs_pn_at + hh.len, decodePn(null, hh.truncated, hh.len)).?;
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x00 }, hs_plain);
+
+    const app_pkt = d[hs_end..];
+    try testing.expectEqual(0x40, app_pkt[0] & 0xc0);
+    const app_pn_at = 1 + c.dcid.len;
+    const ah = app_tx.unmask(app_pkt, app_pn_at);
+    const app_plain = app_tx.open(app_pkt, app_pn_at + ah.len, decodePn(null, ah.truncated, ah.len)).?;
+    try testing.expectEqual(0x02, app_plain[0]);
 }
