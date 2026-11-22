@@ -264,8 +264,7 @@ const Server = struct {
         // spin the loop; `reopen` accepts what queued meanwhile.
         try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN | linux.EPOLL.ET);
         try s.listeners.append(s.gpa, tcp);
-        var ab: [64]u8 = undefined;
-        log.info("listening on {s}", .{na.format(addr, &ab)});
+        log.info("listening on {f}", .{addr});
     }
 
     fn onClient(s: *Server, tok: u32, events: u32) !void {
@@ -958,8 +957,7 @@ pub fn run(gpa: Allocator, work: Allocator, owed: *const Share, facts: store.Fac
         return error.MemoryTooSmall;
     }
     for (cfg.listen) |addr| s.listen(addr) catch |err| {
-        var ab: [64]u8 = undefined;
-        log.err("listening on {s}: {s}", .{ na.format(addr, &ab), @errorName(err) });
+        log.err("listening on {f}: {s}", .{ addr, @errorName(err) });
         return err;
     };
     if (cfg.drop_gid != null or cfg.drop_uid != null) {

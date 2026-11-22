@@ -536,8 +536,7 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
     errdefer out.deinit(gpa);
     for (log) |row| {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
-        var ab: [64]u8 = undefined;
-        try out.print(gpa, "    {s} <- {s} {f}\n", .{ na.format(row.server, &ab), row.qname.formatInto(&nb), dns.tag(row.qtype) });
+        try out.print(gpa, "    {f} <- {s} {f}\n", .{ row.server, row.qname.formatInto(&nb), dns.tag(row.qtype) });
     }
     return out.toOwnedSlice(gpa);
 }

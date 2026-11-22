@@ -89,11 +89,10 @@ pub const Chaos = struct {
         try c.left.ensureUnusedCapacity(c.gpa, 1);
         if (c.told) |*told| {
             try told.ensureUnusedCapacity(c.gpa, 1);
-            var buf: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             told.appendAssumeCapacity(switch (about) {
                 .key => |k| try c.gpa.print("{t} {t}({s} {f})", .{ site, k.kind, k.shown(&nb), dns.tag(k.rtype) }),
-                .server => |s| try c.gpa.print("{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
+                .server => |s| try c.gpa.print("{t} {f}", .{ site, s.toAddress() }),
                 .none => try c.gpa.print("{t}", .{site}),
             });
         }
