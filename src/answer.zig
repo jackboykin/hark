@@ -475,29 +475,19 @@ const Keep = struct {
 
     fn keeps(k: Keep, rr: dns.ResourceRecord) bool {
         const t = rr.rtype;
+        const shown = switch (t) {
+            .rrsig, .nsec, .nsec3 => k.do_bit,
+            else => true,
+        };
         return switch (k.section) {
-            .answer => t == k.qtype or switch (t) {
-                .rrsig, .nsec, .nsec3 => k.do_bit,
-                else => true,
-            },
-            .authority => (!k.proofs_only or switch (if (t == .rrsig) rr.covers().? else t) {
-                .soa, .nsec, .nsec3 => true,
-                else => false,
-            }) and switch (t) {
+            .answer => t == k.qtype or shown,
+            .authority => shown and switch (rr.covers() orelse t) {
                 .soa => k.denial,
-                .nsec, .nsec3 => k.do_bit,
                 .ds => false,
-                .rrsig => k.do_bit and switch (rr.covers().?) {
-                    .soa => k.denial,
-                    .ds => false,
-                    else => true,
-                },
-                else => true,
+                .nsec, .nsec3 => true,
+                else => !k.proofs_only,
             },
-            .additional => switch (t) {
-                .rrsig, .nsec, .nsec3 => k.do_bit,
-                else => true,
-            },
+            .additional => shown,
         };
     }
 };
