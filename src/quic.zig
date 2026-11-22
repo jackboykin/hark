@@ -1320,7 +1320,7 @@ pub const Conn = struct {
             const delay_us: i64 = if (level == .application) @min(delay_raw <<| c.peer.ack_delay_exponent, std.math.maxInt(i32)) else 0;
             c.sampleRtt(now - newest.sent_ns, delay_us * std.time.ns_per_us, now);
         }
-        try c.detectLoss(level, now);
+        c.detectLoss(level, now);
         if (c.handshake_acked or c.phase == .confirmed) c.pto_count = 0;
         c.trim(level);
     }
@@ -1380,7 +1380,7 @@ pub const Conn = struct {
         if (acked) c.compact();
     }
 
-    fn detectLoss(c: *Conn, level: Level, now: i64) !void {
+    fn detectLoss(c: *Conn, level: Level, now: i64) void {
         const s = c.space(level);
         const largest = s.largest_acked orelse return;
         s.loss_ns = null;
@@ -1523,7 +1523,7 @@ pub const Conn = struct {
         if (now >= c.idleAt()) return c.end(.closed, "idle");
         if (c.prev_rx != null and now >= c.prev_until_ns) wipe(&c.prev_rx);
         if (c.lossTime()) |l| {
-            if (now >= l.at) try c.detectLoss(l.level, now);
+            if (now >= l.at) c.detectLoss(l.level, now);
             return;
         }
         const p = c.ptoTime(now) orelse return;
