@@ -174,8 +174,10 @@ fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
 }
 
 fn nodataAt(types: []const u8, qname: dns.Name, qtype: dns.RType) SecurityStatus {
-    if (wrongSideOfCut(types, qname, qtype)) return .unchecked;
-    return if (bitmapContradictsNodata(types, qtype)) .bogus else .secure;
+    // A set bit is signed fact from either side of a cut; the side limits
+    // only what a missing bit can prove.
+    if (bitmapContradictsNodata(types, qtype)) return .bogus;
+    return if (wrongSideOfCut(types, qname, qtype)) .unchecked else .secure;
 }
 
 const nsec3_opt_out: u8 = 0x01;
@@ -583,13 +585,11 @@ fn validateNsec3NegativeProof(
     const wc_optout = wc_cover orelse false;
     var wc_proven = wc_cover != null;
     var wc_contradicted = false;
-    if (chain.match(&wc_hash)) |n3| {
-        if (is_nxdomain or bitmapContradictsNodata(n3.type_bit_maps, qtype)) {
-            wc_contradicted = true;
-        } else if (!wrongSideOfCut(n3.type_bit_maps, qname, qtype)) {
-            wc_proven = true;
-        }
-    }
+    if (chain.match(&wc_hash)) |n3| switch (if (is_nxdomain) SecurityStatus.bogus else nodataAt(n3.type_bit_maps, qname, qtype)) {
+        .bogus => wc_contradicted = true,
+        .secure => wc_proven = true,
+        .unchecked, .insecure => {},
+    };
     // RFC 5155 §8.6: an unsigned delegation under Opt-Out owns no NSEC3, so
     // the Opt-Out span over the next closer is the whole DS proof. It ranks
     // above a wildcard contradiction: the delegation exists, so no wildcard
@@ -687,6 +687,10 @@ test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)
     try testing.expectEqual(
         SecurityStatus.unchecked,
         try validateNegativeProof(&parent_auth, cut, .a, false, test_root, &b),
+    );
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        try validateNegativeProof(&parent_auth, cut, .ns, false, test_root, &b),
     );
     try testing.expectEqual(
         SecurityStatus.secure,
@@ -917,6 +921,10 @@ test "NSEC3 rejects an ancestor-delegation record (RFC 6840 §4.1)" {
     try testing.expectEqual(
         SecurityStatus.unchecked,
         try validateNegativeProof(&at_cut, cut, .a, false, test_root, &b),
+    );
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        try validateNegativeProof(&at_cut, cut, .ns, false, test_root, &b),
     );
     try testing.expectEqual(
         SecurityStatus.secure,
