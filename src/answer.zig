@@ -648,22 +648,14 @@ test "a failure is remembered, backs off while it persists, and an answer forget
 
 test "an answer finished short of memory holds no blob" {
     const testing = std.testing;
-    const Quiet = struct {
-        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
-            return .none;
-        }
-        fn wake(_: *anyopaque, _: model.CellId, _: u32, _: i64) graph.Error!void {}
-    };
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
-    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("sys.zig").random, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    var quiet: graph.Quiet = .{};
+    var g = try quiet.graph(.{ .root_hints = &.{} });
     defer g.deinit();
     var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = .well_known };
     defer d.deinit();
     const name: dns.Name = .lit("example");
     const q: dns.Question = .{ .name = name, .qtype = .aaaa, .qclass = .in };
-    const blob = (try g.fact(.of(.rrset, name, .aaaa), .{ .rrset = .{ .kind = .nodata, .stored_ns = now, .zone = name } }, now + 60 * std.time.ns_per_s)).?;
+    const blob = (try g.fact(.of(.rrset, name, .aaaa), .{ .rrset = .{ .kind = .nodata, .stored_ns = quiet.now, .zone = name } }, quiet.now + 60 * std.time.ns_per_s)).?;
     const a = try g.demandRoot(name, .a, .new);
     defer g.unhold(a);
     g.fail(a, .{ .name = .unreachable_authority });
@@ -686,17 +678,9 @@ test "an answer finished short of memory holds no blob" {
 test "a last-tenth hit is served from memory, asks for one refresh, and survives a full door" {
     const testing = std.testing;
     const Share = @import("share.zig");
-    const Quiet = struct {
-        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
-            return .none;
-        }
-        fn wake(_: *anyopaque, _: model.CellId, _: u32, _: i64) graph.Error!void {}
-    };
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
+    var quiet: graph.Quiet = .{};
     var owed: Share = .{ .limit = 8 };
-    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{}, .prefetch = true, .owed = &owed }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("sys.zig").random, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    var g = try quiet.graph(.{ .root_hints = &.{}, .prefetch = true, .owed = &owed });
     defer g.deinit();
     var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = null };
     defer d.deinit();
@@ -707,9 +691,9 @@ test "a last-tenth hit is served from memory, asks for one refresh, and survives
     const qb: dns.Question = .{ .name = b_name, .qtype = .a, .qclass = .in };
     const rra = [_]dns.ResourceRecord{.fixture(.{ .name = a_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })};
     const rrb = [_]dns.ResourceRecord{.fixture(.{ .name = b_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } })};
-    _ = (try g.fact(.of(.rrset, a_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rra, .target = a_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
-    _ = (try g.fact(.of(.rrset, b_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rrb, .target = b_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
-    now += 55 * s;
+    _ = (try g.fact(.of(.rrset, a_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rra, .target = a_name, .zone = .root, .stored_ns = quiet.now, .ttl = 60 } }, quiet.now + 60 * s)).?;
+    _ = (try g.fact(.of(.rrset, b_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rrb, .target = b_name, .zone = .root, .stored_ns = quiet.now, .ttl = 60 } }, quiet.now + 60 * s)).?;
+    quiet.now += 55 * s;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     for (0..2) |_| {

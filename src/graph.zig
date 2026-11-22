@@ -1481,12 +1481,12 @@ pub const Graph = struct {
     }
 };
 
-const Quiet = struct {
+pub const Quiet = struct {
     now: i64 = std.time.ns_per_s,
     wall: i64 = 0,
     prng: std.Random.DefaultPrng = .init(0),
 
-    fn graph(q: *Quiet, cfg: Config) !Graph {
+    pub fn graph(q: *Quiet, cfg: Config) !Graph {
         return q.graphOn(std.testing.allocator, std.testing.allocator, cfg);
     }
 

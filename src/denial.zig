@@ -615,31 +615,19 @@ test "a read pays for a name's hash once" {
     try testing.expect(allowance.nsec3_blocks_spent > spent);
 }
 
-fn testGraph(prng: *std.Random.DefaultPrng, now: *const i64, wall: *const i64) !Graph {
-    const Stub = struct {
-        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
-            return .none;
-        }
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) graph.Error!void {}
-    };
-    return Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = prng, .now_ns = now, .wall_sec = wall, .rng = prng.random(), .sendFn = Stub.send, .wakeFn = Stub.wake });
-}
-
 test "re-absorbing a spanless zone survives the store replacing its SOA" {
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var prng: std.Random.DefaultPrng = .init(0);
-    var g = try testGraph(&prng, &now, &wall);
+    var quiet: graph.Quiet = .{};
+    var g = try quiet.graph(.{ .root_hints = &.{} });
     defer g.deinit();
 
     const zone: dns.Name = .lit("example");
     const soa: RR = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
-    const reply: model.Reply = .{ .kind = .nodata, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
+    const reply: model.Reply = .{ .kind = .nodata, .authorities = &.{soa}, .stored_ns = quiet.now, .zone = zone };
 
-    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, quiet.now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
 
-    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, quiet.now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
     try testing.expect(g.denial.zones.getPtr(zone.wire).?.soa != null);
 }
