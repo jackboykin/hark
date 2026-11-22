@@ -17,7 +17,6 @@ const mem = std.mem;
 const crypto = std.crypto;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const rand = @import("rand.zig");
 const dot = @import("dot.zig");
 const tls13 = @import("tls13.zig");
 const Edge = @import("edge.zig");
@@ -149,7 +148,7 @@ fn connected(sock: *Socket) !News {
         return .{ .ended = .failed };
     }
     var entropy: [tls13.entropy_len]u8 = undefined;
-    rand.thread.bytes(&entropy);
+    sys.random.bytes(&entropy);
     defer crypto.secureZero(u8, &entropy);
     var hello: [tls13.header_len + tls13.max_hello]u8 = undefined;
     sock.session, const bytes = dot.Session.begin(sock.edge.work, &hello, &entropy) catch return .{ .ended = .failed };

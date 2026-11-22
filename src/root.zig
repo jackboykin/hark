@@ -1,12 +1,12 @@
 //! The hark module: every source file, for main, the fuzzers and the tests.
 
 pub const config = @import("config.zig");
+pub const keyed = @import("keyed.zig");
 pub const log = @import("log.zig");
-pub const monotonic = @import("monotonic.zig");
-pub const rand = @import("rand.zig");
 pub const rpl = @import("sim/rpl.zig");
 pub const serve = @import("serve.zig");
 pub const slab = @import("slab.zig");
+pub const sys = @import("sys.zig");
 pub const Share = @import("share.zig");
 
 // Tests are found by reachability from here: a file not listed runs none.
@@ -33,12 +33,10 @@ test {
     _ = @import("keyed.zig");
     _ = @import("log.zig");
     _ = @import("model.zig");
-    _ = @import("monotonic.zig");
     _ = @import("net_address.zig");
     _ = @import("ns_rtt.zig");
     _ = @import("proof.zig");
     _ = @import("quic.zig");
-    _ = @import("rand.zig");
     _ = @import("rebinding.zig");
     _ = @import("response.zig");
     _ = @import("rrsig.zig");

@@ -670,7 +670,7 @@ test "an answer finished short of memory holds no blob" {
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
     var ctx: u8 = 0;
-    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("sys.zig").random, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
     defer g.deinit();
     var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = .well_known };
     defer d.deinit();

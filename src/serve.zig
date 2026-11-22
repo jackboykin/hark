@@ -20,7 +20,6 @@ const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 const acl = @import("acl.zig");
 const config = @import("config.zig");
-const monotonic = @import("monotonic.zig");
 const response = @import("response.zig");
 const sys_linux = @import("sys_linux.zig");
 const Edge = @import("edge.zig");
@@ -486,7 +485,7 @@ const Server = struct {
         const q = query.question.?;
         const client = answer.Client.fromQuery(query);
         if (build_options.testing_enabled) if (advanceClockSeconds(q.name)) |secs| {
-            monotonic.advanceTestClock(secs);
+            sys.advanceTestClock(secs);
             return s.send(reply, query, .{ .rcode = .no_error, .question = q, .cacheable = false }, s.e.now_ns);
         };
         const c = &s.clients;

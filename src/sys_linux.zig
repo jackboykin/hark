@@ -62,6 +62,25 @@ pub fn detach(fd: posix.fd_t) !void {
     };
 }
 
+/// BOOTTIME never steps with NTP, and keeps counting through suspend.
+pub fn uptime() posix.timespec {
+    return clock(.BOOTTIME);
+}
+
+pub fn wallclock() posix.timespec {
+    return clock(.REALTIME_COARSE);
+}
+
+fn clock(id: linux.clockid_t) posix.timespec {
+    var ts: posix.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(id, &ts)) != .SUCCESS) @panic("clock_gettime failed");
+    return ts;
+}
+
+pub fn entropy(buf: []u8) void {
+    if (linux.getrandom(buf.ptr, buf.len, 0) != buf.len) @panic("getrandom failed");
+}
+
 pub fn close(fd: posix.fd_t) void {
     _ = linux.close(fd);
 }

@@ -4,7 +4,6 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
-const monotonic = @import("monotonic.zig");
 const sys = @import("sys.zig");
 
 var held: [64 * 1024]u8 = undefined;
@@ -21,7 +20,7 @@ const Stamp = struct {
     len: u8 = 0,
 
     fn now(s: *Stamp) []const u8 {
-        const sec = monotonic.wallclockSec();
+        const sec = sys.wallclockSec();
         if (sec == s.sec) return s.text[0..s.len];
         const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(sec) };
         const day = es.getDaySeconds();

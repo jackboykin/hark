@@ -1,8 +1,10 @@
-//! The socket surface hark asks of the OS. Syscall wrappers come from the
-//! per-OS file and are re-exported, so the list below is what a new platform
-//! has to provide. Addresses convert to and from sockaddr here.
+//! What hark asks of the OS: sockets, the clocks and entropy. Syscall
+//! wrappers come from the per-OS file and are re-exported, so the list below
+//! is what a new platform has to provide. Addresses convert to and from
+//! sockaddr here.
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const posix = std.posix;
 const mem = std.mem;
 const na = @import("net_address.zig");
@@ -82,4 +84,56 @@ pub fn bindTo(fd: posix.fd_t, addr: *const na.Address) !void {
     var storage: PosixAddress = undefined;
     const sa_len = toSockaddr(addr, &storage);
     try bind(fd, &storage.any, sa_len);
+}
+
+var test_offset_secs: i64 = 0;
+
+inline fn testOffsetSec() i64 {
+    return if (build_options.testing_enabled) test_offset_secs else 0;
+}
+
+pub fn advanceTestClock(secs: i64) void {
+    if (build_options.testing_enabled) test_offset_secs += secs;
+}
+
+/// Boot time for ages and deadlines, wall time for signature windows (RFC
+/// 4034 §3.1.5) and log stamps. Both run ahead under -Dtesting by an offset
+/// the live harness advances.
+pub fn nowNs() i64 {
+    const ts = os.uptime();
+    return (ts.sec + testOffsetSec()) * std.time.ns_per_s + ts.nsec;
+}
+
+pub fn wallclockSec() i64 {
+    return os.wallclock().sec + testOffsetSec();
+}
+
+threadlocal var csprng: ?std.Random.DefaultCsprng = null;
+
+/// Per-thread, not `io.random`: its global mutex costs ~6% CPU on misses.
+pub const random: std.Random = .{ .ptr = undefined, .fillFn = fill };
+
+fn fill(_: *anyopaque, buf: []u8) void {
+    if (csprng == null) {
+        @branchHint(.unlikely);
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        // No fallback seed: guessable TXIDs are worse than no resolver.
+        os.entropy(&seed);
+        csprng = .init(seed);
+    }
+    csprng.?.fill(buf);
+}
+
+test "random draws differ across threads" {
+    const T = struct {
+        fn draw(out: *u64) void {
+            out.* = random.int(u64);
+        }
+    };
+    var a: u64 = 0;
+    var b: u64 = 0;
+    const t = try std.Thread.spawn(.{}, T.draw, .{&a});
+    T.draw(&b);
+    t.join();
+    try std.testing.expect(a != b);
 }

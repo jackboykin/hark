@@ -12,7 +12,6 @@ const posix = std.posix;
 const crypto = std.crypto;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const rand = @import("rand.zig");
 const tls13 = @import("tls13.zig");
 const quic = @import("quic.zig");
 const Edge = @import("edge.zig");
@@ -48,7 +47,7 @@ pub fn open(edge: *Edge, sh: *Shared, server: na.Address, port: u16, token: u32)
     to.setPort(port);
     try sys.connectTo(fd, &to);
     var entropy: [tls13.entropy_len + 8]u8 = undefined;
-    rand.thread.bytes(&entropy);
+    sys.random.bytes(&entropy);
     defer crypto.secureZero(u8, &entropy);
     var sock: Socket = .{ .edge = edge, .token = token, .fd = fd, .conn = try .begin(edge.work, &entropy, edge.now_ns) };
     errdefer sock.conn.deinit();

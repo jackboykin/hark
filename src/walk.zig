@@ -960,7 +960,7 @@ test "a send that shows less goes first, however slower, until the ask has shown
     const near: na.AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 53));
     const far: na.AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 2 }, 53));
     var w: World = .{ .sealed = far };
-    var g = try Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &w, .now_ns = &w.now, .wall_sec = &w.wall, .rng = @import("rand.zig").thread, .sendFn = World.send, .wakeFn = World.wake, .quoteFn = World.quote });
+    var g = try Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &w, .now_ns = &w.now, .wall_sec = &w.wall, .rng = @import("sys.zig").random, .sendFn = World.send, .wakeFn = World.wake, .quoteFn = World.quote });
     defer g.deinit();
     g.rtt.write(near, 1000).observe(10 * std.time.us_per_ms, 1000);
     g.rtt.write(far, 1000).observe(300 * std.time.us_per_ms, 1000);

@@ -26,8 +26,6 @@ const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const monotonic = @import("monotonic.zig");
-const rand = @import("rand.zig");
 const graph = @import("graph.zig");
 const model = @import("model.zig");
 const Sessions = @import("sessions.zig");
@@ -121,7 +119,7 @@ pub fn deinit(e: *Edge) void {
 }
 
 pub fn edge(e: *Edge) graph.Edge {
-    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = rand.thread, .sendFn = sendErased, .wakeFn = wakeErased, .quoteFn = if (e.sessions != null) quoteErased else null };
+    return .{ .ctx = e, .now_ns = &e.now_ns, .wall_sec = &e.wall_sec, .rng = sys.random, .sendFn = sendErased, .wakeFn = wakeErased, .quoteFn = if (e.sessions != null) quoteErased else null };
 }
 
 fn quoteErased(ctx: *anyopaque, server: na.AddressKey, need: graph.Need) graph.Quote {
@@ -137,8 +135,8 @@ fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) graph.Error!voi
 }
 
 fn tick(e: *Edge) void {
-    e.now_ns = monotonic.nowNs();
-    e.wall_sec = monotonic.wallclockSec();
+    e.now_ns = sys.nowNs();
+    e.wall_sec = sys.wallclockSec();
 }
 
 pub fn watch(e: *Edge, fd: posix.fd_t, token: u32, events: u32) !void {
