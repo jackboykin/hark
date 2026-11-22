@@ -506,7 +506,7 @@ const Claims = struct {
             if (rr.rtype == .rrsig) continue;
             var dname: ?RR = null;
             if (rr.rtype == .cname) for (answers) |d| {
-                if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
+                if (d.rtype == .dname and proof.isProperAncestor(d.name, rr.name) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
             };
             it.pos = .{ .answer = head };
             if (dname) |d| return it.claim(rr.name, rr.rtype, head, .{ .synthesised = .{ .cname = rr, .dname = d } });
@@ -614,10 +614,6 @@ fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claim
     var narrowed = r.*;
     if (c.is == .proof) narrowed.authorities = kept else narrowed.answers = kept;
     try g.narrow(target, narrowed);
-}
-
-fn synthesisedUnder(rr: RR, dname: RR) bool {
-    return rr.rtype == .cname and rr.name.depth() > dname.name.depth() and rr.name.isSubdomainOf(dname.name);
 }
 
 /// On a denial only the NSEC or NSEC3 proof is kept: the child's NS in a
