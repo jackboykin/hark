@@ -82,7 +82,7 @@ pub const Sim = struct {
             .seed = seed,
             .gpa = gpa,
         };
-        s.signer = try sign.Signer.init(arena, scenario, mint, s.wall_sec);
+        s.signer = sign.Signer.init(arena, scenario, mint, s.wall_sec);
         s.ranges = try s.signer.bake(scenario.ranges);
         for (scenario.steps) |st| {
             s.shifts = s.shifts or st.kind == .unsent;

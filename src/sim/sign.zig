@@ -63,7 +63,7 @@ pub const Signer = struct {
 
     const Served = struct { address: na.Address, key: *const Key };
 
-    pub fn init(arena: Allocator, scenario: *const rpl.Scenario, mint: *Mint, wall_sec: i64) !Signer {
+    pub fn init(arena: Allocator, scenario: *const rpl.Scenario, mint: *Mint, wall_sec: i64) Signer {
         return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse (365 * 86400), .original_ttl = scenario.sig_original_ttl };
     }
 
@@ -173,7 +173,7 @@ pub const Signer = struct {
         try self.served.append(self.arena, .{ .address = address, .key = key });
     }
 
-    pub fn sign(self: *Signer, key: *const Key, set: rrsig.Canonical, wildcard: ?dns.Name) !RR {
+    fn sign(self: *Signer, key: *const Key, set: rrsig.Canonical, wildcard: ?dns.Name) !RR {
         const head = set.records[0];
         var sig: dns.RrsigData = .{
             .type_covered = head.rtype,
