@@ -595,8 +595,7 @@ const Stream = struct {
 
 const Close = struct { app: bool, code: u64, frame: u64 = 0 };
 
-const Error = error{
-    InternalError,
+const Closing = error{
     FlowControlError,
     StreamLimitError,
     StreamStateError,
@@ -606,15 +605,14 @@ const Error = error{
     ConnectionIdLimitError,
     ProtocolViolation,
     CryptoBufferExceeded,
-    KeyUpdateError,
     AeadLimitReached,
     DoqProtocolError,
-    OutOfMemory,
 } || tls13.Error;
 
-fn closeFor(err: Error) Close {
+const Error = Closing || error{OutOfMemory};
+
+fn closeFor(err: Closing) Close {
     return switch (err) {
-        error.InternalError, error.OutOfMemory => .{ .app = false, .code = 0x1 },
         error.FlowControlError => .{ .app = false, .code = 0x3 },
         error.StreamLimitError => .{ .app = false, .code = 0x4 },
         error.StreamStateError => .{ .app = false, .code = 0x5 },
@@ -624,7 +622,6 @@ fn closeFor(err: Error) Close {
         error.ConnectionIdLimitError => .{ .app = false, .code = 0x9 },
         error.ProtocolViolation => .{ .app = false, .code = 0xa },
         error.CryptoBufferExceeded => .{ .app = false, .code = 0xd },
-        error.KeyUpdateError => .{ .app = false, .code = 0xe },
         error.AeadLimitReached => .{ .app = false, .code = 0xf },
         error.DoqProtocolError => .{ .app = true, .code = doq_protocol_error },
         else => |e| .{ .app = false, .code = 0x100 + @as(u64, @backingInt(tls13.alert(@errorCast(e)))) },
@@ -838,7 +835,7 @@ pub const Conn = struct {
     fn caught(c: *Conn, err: Error) !void {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (c.ended != null) return;
-        c.close = closeFor(err);
+        c.close = closeFor(@errorCast(err));
         try c.end(.failed, @errorName(err));
     }
 
