@@ -485,8 +485,7 @@ fn shapeClient(r: Run, q: dns.Question, client: answer.Client) !?answer.Served {
     if (desk.retention.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
         if (try desk.memory(arena, q, client, .stale)) |served| {
             errdefer served.release(&g.store);
-            held.roots[0] = null;
-            if (g.cell(root).holds == 1) try held.kept.append(held.gpa, root) else g.unhold(root);
+            _ = try leave(g, held);
             return served;
         }
     }
