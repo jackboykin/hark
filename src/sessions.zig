@@ -178,7 +178,8 @@ pub fn carry(s: *Sessions, ex: Exchange) !bool {
     try e.timers.ensureUnusedCapacity(e.gpa, 1);
     try s.flights.ensureUnusedCapacity(e.gpa, 1);
     try c.queued.ensureUnusedCapacity(e.gpa, 1);
-    try c.pending.ensureUnusedCapacity(e.gpa, 1);
+    // Room for every queued exchange, so drain allocates nothing.
+    try c.pending.ensureUnusedCapacity(e.gpa, c.queued.items.len + 1);
     const at = try e.work.create(Carried);
     errdefer e.work.destroy(at);
     const seq = try e.schedule(ex.deadline_ns, .{ .carried = ex.id });
@@ -228,7 +229,6 @@ fn send(s: *Sessions, c: *Conn, at: *Carried) !carrier.Taken {
 }
 
 fn drain(s: *Sessions, c: *Conn) !bool {
-    try c.pending.ensureUnusedCapacity(s.edge.gpa, c.queued.items.len);
     c.overdue = false;
     while (c.queued.items.len > 0) switch (try s.send(c, c.queued.items[0])) {
         .sent => _ = c.queued.orderedRemove(0),
@@ -496,6 +496,7 @@ test "a write lost while queries leave the handshake moves each query once" {
     try s.conns.append(testing.allocator, c);
     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
     const queries = 2 * s.shared.dot.out.len / dot.max_sealed * 8;
+    try c.pending.ensureUnusedCapacity(testing.allocator, queries);
     for (0..queries) |i| {
         const at = try testing.allocator.create(Carried);
         at.* = .{ .conn = c, .id = @intCast(i), .seq = 0, .wire = &wire, .asked_ns = 0 };
@@ -507,6 +508,71 @@ test "a write lost while queries leave the handshake moves each query once" {
     s.drop(c, .closed);
     try testing.expectEqual(queries, e.queue.items.len);
     try testing.expectEqual(0, s.flights.count());
+}
+
+test "a handshake establishing under a full allocator leaves the DoT out buffer clear" {
+    const testing = std.testing;
+    const tls = std.crypto.tls;
+    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var e = try Edge.init(failing.allocator());
+    defer e.deinit();
+    try e.enableSessions(53, 853);
+    const s = e.sessions.?;
+
+    var pair: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)) != .SUCCESS) return error.SocketPairFailed;
+    defer sys.close(pair[1]);
+
+    const secret: tls13.Secret = @splat(1);
+    const server = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+    const h = try e.work.create(tls13.Handshake);
+    h.* = .{
+        .shares = .{ .x25519 = @splat(0), .p256 = @splat(0), .ml_kem = @splat(0) },
+        .offer = .{ .alpn = "dot" },
+        .stage = .finished,
+        .handshake_secret = secret,
+        .traffic = .{ .client = secret, .server = secret },
+    };
+    const c = try e.gpa.create(Conn);
+    c.* = .{
+        .key = .fromAddress(server),
+        .carrier = .{ .dot = .{
+            .edge = &e,
+            .token = 1,
+            .fd = pair[0],
+            .state = .handshaking,
+            .session = .{ .gpa = e.work, .handshake = h, .phase = .handshake, .read = .of(&secret), .write = .of(&secret) },
+        } },
+        .last_ns = e.now_ns,
+        .dial_by_ns = e.now_ns + dial_timeout_ns,
+        .wake_ns = e.now_ns + dial_timeout_ns,
+    };
+    try s.conns.append(e.gpa, c);
+    try s.by_server.put(e.gpa, c.key, .init(.{ .dot = c, .doq = null }));
+    s.setStanding(c.key, .dot, persistence_ns, true);
+    s.setStanding(c.key, .doq, damping_ns, false);
+
+    const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
+    const queries = std.atomic.cache_line / @sizeOf(carrier.QueryId) + 1;
+    for (1..queries + 1) |id| {
+        try testing.expect(try s.carry(.{ .id = @intCast(id), .server = server, .need = .datagram, .wire = &wire, .deadline_ns = e.now_ns + std.time.ns_per_s }));
+    }
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    const empty = tls.emptyHash(std.crypto.hash.sha2.Sha256);
+    const fin_key = tls.hkdfExpandLabel(Hkdf, secret, "finished", "", Hmac.key_length);
+    const finished = [_]u8{@backingInt(tls.HandshakeType.finished)} ++ tls.int(u24, Hmac.mac_length) ++ tls.hmac(Hmac, &empty, fin_key);
+    var srv: tls13.Keys = .of(&secret);
+    var rec: [tls13.overhead + finished.len]u8 = undefined;
+    _ = try sys.write(pair[1], srv.seal(&rec, .handshake, &finished));
+    s.ready(1, linux.EPOLL.IN);
+
+    try testing.expectEqual(0, s.shared.dot.out_len);
+    try testing.expectEqual(queries, c.pending.count());
 }
 
 test "a spent session keeps its pending to the end while a successor takes the rest" {
