@@ -119,23 +119,23 @@ fn isValidBareKey(key: []const u8) bool {
 }
 
 fn parseValue(arena: Allocator, raw: []const u8) ParseError!Value {
-    if (raw[0] == '"') return .{ .string = try parseString(arena, raw) };
+    if (raw[0] == '"') {
+        const s = try parseString(arena, raw);
+        if (s.end != raw.len) return error.InvalidSyntax;
+        return .{ .string = s.text };
+    }
     if (raw[0] == '[') return .{ .string_array = try parseArray(arena, raw) };
     if (mem.eql(u8, raw, "true")) return .{ .boolean = true };
     if (mem.eql(u8, raw, "false")) return .{ .boolean = false };
     return .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidInteger };
 }
 
-fn parseString(arena: Allocator, raw: []const u8) ParseError![]const u8 {
+fn parseString(arena: Allocator, raw: []const u8) ParseError!struct { text: []const u8, end: usize } {
     var result: std.ArrayList(u8) = .empty;
     var i: usize = 1;
     while (i < raw.len) : (i += 1) {
         const c = raw[i];
-        if (c == '"') {
-            const after = mem.trim(u8, raw[i + 1 ..], &std.ascii.whitespace);
-            if (after.len > 0) return error.InvalidSyntax;
-            return result.items;
-        }
+        if (c == '"') return .{ .text = result.items, .end = i + 1 };
         try result.append(arena, if (c != '\\') c else blk: {
             i += 1;
             if (i >= raw.len) return error.InvalidEscape;
@@ -163,18 +163,9 @@ fn parseArray(arena: Allocator, raw: []const u8) ParseError![]const []const u8 {
         if (pos >= inner.len) break;
         if (inner[pos] != '"') return error.InvalidSyntax;
 
-        var end = pos + 1;
-        while (end < inner.len) {
-            if (inner[end] == '\\') {
-                if (end + 1 >= inner.len) break;
-                end += 2;
-                continue;
-            }
-            end += 1;
-            if (inner[end - 1] == '"') break;
-        }
-        try items.append(arena, try parseString(arena, inner[pos..end]));
-        pos = end;
+        const s = try parseString(arena, inner[pos..]);
+        try items.append(arena, s.text);
+        pos += s.end;
 
         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
         if (pos < inner.len and inner[pos] == ',') pos += 1;
