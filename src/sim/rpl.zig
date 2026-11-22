@@ -451,7 +451,7 @@ const Parser = struct {
         const spelled = try p.spelledName(owner);
         return .{
             .name = canonical,
-            .qtype = rtypeFromText(type_tok) orelse return p.fail("bad QUESTION type"),
+            .qtype = enumIgnoreCase(dns.RType, type_tok) orelse return p.fail("bad QUESTION type"),
             .qclass = .in,
             .spelled = if (mem.eql(u8, spelled, canonical.wire)) null else spelled,
         };
@@ -465,7 +465,7 @@ const Parser = struct {
         if (toks.next() != null) return p.fail("bad QUERY_LOG line (want `qname qtype [dest]`)");
         return .{
             .qname = try p.name(owner),
-            .qtype = rtypeFromText(qtype) orelse return p.fail("bad QUERY_LOG qtype"),
+            .qtype = enumIgnoreCase(dns.RType, qtype) orelse return p.fail("bad QUERY_LOG qtype"),
             .dest = if (dest) |d| try p.parseAddr(d) else null,
         };
     }
@@ -499,7 +499,7 @@ const Parser = struct {
             ttl = try p.int(u32, t);
             t = toks.next() orelse return p.fail("RR needs a type");
         }
-        const rtype = rtypeFromText(t) orelse return p.fail("unknown RR type");
+        const rtype = enumIgnoreCase(dns.RType, t) orelse return p.fail("unknown RR type");
         p.spelled.clearRetainingCapacity();
         const rr: dns.ResourceRecord = try .init(p.arena, .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) });
         return p.written(rr, try p.spelledName(owner_text));
@@ -589,7 +589,7 @@ const Parser = struct {
                 .public_key = try p.base64(toks),
             } },
             .rrsig => return .{ .rrsig = .{
-                .type_covered = rtypeFromText(try p.word(toks)) orelse return p.fail("unknown RRSIG type covered"),
+                .type_covered = enumIgnoreCase(dns.RType, try p.word(toks)) orelse return p.fail("unknown RRSIG type covered"),
                 .algorithm = try p.algorithm(try p.word(toks)),
                 .labels = try p.int(u8, try p.word(toks)),
                 .original_ttl = try p.int(u32, try p.word(toks)),
@@ -708,7 +708,7 @@ const Parser = struct {
         var out: std.ArrayList(u8) = .empty;
         var window: [256]u8 = undefined;
         var types: std.ArrayList(u16) = .empty;
-        while (toks.next()) |t| try types.append(p.arena, @backingInt(rtypeFromText(t) orelse return p.fail("unknown type in bitmap")));
+        while (toks.next()) |t| try types.append(p.arena, @backingInt(enumIgnoreCase(dns.RType, t) orelse return p.fail("unknown type in bitmap")));
         mem.sortUnstable(u16, types.items, {}, std.sort.asc(u16));
         var i: usize = 0;
         while (i < types.items.len) {
@@ -880,23 +880,6 @@ fn rcodeFromText(t: []const u8) ?dns.RCode {
         .{ "YXDOMAIN", dns.RCode.yx_domain },
     };
     inline for (table) |row| if (mem.eql(u8, t, row[0])) return row[1];
-    return null;
-}
-
-fn rtypeFromText(t: []const u8) ?dns.RType {
-    var buf: [16]u8 = undefined;
-    if (t.len > buf.len) return null;
-    const u = std.ascii.upperString(&buf, t);
-    const table = .{
-        .{ "A", dns.RType.a },                   .{ "NS", dns.RType.ns },         .{ "CNAME", dns.RType.cname },
-        .{ "SOA", dns.RType.soa },               .{ "PTR", dns.RType.ptr },       .{ "MX", dns.RType.mx },
-        .{ "TXT", dns.RType.txt },               .{ "AAAA", dns.RType.aaaa },     .{ "DNAME", dns.RType.dname },
-        .{ "OPT", dns.RType.opt },               .{ "DS", dns.RType.ds },         .{ "RRSIG", dns.RType.rrsig },
-        .{ "NSEC", dns.RType.nsec },             .{ "DNSKEY", dns.RType.dnskey }, .{ "NSEC3", dns.RType.nsec3 },
-        .{ "NSEC3PARAM", dns.RType.nsec3param }, .{ "SVCB", dns.RType.svcb },     .{ "HTTPS", dns.RType.https },
-        .{ "ANY", dns.RType.any },               .{ "HINFO", dns.RType.hinfo },
-    };
-    inline for (table) |row| if (mem.eql(u8, u, row[0])) return row[1];
     return null;
 }
 
