@@ -828,14 +828,6 @@ pub const Conn = struct {
         try c.events.append(c.gpa, ev);
     }
 
-    fn fail(c: *Conn, err: Error, fault: []const u8) !void {
-        if (c.ended != null) return;
-        c.close = closeFor(err);
-        c.fault = fault;
-        c.ended = .failed;
-        try c.emit(.{ .ended = .failed });
-    }
-
     fn end(c: *Conn, how: End, fault: []const u8) !void {
         if (c.ended != null) return;
         c.fault = fault;
@@ -845,7 +837,9 @@ pub const Conn = struct {
 
     fn caught(c: *Conn, err: Error) !void {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        try c.fail(err, @errorName(err));
+        if (c.ended != null) return;
+        c.close = closeFor(err);
+        try c.end(.failed, @errorName(err));
     }
 
     /// Reply bytes may point into `datagram`, which must live until the events
