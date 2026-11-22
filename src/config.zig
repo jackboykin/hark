@@ -306,10 +306,8 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
 fn reaches(l: Address, to: Address) bool {
     if (l.getPort() != to.getPort()) return false;
     if (net_addr.ipEqual(l, to)) return true;
-    return switch (l) {
-        .ip4 => |b| to == .ip4 and mem.allEqual(u8, &b.bytes, 0) and (to.ip4.bytes[0] == 127 or mem.allEqual(u8, &to.ip4.bytes, 0)),
-        .ip6 => |b| to == .ip6 and mem.allEqual(u8, &b.bytes, 0) and mem.allEqual(u8, to.ip6.bytes[0..15], 0) and to.ip6.bytes[15] <= 1,
-    };
+    const here = net_addr.isUnspecified(to) or net_addr.AddressKey.fromAddress(to).isLoopback();
+    return std.meta.activeTag(l) == std.meta.activeTag(to) and net_addr.isUnspecified(l) and here;
 }
 
 fn parseTrustAnchors(arena: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
