@@ -167,14 +167,11 @@ pub const Desk = struct {
         if (q.qtype == .rrsig and d.g.cfg.trust_anchors != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = d.derived(q, c, s) };
-        if (try d.hold(q, c)) |held| {
-            if (try d.memory(arena, q, c, .live)) |s| return .{ .recalled = d.derived(q, c, s) };
-            switch (held) {
-                // A stale hold with nothing left to serve falls through and asks afresh.
-                .stale => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
-                .failed => |ede| return .{ .held = servfail(q, ede) },
-            }
-        }
+        if (try d.hold(q, c)) |held| switch (held) {
+            // A stale hold with nothing left to serve falls through and asks afresh.
+            .stale => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
+            .failed => |ede| return .{ .held = servfail(q, ede) },
+        };
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = d.derived(q, c, s) };
         return .graph;
     }
@@ -200,21 +197,19 @@ pub const Desk = struct {
         return try x.shape(arena, q, served, a);
     }
 
-    const How = enum { fresh, live, floored, stale };
+    const How = enum { fresh, floored, stale };
 
     fn ladder(how: How) []const How {
         return switch (how) {
             .fresh => &.{.fresh},
-            .live => &.{.live},
-            .floored => &.{ .floored, .live },
-            .stale => &.{ .stale, .floored, .live },
+            .floored => &.{ .floored, .fresh },
+            .stale => &.{ .stale, .floored, .fresh },
         };
     }
 
     fn recall(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: How) !?Served {
         return switch (how) {
-            .fresh => fresh(d, arena, q, c, true),
-            .live => fresh(d, arena, q, c, false),
+            .fresh => fresh(d, arena, q, c),
             .floored => floored(d, arena, q, c),
             .stale => stale(d, arena, q, c),
         };
@@ -338,7 +333,7 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
     return @intCast(@min(@max(@divTrunc(proven_until_ns - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
 }
 
-fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_last_tenth: bool) !?Served {
+fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
     const g = d.g;
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
     defer g.letGo(chain);
@@ -356,8 +351,10 @@ fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_las
         secure = secure and v.status == .secure;
         hop.life = lifeOf(g, v.proven_until_ns);
     }
-    if (yield_last_tenth and g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
-    return try shape(d, arena, q, c, hops, secure, true);
+    const served = try shape(d, arena, q, c, hops, secure, true);
+    if (g.cfg.prefetch and first.?.inLastTenth(g.now()))
+        g.refresh(.of(.answer, q.name, q.qtype), q.name, first.?.end_ns) catch {};
+    return served;
 }
 
 fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
@@ -686,7 +683,7 @@ test "an answer finished short of memory holds no blob" {
     while (true) : (refused += 1) {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        const served = (try fresh(&d, arena.allocator(), q, .{}, false)).?;
+        const served = (try fresh(&d, arena.allocator(), q, .{})).?;
         var failing: testing.FailingAllocator = .init(arena.allocator(), .{ .fail_index = refused });
         const finished = d.finish(failing.allocator(), q, .{}, served, a) catch {
             try testing.expectEqual(1, blob.refs);
@@ -696,4 +693,49 @@ test "an answer finished short of memory holds no blob" {
         break;
     }
     try testing.expect(refused > 0);
+}
+
+test "a last-tenth hit is served from memory, asks for one refresh, and survives a full door" {
+    const testing = std.testing;
+    const Share = @import("share.zig");
+    const Quiet = struct {
+        fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
+            return .none;
+        }
+        fn wake(_: *anyopaque, _: model.CellId, _: u32, _: i64) graph.Error!void {}
+    };
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    var owed: Share = .{ .limit = 8 };
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{}, .prefetch = true, .owed = &owed }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("sys.zig").random, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    defer g.deinit();
+    var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = null };
+    defer d.deinit();
+    const s = std.time.ns_per_s;
+    const a_name: dns.Name = .lit("a.example");
+    const b_name: dns.Name = .lit("b.example");
+    const qa: dns.Question = .{ .name = a_name, .qtype = .a, .qclass = .in };
+    const qb: dns.Question = .{ .name = b_name, .qtype = .a, .qclass = .in };
+    const rra = [_]dns.ResourceRecord{.fixture(.{ .name = a_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })};
+    const rrb = [_]dns.ResourceRecord{.fixture(.{ .name = b_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } })};
+    _ = (try g.fact(.of(.rrset, a_name, .a), .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rra, .target = a_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
+    _ = (try g.fact(.of(.rrset, b_name, .a), .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rrb, .target = b_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
+    now += 55 * s;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (0..2) |_| {
+        const hit = try d.early(arena.allocator(), qa, .{});
+        try testing.expectEqual(.recalled, std.meta.activeTag(hit));
+        hit.recalled.release(&g.store);
+    }
+    try testing.expectEqual(1, g.stats.resolver.early.refresh);
+    try testing.expectEqual(1, g.live);
+    owed.held = 7;
+    try testing.expectError(error.Full, g.demandRoot(b_name, .a, .new));
+    const full = try d.early(arena.allocator(), qb, .{});
+    try testing.expectEqual(.recalled, std.meta.activeTag(full));
+    full.recalled.release(&g.store);
+    try testing.expectEqual(1, g.stats.resolver.detail.unrefreshed);
+    try testing.expectEqual(1, g.live);
 }
