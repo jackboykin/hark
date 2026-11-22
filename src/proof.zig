@@ -374,51 +374,32 @@ fn validateNsecNegativeProof(
         if (nsecProvesEnt(rr.name, nsec, qname)) ent = true;
     }
     var next: dns.Name.Buf = undefined;
-
-    if (is_nxdomain) {
-        const covering = covering_nsec orelse return .unchecked;
-        const ce = closestEncloser(qname, covering.name, covering.nsec(&next).next_domain_name) orelse
-            return .unchecked;
-
-        // No check that the closest encloser owns an NSEC: it is a suffix of a
-        // verified bound, so it exists (RFC 4592 §2.2.2), and as an empty
-        // non-terminal it owns none. Such a check refuses every ip6.arpa NXDOMAIN.
-        var wc_buf: dns.Name.Buf = undefined;
-        const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
-
-        var wildcard_denied = false;
-        for (authorities) |rr| {
-            if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
-            if (rr.name.eql(wildcard)) return .bogus;
-            var other: dns.Name.Buf = undefined;
-            if (nsecProvesNameNonexistence(rr.name, rr.nsec(&other), wildcard)) wildcard_denied = true;
-        }
-        return if (wildcard_denied) .secure else .unchecked;
+    if (!is_nxdomain) {
+        if (matching_nsec) |rr| return nodataAt(rr.nsec(&next).type_bit_maps, qname, qtype);
+        if (ent) return .secure;
     }
-
-    if (matching_nsec) |rr| return nodataAt(rr.nsec(&next).type_bit_maps, qname, qtype);
-
-    if (ent) return .secure;
-
-    const cov = covering_nsec orelse return .unchecked;
-    const ce = closestEncloser(qname, cov.name, cov.nsec(&next).next_domain_name) orelse
+    const covering = covering_nsec orelse return .unchecked;
+    const ce = closestEncloser(qname, covering.name, covering.nsec(&next).next_domain_name) orelse
         return .unchecked;
 
+    // No check that the closest encloser owns an NSEC: it is a suffix of a
+    // verified bound, so it exists (RFC 4592 §2.2.2), and as an empty
+    // non-terminal it owns none. Such a check refuses every ip6.arpa NXDOMAIN.
     var wc_buf: dns.Name.Buf = undefined;
     const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
 
+    var denied = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
         var other: dns.Name.Buf = undefined;
         const nsec = rr.nsec(&other);
-        if (rr.name.eql(wildcard)) return nodataAt(nsec.type_bit_maps, qname, qtype);
+        if (rr.name.eql(wildcard)) return if (is_nxdomain) .bogus else nodataAt(nsec.type_bit_maps, qname, qtype);
         // RFC 4035 §5.4 shape under NOERROR: qname and `*.CE` both denied. The
         // rcode is unsigned, so the proof decides. `nsecCovers`, not name
         // nonexistence: a wildcard that is an empty non-terminal is NODATA too.
-        if (nsecCovers(rr.name, nsec, wildcard))
-            return .secure;
+        if (if (is_nxdomain) nsecProvesNameNonexistence(rr.name, nsec, wildcard) else nsecCovers(rr.name, nsec, wildcard)) denied = true;
     }
-    return .unchecked;
+    return if (denied) .secure else .unchecked;
 }
 
 const Nsec3Chain = struct {
