@@ -444,20 +444,10 @@ const Owed = union(enum) {
     due,
     flying: u64,
 
-    fn lost(o: *Owed, pn: u64) bool {
-        if (o.* == .flying and o.flying == pn) {
-            o.* = .due;
-            return true;
-        }
-        return false;
-    }
-
-    fn acked(o: *Owed, pn: u64) bool {
-        if (o.* == .flying and o.flying == pn) {
-            o.* = .none;
-            return true;
-        }
-        return false;
+    fn settle(o: *Owed, pn: u64, acked: bool) bool {
+        if (o.* != .flying or o.flying != pn) return false;
+        o.* = if (acked) .none else .due;
+        return true;
     }
 };
 
@@ -1387,11 +1377,11 @@ pub const Conn = struct {
 
     fn settle(c: *Conn, level: Level, pn: u64, window: ?Span, acked: bool) void {
         const s = c.space(level);
-        for (s.out.all()) |*ch| _ = if (acked) ch.owed.acked(pn) else ch.owed.lost(pn);
+        for (s.out.all()) |*ch| _ = ch.owed.settle(pn, acked);
         if (level != .application) return;
         const pairs = .{ &c.max_data, &c.streams_blocked, &c.data_blocked, &c.ping };
-        inline for (pairs) |o| _ = if (acked) o.acked(pn) else o.lost(pn);
-        for (c.retiring[0..c.nretiring]) |*x| _ = if (acked) x.owed.acked(pn) else x.owed.lost(pn);
+        inline for (pairs) |o| _ = o.settle(pn, acked);
+        for (c.retiring[0..c.nretiring]) |*x| _ = x.owed.settle(pn, acked);
         var i: usize = 0;
         while (i < c.nretiring) {
             if (c.retiring[i].owed == .none) {
@@ -1405,16 +1395,12 @@ pub const Conn = struct {
         if (from >= to) return;
         for (c.streams.items[@intCast(from - c.streams_from)..@intCast(to - c.streams_from)]) |o| {
             const st = o orelse continue;
+            const sent = st.send.settle(pn, acked);
+            const stopped = st.stop.settle(pn, acked);
+            const reset = st.reset.settle(pn, acked);
             if (acked) {
-                const a = st.send.acked(pn);
-                const b = st.stop.acked(pn);
-                const r = st.reset.acked(pn);
-                if (a or b or r) c.reap(st);
-            } else {
-                if (st.send.lost(pn)) c.owe_sends += 1;
-                _ = st.stop.lost(pn);
-                _ = st.reset.lost(pn);
-            }
+                if (sent or stopped or reset) c.reap(st);
+            } else if (sent) c.owe_sends += 1;
         }
         if (acked) c.compact();
     }
