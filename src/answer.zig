@@ -284,8 +284,8 @@ fn retainedUntil(d: *const Desk, r: store.Rrset) i64 {
     return @max(own, until);
 }
 
-fn hopOf(d: *const Desk, b: *store.Blob, r: store.Rrset) Hop {
-    const retained = @divTrunc(retainedUntil(d, r) - r.stored_ns, std.time.ns_per_s);
+fn hopOf(d: *const Desk, b: *store.Blob, r: store.Rrset, until: i64) Hop {
+    const retained = @divTrunc(until - r.stored_ns, std.time.ns_per_s);
     const floor = @min(d.retention.min_ttl, @as(u32, @intCast(std.math.clamp(retained, 0, std.math.maxInt(u32)))));
     return .{ .blob = b, .rrset = r, .floor = floor };
 }
@@ -299,7 +299,8 @@ fn build(d: *const Desk, arena: Allocator, root: model.CellId, q: dns.Question, 
     const hops = try arena.alloc(Hop, a.hops.len);
     for (hops, a.hops) |*hop, h| {
         const b = g.cell(h.set).blob.?;
-        hop.* = hopOf(d, b, .of(b));
+        const r: store.Rrset = .of(b);
+        hop.* = hopOf(d, b, r, retainedUntil(d, r));
         const j = h.judge.unwrap() orelse {
             secure = false;
             continue;
@@ -339,7 +340,7 @@ fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served 
     var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
-        hop.* = hopOf(d, h.blob, h.rrset);
+        hop.* = hopOf(d, h.blob, h.rrset, retainedUntil(d, h.rrset));
         const life: store.Life = .of(hop.rrset.stored_ns, h.blob.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
         const v = h.standing orelse {
@@ -360,14 +361,15 @@ fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Serve
     if (d.retention.min_ttl == 0) return null;
     const chain = try g.recall(arena, q.name, q.qtype, .any) orelse return null;
     defer g.letGo(chain);
+    const hops = try arena.alloc(Hop, chain.len);
     var expired = false;
-    for (chain) |h| {
-        if (g.now() >= retainedUntil(d, h.rrset)) return null;
+    for (hops, chain) |*hop, h| {
+        const until = retainedUntil(d, h.rrset);
+        if (g.now() >= until) return null;
         expired = expired or g.now() >= walk.replyExpiry(h.rrset);
+        hop.* = hopOf(d, h.blob, h.rrset, until);
     }
     if (!expired) return null;
-    const hops = try arena.alloc(Hop, chain.len);
-    for (hops, chain) |*hop, h| hop.* = hopOf(d, h.blob, h.rrset);
     return try shape(d, arena, q, c, hops, false, true);
 }
 
@@ -382,7 +384,7 @@ fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served 
     for (hops, chain) |*hop, h| {
         const until = retainedUntil(d, h.rrset);
         window = @min(window, until + @as(i64, d.retention.serve_stale_ttl) * std.time.ns_per_s);
-        hop.* = hopOf(d, h.blob, h.rrset);
+        hop.* = hopOf(d, h.blob, h.rrset, until);
         hop.stale = g.now() >= until;
         any = any or hop.stale;
     }
