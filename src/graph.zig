@@ -1056,13 +1056,10 @@ pub const Graph = struct {
     }
 
     pub fn holds(g: *Graph, key: Key) bool {
-        if (g.stored(key) != null) return true;
-        const id = g.liveServed(g.indexed(key)) orelse return false;
-        return g.cell(id).state == .fact;
+        return g.held(key) != null;
     }
 
     pub fn held(g: *Graph, key: Key) ?*store.Blob {
-        std.debug.assert(key.kind == .rrset);
         return switch (g.served(key, g.indexed(key)) orelse return null) {
             .stored => |e| e,
             .live => |id| if (g.cell(id).state == .fact) g.cell(id).blob.? else null,
