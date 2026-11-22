@@ -21,8 +21,13 @@ pub const Nsec3Params = struct {
         return a.iterations == b.iterations and mem.eql(u8, a.salt, b.salt);
     }
 
+    /// An NSEC3 hash is paid for before it is made (CVE-2023-50868).
     pub fn hash(p: Nsec3Params, name: dns.Name, budget: *rrsig.ValidationBudget) Stop!Hash {
-        return budgetedNsec3Hash(name, p.salt, p.iterations, budget);
+        if (budget.hashes) |made| if (made.of(name.wire, p.salt, p.iterations)) |h| return h;
+        try budget.consumeNsec3(nsec3HashBlocks(name, p.salt.len, p.iterations));
+        const h = nsec3Hash(name, p.salt, p.iterations);
+        if (budget.hashes) |made| made.hold(name.wire, p.salt, p.iterations, h);
+        return h;
     }
 };
 
@@ -300,20 +305,6 @@ pub fn nsec3OwnerHash(name: dns.Name) ?Hash {
 
 pub fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?Hash {
     return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
-}
-
-/// An NSEC3 hash is paid for before it is made (CVE-2023-50868).
-fn budgetedNsec3Hash(
-    name: dns.Name,
-    salt: []const u8,
-    iterations: u16,
-    budget: *rrsig.ValidationBudget,
-) error{ValidationBudgetExhausted}!Hash {
-    if (budget.hashes) |made| if (made.of(name.wire, salt, iterations)) |hash| return hash;
-    try budget.consumeNsec3(nsec3HashBlocks(name, salt.len, iterations));
-    const hash = nsec3Hash(name, salt, iterations);
-    if (budget.hashes) |made| made.hold(name.wire, salt, iterations, hash);
-    return hash;
 }
 
 fn nsec3HashBlocks(name: dns.Name, salt_len: usize, iterations: u16) u32 {
