@@ -531,16 +531,9 @@ pub const RData = union(enum) {
     }
 };
 
-fn nameLen(d: []const u8) Error!usize {
-    var i: usize = 0;
-    while (i < d.len) : (i += 1 + d[i]) if (d[i] == 0) return i + 1;
-    return error.InvalidRDataLength;
-}
-
-fn readSoa(d: []const u8) Error!SoaData {
-    const m = try nameLen(d);
-    const r = m + try nameLen(d[m..]);
-    if (d.len != r + 20) return error.FormatError;
+fn readSoa(d: []const u8) SoaData {
+    const m = wireNameLen(d);
+    const r = m + wireNameLen(d[m..]);
     const n = d[r..][0..20];
     return .{
         .mname = .of(d[0..m]),
@@ -559,9 +552,8 @@ fn checkTxt(d: []const u8) Error!void {
     if (at != d.len) return error.FormatError;
 }
 
-fn readRrsig(d: []const u8) Error!RrsigData {
-    if (d.len < 18) return error.InvalidRDataLength;
-    const n = 18 + try nameLen(d[18..]);
+fn readRrsig(d: []const u8) RrsigData {
+    const n = 18 + wireNameLen(d[18..]);
     return .{
         .type_covered = @fromBackingInt(mem.readInt(u16, d[0..2], .big)),
         .algorithm = @fromBackingInt(d[2]),
@@ -575,18 +567,16 @@ fn readRrsig(d: []const u8) Error!RrsigData {
     };
 }
 
-fn readDnskey(d: []const u8) Error!DnskeyData {
-    if (d.len < 4) return error.InvalidRDataLength;
+fn readDnskey(d: []const u8) DnskeyData {
     return .{ .flags = mem.readInt(u16, d[0..2], .big), .protocol = d[2], .algorithm = @fromBackingInt(d[3]), .public_key = d[4..] };
 }
 
-fn readDs(d: []const u8) Error!DsData {
-    if (d.len < 4) return error.InvalidRDataLength;
+fn readDs(d: []const u8) DsData {
     return .{ .key_tag = mem.readInt(u16, d[0..2], .big), .algorithm = @fromBackingInt(d[2]), .digest_type = @fromBackingInt(d[3]), .digest = d[4..] };
 }
 
-fn readNsec(d: []const u8, buf: *Name.Buf) Error!NsecData {
-    const n = try nameLen(d);
+fn readNsec(d: []const u8, buf: *Name.Buf) NsecData {
+    const n = wireNameLen(d);
     const spelled = d[0..n];
     // A length octet is at most 63, below 'A', so every byte can be tested.
     const folded = for (spelled) |c| {
@@ -617,8 +607,7 @@ fn checkRdata(rtype: RType, d: []const u8) Error!void {
         .a => if (d.len != 4) return error.InvalidRDataLength,
         .aaaa => if (d.len != 16) return error.InvalidRDataLength,
         .txt => try checkTxt(d),
-        .dnskey => _ = try readDnskey(d),
-        .ds => _ = try readDs(d),
+        .dnskey, .ds => if (d.len < 4) return error.InvalidRDataLength,
         .nsec3 => _ = try readNsec3(d),
         else => {},
     }
@@ -793,7 +782,7 @@ pub const ResourceRecord = struct {
 
     pub fn soa(rr: ResourceRecord) SoaData {
         std.debug.assert(rr.rtype == .soa);
-        return readSoa(rr.rdata) catch unreachable;
+        return readSoa(rr.rdata);
     }
 
     pub fn txt(rr: ResourceRecord) TxtData.Strings {
@@ -803,22 +792,22 @@ pub const ResourceRecord = struct {
 
     pub fn rrsig(rr: ResourceRecord) RrsigData {
         std.debug.assert(rr.rtype == .rrsig);
-        return readRrsig(rr.rdata) catch unreachable;
+        return readRrsig(rr.rdata);
     }
 
     pub fn dnskey(rr: ResourceRecord) DnskeyData {
         std.debug.assert(rr.rtype == .dnskey);
-        return readDnskey(rr.rdata) catch unreachable;
+        return readDnskey(rr.rdata);
     }
 
     pub fn ds(rr: ResourceRecord) DsData {
         std.debug.assert(rr.rtype == .ds);
-        return readDs(rr.rdata) catch unreachable;
+        return readDs(rr.rdata);
     }
 
     pub fn nsec(rr: ResourceRecord, buf: *Name.Buf) NsecData {
         std.debug.assert(rr.rtype == .nsec);
-        return readNsec(rr.rdata, buf) catch unreachable;
+        return readNsec(rr.rdata, buf);
     }
 
     pub fn nsec3(rr: ResourceRecord) Nsec3Data {
