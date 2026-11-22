@@ -122,7 +122,6 @@ const ConfigError = error{
     InvalidAclEntry,
     TestOnlyConfigKey,
     UnknownConfigKey,
-    ConfigFileTooLarge,
     OutOfMemory,
 };
 
@@ -343,15 +342,6 @@ fn reaches(l: Address, to: Address) bool {
         .ip4 => |b| to == .ip4 and mem.allEqual(u8, &b.bytes, 0) and (to.ip4.bytes[0] == 127 or mem.allEqual(u8, &to.ip4.bytes, 0)),
         .ip6 => |b| to == .ip6 and mem.allEqual(u8, &b.bytes, 0) and mem.allEqual(u8, to.ip6.bytes[0..15], 0) and to.ip6.bytes[15] <= 1,
     };
-}
-
-pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !ServerConfig {
-    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.StreamTooLong => return error.ConfigFileTooLarge,
-        else => |e| return e,
-    };
-    defer allocator.free(contents);
-    return parseConfig(allocator, contents);
 }
 
 fn parseTrustAnchors(arena: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {

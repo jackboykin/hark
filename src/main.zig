@@ -99,7 +99,7 @@ fn runServe(allocator: std.mem.Allocator, work_allocator: std.mem.Allocator, arg
     }
 
     var cfg = if (config_path) |path|
-        hark.config.parseConfigFile(allocator, io, path) catch |err| {
+        readConfig(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             return err;
         }
@@ -156,10 +156,19 @@ fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+fn readConfig(allocator: std.mem.Allocator, io: Io, path: []const u8) !hark.config.ServerConfig {
+    const contents = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => return error.ConfigFileTooLarge,
+        else => |e| return e,
+    };
+    defer allocator.free(contents);
+    return hark.config.parseConfig(allocator, contents);
+}
+
 fn loadDefaultConfig(allocator: std.mem.Allocator, io: Io) !hark.config.ServerConfig {
     // Absolute: a service manager's working directory is not where the config is.
     const default_path = "/etc/hark/hark.toml";
-    if (hark.config.parseConfigFile(allocator, io, default_path)) |cfg| {
+    if (readConfig(allocator, io, default_path)) |cfg| {
         return cfg;
     } else |err| switch (err) {
         error.FileNotFound => {
