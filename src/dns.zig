@@ -2,7 +2,6 @@
 //! messages with their records and EDNS (RFC 6891) parsed and serialized.
 
 const std = @import("std");
-const slab = @import("slab.zig");
 const builtin = @import("builtin");
 const mem = std.mem;
 const testing = std.testing;
@@ -733,7 +732,8 @@ pub const Question = struct {
     spelled: ?[]const u8 = null,
 };
 
-var fixtures: std.heap.ArenaAllocator = .init(slab.scaffold.allocator());
+var fixture_bytes: [64 << 10]u8 = undefined;
+var fixtures: std.heap.FixedBufferAllocator = .init(&fixture_bytes);
 
 pub const ResourceRecord = struct {
     name: Name,
