@@ -81,10 +81,8 @@ pub fn classifyDelegation(
         .verdict => |v| return if (v == .bogus) .bogus else .unproven,
     };
     const child_hash = try chain.params.hash(child_zone, budget);
-    for (chain.owners(), chain.records()) |owner_hash, rr| {
-        if (mem.eql(u8, &owner_hash, &child_hash))
-            return if (isInsecureDelegationProof(rr.nsec3().type_bit_maps)) .unsigned else .unproven;
-    }
+    if (chain.match(&child_hash)) |n3|
+        return if (isInsecureDelegationProof(n3.type_bit_maps)) .unsigned else .unproven;
     // RFC 5155 §8.6: closest encloser, then an Opt-Out span over the next
     // closer. No wildcard step: delegations are never synthesized.
     const found = switch (try nsec3ClosestEncloser(&chain, child_zone, child_hash, zone, budget)) {
@@ -436,6 +434,11 @@ const Nsec3Chain = struct {
     fn records(c: *const Nsec3Chain) []const dns.ResourceRecord {
         return c.rrs[0..c.len];
     }
+
+    fn match(c: *const Nsec3Chain, h: *const Hash) ?dns.Nsec3Data {
+        for (c.owners(), c.records()) |o, rr| if (mem.eql(u8, &o, h)) return rr.nsec3();
+        return null;
+    }
 };
 
 const Nsec3ChainOr = union(enum) {
@@ -482,9 +485,8 @@ fn nsec3ClosestEncloser(
     while (up) |ancestor| : (up = ancestor.parent()) {
         if (ancestor.depth() < zone.depth()) break;
         const ancestor_hash = if (ancestor.depth() == qname.depth()) qname_hash else try chain.params.hash(ancestor, budget);
-        for (chain.owners(), chain.records()) |owner_hash, rr| {
-            if (!mem.eql(u8, &owner_hash, &ancestor_hash)) continue;
-            if (provesNothingBelowOwner(rr.nsec3().type_bit_maps)) return .{ .verdict = .unchecked };
+        if (chain.match(&ancestor_hash)) |n3| {
+            if (provesNothingBelowOwner(n3.type_bit_maps)) return .{ .verdict = .unchecked };
             return .{ .found = .{ .ce = ancestor, .next_closer_hash = below_hash } };
         }
         below_hash = ancestor_hash;
@@ -584,12 +586,7 @@ fn validateNsec3NegativeProof(
     };
     const qname_hash = try chain.params.hash(qname, budget);
 
-    if (!is_nxdomain) {
-        for (chain.owners(), chain.records()) |owner_hash, rr| {
-            if (mem.eql(u8, &owner_hash, &qname_hash))
-                return nodataAt(rr.nsec3().type_bit_maps, qname, qtype);
-        }
-    }
+    if (!is_nxdomain) if (chain.match(&qname_hash)) |n3| return nodataAt(n3.type_bit_maps, qname, qtype);
 
     const found = switch (try nsec3ClosestEncloser(&chain, qname, qname_hash, zone, budget)) {
         .found => |f| f,
@@ -610,21 +607,15 @@ fn validateNsec3NegativeProof(
     const nc_cover = nsec3Cover(&chain, &nc_hash);
     const nc_covered = nc_cover != null;
     const nc_optout = nc_cover orelse false;
-    var wc_proven = false;
-    var wc_optout = false;
+    const wc_cover = nsec3Cover(&chain, &wc_hash);
+    const wc_optout = wc_cover orelse false;
+    var wc_proven = wc_cover != null;
     var wc_contradicted = false;
-    for (chain.owners(), chain.records()) |owner_hash, rr| {
-        const nsec3 = rr.nsec3();
-
-        if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
+    if (chain.match(&wc_hash)) |n3| {
+        if (is_nxdomain or bitmapContradictsNodata(n3.type_bit_maps, qtype)) {
+            wc_contradicted = true;
+        } else if (!wrongSideOfCut(n3.type_bit_maps, qname, qtype)) {
             wc_proven = true;
-            if (nsec3.flags & nsec3_opt_out != 0) wc_optout = true;
-        } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
-            if (is_nxdomain or bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
-                wc_contradicted = true;
-            } else if (!wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) {
-                wc_proven = true;
-            }
         }
     }
     // RFC 5155 §8.6: an unsigned delegation under Opt-Out owns no NSEC3, so
