@@ -611,8 +611,8 @@ test "a proof two hops share goes out once" {
     const ab = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec;
     const ac = "\x01a\x00" ++ nsec ++ "\x01c\x00" ++ nsec;
     const hops = [_]store.Records{
-        .{ .payload = ab, .start = 0, .end = ab.len, .len = 2 },
-        .{ .payload = ac, .start = 0, .end = ac.len, .len = 2 },
+        .{ .payload = ab, .start = 0, .len = 2 },
+        .{ .payload = ac, .start = 0, .len = 2 },
     };
     var out: std.ArrayList(dns.ResourceRecord) = .empty;
     var seen: Seen = .{ .bound = 4 };

@@ -343,12 +343,23 @@ test "fuzz: store round trip" {
             st.put(blob) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;
             const back = (try store.Store.parse(alloc, got)).rrset;
-            for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals }, [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals }) |want, have| {
+            const rrset: store.Rrset = .of(got);
+            for (
+                [_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals },
+                [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals },
+                rrset.sections,
+            ) |want, have, sec| {
                 try testing.expectEqual(want.len, have.len);
+                try testing.expectEqual(have.len, sec.len);
+                var it = sec.iterator();
                 for (want, have) |a, b| {
                     try testing.expect(a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and a.ttl == b.ttl);
                     try testing.expectEqualSlices(u8, a.rdata, b.rdata);
+                    const c = it.next().?;
+                    try testing.expect(b.name.eql(c.name) and b.rtype == c.rtype and b.rclass == c.rclass and b.ttl == c.ttl);
+                    try testing.expectEqualSlices(u8, b.rdata, c.rdata);
                 }
+                try testing.expectEqual(null, it.next());
             }
         }
     }.one, .{});

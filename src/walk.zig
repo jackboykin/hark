@@ -507,7 +507,7 @@ fn ownAddresses(g: *const Graph, blob: *store.Blob, family: dns.RType) OwnAddres
 }
 
 const OwnAddresses = struct {
-    own: ?store.Rrset.Answered,
+    own: ?store.Records.Iterator,
     family: dns.RType,
     policy: delegation.AddrPolicy,
 

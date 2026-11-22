@@ -324,7 +324,7 @@ pub const Store = struct {
                 for (c.servers) |server| for (server.glue) |gl| w.addr(gl);
             },
             .rrset, .stub => |r| {
-                // `Rrset.read` and `Rrset.answered` read this layout in place.
+                // `Rrset.read` reads this layout in place.
                 w.int(u8, @backingInt(r.kind));
                 w.int(u8, @intFromBool(r.aa) | (@as(u8, @intFromBool(r.ede != null)) << 1));
                 w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
@@ -369,24 +369,19 @@ pub const Store = struct {
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
             .rrset, .stub, .span => |kind| blk: {
-                var reply: model.Reply = .{
-                    .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
-                    .aa = undefined,
+                const rrset = Rrset.read(r);
+                const reply: model.Reply = .{
+                    .kind = rrset.kind,
+                    .aa = rrset.aa,
+                    .answers = try rrset.sections[0].slice(arena),
+                    .authorities = try rrset.sections[1].slice(arena),
+                    .additionals = try rrset.sections[2].slice(arena),
+                    .target = .of(rrset.target),
+                    .zone = .of(rrset.zone),
+                    .ede = rrset.ede,
+                    .stored_ns = rrset.stored_ns,
+                    .ttl = rrset.ttl,
                 };
-                const flags = r.int(u8);
-                reply.aa = flags & 1 != 0;
-                const ede = r.int(u16);
-                if (flags & 2 != 0) reply.ede = @fromBackingInt(ede);
-                reply.ttl = r.int(u32);
-                reply.stored_ns = r.int(i64);
-                reply.target = r.name();
-                reply.zone = r.name();
-                const an = r.int(u16);
-                const ns = r.int(u16);
-                const ar = r.int(u16);
-                reply.answers = try r.records(arena, an);
-                reply.authorities = try r.records(arena, ns);
-                reply.additionals = try r.records(arena, ar);
                 break :blk if (kind == .stub) .{ .stub = reply } else .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
@@ -415,26 +410,10 @@ pub const Rrset = struct {
         return read(.{ .buf = b.payload(), .pos = b.name_len });
     }
 
-    pub fn answered(b: *Blob) ?Answered {
-        std.debug.assert(isReply(b));
-        const p = b.payload();
-        if (@as(model.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[b.name_len])))) != .answer) return null;
-        var at: usize = b.name_len + 1 + 1 + 2 + 4 + 8;
-        at += stored(p, at).len;
-        at += stored(p, at).len;
-        return .{ .it = .{ .payload = p, .pos = at + 6, .end = p.len }, .left = mem.readInt(u16, p[at..][0..2], .little) };
+    pub fn answered(b: *Blob) ?Records.Iterator {
+        const r = of(b);
+        return if (r.kind == .answer) r.sections[0].iterator() else null;
     }
-
-    pub const Answered = struct {
-        it: Records.Iterator,
-        left: u16,
-
-        pub fn next(a: *Answered) ?dns.ResourceRecord {
-            if (a.left == 0) return null;
-            a.left -= 1;
-            return a.it.next();
-        }
-    };
 
     fn read(r0: Reader) Rrset {
         var r = r0;
@@ -458,14 +437,13 @@ pub const Rrset = struct {
         v.zone = r.wireName();
         var counts: [3]u16 = undefined;
         for (&counts) |*n| n.* = r.int(u16);
-        for (&v.sections, counts) |*sec, n| {
-            const start = r.pos;
-            for (0..n) |_| {
-                _ = r.wireName();
-                const fixed = r.slice(10);
-                _ = r.slice(mem.readInt(u16, fixed[8..10], .big));
+        for (&v.sections, counts, 0..) |*sec, n, i| {
+            sec.* = .{ .payload = r.buf, .start = r.pos, .len = n };
+            if (i < 2) {
+                var it = sec.iterator();
+                while (it.next() != null) {}
+                r.pos = it.pos;
             }
-            sec.* = .{ .payload = r.buf, .start = start, .end = r.pos, .len = n };
         }
         return v;
     }
@@ -474,20 +452,27 @@ pub const Rrset = struct {
 pub const Records = struct {
     payload: []const u8,
     start: usize,
-    end: usize,
     len: u16,
 
     pub fn iterator(r: Records) Iterator {
-        return .{ .payload = r.payload, .pos = r.start, .end = r.end };
+        return .{ .payload = r.payload, .pos = r.start, .left = r.len };
+    }
+
+    fn slice(r: Records, arena: Allocator) Allocator.Error![]RR {
+        const out = try arena.alloc(RR, r.len);
+        var it = r.iterator();
+        for (out) |*rr| rr.* = it.next().?;
+        return out;
     }
 
     pub const Iterator = struct {
         payload: []const u8,
         pos: usize,
-        end: usize,
+        left: u16,
 
         pub fn next(it: *Iterator) ?dns.ResourceRecord {
-            if (it.pos == it.end) return null;
+            if (it.left == 0) return null;
+            it.left -= 1;
             const owner = stored(it.payload, it.pos);
             const fixed = it.payload[it.pos + owner.len ..][0..10];
             const rdata = it.payload[it.pos + owner.len + 10 ..][0..mem.readInt(u16, fixed[8..10], .big)];
@@ -604,7 +589,7 @@ const Reader = struct {
 
     fn records(r: *Reader, arena: Allocator, n: u16) Allocator.Error![]RR {
         const out = try arena.alloc(RR, n);
-        var it: Records.Iterator = .{ .payload = r.buf, .pos = r.pos, .end = r.buf.len };
+        var it: Records.Iterator = .{ .payload = r.buf, .pos = r.pos, .left = n };
         for (out) |*rr| rr.* = it.next().?;
         r.pos = it.pos;
         return out;
