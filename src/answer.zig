@@ -106,10 +106,8 @@ fn synthesized(q: dns.Question, s: special_use.Synthesized) Served {
 
 fn ownAnswer(arena: Allocator, q: dns.Question, z: *const special_use.Zone, d64: ?Dns64) !Served {
     const served = synthesized(q, try special_use.answer(arena, z, q));
-    if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
-        var qa = q;
-        qa.qtype = .a;
-        var a = synthesized(q, try special_use.answer(arena, z, qa));
+    if (d64) |d| if (Dns64.wantsA(q, served)) {
+        var a = synthesized(q, try special_use.answer(arena, z, Desk.aOf(q)));
         a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
     };
