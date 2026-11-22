@@ -392,11 +392,7 @@ fn onNews(s: *Sessions, c: *Conn, news: carrier.News) !void {
         .ended => |how| return s.drop(c, how),
         .read => while (try c.carrier.next(&s.shared)) |ev| switch (ev) {
             .established => if (!try s.onEstablished(c)) return s.drop(c, .closed),
-            .room => {
-                if (!try s.drain(c)) return s.drop(c, .closed);
-                if (s.unflushed != c) s.flush();
-                s.unflushed = c;
-            },
+            .room => if (!try s.drain(c)) return s.drop(c, .closed),
             .ended => |how| return s.drop(c, how),
             .reply => |r| {
                 const at = (c.pending.fetchSwapRemove(r.id) orelse continue).value;
