@@ -794,6 +794,22 @@ test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
     try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
 }
 
+test "an NSEC NODATA set reads the same whatever order its records come in" {
+    const apex = dns.Name.lit("go-vip.net");
+    const lotus = dns.Name.lit("lotus.go-vip.net");
+    const ns1 = dns.Name.lit("ns1.go-vip.net");
+    const wildcard = dns.Name.lit("*.go-vip.net");
+    const acme = dns.Name.lit("_acme-challenge.go-vip.net");
+    const qname = dns.Name.lit("nasa-tv.go-vip.net");
+
+    const owns = nsecRrWithBitmap(wildcard, acme, &[_]u8{ 0x00, 0x09, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x40 });
+    const denies = nsecRr(apex, lotus);
+    var b: rrsig.ValidationBudget = .{};
+    for ([_][3]dns.ResourceRecord{ .{ nsecRr(lotus, ns1), owns, denies }, .{ nsecRr(lotus, ns1), denies, owns } }) |authorities| {
+        try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+    }
+}
+
 test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unchecked" {
     const aaa = dns.Name.lit("aaa.example.com");
     const zzz = dns.Name.lit("zzz.example.com");
