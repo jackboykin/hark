@@ -850,7 +850,11 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: 
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
     for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rrsig().labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rrsig().signer_name);
-    dnssec.sort(dns.Name, signers.items, before);
+    dnssec.sort(dns.Name, signers.items, struct {
+        fn lessThan(_: void, x: dns.Name, y: dns.Name) bool {
+            return wireOrder(x, y) == .lt;
+        }
+    }.lessThan);
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
         life = @min(rr.ttl, rr.soa().minimum, dns.max_negative_ttl);
@@ -874,14 +878,14 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply, rest: 
     return keep.items;
 }
 
-fn before(_: void, a: dns.Name, b: dns.Name) bool {
-    return a.order(b) == .lt;
+fn wireOrder(a: dns.Name, b: dns.Name) std.math.Order {
+    return mem.order(u8, a.wire, b.wire);
 }
 
 /// Searches `signers`, sorted: a section's signatures and a reply's signers
 /// are both the sender's to multiply.
 fn signs(signers: []const dns.Name, rr: dns.ResourceRecord) bool {
-    return rr.rtype == .rrsig and std.sort.binarySearch(dns.Name, signers, rr.rrsig().signer_name, dns.Name.order) != null;
+    return rr.rtype == .rrsig and std.sort.binarySearch(dns.Name, signers, rr.rrsig().signer_name, wireOrder) != null;
 }
 
 fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {
