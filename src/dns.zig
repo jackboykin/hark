@@ -1415,12 +1415,6 @@ pub const Serializer = struct {
         if (self.pos + n > self.buf.len) return error.EndOfData;
     }
 
-    fn writeU8(self: *Serializer, val: u8) Error!void {
-        try self.ensureSpace(1);
-        self.buf[self.pos] = val;
-        self.pos += 1;
-    }
-
     fn writeU16(self: *Serializer, val: u16) Error!void {
         try self.ensureSpace(2);
         mem.writeInt(u16, self.buf[self.pos..][0..2], val, .big);
