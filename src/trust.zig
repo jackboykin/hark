@@ -76,11 +76,16 @@ const Fault = union(enum) {
 const bogus: Failure = .of(.bogus);
 const no_cut: Failure = .of(.no_insecure_cut);
 
+fn spent(g: *Graph, id: CellId, err: (proof.Stop || graph.Error)) graph.Error!void {
+    switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.ValidationBudgetExhausted => g.fail(id, g.payer.validationStop().?),
+    }
+}
+
 /// Bogus bytes leave the store now: their TTL was the forger's to set (RFC
-/// 4035 §4.7). Not when a budget stopped the judgement: nothing was proven,
-/// and a zone draining its own budget must not evict a victim's bytes.
+/// 4035 §4.7).
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
-    if (g.payer.validationStop()) |why| return g.fail(id, why);
     if (g.limit(g.payer) == null) {
         const b = g.cell(rid).blob.?;
         b.shorten(g.now());
@@ -92,7 +97,7 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
 /// A bogus DS or keyset is remembered (RFC 9520 §3.4): judging it again per
 /// question is KeyTrap's lever.
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (g.payer.validationStop() == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
+    if (g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
     try failBogus(g, id, rid);
 }
 
@@ -131,10 +136,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
-    if (s.fault == null) {
-        s.fault = try judgeDs(g, id, s, zone, rs) orelse return;
-        if (g.payer.validationStop()) |why| return g.fail(id, why);
-    }
+    if (s.fault == null) s.fault = (judgeDs(g, id, s, zone, rs) catch |err| return spent(g, id, err)) orelse return;
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
         .stopped => |why| g.fail(id, why),
@@ -193,17 +195,17 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             const until = @min(rs.expires(), keys.expires());
             const proven = try g.scratch.allocator().alloc(i64, r.authorities.len);
             @memset(proven, capExpiry(g, cap, r.stored_ns));
-            const shown: ?Chain = switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
+            const shown: ?Chain = switch (try proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => .{ .status = .insecure },
                 // A signed denial of the DS that shows no delegation either: no zone.
-                .unproven => if (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget) == .secure) .{ .status = .absent, .records = r.authorities } else null,
+                .unproven => if (try proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget) == .secure) .{ .status = .absent, .records = r.authorities } else null,
                 .bogus => null,
             };
             if (shown) |ds| {
                 try denial.absorb(g, signer, r.stored_ns, .{ .rrs = r.authorities, .until = proven }, keys.expires());
                 g.keep(s.rrset.unwrap().?);
                 try g.settle(id, .{ .ds = ds }, until);
-            } else g.fail(id, g.payer.validationStop() orelse no_cut);
+            } else g.fail(id, no_cut);
         },
         .alias, .yxdomain => unreachable,
     }
@@ -258,7 +260,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.ds());
     const budget = &g.payer.validation;
     const now = g.wallNow();
-    const sig = try dnssec.validateDnskeyRrset(g.scratch.allocator(), r.answers, ds_data.items, zone, .{ .now = now, .budget = budget, .memo = &g.verify_memo }) orelse
+    const sig = (dnssec.validateDnskeyRrset(g.scratch.allocator(), r.answers, ds_data.items, zone, .{ .now = now, .budget = budget, .memo = &g.verify_memo }) catch |err| return spent(g, id, err)) orelse
         return failChain(g, id, s.rrset.unwrap().?);
     g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, .of(sig, now), r.stored_ns));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
@@ -300,10 +302,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         .insecure => return g.settle(id, .{ .secure = .{ .status = .insecure } }, zd.expires()),
     }
     while (true) {
-        if (s.fault == null) {
-            s.fault = try judge(g, id, s, t, @min(t.expires(), zd.expires())) orelse return;
-            if (g.payer.validationStop()) |why| return g.fail(id, why);
-        }
+        if (s.fault == null) s.fault = (judge(g, id, s, t, @min(t.expires(), zd.expires())) catch |err| return spent(g, id, err)) orelse return;
         const c = Claims.at(&t.state.fact.rrset, t.key.rtype, s.next);
         const r = &t.state.fact.rrset;
         // A proof may sit below an insecure cut only where the data it speaks
@@ -384,7 +383,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 }
                 if (c.is == .denial) {
                     const own = try verifiedProofs(g, r, qtype, s, signer);
-                    switch (proof.validateNegativeProof(own.rrs, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
+                    switch (try proof.validateNegativeProof(own.rrs, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
                         .secure => try denial.absorb(g, signer, r.stored_ns, own, kc.expires()),
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
@@ -406,7 +405,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
                     const own = try verifiedProofs(g, r, qtype, s, verified.signer_name);
-                    switch (proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
+                    switch (try proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {
                             try denial.absorb(g, verified.signer_name, r.stored_ns, own, kc.expires());
                             try publishSource(g, r, &c, verified, @min(cap, kc.expires()));

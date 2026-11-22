@@ -509,7 +509,7 @@ fn expandOver(q: *const Asked, zone: dns.Name, source: *store.Blob, encloser: dn
     var authorities: std.ArrayList(RR) = .empty;
     const spans = (try store.Store.parse(q.arena, cover.judged)).rrset;
     try aged(q, &authorities, spans.answers, spans.stored_ns);
-    if (proof.proveNoCloserMatch(authorities.items, q.name, encloser.depth(), zone, q.allowance) != .secure) return null;
+    if ((proof.proveNoCloserMatch(authorities.items, q.name, encloser.depth(), zone, q.allowance) catch return null) != .secure) return null;
 
     const expires = @min(source.end(), cover.expires_ns);
     var reply: model.Reply = .{ .kind = held.kind, .aa = true, .answers = answers.items, .authorities = authorities.items, .target = held.target, .zone = zone, .ede = .synthesized, .stored_ns = now };
@@ -572,7 +572,7 @@ fn weigh(q: *const Asked, zone: dns.Name, held: Held, proofs: []const Held, nxdo
         const fact = (try store.Store.parse(q.arena, p.judged)).rrset;
         try aged(q, &authorities, fact.answers, fact.stored_ns);
     }
-    if (proof.validateNegativeProof(authorities.items, q.name, q.qtype, nxdomain, zone, q.allowance) != .secure) return null;
+    if ((proof.validateNegativeProof(authorities.items, q.name, q.qtype, nxdomain, zone, q.allowance) catch return null) != .secure) return null;
 
     var reply: model.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,

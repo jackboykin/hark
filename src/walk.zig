@@ -603,9 +603,8 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     @memset(kept, false);
     for (set) |sig| if (sig.rtype == .rrsig and sig.rrsig().labels < rrsig.signedLabels(name)) {
         const zone = sig.rrsig().signer_name;
-        const p = proof.noCloserMatch(reply.authorities, name, sig.rrsig().labels, zone, &g.payer.validation);
         // The budget refused a hash, so no proof was chosen: an alias without its own is no fact.
-        if (p == .verdict and g.payer.validation.stopped != null) return;
+        const p = proof.noCloserMatch(reply.authorities, name, sig.rrsig().labels, zone, &g.payer.validation) catch return;
         keepProof(reply.authorities, kept, p, zone);
     };
     var proofs: std.ArrayList(dns.ResourceRecord) = .empty;

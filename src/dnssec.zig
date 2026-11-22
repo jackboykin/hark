@@ -437,7 +437,7 @@ fn weigh(scratch: mem.Allocator, w: Weighed, at: rrsig.Verifier) !?Verified {
     var it = w;
     while (it.next()) |i| {
         const sig = w.rrs[i].rrsig();
-        if (rrsetVerifiesWithAnyKey(sig, w.keys, set, at) catch return null) {
+        if (try rrsetVerifiesWithAnyKey(sig, w.keys, set, at)) {
             // Drain so `passed` covers the signatures after the one that verified.
             while (it.next()) |_| {}
             return .{ .sig = sig, .unweighed = it.passed };
@@ -632,7 +632,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
 
     const cap: u32 = 8;
     var budget: rrsig.ValidationBudget = .{ .max_sig_verify = cap };
-    try testing.expect(try validateDnskeyRrset(arena.allocator(), &records, &.{ds}, rrsig.test_owner, .{ .now = 1700000000, .budget = &budget, .memo = test_memo }) == null);
+    try testing.expectError(error.ValidationBudgetExhausted, validateDnskeyRrset(arena.allocator(), &records, &.{ds}, rrsig.test_owner, .{ .now = 1700000000, .budget = &budget, .memo = test_memo }));
     try testing.expectEqual(cap, budget.sig_verify_spent);
     try testing.expect(budget.stopped != null);
 }

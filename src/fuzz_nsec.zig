@@ -381,7 +381,7 @@ fn fuzzOne(s: *Smith) !void {
     const nc = z.nextCloser(qname);
     var wl: dns.Name.Buf = undefined;
     const wc = dns.Name.child(&wl, "*", ce).?;
-    const v1 = proof.validateNegativeProof(auth, qname, qtype, is_nxdomain, zone, &budget);
+    const v1 = try proof.validateNegativeProof(auth, qname, qtype, is_nxdomain, zone, &budget);
     errdefer dump(&z, auth, qname, qtype, .{ t, is_nxdomain, exact, v1 });
     switch (v1) {
         .secure => if (t == .positive or t == .referral or (is_nxdomain and t != .nxdomain)) return error.UnsoundDenial,
@@ -395,7 +395,7 @@ fn fuzzOne(s: *Smith) !void {
 
     budget = .{};
     const labels: u8 = if (exact) ce.depth() else s.valueRangeAtMost(u8, 0, qname.depth());
-    const v2 = proof.proveNoCloserMatch(auth, qname, labels, zone, &budget);
+    const v2 = try proof.proveNoCloserMatch(auth, qname, labels, zone, &budget);
     errdefer std.debug.print("wildcard labels={d} {t}\n", .{ labels, v2 });
     switch (v2) {
         .secure, .insecure => |v| {
@@ -419,7 +419,7 @@ fn fuzzOne(s: *Smith) !void {
     const ref = sec.pick(&z, s, &mask, exact);
     const e = z.find(child);
     const insecure_delegation = if (e) |x| x.types.delegation() and !x.types.ds else false;
-    const v3 = proof.classifyDelegation(ref, child, zone, &budget);
+    const v3 = try proof.classifyDelegation(ref, child, zone, &budget);
     errdefer dump(&z, ref, child, .ds, .{ insecure_delegation, v3 });
     switch (v3) {
         .unsigned => {
