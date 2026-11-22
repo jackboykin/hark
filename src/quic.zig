@@ -1408,7 +1408,8 @@ pub const Conn = struct {
             if (acked) {
                 const a = st.send.acked(pn);
                 const b = st.stop.acked(pn);
-                if (a or b or st.reset.acked(pn)) c.reap(st);
+                const r = st.reset.acked(pn);
+                if (a or b or r) c.reap(st);
             } else {
                 if (st.send.lost(pn)) c.owe_sends += 1;
                 _ = st.stop.lost(pn);
@@ -2056,4 +2057,38 @@ test "RFC 9001 5.4.2: a coalesced PING pads for its header protection sample" {
     const ah = app_tx.unmask(app_pkt, app_pn_at);
     const app_plain = app_tx.open(app_pkt, app_pn_at + ah.len, decodePn(null, ah.truncated, ah.len)).?;
     try testing.expectEqual(0x02, app_plain[0]);
+}
+
+test "a cancelled stream is reaped when its stop and reset are acknowledged together" {
+    var entropy: [tls13.entropy_len + 8]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    var c = try Conn.begin(testing.allocator, &entropy, 0);
+    defer c.deinit();
+    c.discard(.initial);
+    const app_tx: Keys = .of(&@as(Secret, @splat(3)));
+    const app_rx: Keys = .of(&@as(Secret, @splat(4)));
+    c.space(.application).tx = app_tx;
+    c.space(.application).rx = app_rx;
+    c.next_rx = app_rx.updated();
+    c.phase = .confirmed;
+    c.peer.max_streams = 10;
+    c.peer.max_data = 4096;
+    c.peer.stream_data = 4096;
+    c.dropHandshake();
+
+    const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
+    const id = (try c.query(&wire)).id;
+    var buf: [max_datagram]u8 = undefined;
+    try testing.expect(c.output(&buf, 0) != null);
+    c.cancel(id);
+    try testing.expect(c.output(&buf, 1) != null);
+
+    var delivered: std.ArrayList([]u8) = .empty;
+    defer delivered.deinit(testing.allocator);
+    var ack_pkt: [2 + 5 + Aead.tag_length]u8 = .{ 0x40, 0, 0x02, 1, 0, 0, 1 } ++ @as([Aead.tag_length]u8, @splat(0));
+    app_rx.seal(&ack_pkt, 2, 1, 0);
+    try c.input(&ack_pkt, 2, &delivered);
+
+    try testing.expectEqual(1, c.streams_from);
+    try testing.expectEqual(0, c.streams.items.len);
 }
