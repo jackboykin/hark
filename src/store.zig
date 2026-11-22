@@ -349,8 +349,9 @@ pub const Store = struct {
         return .{ .refs = 1, .len = @intCast(len), .name_hash = key.name_hash, .rtype = @backingInt(key.rtype), .kind = @backingInt(key.kind), .name_len = @intCast(key.name.len), .expires_ns = expires_ns };
     }
 
+    /// The names and records returned point into `b`, which must outlive them.
     pub fn parse(arena: Allocator, b: *Blob) Allocator.Error!Value {
-        var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()), .pos = b.name_len };
+        var r: Reader = .{ .buf = b.payload(), .pos = b.name_len };
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = r.name();

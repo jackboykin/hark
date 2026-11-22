@@ -385,7 +385,7 @@ pub const Graph = struct {
         // Not `free`: in slot order a cell would unpin from inputs gone first.
         for (g.cells.items) |s| if (s.cell) |c| {
             while (c.inputs.popFirst()) |n| g.work.destroy(Pin.ofInput(n));
-            if (c.blob) |bl| g.store.unref(bl);
+            g.unrefBlobs(c);
             if (budgetOf(c)) |b| g.unref(b);
             c.arena.deinit();
             g.work.destroy(c);
@@ -820,7 +820,7 @@ pub const Graph = struct {
         g.live -= 1;
         if (c.key.kind == .answer and !c.settled()) g.answering -= 1;
         g.unpinAll(c);
-        if (c.blob) |b| g.store.unref(b);
+        g.unrefBlobs(c);
         if (budgetOf(c)) |b| {
             // A question gone, the key fetches its walk began end too.
             if (c.scratch == .answer) b.deadline_ns = @min(b.deadline_ns, g.now());
@@ -828,6 +828,14 @@ pub const Graph = struct {
         }
         c.arena.deinit();
         g.work.destroy(c);
+    }
+
+    fn unrefBlobs(g: *Graph, c: *Cell) void {
+        if (c.blob) |b| g.store.unref(b);
+        if (c.scratch == .rrset) {
+            var it = c.scratch.rrset.superseded;
+            while (it) |h| : (it = h.next) g.store.unref(h.blob);
+        }
     }
 
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
@@ -881,12 +889,11 @@ pub const Graph = struct {
         const c = g.cell(id);
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
         std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.verdict.judged());
-        const value = try store.Store.parse(c.arena.allocator(), v);
-        const blob = try g.store.build(c.key, value, v.end());
+        const blob = try g.store.build(c.key, try store.Store.parse(g.scratch.allocator(), v), v.end());
         blob.verdict = v.verdict;
         const owned = owned: {
             errdefer g.store.unref(blob);
-            break :owned try c.own(value);
+            break :owned try c.own(try store.Store.parse(c.arena.allocator(), blob));
         };
         c.blob = blob;
         c.state = .{ .fact = owned };
@@ -895,10 +902,15 @@ pub const Graph = struct {
 
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
         const c = g.cell(id);
+        std.debug.assert(c.key.kind == .rrset);
         const blob = try g.store.build(c.key, .{ .rrset = reply }, c.expires());
         errdefer g.store.unref(blob);
         const parsed = try store.Store.parse(c.arena.allocator(), blob);
-        if (c.blob) |b| g.store.unref(b);
+        if (c.blob) |old| {
+            const kept = try c.arena.allocator().create(walk.RrsetScratch.Held);
+            kept.* = .{ .blob = old, .next = c.scratch.rrset.superseded };
+            c.scratch.rrset.superseded = kept;
+        }
         c.blob = blob;
         c.state.fact.* = parsed;
     }
@@ -1157,7 +1169,8 @@ pub const Graph = struct {
     }
 
     /// Pins nothing and reads the store as of now: good for a speedup's guess,
-    /// never as the cause of a fact.
+    /// never as the cause of a fact. The bytes are the store's: read them
+    /// before the store next changes.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.indexed(key);
         if (g.store.get(key, g.now())) |e| return try g.factOf(live, e);
@@ -1725,4 +1738,47 @@ test "a recalled chain holds an earlier hop a later denial read evicts" {
     try testing.expectEqual(1, chain[0].blob.refs);
     var it = chain[0].rrset.section(0).iterator();
     try testing.expect(it.next().?.cname().eql(target));
+}
+
+test "narrowing a cell keeps slices borrowed from its earlier blobs alive until it dies" {
+    const testing = std.testing;
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
+    defer g.deinit();
+    const name: dns.Name = .lit("www.example");
+    const zone: dns.Name = .lit("example");
+    const key = Key.of(.rrset, name, .a);
+    const a_rr: dns.ResourceRecord = .fixture(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } });
+    const id = try g.newCell(key, name, 0);
+    g.cell(id).holds += 1;
+    defer g.unhold(id);
+    const first_reply: Reply = .{ .kind = .answer, .aa = true, .answers = &.{a_rr}, .target = name, .zone = zone, .stored_ns = q.now, .ttl = 300 };
+    try g.settle(id, .{ .rrset = first_reply }, q.now + 300 * std.time.ns_per_s);
+    g.store.drop(g.cell(id).blob.?);
+    const held_zone = g.cell(id).state.fact.rrset.zone;
+    const held_owner = g.cell(id).state.fact.rrset.answers[0].name;
+    try g.narrow(id, first_reply);
+    const second_zone = g.cell(id).state.fact.rrset.zone;
+    try g.narrow(id, first_reply);
+    try testing.expect(held_zone.eql(zone));
+    try testing.expect(held_owner.eql(name));
+    try testing.expect(second_zone.eql(zone));
+}
+
+test "a cell settled from another blob outlives that blob" {
+    const testing = std.testing;
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
+    defer g.deinit();
+    const above: dns.Name = .lit("a.example");
+    const below: dns.Name = .lit("b.a.example");
+    const zone: dns.Name = .lit("example");
+    const src = try g.store.build(Key.of(.rrset, above, .a), .{ .rrset = .{ .kind = .nxdomain, .aa = true, .target = above, .zone = zone, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
+    const id = try g.newCell(Key.of(.rrset, below, .a), below, 0);
+    g.cell(id).holds += 1;
+    defer g.unhold(id);
+    try g.settleAs(id, src);
+    g.store.unref(src);
+    try testing.expect(g.cell(id).state.fact.rrset.zone.eql(zone));
+    try testing.expect(g.cell(id).state.fact.rrset.target.eql(above));
 }

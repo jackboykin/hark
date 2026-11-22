@@ -218,6 +218,11 @@ pub const RrsetScratch = struct {
     dname: Above = .{},
     denial: Above = .{},
     ask: ?Ask = null,
+    /// Blobs `Graph.narrow` replaced. Names read from them are still in use,
+    /// so they live as long as the cell.
+    superseded: ?*Held = null,
+
+    pub const Held = struct { blob: *store.Blob, next: ?*Held };
 };
 
 pub const CutScratch = struct {
