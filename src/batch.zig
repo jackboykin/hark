@@ -166,13 +166,12 @@ fn roundTrip(bound: na.Address, lo: na.Address) !void {
     _ = linux.getsockname(server, &sa.any, &sa_len);
     var at = lo;
     at.setPort(sys.fromSockaddr(&sa).getPort());
-    sa_len = sys.toSockaddr(&at, &sa);
 
     const count = max + 3;
     var clients: [count]posix.fd_t = undefined;
     for (&clients, 0..) |*c, i| {
         c.* = try sys.socket(af, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
-        try sys.connect(c.*, &sa.any, sa_len);
+        try sys.connectTo(c.*, &at);
         var ask: [count]u8 = @splat(@intCast(i));
         _ = try sys.sendto(c.*, ask[0 .. 1 + i], 0, null, 0);
     }

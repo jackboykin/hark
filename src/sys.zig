@@ -15,8 +15,8 @@ const os = switch (builtin.os.tag) {
 };
 
 pub const socket = os.socket;
-pub const bind = os.bind;
-pub const connect = os.connect;
+const bind = os.bind;
+const connect = os.connect;
 pub const detach = os.detach;
 pub const close = os.close;
 pub const listen = os.listen;
