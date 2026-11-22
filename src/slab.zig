@@ -303,7 +303,13 @@ pub const Tenant = struct {
             const empty = t.reserve.take() orelse return null;
             const size = slot_sizes[c];
             const at = empty.base();
-            empty.* = .{ .node = empty.node, .dirty = true, .class = c, .owner = t, .fresh = at, .end = at + slab_len / size * size };
+            assert(empty.used == 0);
+            empty.free = null;
+            empty.fresh = at;
+            empty.end = at + slab_len / size * size;
+            empty.class = c;
+            empty.dirty = true;
+            empty.owner = t;
             break :blk empty;
         };
         if (t.current[c]) |full| full.where = .full;
