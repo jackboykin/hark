@@ -872,14 +872,6 @@ fn rcodeFromText(t: []const u8) ?dns.RCode {
     return null;
 }
 
-fn parseTest(arena: Allocator, text: []const u8) !Scenario {
-    var diag: Diag = .{};
-    return parse(arena, text, &diag) catch |err| {
-        std.debug.print("line {d}: {s}\n", .{ diag.line, diag.msg });
-        return err;
-    };
-}
-
 test "rejections" {
     const cases = [_]struct { text: []const u8, msg: []const u8 }{
         .{ .text = "SCENARIO_BEGIN x\nSTEP 1 QUERY\nENTRY_BEGIN\nMATCH quesiton\nENTRY_END\nSCENARIO_END", .msg = "unknown MATCH flag" },
