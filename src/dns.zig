@@ -1326,13 +1326,15 @@ fn findOpt(msg: []const u8) Error!?struct { rdlength_at: usize, end: usize } {
         try p.skipName();
         _ = try p.readSlice(4);
     }
-    for (0..@as(usize, hdr.an_count) + hdr.ns_count + hdr.ar_count) |_| {
+    // RFC 6891 §6.1.1: the OPT lies in the additional section.
+    const before = @as(usize, hdr.an_count) + hdr.ns_count;
+    for (0..before + hdr.ar_count) |i| {
         try p.skipName();
         const rtype: RType = @fromBackingInt(try p.readU16());
         _ = try p.readSlice(6);
         const rdlength_at = p.pos;
         _ = try p.readSlice(try p.readU16());
-        if (rtype == .opt) return .{ .rdlength_at = rdlength_at, .end = p.pos };
+        if (i >= before and rtype == .opt) return .{ .rdlength_at = rdlength_at, .end = p.pos };
     }
     return null;
 }
@@ -1592,6 +1594,15 @@ test "RFC 6891 §6.1.1: a query's OPT is the only one in the message, whatever s
     const header = "\x12\x34\x01\x00\x00\x01\x00\x01\x00\x00\x00\x01";
     const wire = header ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ opt ++ opt;
     try testing.expectError(error.MultipleOptRecords, readQuery(arena.allocator(), wire));
+}
+
+test "an option is read from the additional section's OPT alone" {
+    const question = "\x07example\x03com\x00\x00\x01\x00\x01";
+    const opt = "\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x04" ++ "\x00\x0b\x00\x00";
+    const additional = "\x00\x00\x80\x00\x00\x01\x00\x00\x00\x00\x00\x01" ++ question ++ opt;
+    const answer = "\x00\x00\x80\x00\x00\x01\x00\x01\x00\x00\x00\x00" ++ question ++ opt;
+    try testing.expect(try hasOption(additional, edns_opt_tcp_keepalive));
+    try testing.expect(!try hasOption(answer, edns_opt_tcp_keepalive));
 }
 
 test "padding ends the OPT's options, whatever it holds and whatever follows it" {
