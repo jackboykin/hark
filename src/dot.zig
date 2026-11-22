@@ -52,16 +52,9 @@ pub const Session = struct {
     }
 
     pub fn deinit(s: *Session) void {
-        s.dropHandshake();
+        tls13.Handshake.destroy(&s.handshake, s.gpa);
         crypto.secureZero(u8, mem.asBytes(&s.read));
         crypto.secureZero(u8, mem.asBytes(&s.write));
-    }
-
-    fn dropHandshake(s: *Session) void {
-        const h = s.handshake orelse return;
-        crypto.secureZero(u8, mem.asBytes(h));
-        s.gpa.destroy(h);
-        s.handshake = null;
     }
 
     pub fn query(s: *Session, out: []u8, wire: []const u8, id: u16) []u8 {
@@ -149,7 +142,7 @@ pub const Session = struct {
                     s.read = .of(&done.application.server);
                     s.write = .of(&done.application.client);
                     s.phase = .application;
-                    s.dropHandshake();
+                    tls13.Handshake.destroy(&s.handshake, s.gpa);
                     break :blk .{ .established = sealed };
                 },
             };

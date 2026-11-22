@@ -221,6 +221,13 @@ pub const Handshake = struct {
         return out[0..n];
     }
 
+    pub fn destroy(slot: *?*Handshake, gpa: mem.Allocator) void {
+        const h = slot.* orelse return;
+        crypto.secureZero(u8, mem.asBytes(h));
+        gpa.destroy(h);
+        slot.* = null;
+    }
+
     pub fn read(h: *Handshake, record: []const u8) Error!Step {
         if (record.len == 0) return error.UnexpectedMessage;
         var rest = record;

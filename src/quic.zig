@@ -716,7 +716,7 @@ pub const Conn = struct {
 
     pub fn deinit(c: *Conn) void {
         const gpa = c.gpa;
-        c.dropHandshake();
+        tls13.Handshake.destroy(&c.hs, gpa);
         gpa.free(c.hello);
         gpa.free(c.token);
         for (&c.spaces) |*s| {
@@ -730,13 +730,6 @@ pub const Conn = struct {
         for (c.streams.items) |o| if (o) |st| c.freeStream(st);
         c.streams.deinit(gpa);
         c.events.deinit(gpa);
-    }
-
-    fn dropHandshake(c: *Conn) void {
-        const h = c.hs orelse return;
-        crypto.secureZero(u8, mem.asBytes(h));
-        c.gpa.destroy(h);
-        c.hs = null;
     }
 
     pub fn established(c: *const Conn) bool {
@@ -1238,7 +1231,7 @@ pub const Conn = struct {
                 s.rx = rx;
                 c.next_rx = rx.updated();
                 c.phase = .established;
-                c.dropHandshake();
+                tls13.Handshake.destroy(&c.hs, c.gpa);
                 try c.emit(.established);
             },
         }
@@ -2010,7 +2003,7 @@ test "RFC 9001 5.4.2: a coalesced PING pads for its header protection sample" {
     c.space(.application).rx = app_rx;
     c.next_rx = app_rx.updated();
     c.phase = .established;
-    c.dropHandshake();
+    tls13.Handshake.destroy(&c.hs, c.gpa);
 
     var buf: [max_datagram]u8 = undefined;
     try testing.expect(c.output(&buf, 0) != null);
@@ -2060,7 +2053,7 @@ test "a cancelled stream is reaped when its stop and reset are acknowledged toge
     c.peer.max_streams = 10;
     c.peer.max_data = 4096;
     c.peer.stream_data = 4096;
-    c.dropHandshake();
+    tls13.Handshake.destroy(&c.hs, c.gpa);
 
     const wire = [_]u8{ 0xab, 0xcd, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0 };
     const id = (try c.query(&wire)).id;
