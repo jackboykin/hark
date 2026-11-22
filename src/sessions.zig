@@ -252,7 +252,7 @@ fn rearm(s: *Sessions, c: *Conn) !void {
 
 fn dial(s: *Sessions, kind: Kind, server: na.Address, key: na.AddressKey) !*Conn {
     const e = s.edge;
-    if (s.conns.items.len >= max_conns and !try s.evictIdle()) return error.TooManySessions;
+    if (s.conns.items.len >= max_conns and !s.evictIdle()) return error.TooManySessions;
     try s.conns.ensureUnusedCapacity(e.gpa, 1);
     try s.by_server.ensureUnusedCapacity(e.gpa, 1);
     const c = try e.gpa.create(Conn);
@@ -298,7 +298,7 @@ fn byToken(s: *const Sessions, token: u32) ?*Conn {
     return null;
 }
 
-fn evictIdle(s: *Sessions) !bool {
+fn evictIdle(s: *Sessions) bool {
     var oldest: ?*Conn = null;
     for (s.conns.items) |c| {
         if (!c.carrier.established() or c.pending.count() > 0 or c.queued.items.len > 0) continue;
