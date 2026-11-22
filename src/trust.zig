@@ -598,7 +598,7 @@ fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const 
         // reads them. Sets excused or passed under insecure keys stay out.
         if (c.is != .proof) break;
         if (s.proved[c.slot] != signer.depth() or !c.owner.isSubdomainOf(signer)) continue;
-        for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rrsig().signer_name.eql(signer)) {
+        for (dnssec.setFrom(r.authorities, c.head)) |rr| if (rr.rtype != .rrsig or rr.rrsig().signer_name.eql(signer)) {
             try keep.append(a, rr);
             try until.append(a, s.proved_until[c.slot]);
         };
