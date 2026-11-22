@@ -168,14 +168,6 @@ const Keys = struct {
         return u;
     }
 
-    fn nonce(k: *const Keys, pn: u64) [Aead.nonce_length]u8 {
-        var n = k.iv;
-        var be: [8]u8 = undefined;
-        mem.writeInt(u64, &be, pn, .big);
-        for (n[n.len - 8 ..], be) |*b, x| b.* ^= x;
-        return n;
-    }
-
     fn mask(k: *const Keys, sample: *const [16]u8) [16]u8 {
         var out: [16]u8 = undefined;
         Aes.initEnc(k.hp).encrypt(&out, sample);
@@ -184,7 +176,7 @@ const Keys = struct {
 
     pub fn seal(k: *const Keys, packet: []u8, head: usize, pn_len: usize, pn: u64) void {
         const body = packet[head .. packet.len - Aead.tag_length];
-        Aead.encrypt(body, packet[packet.len - Aead.tag_length ..][0..Aead.tag_length], body, packet[0..head], k.nonce(pn), k.key);
+        Aead.encrypt(body, packet[packet.len - Aead.tag_length ..][0..Aead.tag_length], body, packet[0..head], tls13.nonce(&k.iv, pn), k.key);
         const pn_at = head - pn_len;
         const m = k.mask(packet[pn_at + 4 ..][0..16]);
         packet[0] ^= m[0] & @as(u8, if (packet[0] & 0x80 != 0) 0x0f else 0x1f);
@@ -207,7 +199,7 @@ const Keys = struct {
         if (packet.len < head + Aead.tag_length) return null;
         const body = packet[head .. packet.len - Aead.tag_length];
         const tag = packet[packet.len - Aead.tag_length ..][0..Aead.tag_length].*;
-        Aead.decrypt(body, body, tag, packet[0..head], k.nonce(pn), k.key) catch return null;
+        Aead.decrypt(body, body, tag, packet[0..head], tls13.nonce(&k.iv, pn), k.key) catch return null;
         return body;
     }
 };

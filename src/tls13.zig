@@ -488,6 +488,13 @@ const Extensions = struct {
 pub const header_len = tls.record_header_len;
 pub const overhead = header_len + 1 + Aead.tag_length;
 
+pub fn nonce(iv: *const [Aead.nonce_length]u8, n: u64) [Aead.nonce_length]u8 {
+    var out = iv.*;
+    const seq = mem.nativeToBig(u64, n);
+    for (out[out.len - 8 ..], mem.asBytes(&seq)) |*b, s| b.* ^= s;
+    return out;
+}
+
 pub const Keys = struct {
     secret: Secret,
     key: [Aead.key_length]u8,
@@ -506,12 +513,9 @@ pub const Keys = struct {
         return .of(&tls.hkdfExpandLabel(Hkdf, k.secret, "traffic upd", "", secret_len));
     }
 
-    fn nonce(k: *Keys) [Aead.nonce_length]u8 {
-        var n = k.iv;
-        const seq = mem.nativeToBig(u64, k.seq);
-        for (n[n.len - 8 ..], mem.asBytes(&seq)) |*b, s| b.* ^= s;
-        k.seq += 1;
-        return n;
+    fn nextNonce(k: *Keys) [Aead.nonce_length]u8 {
+        defer k.seq += 1;
+        return nonce(&k.iv, k.seq);
     }
 
     pub fn seal(k: *Keys, out: []u8, kind: tls.ContentType, plain: []const u8) []u8 {
@@ -522,7 +526,7 @@ pub const Keys = struct {
         const inner = out[header_len..][0 .. plain.len + 1];
         @memcpy(inner[0..plain.len], plain);
         inner[plain.len] = @backingInt(kind);
-        Aead.encrypt(inner, out[header_len + inner.len ..][0..Aead.tag_length], inner, &header, k.nonce(), k.key);
+        Aead.encrypt(inner, out[header_len + inner.len ..][0..Aead.tag_length], inner, &header, k.nextNonce(), k.key);
         return out[0 .. header_len + n];
     }
 
@@ -531,7 +535,7 @@ pub const Keys = struct {
         const sealed = record[header_len..];
         const inner = sealed[0 .. sealed.len - Aead.tag_length];
         const tag = sealed[inner.len..][0..Aead.tag_length].*;
-        Aead.decrypt(inner, inner, tag, record[0..header_len], k.nonce(), k.key) catch return error.BadRecordMac;
+        Aead.decrypt(inner, inner, tag, record[0..header_len], k.nextNonce(), k.key) catch return error.BadRecordMac;
         var n = inner.len;
         while (n > 0 and inner[n - 1] == 0) n -= 1;
         if (n == 0) return error.UnexpectedMessage;
