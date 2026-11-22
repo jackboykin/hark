@@ -1187,21 +1187,22 @@ const Parser = struct {
     }
 };
 
+fn nextEdnsOption(rdata: []const u8, pos: *usize) Error!?EdnsOption {
+    const rest = rdata[pos.*..];
+    if (rest.len == 0) return null;
+    if (rest.len < 4) return error.FormatError;
+    const len: usize = mem.readInt(u16, rest[2..4], .big);
+    if (rest.len - 4 < len) return error.FormatError;
+    pos.* += 4 + len;
+    return .{ .code = mem.readInt(u16, rest[0..2], .big), .data = rest[4..][0..len] };
+}
+
 fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsOption {
     if (rdata.len == 0) return &.{};
 
     var options: ArrayList(EdnsOption) = .empty;
     var pos: usize = 0;
-    while (pos + 4 <= rdata.len) {
-        const code = mem.readInt(u16, rdata[pos..][0..2], .big);
-        const length = mem.readInt(u16, rdata[pos + 2 ..][0..2], .big);
-        pos += 4;
-        if (pos + length > rdata.len) return error.FormatError;
-        const data = rdata[pos..][0..length];
-        try options.append(allocator, .{ .code = code, .data = data });
-        pos += length;
-    }
-    if (pos != rdata.len) return error.FormatError;
+    while (try nextEdnsOption(rdata, &pos)) |o| try options.append(allocator, o);
     return try options.toOwnedSlice(allocator);
 }
 
@@ -1310,16 +1311,11 @@ pub fn readQuery(allocator: Allocator, bytes: []const u8) Error!Query {
         if (i < before_additional) continue;
         var at = Parser{ .msg = bytes, .pos = owner };
         if (!(try at.parseName(allocator, .compressed)).isRoot()) return error.FormatError;
-        try frameEdnsOptions(rdata);
+        var pos: usize = 0;
+        while (try nextEdnsOption(rdata, &pos)) |_| {}
         edns = .{ .udp_payload_size = class, .version = @intCast((ttl >> 16) & 0xFF), .do_bit = ttl & 0x8000 != 0 };
     }
     return .{ .header = hdr, .question = question, .edns = edns };
-}
-
-fn frameEdnsOptions(rdata: []const u8) Error!void {
-    var pos: usize = 0;
-    while (pos + 4 <= rdata.len) pos += 4 + @as(usize, mem.readInt(u16, rdata[pos + 2 ..][0..2], .big));
-    if (pos != rdata.len) return error.FormatError;
 }
 
 fn findOpt(msg: []const u8) Error!?struct { rdlength_at: usize, end: usize } {
@@ -1360,12 +1356,10 @@ pub fn pad(out: []u8, msg: []const u8, block: usize) Error![]u8 {
 pub fn hasOption(msg: []const u8, code: u16) Error!bool {
     const opt = try findOpt(msg) orelse return false;
     const rdata = msg[opt.rdlength_at + 2 .. opt.end];
-    try frameEdnsOptions(rdata);
     var pos: usize = 0;
-    while (pos < rdata.len) : (pos += 4 + @as(usize, mem.readInt(u16, rdata[pos + 2 ..][0..2], .big))) {
-        if (mem.readInt(u16, rdata[pos..][0..2], .big) == code) return true;
-    }
-    return false;
+    var found = false;
+    while (try nextEdnsOption(rdata, &pos)) |o| found = found or o.code == code;
+    return found;
 }
 
 /// Compression targets. Matching is byte-exact, so a pointer never changes a
