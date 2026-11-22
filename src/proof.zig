@@ -170,6 +170,11 @@ fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
         dns.typeBitmapContains(type_bit_maps, .cname);
 }
 
+fn nodataAt(types: []const u8, qname: dns.Name, qtype: dns.RType) SecurityStatus {
+    if (wrongSideOfCut(types, qname, qtype)) return .unchecked;
+    return if (bitmapContradictsNodata(types, qtype)) .bogus else .secure;
+}
+
 const nsec3_opt_out: u8 = 0x01;
 
 /// RFC 5155 §8.1, §8.2: a record with an unknown hash algorithm or any
@@ -393,11 +398,7 @@ fn validateNsecNegativeProof(
         return if (wildcard_denied) .secure else .unchecked;
     }
 
-    if (matching_nsec) |rr| {
-        const types = rr.nsec(&next).type_bit_maps;
-        if (wrongSideOfCut(types, qname, qtype)) return .unchecked;
-        return if (bitmapContradictsNodata(types, qtype)) .bogus else .secure;
-    }
+    if (matching_nsec) |rr| return nodataAt(rr.nsec(&next).type_bit_maps, qname, qtype);
 
     if (ent) return .secure;
 
@@ -412,13 +413,7 @@ fn validateNsecNegativeProof(
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
         var other: dns.Name.Buf = undefined;
         const nsec = rr.nsec(&other);
-        if (rr.name.eql(wildcard)) {
-            if (wrongSideOfCut(nsec.type_bit_maps, qname, qtype))
-                return .unchecked;
-            if (bitmapContradictsNodata(nsec.type_bit_maps, qtype))
-                return .bogus;
-            return .secure;
-        }
+        if (rr.name.eql(wildcard)) return nodataAt(nsec.type_bit_maps, qname, qtype);
         // RFC 4035 §5.4 shape under NOERROR: qname and `*.CE` both denied. The
         // rcode is unsigned, so the proof decides. `nsecCovers`, not name
         // nonexistence: a wildcard that is an empty non-terminal is NODATA too.
@@ -591,11 +586,8 @@ fn validateNsec3NegativeProof(
 
     if (!is_nxdomain) {
         for (chain.owners(), chain.records()) |owner_hash, rr| {
-            if (mem.eql(u8, &owner_hash, &qname_hash)) {
-                const nsec3 = rr.nsec3();
-                if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
-                return if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) .bogus else .secure;
-            }
+            if (mem.eql(u8, &owner_hash, &qname_hash))
+                return nodataAt(rr.nsec3().type_bit_maps, qname, qtype);
         }
     }
 
