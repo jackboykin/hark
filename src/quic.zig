@@ -670,6 +670,7 @@ pub const Conn = struct {
 
     key_phase: u1 = 0,
     prev_rx: ?Keys = null,
+    next_rx: ?Keys = null,
     prev_until_ns: i64 = 0,
     phase_from: u64 = 0,
     sealed: u64 = 0,
@@ -728,7 +729,7 @@ pub const Conn = struct {
             if (s.in.window) |w| gpa.destroy(w);
             inline for (.{ &s.tx, &s.rx }) |k| if (k.*) |*x| crypto.secureZero(u8, mem.asBytes(x));
         }
-        if (c.prev_rx) |*k| crypto.secureZero(u8, mem.asBytes(k));
+        inline for (.{ &c.prev_rx, &c.next_rx }) |k| if (k.*) |*x| crypto.secureZero(u8, mem.asBytes(x));
         for (c.streams.items) |o| if (o) |st| c.freeStream(st);
         c.streams.deinit(gpa);
         c.events.deinit(gpa);
@@ -976,7 +977,7 @@ pub const Conn = struct {
                 if (pn < c.phase_from and c.prev_rx != null) {
                     keys = c.prev_rx.?;
                 } else {
-                    keys = keys.updated();
+                    keys = c.next_rx.?;
                     update = true;
                 }
             }
@@ -994,6 +995,7 @@ pub const Conn = struct {
             c.prev_rx = s.rx;
             c.prev_until_ns = now + 3 * c.pto(.application);
             s.rx = keys;
+            c.next_rx = keys.updated();
             s.tx = s.tx.?.updated();
             c.key_phase ^= 1;
             c.phase_from = pn;
@@ -1235,7 +1237,9 @@ pub const Conn = struct {
                 c.space(.handshake).out.set(c.finished[0..flight.len]);
                 const s = c.space(.application);
                 s.tx = .of(&done.application.client);
-                s.rx = .of(&done.application.server);
+                const rx: Keys = .of(&done.application.server);
+                s.rx = rx;
+                c.next_rx = rx.updated();
                 c.phase = .established;
                 c.dropHandshake();
                 try c.emit(.established);
