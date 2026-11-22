@@ -39,13 +39,13 @@ const News = carrier.News;
 const Event = carrier.Event;
 
 pub fn open(edge: *Edge, _: *Shared, server: na.Address, port: u16, token: u32) !Socket {
-    const fd = try sys.socket(na.afU32(server), posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const fd = try sys.socket(sys.afU32(server), posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
     const on: i32 = 1;
     _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, mem.asBytes(&on), @sizeOf(i32));
     var to = server;
     to.setPort(port);
-    na.connectTo(fd, &to) catch |err| switch (err) {
+    sys.connectTo(fd, &to) catch |err| switch (err) {
         error.WouldBlock => {},
         else => return err,
     };

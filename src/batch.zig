@@ -2,7 +2,7 @@
 //! syscall. Nothing waits to fill a batch.
 hdrs: [max]linux.mmsghdr,
 iovs: [max]posix.iovec,
-addrs: [max]na.PosixAddress,
+addrs: [max]sys.PosixAddress,
 infos: [max]PktInfo,
 bytes: []u8,
 size: usize,
@@ -78,7 +78,7 @@ pub fn destroy(b: *Batch, gpa: Allocator) void {
 pub fn recv(b: *Batch, fd: posix.fd_t, want: usize) usize {
     // Reset each time: the kernel overwrites the room given with the lengths used.
     for (b.hdrs[0..want]) |*h| {
-        h.hdr.namelen = @sizeOf(na.PosixAddress);
+        h.hdr.namelen = @sizeOf(sys.PosixAddress);
         h.hdr.controllen = @sizeOf(PktInfo);
     }
     const rc = linux.recvmmsg(fd, &b.hdrs, @intCast(want), linux.MSG.DONTWAIT, null);
@@ -90,7 +90,7 @@ pub fn datagram(b: *Batch, i: usize) []u8 {
 }
 
 pub fn from(b: *const Batch, i: usize) na.Address {
-    return na.fromSockaddr(&b.addrs[i]);
+    return sys.fromSockaddr(&b.addrs[i]);
 }
 
 pub fn local(b: *const Batch, i: usize) Local {
@@ -121,7 +121,7 @@ pub fn pushFrom(b: *Batch, len: usize, to: *const na.Address, source: Local) voi
 
 fn put(b: *Batch, len: usize, to: *const na.Address, controllen: usize) void {
     b.iovs[b.n].len = len;
-    b.hdrs[b.n].hdr.namelen = na.toSockaddr(to, &b.addrs[b.n]);
+    b.hdrs[b.n].hdr.namelen = sys.toSockaddr(to, &b.addrs[b.n]);
     b.hdrs[b.n].hdr.controllen = controllen;
     b.n += 1;
     if (b.n == max) b.flush();
@@ -155,18 +155,18 @@ fn roundTrip(bound: na.Address, lo: na.Address) !void {
     const out = try Batch.create(gpa, 64);
     defer out.destroy(gpa);
 
-    const af = na.afU32(bound);
+    const af = sys.afU32(bound);
     const server = try sys.socket(af, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer sys.close(server);
     const wildcard = na.isUnspecified(bound);
     if (wildcard) try tellLocal(server, af);
-    try na.bindTo(server, &bound);
-    var sa: na.PosixAddress = undefined;
-    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    try sys.bindTo(server, &bound);
+    var sa: sys.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
     _ = linux.getsockname(server, &sa.any, &sa_len);
     var at = lo;
-    at.setPort(na.fromSockaddr(&sa).getPort());
-    sa_len = na.toSockaddr(&at, &sa);
+    at.setPort(sys.fromSockaddr(&sa).getPort());
+    sa_len = sys.toSockaddr(&at, &sa);
 
     const count = max + 3;
     var clients: [count]posix.fd_t = undefined;
@@ -207,14 +207,14 @@ test "a datagram the kernel refuses is dropped and the rest are sent" {
     defer out.destroy(gpa);
     const server = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer sys.close(server);
-    try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    try sys.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
     const client = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer sys.close(client);
-    try na.bindTo(client, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
-    var sa: na.PosixAddress = undefined;
-    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    try sys.bindTo(client, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    var sa: sys.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
     _ = linux.getsockname(client, &sa.any, &sa_len);
-    const to = na.fromSockaddr(&sa);
+    const to = sys.fromSockaddr(&sa);
 
     for ([_]na.Address{ to, na.initIp4(.{ 127, 0, 0, 1 }, 0), to }, "abc") |addr, byte| {
         out.next(server)[0] = byte;

@@ -547,7 +547,7 @@ fn Writer(comptime measuring: bool) type {
         }
 
         fn addr(w: *W, k: na.AddressKey) void {
-            w.int(u8, k.family);
+            w.int(u8, @backingInt(k.family));
             w.int(u16, k.port);
             w.slice(&k.addr);
         }
@@ -588,7 +588,7 @@ const Reader = struct {
     }
 
     fn addr(r: *Reader) na.AddressKey {
-        const family = r.int(u8);
+        const family: na.Family = @fromBackingInt(@intCast(r.int(u8)));
         const port = r.int(u16);
         return .{ .family = family, .port = port, .addr = r.slice(16)[0..16].* };
     }

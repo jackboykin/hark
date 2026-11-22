@@ -303,8 +303,8 @@ const Server = struct {
     fn accept(s: *Server, fd: posix.fd_t) !bool {
         while (true) {
             if (s.conns >= s.max_conns) return false;
-            var pa: na.PosixAddress = undefined;
-            var len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            var pa: sys.PosixAddress = undefined;
+            var len: posix.socklen_t = @sizeOf(sys.PosixAddress);
             const rc = linux.accept4(fd, &pa.any, &len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
@@ -315,7 +315,7 @@ const Server = struct {
                 else => continue,
             }
             const cfd: posix.fd_t = @intCast(rc);
-            const addr = na.fromSockaddr(&pa);
+            const addr = sys.fromSockaddr(&pa);
             if (!acl.allow(s.cfg.clients, addr)) {
                 sys.close(cfd);
                 continue;
@@ -1120,7 +1120,7 @@ fn crowdedQueue(fd: posix.fd_t) bool {
 }
 
 fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
-    const af = na.afU32(addr);
+    const af = sys.afU32(addr);
     const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(sock);
     const one: c_int = 1;
@@ -1134,7 +1134,7 @@ fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
         posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.RCVBUF, &mem.toBytes(bufsize)) catch {};
         posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(bufsize)) catch {};
     }
-    try na.bindTo(sock, &addr);
+    try sys.bindTo(sock, &addr);
     if (sock_type == posix.SOCK.STREAM) try sys.listen(sock, 128);
     return sock;
 }

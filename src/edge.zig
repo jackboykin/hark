@@ -73,7 +73,7 @@ const Flight = struct {
     },
 };
 
-const Family = std.meta.Tag(na.Address);
+const Family = na.Family;
 
 const Idle = struct {
     fds: std.ArrayList(posix.fd_t) = .empty,
@@ -176,14 +176,14 @@ fn open(e: *Edge, ex: Exchange) !Flight {
     if (ex.need == .datagram) {
         const family = std.meta.activeTag(ex.server);
         const rested = e.idle.getPtr(family).pop();
-        const fd = rested orelse try sys.socket(na.afU32(ex.server), posix.SOCK.DGRAM | flags, 0);
+        const fd = rested orelse try sys.socket(sys.afU32(ex.server), posix.SOCK.DGRAM | flags, 0);
         errdefer sys.close(fd);
-        try na.connectTo(fd, &ex.server);
+        try sys.connectTo(fd, &ex.server);
         _ = try sys.sendto(fd, ex.wire, 0, null, 0);
         try e.ctl(if (rested == null) linux.EPOLL.CTL_ADD else linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, ex.id);
         return .{ .fd = fd, .seq = 0, .over = .{ .datagram = family } };
     }
-    const fd = try sys.socket(na.afU32(ex.server), posix.SOCK.STREAM | flags, 0);
+    const fd = try sys.socket(sys.afU32(ex.server), posix.SOCK.STREAM | flags, 0);
     errdefer sys.close(fd);
     const t = try e.work.create(Tcp);
     errdefer e.work.destroy(t);
@@ -192,7 +192,7 @@ fn open(e: *Edge, ex: Exchange) !Flight {
     try t.unsent.bytes.ensureTotalCapacityPrecise(e.work, 2 + ex.wire.len);
     t.unsent.bytes.appendSliceAssumeCapacity(&mem.toBytes(mem.nativeToBig(u16, @intCast(ex.wire.len))));
     t.unsent.bytes.appendSliceAssumeCapacity(ex.wire);
-    na.connectTo(fd, &ex.server) catch |err| switch (err) {
+    sys.connectTo(fd, &ex.server) catch |err| switch (err) {
         error.WouldBlock => {},
         else => return err,
     };
@@ -362,11 +362,11 @@ test "a consumer that stops between events leaves nothing behind" {
 
     const server = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer sys.close(server);
-    try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
-    var sa: na.PosixAddress = undefined;
-    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    try sys.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    var sa: sys.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
     _ = linux.getsockname(server, &sa.any, &sa_len);
-    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    _ = try e.send(.{ .id = 1, .server = sys.fromSockaddr(&sa), .need = .datagram, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
 
     var stop: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&stop, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
@@ -392,22 +392,22 @@ const Peer = struct {
     fn init() !Peer {
         const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
         errdefer sys.close(fd);
-        try na.bindTo(fd, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
-        var sa: na.PosixAddress = undefined;
-        var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+        try sys.bindTo(fd, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+        var sa: sys.PosixAddress = undefined;
+        var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
         _ = linux.getsockname(fd, &sa.any, &sa_len);
-        return .{ .fd = fd, .addr = na.fromSockaddr(&sa) };
+        return .{ .fd = fd, .addr = sys.fromSockaddr(&sa) };
     }
 
-    fn hear(p: Peer) !na.PosixAddress {
+    fn hear(p: Peer) !sys.PosixAddress {
         var buf: [8]u8 = undefined;
-        var sa: na.PosixAddress = undefined;
-        var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+        var sa: sys.PosixAddress = undefined;
+        var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
         if (linux.errno(linux.recvfrom(p.fd, &buf, buf.len, 0, &sa.any, &sa_len)) != .SUCCESS) return error.RecvFailed;
         return sa;
     }
 
-    fn tell(p: Peer, to: *const na.PosixAddress, bytes: []const u8) !void {
+    fn tell(p: Peer, to: *const sys.PosixAddress, bytes: []const u8) !void {
         _ = try sys.sendto(p.fd, bytes, 0, &to.any, @sizeOf(posix.sockaddr.in));
     }
 };
@@ -463,13 +463,13 @@ test "a stream reply holds what has arrived" {
 
     const listener = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer sys.close(listener);
-    try na.bindTo(listener, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    try sys.bindTo(listener, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
     if (linux.errno(linux.listen(listener, 1)) != .SUCCESS) return error.ListenFailed;
-    var sa: na.PosixAddress = undefined;
-    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    var sa: sys.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(sys.PosixAddress);
     _ = linux.getsockname(listener, &sa.any, &sa_len);
 
-    _ = try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .need = .stream, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+    _ = try e.send(.{ .id = 1, .server = sys.fromSockaddr(&sa), .need = .stream, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
     const rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC);
     if (linux.errno(rc) != .SUCCESS) return error.AcceptFailed;
     const server: posix.fd_t = @intCast(rc);

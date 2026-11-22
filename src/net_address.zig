@@ -1,13 +1,11 @@
-//! std.Io.net.IpAddress, with constructors, a hashable key, and sockaddr
-//! conversion for the raw syscalls.
+//! std.Io.net.IpAddress, with constructors and a hashable key.
 const std = @import("std");
-const posix = std.posix;
 const mem = std.mem;
-const sys = @import("sys.zig");
 const rand = @import("rand.zig");
 const acl = @import("acl.zig");
 
 pub const Address = std.Io.net.IpAddress;
+pub const Family = std.meta.Tag(Address);
 
 pub fn initIp4(bytes: [4]u8, port: u16) Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
@@ -18,7 +16,7 @@ pub fn initIp6(bytes: [16]u8, port: u16) Address {
 }
 
 pub const AddressKey = struct {
-    family: u8,
+    family: Family,
     addr: [16]u8,
     port: u16,
 
@@ -27,18 +25,18 @@ pub const AddressKey = struct {
     }
 
     pub fn isLoopback(a: AddressKey) bool {
-        if (a.family == std.posix.AF.INET) return a.addr[0] == 127;
+        if (a.family == .ip4) return a.addr[0] == 127;
         return mem.eql(u8, &a.addr, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
     }
 
     pub fn ip4(bytes: [4]u8, port: u16) AddressKey {
         var addr: [16]u8 = @splat(0);
         addr[0..4].* = bytes;
-        return .{ .family = @intCast(posix.AF.INET), .addr = addr, .port = port };
+        return .{ .family = .ip4, .addr = addr, .port = port };
     }
 
     pub fn ip6(bytes: [16]u8, port: u16) AddressKey {
-        return .{ .family = @intCast(posix.AF.INET6), .addr = bytes, .port = port };
+        return .{ .family = .ip6, .addr = bytes, .port = port };
     }
 
     pub fn fromAddress(address: Address) AddressKey {
@@ -49,14 +47,17 @@ pub const AddressKey = struct {
     }
 
     pub fn toAddress(k: AddressKey) Address {
-        return if (k.family == posix.AF.INET) initIp4(k.addr[0..4].*, k.port) else initIp6(k.addr, k.port);
+        return switch (k.family) {
+            .ip4 => initIp4(k.addr[0..4].*, k.port),
+            .ip6 => initIp6(k.addr, k.port),
+        };
     }
 
     pub const HashCtx = struct {
         pub fn hash(_: @This(), key: AddressKey) u64 {
             var bytes: [19]u8 = undefined;
             bytes[0..16].* = key.addr;
-            bytes[16] = key.family;
+            bytes[16] = @backingInt(key.family);
             mem.writeInt(u16, bytes[17..19], key.port, .little);
             return rand.hash(&bytes);
         }
@@ -67,59 +68,9 @@ pub const AddressKey = struct {
     };
 };
 
-pub const PosixAddress = extern union {
-    any: posix.sockaddr,
-    in: posix.sockaddr.in,
-    in6: posix.sockaddr.in6,
-};
-
-pub fn toSockaddr(addr: *const Address, storage: *PosixAddress) posix.socklen_t {
-    return switch (addr.*) {
-        .ip4 => |ip4| {
-            storage.in = .{
-                .port = mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
-            };
-            return @sizeOf(posix.sockaddr.in);
-        },
-        .ip6 => |ip6| {
-            storage.in6 = .{
-                .port = mem.nativeToBig(u16, ip6.port),
-                .flowinfo = ip6.flow,
-                .addr = ip6.bytes,
-                .scope_id = ip6.interface.index,
-            };
-            return @sizeOf(posix.sockaddr.in6);
-        },
-    };
-}
-
-pub fn fromSockaddr(sa: *const PosixAddress) Address {
-    return switch (sa.any.family) {
-        posix.AF.INET => .{ .ip4 = .{
-            .port = mem.bigToNative(u16, sa.in.port),
-            .bytes = @bitCast(sa.in.addr),
-        } },
-        posix.AF.INET6 => .{ .ip6 = .{
-            .port = mem.bigToNative(u16, sa.in6.port),
-            .bytes = sa.in6.addr,
-            .flow = sa.in6.flowinfo,
-            .interface = .{ .index = sa.in6.scope_id },
-        } },
-        else => unreachable,
-    };
-}
-
 pub fn isUnspecified(addr: Address) bool {
     return switch (addr) {
         inline else => |a| mem.allEqual(u8, &a.bytes, 0),
-    };
-}
-
-pub fn afU32(addr: Address) u32 {
-    return switch (addr) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
     };
 }
 
@@ -127,18 +78,6 @@ pub fn format(addr: Address, buf: []u8) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     addr.format(&w) catch return "?";
     return w.buffered();
-}
-
-pub fn connectTo(fd: posix.fd_t, addr: *const Address) !void {
-    var storage: PosixAddress = undefined;
-    const sa_len = toSockaddr(addr, &storage);
-    try sys.connect(fd, &storage.any, sa_len);
-}
-
-pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
-    var storage: PosixAddress = undefined;
-    const sa_len = toSockaddr(addr, &storage);
-    try sys.bind(fd, &storage.any, sa_len);
 }
 
 pub fn ipEqual(a: Address, b: Address) bool {
@@ -151,7 +90,10 @@ pub fn ipEqual(a: Address, b: Address) bool {
 /// A superset of the special-use table: nameserver contact also refuses
 /// multicast, which the answer scrub (rebinding.zig) deliberately serves.
 pub fn isNonRoutableNs(addr: AddressKey) bool {
-    return if (addr.family == posix.AF.INET) isNonRoutableIp4(addr.addr[0..4].*) else isNonRoutableIp6(addr.addr);
+    return switch (addr.family) {
+        .ip4 => isNonRoutableIp4(addr.addr[0..4].*),
+        .ip6 => isNonRoutableIp6(addr.addr),
+    };
 }
 
 fn isNonRoutableIp4(b: [4]u8) bool {

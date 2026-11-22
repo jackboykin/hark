@@ -36,7 +36,7 @@ pub const Shared = struct {
 };
 
 pub fn open(edge: *Edge, sh: *Shared, server: na.Address, port: u16, token: u32) !Socket {
-    const fd = try sys.socket(na.afU32(server), posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const fd = try sys.socket(sys.afU32(server), posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
     const probe: i32 = linux.IP.PMTUDISC_PROBE;
     if (server == .ip4) {
@@ -46,7 +46,7 @@ pub fn open(edge: *Edge, sh: *Shared, server: na.Address, port: u16, token: u32)
     }
     var to = server;
     to.setPort(port);
-    try na.connectTo(fd, &to);
+    try sys.connectTo(fd, &to);
     var entropy: [tls13.entropy_len + 8]u8 = undefined;
     rand.thread.bytes(&entropy);
     defer crypto.secureZero(u8, &entropy);
