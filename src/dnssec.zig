@@ -179,7 +179,7 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     return false;
 }
 
-pub const Keyset = struct {
+const Keyset = struct {
     keys: []Key,
     zone: ?dns.Name = null,
 
@@ -196,7 +196,7 @@ pub const Keyset = struct {
         }
     };
 
-    pub fn init(scratch: mem.Allocator, records: []const dns.ResourceRecord) !Keyset {
+    fn init(scratch: mem.Allocator, records: []const dns.ResourceRecord) !Keyset {
         var n: usize = 0;
         for (records) |rr| n += @intFromBool(rr.rtype == .dnskey);
         var k: Keyset = .{ .keys = try scratch.alloc(Key, n) };
@@ -280,7 +280,7 @@ fn usable(sig: dns.RrsigData, now: u32) bool {
 /// Iterates the signatures worth a verify: the zone's own, usable now,
 /// that some key could check, at most `max_sigs_per_set`. `passed`
 /// records that some covering one was skipped.
-pub const Weighed = struct {
+const Weighed = struct {
     rrs: []const dns.ResourceRecord,
     owner: dns.Name,
     rtype: dns.RType,
@@ -295,7 +295,7 @@ pub const Weighed = struct {
     n: usize = 0,
     passed: bool = false,
 
-    pub inline fn next(w: *Weighed) ?usize {
+    inline fn next(w: *Weighed) ?usize {
         while (w.at < w.rrs.len) {
             const i = w.at;
             w.at += 1;
@@ -313,6 +313,13 @@ pub const Weighed = struct {
             return i;
         }
         return null;
+    }
+
+    fn keep(w: Weighed, scratch: mem.Allocator, out: *std.ArrayList(dns.ResourceRecord)) !void {
+        std.debug.assert(w.rtype != .rrsig);
+        for (w.rrs) |rr| if (rr.rtype == w.rtype and rr.name.eql(w.owner)) try out.append(scratch, rr);
+        var it = w;
+        while (it.next()) |i| try out.append(scratch, w.rrs[i]);
     }
 };
 
@@ -446,6 +453,27 @@ fn weigh(scratch: mem.Allocator, w: Weighed, at: rrsig.Verifier) !?Verified {
     return null;
 }
 
+pub fn narrowSet(
+    scratch: mem.Allocator,
+    section: []const dns.ResourceRecord,
+    head: usize,
+    unexpanded: bool,
+    dnskey_records: []const dns.ResourceRecord,
+    now: u32,
+) ![]const dns.ResourceRecord {
+    const set = setFrom(section, head);
+    const keyset: Keyset = try .init(scratch, dnskey_records);
+    const zone = keyset.zone.?;
+    var out: std.ArrayList(dns.ResourceRecord) = try .initCapacity(scratch, section.len);
+    out.appendSliceAssumeCapacity(section[0..head]);
+    const w: Weighed = .{ .rrs = set, .owner = set[0].name, .rtype = set[0].rtype, .zone = zone, .keys = &keyset, .now = now, .unexpanded = unexpanded };
+    try w.keep(scratch, &out);
+    out.appendSliceAssumeCapacity(section[head + set.len ..]);
+    return out.items;
+}
+
+const VerifiedProofs = struct { cap: rrsig.Cap, rrs: []const dns.ResourceRecord };
+
 /// Null is bogus, including a section with no NSEC or NSEC3 at all. NS and
 /// glue are unsigned delegation data and are not checked.
 pub fn verifyAuthorityProofSigs(
@@ -453,7 +481,7 @@ pub fn verifyAuthorityProofSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     at: rrsig.Verifier,
-) !?rrsig.Cap {
+) !?VerifiedProofs {
     for (authorities) |rr| {
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
     } else return null;
@@ -462,6 +490,7 @@ pub fn verifyAuthorityProofSigs(
     const zone = keyset.zone orelse return null;
 
     var cap: rrsig.Cap = .none;
+    var kept: std.ArrayList(dns.ResourceRecord) = try .initCapacity(scratch, authorities.len);
     var sets: Sets = .{ .rrs = authorities };
     while (sets.next()) |group| {
         const rr = for (group) |x| {
@@ -473,8 +502,9 @@ pub fn verifyAuthorityProofSigs(
         const w: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .keys = &keyset, .now = at.now, .unexpanded = true };
         const v = try weigh(scratch, w, at) orelse return null;
         cap = cap.meet(.of(v.sig, at.now));
+        try w.keep(scratch, &kept);
     }
-    return cap;
+    return .{ .cap = cap, .rrs = kept.items };
 }
 
 test "isValidZoneKey (RFC 4034 §2.1.1–2)" {

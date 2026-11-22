@@ -189,20 +189,21 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
         .nodata, .nxdomain => {
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
                 return .bogus;
-            const cap = try dnssec.verifyAuthorityProofSigs(g.scratch.allocator(), r.authorities, keys.state.fact.dnskey.records, .{ .now = now, .budget = budget, .memo = &g.verify_memo }) orelse
+            const verified = try dnssec.verifyAuthorityProofSigs(g.scratch.allocator(), r.authorities, keys.state.fact.dnskey.records, .{ .now = now, .budget = budget, .memo = &g.verify_memo }) orelse
                 return .bogus;
-            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap, r.stored_ns));
+            const cap_until = capExpiry(g, verified.cap, r.stored_ns);
+            g.authenticUntil(s.rrset.unwrap().?, cap_until);
             const until = @min(rs.expires(), keys.expires());
-            const proven = try g.scratch.allocator().alloc(i64, r.authorities.len);
-            @memset(proven, capExpiry(g, cap, r.stored_ns));
-            const shown: ?Chain = switch (try proof.classifyDelegation(r.authorities, zone, signer, budget)) {
+            const proven = try g.scratch.allocator().alloc(i64, verified.rrs.len);
+            @memset(proven, cap_until);
+            const shown: ?Chain = switch (try proof.classifyDelegation(verified.rrs, zone, signer, budget)) {
                 .unsigned => .{ .status = .insecure },
                 // A signed denial of the DS that shows no delegation either: no zone.
-                .unproven => if (try proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget) == .secure) .{ .status = .absent, .records = r.authorities } else null,
+                .unproven => if (try proof.validateNegativeProof(verified.rrs, zone, .ds, r.kind == .nxdomain, signer, budget) == .secure) .{ .status = .absent, .records = verified.rrs } else null,
                 .bogus => null,
             };
             if (shown) |ds| {
-                try denial.absorb(g, signer, r.stored_ns, .{ .rrs = r.authorities, .until = proven }, keys.expires());
+                try denial.absorb(g, signer, r.stored_ns, .{ .rrs = verified.rrs, .until = proven }, keys.expires());
                 g.keep(s.rrset.unwrap().?);
                 try g.settle(id, .{ .ds = ds }, until);
             } else g.fail(id, no_cut);
@@ -400,7 +401,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (c.is == .proof) {
                     s.proved[c.slot] = signer.depth();
                     s.proved_until[c.slot] = cap;
-                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, keys.records, now);
+                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, keys.records, now);
                     break :f null;
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
@@ -414,7 +415,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                         .bogus, .unchecked => break :f .bogus,
                     }
                 }
-                if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, keys.records, now);
+                if (v.unweighed) try keepWeighed(g, s.target, r, &c, keys.records, now);
                 break :f null;
             },
         };
@@ -610,18 +611,11 @@ fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const 
 
 /// Drops the signatures the verifier did not weigh before a verdict is
 /// stamped on the bytes.
-fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, zone: dns.Name, keys: []const RR, now: u32) !void {
+fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, keys: []const RR, now: u32) !void {
     const section = if (c.is == .proof) r.authorities else r.answers;
-    const set = dnssec.setFrom(section, c.head);
-    const keyset: dnssec.Keyset = try .init(g.scratch.allocator(), keys);
-    var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), section.len);
-    keep.appendSliceAssumeCapacity(section[0..c.head]);
-    for (set) |rr| if (rr.rtype != .rrsig) keep.appendAssumeCapacity(rr);
-    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .keys = &keyset, .now = now, .unexpanded = c.is == .proof };
-    while (w.next()) |i| keep.appendAssumeCapacity(set[i]);
-    keep.appendSliceAssumeCapacity(section[c.head + set.len ..]);
+    const kept = try dnssec.narrowSet(g.scratch.allocator(), section, c.head, c.is == .proof, keys, now);
     var narrowed = r.*;
-    if (c.is == .proof) narrowed.authorities = keep.items else narrowed.answers = keep.items;
+    if (c.is == .proof) narrowed.authorities = kept else narrowed.answers = kept;
     try g.narrow(target, narrowed);
 }
 
