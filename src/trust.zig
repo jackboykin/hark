@@ -401,10 +401,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (c.is == .proof) {
                     s.proved[c.slot] = signer.depth();
                     s.proved_until[c.slot] = cap;
-                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, keys.records, now);
-                    break :f null;
-                }
-                if (verified.labels < rrsig.signedLabels(c.owner)) {
+                } else if (verified.labels < rrsig.signedLabels(c.owner)) {
                     const own = try verifiedProofs(g, r, qtype, s, verified.signer_name);
                     switch (try proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {
