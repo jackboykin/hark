@@ -277,8 +277,8 @@ fn retainedUntil(d: *const Desk, r: store.Rrset) i64 {
     if (r.kind == .nodata or r.kind == .nxdomain) floor = @min(floor, dns.max_negative_ttl);
     var until = r.stored_ns + floor * std.time.ns_per_s;
     const wall = g.wallNow();
-    for (r.sections[0..2]) |section| {
-        var it = section.iterator();
+    for (0..2) |i| {
+        var it = r.section(i).iterator();
         while (it.next()) |rr| if (rr.rtype == .rrsig) {
             until = @min(until, g.now() + @as(i64, dns.secondsUntil(rr.rrsig().sig_expiration, wall)) * std.time.ns_per_s);
         };
@@ -401,8 +401,8 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     var n: usize = 0;
     var proofs: usize = 0;
     for (hops) |hop| {
-        n += hop.rrset.sections[0].len;
-        proofs += hop.rrset.sections[1].len;
+        n += hop.rrset.counts[0];
+        proofs += hop.rrset.counts[1];
     }
     try answers.ensureTotalCapacityPrecise(arena, n);
     var last: Hop = undefined;
@@ -422,7 +422,7 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
             age = 0;
             life = stale_hold_s;
         }
-        try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, .{ .age = age, .life = life, .floor = hop.floor, .stale = hop.stale });
+        try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.section(0), .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, .{ .age = age, .life = life, .floor = hop.floor, .stale = hop.stale });
     }
     const r = last.rrset;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -434,14 +434,14 @@ fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []c
     const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
         const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
-        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, .{ .age = hop_age, .life = hop.life, .floor = hop.floor, .stale = hop.stale });
+        try appendAged(arena, &authorities, &seen, hop.rrset.section(1), .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .denial = false, .proofs_only = true }, .{ .age = hop_age, .life = hop.life, .floor = hop.floor, .stale = hop.stale });
     }
-    try appendAged(arena, &authorities, &seen, r.sections[1], keep, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
+    try appendAged(arena, &authorities, &seen, r.section(1), keep, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
     // Nothing judges additional, so a reply with AD carries none.
     if (!secure) {
         var add = keep;
         add.section = .additional;
-        try appendAged(arena, &additionals, null, r.sections[2], add, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
+        try appendAged(arena, &additionals, null, r.section(2), add, .{ .age = age, .life = life, .floor = last.floor, .stale = last.stale });
     }
     const ede: ?dns.Ede = if (stale_any)
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }

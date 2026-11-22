@@ -1125,7 +1125,7 @@ pub const Graph = struct {
             }
             const r = hop.rrset;
             const target: dns.Name = if (r.kind == .alias) .of(r.target) else .root;
-            var it = r.sections[0].iterator();
+            var it = r.section(0).iterator();
             while (it.next()) |rr| if (rr.rtype == .cname) {
                 if (links.pass(rr.name) != null) return g.lost(hops.items);
             };
@@ -1723,6 +1723,6 @@ test "a recalled chain holds an earlier hop a later denial read evicts" {
     try testing.expectEqual(2, chain.len);
     try testing.expectEqual(null, g.store.any(.of(.rrset, www, .a)));
     try testing.expectEqual(1, chain[0].blob.refs);
-    var it = chain[0].rrset.sections[0].iterator();
+    var it = chain[0].rrset.section(0).iterator();
     try testing.expect(it.next().?.cname().eql(target));
 }

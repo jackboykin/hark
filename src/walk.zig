@@ -666,7 +666,7 @@ fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
 }
 
 fn provable(b: *store.Blob) bool {
-    var it = store.Rrset.of(b).sections[1].iterator();
+    var it = store.Rrset.of(b).section(1).iterator();
     while (it.next()) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) return true;
     return false;
 }
@@ -678,7 +678,7 @@ fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
         const d = g.held(Key.of(.rrset, owner, .dname)) orelse continue;
         const r: store.Rrset = .of(d);
         if (r.kind != .answer) continue;
-        var it = r.sections[0].iterator();
+        var it = r.section(0).iterator();
         while (it.next()) |rr| if (rr.rtype == .dname and rr.name.eql(owner)) return owner;
     }
     return null;

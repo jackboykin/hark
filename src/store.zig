@@ -369,13 +369,13 @@ pub const Store = struct {
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
             .rrset, .stub, .span => |kind| blk: {
-                const rrset = Rrset.read(r);
+                const rrset = Rrset.read(&r);
                 const reply: model.Reply = .{
                     .kind = rrset.kind,
                     .aa = rrset.aa,
-                    .answers = try rrset.sections[0].slice(arena),
-                    .authorities = try rrset.sections[1].slice(arena),
-                    .additionals = try rrset.sections[2].slice(arena),
+                    .answers = try r.records(arena, rrset.counts[0]),
+                    .authorities = try r.records(arena, rrset.counts[1]),
+                    .additionals = try r.records(arena, rrset.counts[2]),
                     .target = .of(rrset.target),
                     .zone = .of(rrset.zone),
                     .ede = rrset.ede,
@@ -403,20 +403,34 @@ pub const Rrset = struct {
     stored_ns: i64,
     target: []const u8,
     zone: []const u8,
-    sections: [3]Records,
+    counts: [3]u16,
+    payload: []const u8,
+    records_at: usize,
 
     pub fn of(b: *Blob) Rrset {
         std.debug.assert(isReply(b));
-        return read(.{ .buf = b.payload(), .pos = b.name_len });
+        var r: Reader = .{ .buf = b.payload(), .pos = b.name_len };
+        return read(&r);
     }
 
     pub fn answered(b: *Blob) ?Records.Iterator {
         const r = of(b);
-        return if (r.kind == .answer) r.sections[0].iterator() else null;
+        return if (r.kind == .answer) r.section(0).iterator() else null;
     }
 
-    fn read(r0: Reader) Rrset {
-        var r = r0;
+    pub fn section(r: Rrset, index: usize) Records {
+        const n = r.counts[index];
+        if (n == 0) return .{ .payload = r.payload, .start = r.records_at, .len = 0 };
+        var pos = r.records_at;
+        for (r.counts[0..index]) |count| {
+            var it: Records.Iterator = .{ .payload = r.payload, .pos = pos, .left = count };
+            while (it.next() != null) {}
+            pos = it.pos;
+        }
+        return .{ .payload = r.payload, .start = pos, .len = n };
+    }
+
+    fn read(r: *Reader) Rrset {
         var v: Rrset = .{
             .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
             .aa = undefined,
@@ -425,7 +439,9 @@ pub const Rrset = struct {
             .stored_ns = undefined,
             .target = undefined,
             .zone = undefined,
-            .sections = undefined,
+            .counts = undefined,
+            .payload = r.buf,
+            .records_at = undefined,
         };
         const flags = r.int(u8);
         v.aa = flags & 1 != 0;
@@ -435,16 +451,8 @@ pub const Rrset = struct {
         v.stored_ns = r.int(i64);
         v.target = r.wireName();
         v.zone = r.wireName();
-        var counts: [3]u16 = undefined;
-        for (&counts) |*n| n.* = r.int(u16);
-        for (&v.sections, counts, 0..) |*sec, n, i| {
-            sec.* = .{ .payload = r.buf, .start = r.pos, .len = n };
-            if (i < 2) {
-                var it = sec.iterator();
-                while (it.next() != null) {}
-                r.pos = it.pos;
-            }
-        }
+        for (&v.counts) |*n| n.* = r.int(u16);
+        v.records_at = r.pos;
         return v;
     }
 };
@@ -456,13 +464,6 @@ pub const Records = struct {
 
     pub fn iterator(r: Records) Iterator {
         return .{ .payload = r.payload, .pos = r.start, .left = r.len };
-    }
-
-    fn slice(r: Records, arena: Allocator) Allocator.Error![]RR {
-        const out = try arena.alloc(RR, r.len);
-        var it = r.iterator();
-        for (out) |*rr| rr.* = it.next().?;
-        return out;
     }
 
     pub const Iterator = struct {

@@ -347,8 +347,9 @@ test "fuzz: store round trip" {
             for (
                 [_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals },
                 [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals },
-                rrset.sections,
-            ) |want, have, sec| {
+                0..,
+            ) |want, have, i| {
+                const sec = rrset.section(i);
                 try testing.expectEqual(want.len, have.len);
                 try testing.expectEqual(have.len, sec.len);
                 var it = sec.iterator();
