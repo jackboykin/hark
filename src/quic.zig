@@ -585,7 +585,7 @@ const Stream = struct {
     }
 };
 
-const Close = struct { app: bool, code: u64, frame: u64 = 0 };
+const Close = struct { app: bool, code: u64 };
 
 const Closing = error{
     FlowControlError,
@@ -1829,7 +1829,8 @@ pub const Conn = struct {
             } else {
                 w.byte(0x1c);
                 w.varint(if (why.app) 0xc else why.code);
-                w.varint(why.frame);
+                // RFC 9000 §19.19: no frame type to name.
+                w.varint(0);
             }
             w.varint(0);
             p.len = w.at;
