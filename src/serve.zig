@@ -18,7 +18,6 @@ const mem = std.mem;
 const build_options = @import("build_options");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const acl = @import("acl.zig");
 const config = @import("config.zig");
 const response = @import("response.zig");
 const sys_linux = @import("sys_linux.zig");
@@ -33,6 +32,13 @@ const udp_recv_max = 4096;
 const udp_per_wake = 64;
 const udp_misses_per_wake = 8;
 const crowded_eighths = 6;
+
+fn allow(entries: []const na.Cidr, addr: na.Address) bool {
+    for (entries) |e| if (switch (addr) {
+        inline else => |a| e.matchesBytes(&a.bytes),
+    }) return true;
+    return false;
+}
 
 const Conn = struct {
     fd: posix.fd_t,
@@ -290,7 +296,7 @@ const Server = struct {
             const got = s.in.recv(fd, want);
             for (0..got) |i| {
                 const from = s.in.from(i);
-                if (!acl.allow(s.cfg.clients, from)) continue;
+                if (!allow(s.cfg.clients, from)) continue;
                 const reply: Reply = if (wildcard) .{ .wildcard = .{ .fd = fd, .addr = from, .local = s.in.local(i) } } else .{ .udp = .{ .fd = fd, .addr = from } };
                 try s.ask(s.in.datagram(i), reply, crowded);
             }
@@ -316,7 +322,7 @@ const Server = struct {
             }
             const cfd: posix.fd_t = @intCast(rc);
             const addr = sys.fromSockaddr(&pa);
-            if (!acl.allow(s.cfg.clients, addr)) {
+            if (!allow(s.cfg.clients, addr)) {
                 sys.close(cfd);
                 continue;
             }

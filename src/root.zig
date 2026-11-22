@@ -11,7 +11,6 @@ pub const Share = @import("share.zig");
 
 // Tests are found by reachability from here: a file not listed runs none.
 test {
-    _ = @import("acl.zig");
     _ = @import("answer.zig");
     _ = @import("arena.zig");
     _ = @import("batch.zig");

@@ -6,7 +6,6 @@
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
-const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const dns64 = @import("dns64.zig");
 const na = @import("net_address.zig");
@@ -16,8 +15,8 @@ const log = std.log.scoped(.rebinding);
 pub const Config = struct {
     enabled: bool,
     allow_zones: []const dns.Name = &.{},
-    extra_block: []const acl.Cidr = &.{},
-    extra_allow: []const acl.Cidr = &.{},
+    extra_block: []const na.Cidr = &.{},
+    extra_allow: []const na.Cidr = &.{},
     nat64: ?dns64.Prefix = null,
 
     pub const off: Config = .{ .enabled = false };
@@ -190,8 +189,7 @@ fn rrsigOver(covered: dns.RType) dns.ResourceRecord {
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {
-    const allow127 = acl.parse("127.0.0.0/8") orelse return error.ParseFailed;
-    const cfg = Config{ .enabled = true, .extra_allow = &.{allow127} };
+    const cfg = Config{ .enabled = true, .extra_allow = &.{.of("127.0.0.0/8")} };
     const mapped_listed = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 2 };
     const mapped_rfc1918 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
     try testing.expect(!shouldDrop(rrAAAA(public_name, mapped_listed), cfg));

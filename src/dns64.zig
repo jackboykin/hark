@@ -4,7 +4,6 @@
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
-const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 
@@ -15,10 +14,11 @@ pub const Prefix = struct {
     pub const well_known: Prefix = .{ .bytes = .{ 0, 0x64, 0xff, 0x9b } ++ @as([12]u8, @splat(0)), .len = 96 };
 
     pub fn parse(s: []const u8) ?Prefix {
-        const cidr = acl.parse(s) orelse return null;
-        if (cidr.address != .ip6) return null;
-        return switch (cidr.prefix) {
-            32, 40, 48, 56, 64, 96 => .{ .bytes = cidr.address.ip6.bytes, .len = cidr.prefix },
+        const c = na.Cidr.parse(s) orelse return null;
+        if (c != .ip6) return null;
+        const len: u8 = @popCount(c.ip6.mask);
+        return switch (len) {
+            32, 40, 48, 56, 64, 96 => .{ .bytes = mem.toBytes(mem.nativeToBig(u128, c.ip6.net)), .len = len },
             else => null,
         };
     }

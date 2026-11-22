@@ -9,7 +9,6 @@ const Allocator = mem.Allocator;
 const toml = @import("toml.zig");
 const net_addr = @import("net_address.zig");
 const Address = net_addr.Address;
-const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
@@ -51,10 +50,7 @@ const root_hints_default: [2 * root_servers.len]Address = hints: {
     break :hints hints;
 };
 
-const loopback_cidrs = [_]acl.Cidr{
-    .{ .address = net_addr.initIp4(.{ 127, 0, 0, 0 }, 0), .prefix = 8 },
-    .{ .address = net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 0), .prefix = 128 },
-};
+const loopback_cidrs = [_]net_addr.Cidr{ .of("127.0.0.0/8"), .of("::1/128") };
 
 const EncryptedTransport = enum { off, opportunistic };
 
@@ -81,7 +77,7 @@ pub const ServerConfig = struct {
     max_udp_payload: u16 = dns.edns_udp_payload,
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
-    clients: []const acl.Cidr = &loopback_cidrs,
+    clients: []const net_addr.Cidr = &loopback_cidrs,
     tcp_idle_timeout_ms: u32 = 5_000,
     tcp_queries_per_conn: u32 = 128,
     trust_anchors: []const dns.DsData = &.{},
@@ -418,9 +414,9 @@ fn parseStubZones(arena: Allocator, strs: []const []const u8) ConfigError![]stub
     return zones;
 }
 
-pub fn parseCidrList(arena: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
-    const list = try arena.alloc(acl.Cidr, strs.len);
-    for (list, strs) |*c, s| c.* = acl.parse(s) orelse {
+pub fn parseCidrList(arena: Allocator, strs: []const []const u8) ConfigError![]net_addr.Cidr {
+    const list = try arena.alloc(net_addr.Cidr, strs.len);
+    for (list, strs) |*c, s| c.* = net_addr.Cidr.parse(s) orelse {
         errLog("config: invalid CIDR entry '{s}'", .{s});
         return error.InvalidAclEntry;
     };

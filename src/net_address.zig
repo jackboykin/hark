@@ -1,8 +1,7 @@
-//! std.Io.net.IpAddress, with constructors and a hashable key.
+//! std.Io.net.IpAddress, CIDR prefixes, constructors and a hashable key.
 const std = @import("std");
 const mem = std.mem;
 const keyed = @import("keyed.zig");
-const acl = @import("acl.zig");
 
 pub const Address = std.Io.net.IpAddress;
 pub const Family = std.meta.Tag(Address);
@@ -142,20 +141,49 @@ pub fn isSpecialUseIp6(b: [16]u8) bool {
     return special_use_ip6.holds(mem.readInt(u128, &b, .big));
 }
 
+pub const Cidr = union(Family) {
+    ip4: Prefix(u32),
+    ip6: Prefix(u128),
+
+    pub fn parse(s: []const u8) ?Cidr {
+        const addr = s[0 .. mem.findScalar(u8, s, '/') orelse s.len];
+        return if (mem.findScalar(u8, addr, ':') != null)
+            .{ .ip6 = Prefix(u128).parse(s) orelse return null }
+        else
+            .{ .ip4 = Prefix(u32).parse(s) orelse return null };
+    }
+
+    pub fn of(comptime s: []const u8) Cidr {
+        @setEvalBranchQuota(10_000);
+        return parse(s).?;
+    }
+
+    pub fn matchesBytes(c: Cidr, bytes: []const u8) bool {
+        return switch (c) {
+            .ip4 => |p| bytes.len == 4 and p.holds(mem.readInt(u32, bytes[0..4], .big)),
+            .ip6 => |p| bytes.len == 16 and p.holds(mem.readInt(u128, bytes[0..16], .big)),
+        };
+    }
+};
+
 fn Prefix(comptime Int: type) type {
     return struct {
         net: Int,
         mask: Int,
 
+        fn parse(s: []const u8) ?@This() {
+            const Ip = if (Int == u32) std.Io.net.Ip4Address else std.Io.net.Ip6Address;
+            const slash = mem.findScalar(u8, s, '/');
+            const ip = Ip.parse(s[0 .. slash orelse s.len], 0) catch return null;
+            const len = if (slash) |i| std.fmt.parseInt(u8, s[i + 1 ..], 10) catch return null else @bitSizeOf(Int);
+            if (len > @bitSizeOf(Int)) return null;
+            const mask = ~std.math.shr(Int, std.math.maxInt(Int), len);
+            return .{ .net = mem.readInt(Int, &ip.bytes, .big) & mask, .mask = mask };
+        }
+
         fn of(comptime cidr: []const u8) @This() {
             @setEvalBranchQuota(10_000);
-            const c = acl.parse(cidr).?;
-            const bytes = switch (c.address) {
-                .ip4 => |a| a.bytes,
-                .ip6 => |a| a.bytes,
-            };
-            const mask: Int = if (c.prefix == 0) 0 else ~@as(Int, 0) << @intCast(@bitSizeOf(Int) - c.prefix);
-            return .{ .net = mem.readInt(Int, &bytes, .big), .mask = mask };
+            return parse(cidr).?;
         }
 
         fn holds(p: @This(), a: Int) bool {
@@ -274,4 +302,33 @@ test "isNonRoutableNs blocks special-use + multicast IPv6" {
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(.ip6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53)));
+}
+
+test "parse v4 normalizes host bits" {
+    const c = Cidr.parse("192.168.1.255/24") orelse return error.ParseFailed;
+    try testing.expectEqual(@as(u32, 0xC0A8_0100), c.ip4.net);
+}
+
+test "parse bare v4 address is /32" {
+    const c = Cidr.parse("10.0.0.5") orelse return error.ParseFailed;
+    try testing.expectEqual(std.math.maxInt(u32), c.ip4.mask);
+}
+
+test "parse rejects invalid prefix" {
+    try testing.expect(Cidr.parse("10.0.0.0/33") == null);
+    try testing.expect(Cidr.parse("::1/129") == null);
+    try testing.expect(Cidr.parse("garbage") == null);
+}
+
+test "matchesBytes accepts bare rdata bytes" {
+    const v4 = Cidr.parse("10.0.0.0/8") orelse return error.ParseFailed;
+    try testing.expect(v4.matchesBytes(&[_]u8{ 10, 1, 2, 3 }));
+    try testing.expect(!v4.matchesBytes(&[_]u8{ 11, 1, 2, 3 }));
+    try testing.expect(!v4.matchesBytes(&@as([16]u8, @splat(0))));
+
+    const v6 = Cidr.parse("fc00::/7") orelse return error.ParseFailed;
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfc} ++ @as([15]u8, @splat(0)))));
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ @as([15]u8, @splat(0)))));
+    try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ @as([15]u8, @splat(0)))));
+    try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
 }
