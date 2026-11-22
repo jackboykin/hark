@@ -212,6 +212,11 @@ const Keys = struct {
     }
 };
 
+fn wipe(k: *?Keys) void {
+    if (k.*) |*x| crypto.secureZero(u8, mem.asBytes(x));
+    k.* = null;
+}
+
 fn initialKeys(dcid: []const u8) struct { client: Keys, server: Keys } {
     const initial = Hkdf.extract(&initial_salt, dcid);
     return .{
@@ -727,9 +732,11 @@ pub const Conn = struct {
         for (&c.spaces) |*s| {
             gpa.free(s.sent);
             if (s.in.window) |w| gpa.destroy(w);
-            inline for (.{ &s.tx, &s.rx }) |k| if (k.*) |*x| crypto.secureZero(u8, mem.asBytes(x));
+            wipe(&s.tx);
+            wipe(&s.rx);
         }
-        inline for (.{ &c.prev_rx, &c.next_rx }) |k| if (k.*) |*x| crypto.secureZero(u8, mem.asBytes(x));
+        wipe(&c.prev_rx);
+        wipe(&c.next_rx);
         for (c.streams.items) |o| if (o) |st| c.freeStream(st);
         c.streams.deinit(gpa);
         c.events.deinit(gpa);
@@ -1488,8 +1495,8 @@ pub const Conn = struct {
         const s = c.space(level);
         if (s.tx == null) return;
         c.forget(level);
-        s.tx = null;
-        s.rx = null;
+        wipe(&s.tx);
+        wipe(&s.rx);
         s.unacked = 0;
         s.ack_by_ns = null;
         s.out = .{};
@@ -1552,10 +1559,7 @@ pub const Conn = struct {
     pub fn fire(c: *Conn, now: i64) !void {
         if (c.ended != null) return;
         if (now >= c.idleAt()) return c.end(.closed, "idle");
-        if (c.prev_rx != null and now >= c.prev_until_ns) {
-            crypto.secureZero(u8, mem.asBytes(&c.prev_rx.?));
-            c.prev_rx = null;
-        }
+        if (c.prev_rx != null and now >= c.prev_until_ns) wipe(&c.prev_rx);
         if (c.lossTime()) |l| {
             if (now >= l.at) try c.detectLoss(l.level, now);
             return;
