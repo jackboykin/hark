@@ -681,7 +681,6 @@ pub const Conn = struct {
     rx_max: u64 = connection_window,
     max_data: Owed = .none,
     path_response: ?[8]u8 = null,
-    ping: Owed = .none,
 
     idle_ns: i64 = idle_ms * std.time.ns_per_ms,
     idle_from_ns: i64,
@@ -1363,7 +1362,7 @@ pub const Conn = struct {
         const s = c.space(level);
         for (s.out.all()) |*ch| _ = ch.owed.settle(pn, acked);
         if (level != .application) return;
-        const pairs = .{ &c.max_data, &c.streams_blocked, &c.data_blocked, &c.ping };
+        const pairs = .{ &c.max_data, &c.streams_blocked, &c.data_blocked };
         inline for (pairs) |o| _ = o.settle(pn, acked);
         for (c.retiring[0..c.nretiring]) |*x| _ = x.owed.settle(pn, acked);
         var i: usize = 0;
