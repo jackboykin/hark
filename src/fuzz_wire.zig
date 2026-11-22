@@ -108,6 +108,10 @@ fn checkName(alloc: std.mem.Allocator, name: dns.Name) !void {
     } else |_| {}
 }
 
+fn sameMember(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
+    return a.rtype == b.rtype and a.rclass == b.rclass and a.name.eql(b.name) and std.mem.eql(u8, a.rdata, b.rdata);
+}
+
 fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bare: bool) !void {
     const out = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, section), bare);
     var i: usize = 0;
@@ -119,7 +123,14 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
         if (head.rtype == .rrsig) {
             if (!bare) return error.BareSignature;
             for (run) |rr| if (rr.rtype != .rrsig) return error.DataAfterSignature;
-            for (section) |in| if (in.rtype != .rrsig and in.rtype == dnssec.covers(head) and in.name.eql(head.name)) return error.BoundAsBare;
+            var k: usize = 0;
+            for (section) |in| {
+                if (dnssec.covers(in) != dnssec.covers(head) or !in.name.eql(head.name)) continue;
+                if (in.rtype != .rrsig) return error.BoundAsBare;
+                if (k >= run.len or !sameMember(in, run[k]) or in.ttl != run[k].ttl) return error.OrderChanged;
+                k += 1;
+            }
+            if (k != run.len) return error.SignatureLost;
             continue;
         }
         const apex = proof.deepestApex(head.name, head.rtype);
@@ -133,16 +144,27 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
             if (!apex.isSubdomainOf(rr.rrsig().signer_name)) return error.SignerHoldsNoSet;
             sigs += 1;
         }
+        const data_n = run.len - sigs;
+        var data_at: usize = 0;
         var offered: usize = 0;
         var floor: u32 = std.math.maxInt(u32);
         for (section) |in| {
             if (dnssec.covers(in) != head.rtype or !in.name.eql(head.name)) continue;
-            if (in.rtype != .rrsig and in.ttl < head.ttl) return error.AboveSetMinimum;
             if (in.rtype == .rrsig and !apex.isSubdomainOf(in.rrsig().signer_name)) continue;
-            offered += @intFromBool(in.rtype == .rrsig);
+            if (in.rtype != .rrsig) {
+                if (in.ttl < head.ttl) return error.AboveSetMinimum;
+                if (data_at >= data_n) return error.DataDropped;
+                if (!sameMember(in, run[data_at])) return error.OrderChanged;
+                data_at += 1;
+            } else {
+                if (offered >= sigs) return error.SignatureLost;
+                if (!sameMember(in, run[data_n + offered])) return error.OrderChanged;
+                offered += 1;
+            }
             floor = @min(floor, in.ttl);
         }
         if (head.ttl != floor) return error.LevelledWrong;
+        if (data_at != data_n) return error.DataDropped;
         if (sigs != offered) return error.SignatureLost;
     }
     var data_in: usize = 0;
@@ -152,7 +174,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
     if (data_in != data_out) return error.DataDropped;
     const again = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, out), bare);
     if (again.len != out.len) return error.NotFixedPoint;
-    for (again, out) |x, y| if (x.rtype != y.rtype or x.ttl != y.ttl or !x.name.eql(y.name)) return error.NotFixedPoint;
+    for (again, out) |x, y| if (!sameMember(x, y) or x.ttl != y.ttl) return error.NotFixedPoint;
 }
 
 fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
@@ -163,7 +185,7 @@ fn pooledRR(arena: std.mem.Allocator, s: *Smith) !dns.ResourceRecord {
     const ttls = [_]u32{ 0, 60, 300, 3600 };
     const owner = owners[s.index(owners.len)];
     const ttl = ttls[s.index(ttls.len)];
-    if (s.boolWeighted(1, 1)) return .init(arena, .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = "" } });
+    if (s.boolWeighted(1, 1)) return .init(arena, .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = try arena.dupe(u8, &.{s.value(u8)}) } });
     return .init(arena, .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
         .type_covered = data[s.index(data.len)],
         .algorithm = algorithms[s.index(algorithms.len)],
@@ -264,6 +286,18 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     }
 }
 
+const pooled_body = [_]u64{8} ++
+    [_]u64{ 0, 0, 1, 0, 1 } ++
+    [_]u64{ 0, 1, 0, 0, 0, 10, 1 } ++
+    [_]u64{ 0, 2, 1, 0, 2 } ++
+    [_]u64{ 0, 3, 0, 0, 0, 20, 1 } ++
+    [_]u64{ 1, 1, 0, 1, 0, 30, 1 } ++
+    [_]u64{ 1, 2, 0, 1, 0, 40, 1 } ++
+    [_]u64{ 0, 0, 1, 0, 3 } ++
+    [_]u64{ 0, 0, 0, 0, 0, 50, 1 };
+const pooled_bare = std.mem.toBytes(pooled_body ++ [_]u64{1});
+const pooled_bound = std.mem.toBytes(pooled_body ++ [_]u64{0});
+
 test "fuzz: pooled sections bind" {
     try testing.fuzz({}, struct {
         fn one(_: void, s: *Smith) anyerror!void {
@@ -274,7 +308,7 @@ test "fuzz: pooled sections bind" {
             for (rrs[0..n]) |*rr| rr.* = try pooledRR(arena.allocator(), s);
             try checkBound(arena.allocator(), rrs[0..n], s.boolWeighted(1, 3));
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{ &pooled_bare, &pooled_bound } });
 }
 
 test "fuzz: wire message chain" {

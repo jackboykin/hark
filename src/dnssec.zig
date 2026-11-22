@@ -338,20 +338,23 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bo
             const p = c.rrs[x];
             const q = c.rrs[y];
             const t = std.math.order(@backingInt(covers(p)), @backingInt(covers(q)));
-            return if (t != .eq) t else p.name.order(q.name);
+            return if (t != .eq) t else mem.order(u8, p.name.wire, q.name.wire);
         }
 
         fn lessThan(c: @This(), x: u32, y: u32) bool {
             const o = c.order(x, y);
-            return if (o != .eq) o == .lt else @intFromBool(c.rrs[x].rtype == .rrsig) < @intFromBool(c.rrs[y].rtype == .rrsig);
+            if (o != .eq) return o == .lt;
+            const sx = @intFromBool(c.rrs[x].rtype == .rrsig);
+            const sy = @intFromBool(c.rrs[y].rtype == .rrsig);
+            return if (sx != sy) sx < sy else x < y;
         }
     };
     const src = try scratch.dupe(dns.ResourceRecord, rrs);
     const by: By = .{ .rrs = src };
     const at = try scratch.alloc(u32, rrs.len);
     for (at, 0..) |*x, i| x.* = @intCast(i);
-    // Must be stable: a set keeps the order it arrived in.
-    std.mem.sort(u32, at, by, By.lessThan);
+    // The index breaks ties, so a set keeps the order it arrived in.
+    std.sort.heap(u32, at, by, By.lessThan);
     const Kept = struct { lo: u32 = 0, hi: u32 = 0 };
     const kept = try scratch.alloc(Kept, rrs.len);
     @memset(kept, .{});
