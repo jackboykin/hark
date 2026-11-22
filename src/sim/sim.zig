@@ -20,7 +20,6 @@ pub const LogRow = struct {
     server: na.Address,
     qname: dns.Name,
     qtype: dns.RType,
-    need: Need,
 };
 
 const Event = struct {
@@ -47,7 +46,6 @@ const wall0_sec: i64 = 1_800_000_000;
 pub const Sim = struct {
     arena: Allocator,
     gpa: Allocator,
-    scenario: *const rpl.Scenario,
     signer: sign.Signer,
     ranges: []const rpl.Range,
     prng: std.Random.DefaultPrng,
@@ -78,7 +76,6 @@ pub const Sim = struct {
     pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, seed: u64) !Sim {
         var s: Sim = .{
             .arena = arena,
-            .scenario = scenario,
             .signer = undefined,
             .ranges = undefined,
             .prng = std.Random.DefaultPrng.init(seed),
@@ -133,7 +130,7 @@ pub const Sim = struct {
         };
         // RFC 8109 root priming is not logged.
         if (!(q.name.isRoot() and q.qtype == .ns))
-            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype, .need = ex.need });
+            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try q.name.clone(s.arena), .qtype = q.qtype });
         var asked = try s.ask(ex.server, q, ex.need);
         const tie = try s.tieOf(asked.final());
         const delay = s.latency(ex.server, asked);
