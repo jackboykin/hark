@@ -48,6 +48,7 @@ pub const AddrPolicy = struct {
 };
 
 pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Name) ?Referral {
+    if (response.header.flags.rcode != .no_error) return null;
     // Some servers set AA on a referral: only an answer or an SOA makes the NS the zone's own.
     if (response.header.flags.aa and response.answers.len > 0) return null;
     if (soaAbove(response.authorities, target)) return null;
@@ -83,5 +84,5 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     // RA without AA is a recursor's cache (RFC 1034 §5.3.3): ask a sibling,
     // unless it refers, which is still followed.
     if (!flags.ra or flags.aa) return false;
-    return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.question.?.name, parent_zone) == null;
+    return response.answers.len != 0 or extractReferral(response, response.question.?.name, parent_zone) == null;
 }

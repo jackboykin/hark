@@ -4,7 +4,8 @@
 SCENARIO_BEGIN a negative without its SOA is no answer, NXDOMAIN or NODATA
 
 ; RFC 2308 §3. The SOA must be at or above the name denied, at a chain's
-; end too, and an NXDOMAIN carrying a cut is no referral.
+; end too. An NXDOMAIN carrying a cut is no referral: beside an alias
+; that leaves the zone, the alias stands and its target is asked.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -18,6 +19,16 @@ RANGE_BEGIN 0 100
       example. 3600 IN NS ns.example.
     SECTION ADDITIONAL
       ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      lost.org. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 300
   ENTRY_END
 RANGE_END
 
@@ -80,6 +91,20 @@ RANGE_BEGIN 0 100
     SECTION ADDITIONAL
       ns.sub.example. 3600 IN A 127.0.10.3
   ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NXDOMAIN
+    SECTION QUESTION
+      hop.sub.example. IN A
+    SECTION ANSWER
+      hop.sub.example. 3600 IN CNAME lost.org.
+    SECTION AUTHORITY
+      sub.example. 3600 IN NS ns.sub.example.
+    SECTION ADDITIONAL
+      ns.sub.example. 3600 IN A 127.0.10.3
+  ENTRY_END
 RANGE_END
 
 RANGE_BEGIN 0 100
@@ -92,6 +117,16 @@ RANGE_BEGIN 0 100
       www.sub.example. IN A
     SECTION ANSWER
       www.sub.example. 300 IN A 192.0.2.9
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop.sub.example. IN A
+    SECTION ANSWER
+      hop.sub.example. 300 IN A 192.0.2.9
   ENTRY_END
 RANGE_END
 
@@ -134,7 +169,7 @@ ENTRY_END
 
 STEP 6 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags question authority
+  MATCH flags question answer authority
   REPLY QR RD RA NXDOMAIN
   SECTION QUESTION
     denied.example. IN A
@@ -185,6 +220,25 @@ ENTRY_BEGIN
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     chain.example. IN A
+ENTRY_END
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    hop.sub.example. IN A
+ENTRY_END
+
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    hop.sub.example. IN A
+  SECTION ANSWER
+    hop.sub.example. 3600 IN CNAME lost.org.
+  SECTION AUTHORITY
+    . 300 IN SOA root. nobody.invalid. 1 7200 3600 86400 300
 ENTRY_END
 
 SCENARIO_END
