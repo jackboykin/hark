@@ -675,7 +675,7 @@ test "an answer finished short of memory holds no blob" {
     defer d.deinit();
     const name: dns.Name = .lit("example");
     const q: dns.Question = .{ .name = name, .qtype = .aaaa, .qclass = .in };
-    const blob = (try g.fact(.of(.rrset, name, .aaaa), .{ .rrset = .{ .kind = .nodata, .aa = true, .stored_ns = now, .zone = name } }, now + 60 * std.time.ns_per_s)).?;
+    const blob = (try g.fact(.of(.rrset, name, .aaaa), .{ .rrset = .{ .kind = .nodata, .stored_ns = now, .zone = name } }, now + 60 * std.time.ns_per_s)).?;
     const a = try g.demandRoot(name, .a, .new);
     defer g.unhold(a);
     g.fail(a, .{ .name = .unreachable_authority });
@@ -719,8 +719,8 @@ test "a last-tenth hit is served from memory, asks for one refresh, and survives
     const qb: dns.Question = .{ .name = b_name, .qtype = .a, .qclass = .in };
     const rra = [_]dns.ResourceRecord{.fixture(.{ .name = a_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } })};
     const rrb = [_]dns.ResourceRecord{.fixture(.{ .name = b_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } })};
-    _ = (try g.fact(.of(.rrset, a_name, .a), .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rra, .target = a_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
-    _ = (try g.fact(.of(.rrset, b_name, .a), .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rrb, .target = b_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
+    _ = (try g.fact(.of(.rrset, a_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rra, .target = a_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
+    _ = (try g.fact(.of(.rrset, b_name, .a), .{ .rrset = .{ .kind = .answer, .answers = &rrb, .target = b_name, .zone = .root, .stored_ns = now, .ttl = 60 } }, now + 60 * s)).?;
     now += 55 * s;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -101,7 +101,6 @@ pub const Server = struct {
 
 pub const Reply = struct {
     kind: Of,
-    aa: bool,
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
     additionals: []const dns.ResourceRecord = &.{},

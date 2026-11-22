@@ -1562,7 +1562,7 @@ test "a published cell that cannot settle is queued, never left waiting on nothi
         const root = try g.demandRoot(zone, .a, .new);
         g.payer = g.cell(root).scratch.answer.budget;
         failing.fail_index = failing.alloc_index + nth;
-        const published = g.publish(key, zone, root, .{ .rrset = .{ .kind = .nodata, .aa = true, .target = zone, .zone = zone, .stored_ns = q.now } }, q.now + std.time.ns_per_s);
+        const published = g.publish(key, zone, root, .{ .rrset = .{ .kind = .nodata, .target = zone, .zone = zone, .stored_ns = q.now } }, q.now + std.time.ns_per_s);
         failing.fail_index = std.math.maxInt(usize);
         published catch {
             refused += 1;
@@ -1659,7 +1659,7 @@ test "a version shortened through one instant's cell ends for every cell holding
     const now = try g.newCell(key, name, 0);
     g.cell(now).holds += 1;
     defer g.unhold(now);
-    try g.settle(now, .{ .rrset = .{ .kind = .answer, .aa = true, .answers = &rrs, .target = name, .zone = .root, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
+    try g.settle(now, .{ .rrset = .{ .kind = .answer, .answers = &rrs, .target = name, .zone = .root, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
     const version = g.cell(now).blob.?;
     const lapse = q.now + 200 * std.time.ns_per_s;
     const refresh = try g.newCell(Key.of(.refresh, name, .a), name, lapse);
@@ -1720,14 +1720,14 @@ test "a recalled chain holds an earlier hop a later denial read evicts" {
     g.store.drop(g.store.any(.of(.cut, .root, .a)).?);
 
     const cname: dns.ResourceRecord = .fixture(.{ .name = www, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = target } });
-    const alias = (try g.fact(.of(.rrset, www, .a), .{ .rrset = .{ .kind = .alias, .aa = true, .answers = &.{cname}, .target = target, .zone = zone, .stored_ns = q.now, .ttl = 3600 } }, until)).?;
+    const alias = (try g.fact(.of(.rrset, www, .a), .{ .rrset = .{ .kind = .alias, .answers = &.{cname}, .target = target, .zone = zone, .stored_ns = q.now, .ttl = 3600 } }, until)).?;
     alias.verdict.stamp(.{ .status = .secure, .proven_until_ns = until }, until, q.now);
 
     const soa: dns.ResourceRecord = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
     const nsec: dns.ResourceRecord = .fixture(.{ .name = zone, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = zone, .type_bit_maps = &.{ 0x00, 0x01, 0x02 } } } });
     try denial.absorb(&g, zone, q.now, .{ .rrs = &.{ soa, nsec }, .until = &.{ until, until } }, until);
 
-    _ = (try g.fact(.of(.rrset, target, .a), .{ .rrset = .{ .kind = .nodata, .aa = true, .target = target, .zone = zone, .stored_ns = q.now } }, q.now + 1)).?;
+    _ = (try g.fact(.of(.rrset, target, .a), .{ .rrset = .{ .kind = .nodata, .target = target, .zone = zone, .stored_ns = q.now } }, q.now + 1)).?;
     q.now += 1;
     g.store.cap = g.store.held;
 
@@ -1752,7 +1752,7 @@ test "narrowing a cell keeps slices borrowed from its earlier blobs alive until 
     const id = try g.newCell(key, name, 0);
     g.cell(id).holds += 1;
     defer g.unhold(id);
-    const first_reply: Reply = .{ .kind = .answer, .aa = true, .answers = &.{a_rr}, .target = name, .zone = zone, .stored_ns = q.now, .ttl = 300 };
+    const first_reply: Reply = .{ .kind = .answer, .answers = &.{a_rr}, .target = name, .zone = zone, .stored_ns = q.now, .ttl = 300 };
     try g.settle(id, .{ .rrset = first_reply }, q.now + 300 * std.time.ns_per_s);
     g.store.drop(g.cell(id).blob.?);
     const held_zone = g.cell(id).state.fact.rrset.zone;
@@ -1773,7 +1773,7 @@ test "a cell settled from another blob outlives that blob" {
     const above: dns.Name = .lit("a.example");
     const below: dns.Name = .lit("b.a.example");
     const zone: dns.Name = .lit("example");
-    const src = try g.store.build(Key.of(.rrset, above, .a), .{ .rrset = .{ .kind = .nxdomain, .aa = true, .target = above, .zone = zone, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
+    const src = try g.store.build(Key.of(.rrset, above, .a), .{ .rrset = .{ .kind = .nxdomain, .target = above, .zone = zone, .stored_ns = q.now, .ttl = 300 } }, q.now + 300 * std.time.ns_per_s);
     const id = try g.newCell(Key.of(.rrset, below, .a), below, 0);
     g.cell(id).holds += 1;
     defer g.unhold(id);

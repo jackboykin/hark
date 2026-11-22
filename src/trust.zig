@@ -574,7 +574,7 @@ fn publishSource(g: *Graph, r: *const model.Reply, c: *const Claims.Claim, verif
     var buf: dns.Name.Buf = undefined;
     const source = dns.Name.child(&buf, "*", c.owner.ancestor(verified.labels)) orelse return;
     var rrs: std.ArrayList(RR) = .empty;
-    var fact: model.Reply = .{ .kind = .answer, .aa = true, .zone = verified.signer_name, .stored_ns = r.stored_ns, .ttl = std.math.maxInt(u32) };
+    var fact: model.Reply = .{ .kind = .answer, .zone = verified.signer_name, .stored_ns = r.stored_ns, .ttl = std.math.maxInt(u32) };
     for (dnssec.setFrom(r.answers, c.head)) |rr| {
         if (rr.rtype == .rrsig and !std.mem.eql(u8, rr.rrsig().signature, verified.signature)) continue;
         var at = rr;
@@ -628,7 +628,7 @@ fn synthesisedUnder(rr: RR, dname: RR) bool {
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !?model.Reply {
     const ds = dnssec.setAt(msg.authorities, child, .ds);
     if (ds.len > 0) {
-        var reply: model.Reply = .{ .kind = .answer, .aa = true, .answers = ds, .zone = zone, .stored_ns = g.now() };
+        var reply: model.Reply = .{ .kind = .answer, .answers = ds, .zone = zone, .stored_ns = g.now() };
         reply.ttl = walk.replyTtl(reply);
         return reply;
     }
@@ -642,5 +642,5 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
         else => {},
     };
     if (proofs.items.len == 0) return null;
-    return .{ .kind = .nodata, .aa = true, .authorities = proofs.items, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    return .{ .kind = .nodata, .authorities = proofs.items, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
 }

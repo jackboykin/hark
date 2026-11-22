@@ -573,7 +573,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     const cut = try absorbReferral(g, id, ref, msg, zone, a.placed_until_ns);
                     // The parent's referral to the zone is its answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
-                        const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .aa = true, .target = name, .zone = zone, .stored_ns = g.now() };
+                        const reply = try trust.referralDs(g, msg, zone, name) orelse Reply{ .kind = .nodata, .target = name, .zone = zone, .stored_ns = g.now() };
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     a.* = .{ .zone = try ref.zone_cut.clone(g.cell(id).arena.allocator()) };
@@ -616,7 +616,6 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     for (reply.authorities, kept) |rr, k| if (k) try proofs.append(a, rr);
     var hop: Reply = .{
         .kind = .alias,
-        .aa = reply.aa,
         .answers = set,
         .authorities = proofs.items,
         .target = first.cname(),
@@ -641,7 +640,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
     while (sets.next()) |set| {
         const d = set[0];
         if (d.rtype != .dname) continue;
-        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = set, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .answers = set, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         try g.publish(Key.of(.rrset, d.name, .dname), d.name, by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -701,10 +700,10 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     try keep.appendSlice(g.scratch.allocator(), d.answers);
     if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.dname())) |target| {
         try keep.append(g.scratch.allocator(), try .init(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } }));
-        return .{ .kind = .alias, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+        return .{ .kind = .alias, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
     }
     // The substituted name is too long (RFC 6672 §3.3).
-    return .{ .kind = .yxdomain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+    return .{ .kind = .yxdomain, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name, zone_placed_until_ns: i64) !Graph.Fact {
@@ -827,7 +826,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     };
     var reply: Reply = .{
         .kind = kind,
-        .aa = msg.header.flags.aa,
         .answers = keep.items,
         .target = asked_alias orelse cur,
         .zone = zone,
@@ -844,7 +842,9 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     if (rest) reply.additionals = msg.additionals;
     const authorities = if (end == .left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, authorities, reply, rest);
-    reply.ttl = replyTtl(reply);
+    // A negative's life rests on an SOA only an authoritative reply vouches for.
+    const vouched = msg.header.flags.aa or !(reply.kind == .nodata or reply.kind == .nxdomain);
+    reply.ttl = if (vouched) replyTtl(reply) else 0;
     return .{ .reply = reply };
 }
 
@@ -919,7 +919,7 @@ pub fn replyTtl(reply: Reply) u32 {
         },
         .nodata, .nxdomain => {
             var found = false;
-            var sets: dnssec.Sets = .{ .rrs = if (reply.aa) reply.authorities else &.{} };
+            var sets: dnssec.Sets = .{ .rrs = reply.authorities };
             while (sets.next()) |set| {
                 const owner = set[0].name;
                 if (set[0].rtype != .soa or !reply.target.isSubdomainOf(owner)) continue;

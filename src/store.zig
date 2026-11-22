@@ -325,8 +325,7 @@ pub const Store = struct {
             },
             .rrset, .stub => |r| {
                 // `Rrset.read` reads this layout in place.
-                w.int(u8, @backingInt(r.kind));
-                w.int(u8, @intFromBool(r.aa) | (@as(u8, @intFromBool(r.ede != null)) << 1));
+                w.int(u8, @as(u8, @backingInt(r.kind)) | (@as(u8, @intFromBool(r.ede != null)) << 7));
                 w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
                 w.int(u32, r.ttl);
                 w.int(i64, r.stored_ns);
@@ -373,7 +372,6 @@ pub const Store = struct {
                 const rrset = Rrset.read(&r);
                 const reply: model.Reply = .{
                     .kind = rrset.kind,
-                    .aa = rrset.aa,
                     .answers = try r.records(arena, rrset.counts[0]),
                     .authorities = try r.records(arena, rrset.counts[1]),
                     .additionals = try r.records(arena, rrset.counts[2]),
@@ -398,7 +396,6 @@ pub const Store = struct {
 
 pub const Rrset = struct {
     kind: model.Reply.Of,
-    aa: bool,
     ede: ?dns.Ede.Code,
     ttl: u32,
     stored_ns: i64,
@@ -432,9 +429,9 @@ pub const Rrset = struct {
     }
 
     fn read(r: *Reader) Rrset {
+        const head = r.int(u8);
         var v: Rrset = .{
-            .kind = @fromBackingInt(@as(u3, @intCast(r.int(u8)))),
-            .aa = undefined,
+            .kind = @fromBackingInt(@as(u3, @truncate(head))),
             .ede = null,
             .ttl = undefined,
             .stored_ns = undefined,
@@ -444,10 +441,8 @@ pub const Rrset = struct {
             .payload = r.buf,
             .records_at = undefined,
         };
-        const flags = r.int(u8);
-        v.aa = flags & 1 != 0;
         const ede = r.int(u16);
-        if (flags & 2 != 0) v.ede = @fromBackingInt(ede);
+        if (head & 0x80 != 0) v.ede = @fromBackingInt(ede);
         v.ttl = r.int(u32);
         v.stored_ns = r.int(i64);
         v.target = r.wireName();
@@ -617,7 +612,7 @@ test "a blob holds an rrset larger than any message" {
         target[2] = 'a' + @as(u8, @intCast(i % 26));
         rr.* = .{ .name = zone, .rtype = .ns, .rclass = .in, .ttl = 300, .rdata = target };
     }
-    const reply: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .target = zone, .zone = zone, .ttl = 300 };
+    const reply: model.Reply = .{ .kind = .answer, .answers = rrs, .target = zone, .zone = zone, .ttl = 300 };
     const blob = try s.build(.of(.rrset, zone, .ns), .{ .rrset = reply }, 10);
     defer s.unref(blob);
     try testing.expect(blob.len > 2 * @as(usize, dns.max_message_len));

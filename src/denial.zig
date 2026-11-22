@@ -344,7 +344,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, stored_ns: i64, proofs: Proofs, keys_
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         const hashed: ?Hash = if (rr.rtype == .nsec3) chained(rr, signer) orelse continue else null;
         const expires = @min(proofs.until[sets.at], keys_until, stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
-        const fact: model.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = stored_ns, .ttl = rr.ttl };
+        const fact: model.Reply = .{ .kind = .answer, .answers = rrs, .zone = signer, .stored_ns = stored_ns, .ttl = rr.ttl };
         const kind: model.Kind = if (hashed != null or (rr.rtype == .nsec and delegated(rr, signer))) .span else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up only after.
         const judged = (try g.fact(model.Key.of(kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
@@ -512,7 +512,7 @@ fn expandOver(q: *const Asked, zone: dns.Name, source: *store.Blob, encloser: dn
     if ((proof.proveNoCloserMatch(authorities.items, q.name, encloser.depth(), zone, q.allowance) catch return null) != .secure) return null;
 
     const expires = @min(source.end(), cover.expires_ns);
-    var reply: model.Reply = .{ .kind = held.kind, .aa = true, .answers = answers.items, .authorities = authorities.items, .target = held.target, .zone = zone, .ede = .synthesized, .stored_ns = now };
+    var reply: model.Reply = .{ .kind = held.kind, .answers = answers.items, .authorities = authorities.items, .target = held.target, .zone = zone, .ede = .synthesized, .stored_ns = now };
     reply.ttl = @min(walk.replyTtl(reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
     return .{ .reply = reply, .expires_ns = expires, .proven_until_ns = expires };
 }
@@ -576,7 +576,6 @@ fn weigh(q: *const Asked, zone: dns.Name, held: Held, proofs: []const Held, nxdo
 
     var reply: model.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,
-        .aa = true,
         .authorities = authorities.items,
         .target = q.name,
         .zone = zone,
@@ -635,7 +634,7 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
 
     const zone: dns.Name = .lit("example");
     const soa: RR = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
-    const reply: model.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
+    const reply: model.Reply = .{ .kind = .nodata, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
     try absorb(&g, zone, reply.stored_ns, .{ .rrs = reply.authorities, .until = &.{std.math.maxInt(i64)} }, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());

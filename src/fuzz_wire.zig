@@ -337,7 +337,7 @@ test "fuzz: store round trip" {
             if (shared_store == null) shared_store = store.Store.init(std.heap.smp_allocator, 64 * 1024, null);
             const st = &shared_store.?;
             const owner = if (msg.question) |q| q.name else dns.Name.root;
-            const reply: model.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
+            const reply: model.Reply = .{ .kind = .answer, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             const key: model.Key = .of(.rrset, owner, if (msg.question) |q| q.qtype else .a);
             const blob = try st.build(key, .{ .rrset = reply }, 10);
             st.put(blob) catch st.unref(blob);
