@@ -130,9 +130,9 @@ pub const Store = struct {
         addr: u48,
         tag: u16,
 
-        fn of(b: *Blob) Ref {
+        fn of(b: *Blob, h: u64) Ref {
             const addr = std.math.cast(u48, @intFromPtr(b)) orelse @panic("blob mapped above 2^48");
-            return .{ .addr = addr, .tag = tagOf(b.key().hash()) };
+            return .{ .addr = addr, .tag = tagOf(h) };
         }
 
         fn blob(r: Ref) *Blob {
@@ -153,7 +153,14 @@ pub const Store = struct {
         }
     };
 
-    const Probe = struct { key: Key, h: u64 };
+    const Probe = struct {
+        key: Key,
+        h: u64,
+
+        fn of(key: Key) Probe {
+            return .{ .key = key, .h = key.hash() };
+        }
+    };
 
     const ByKey = struct {
         pub fn hash(_: ByKey, p: Probe) u32 {
@@ -165,7 +172,7 @@ pub const Store = struct {
     };
 
     fn find(s: *Store, key: Key) ?usize {
-        return s.map.getIndexAdapted(Probe{ .key = key, .h = key.hash() }, ByKey{});
+        return s.map.getIndexAdapted(Probe.of(key), ByKey{});
     }
 
     pub fn init(gpa: Allocator, cap: usize, share: ?*const Share) Store {
@@ -205,26 +212,29 @@ pub const Store = struct {
     }
 
     pub fn drop(s: *Store, blob: *Blob) void {
-        const i = s.map.getIndex(Ref.of(blob)) orelse return;
+        const i = s.find(blob.key()) orelse return;
         if (s.map.keys()[i].blob() == blob) s.removeAt(i);
     }
 
     /// Takes the caller's reference on success; on any error it stays theirs.
     pub fn put(s: *Store, blob: *Blob) error{ OutOfMemory, Refused }!void {
-        const ref = Ref.of(blob);
-        const gop = try s.map.getOrPut(s.gpa, ref);
-        const old: ?*Blob = if (gop.found_existing) gop.key_ptr.blob() else null;
-        if (old == null) {
-            errdefer s.map.swapRemoveAt(gop.index);
-            if (s.footprint() + blob.len > s.cap and !s.knock(blob.key())) {
+        const probe: Probe = .of(blob.key());
+        const index, const old: ?*Blob = if (s.map.getIndexAdapted(probe, ByKey{})) |i|
+            .{ i, s.map.keys()[i].blob() }
+        else blk: {
+            if (s.footprint() + blob.len > s.cap and !s.knock(probe.h)) {
                 s.unadmitted += 1;
                 return error.Refused;
             }
+            try s.map.ensureUnusedCapacity(s.gpa, 1);
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
-        }
-        gop.key_ptr.* = ref;
+            const gop = s.map.getOrPutAssumeCapacityAdapted(probe, ByKey{});
+            std.debug.assert(!gop.found_existing);
+            break :blk .{ gop.index, null };
+        };
+        s.map.keys()[index] = .of(blob, probe.h);
         s.held += blob.len;
-        s.visited.set(gop.index);
+        s.visited.set(index);
         if (old) |o| {
             if (s.on_evict) |f| f(s, o);
             s.letGo(o);
@@ -263,8 +273,7 @@ pub const Store = struct {
         s.evictions += 1;
     }
 
-    fn knock(s: *Store, key: Key) bool {
-        const h = key.hash();
+    fn knock(s: *Store, h: u64) bool {
         const a: u32 = @truncate(h % door_bits);
         const b: u32 = @truncate((h >> 32) % door_bits);
         const seen = s.door[a / 8] & (@as(u8, 1) << @intCast(a % 8)) != 0 and s.door[b / 8] & (@as(u8, 1) << @intCast(b % 8)) != 0;
@@ -653,6 +662,31 @@ test "the cap holds by eviction and admission" {
     try s.put(again);
     try testing.expect(s.get(key, 0) != null);
     try testing.expectEqual(s.held, s.bytes);
+
+    s.cap = std.math.maxInt(usize);
+    var fill: usize = 0;
+    while (s.map.count() < s.map.capacity()) : (fill += 1) {
+        var buf: [8]u8 = undefined;
+        const n = try std.mem.print(buf[1..], "f{d}\x00", .{fill});
+        buf[0] = @intCast(n.len - 1);
+        const fzone: dns.Name = .of(buf[0 .. n.len + 1]);
+        try s.put(try s.build(.of(.cut, fzone, .a), .{ .cut = .{ .zone = fzone } }, 10));
+    }
+    s.cap = s.held;
+
+    const colder = try s.build(.of(.cut, .lit("colder"), .a), .{ .cut = .{ .zone = .lit("colder") } }, 10);
+    defer s.unref(colder);
+    {
+        const saved = s.gpa;
+        s.gpa = testing.failing_allocator;
+        defer s.gpa = saved;
+        try testing.expectError(error.Refused, s.put(colder));
+    }
+    const unadmitted = s.unadmitted;
+    const replace = try s.build(key, .{ .cut = .{ .zone = zone } }, 10);
+    try s.put(replace);
+    try testing.expectEqual(unadmitted, s.unadmitted);
+    try testing.expectEqual(replace, s.get(key, 0).?);
 }
 
 test "a store on a share evicts for all it holds but what only others read" {
