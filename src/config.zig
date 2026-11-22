@@ -125,90 +125,52 @@ const ConfigError = error{
     OutOfMemory,
 };
 
-const KeySpec = struct { name: []const u8, kind: std.meta.Tag(toml.Value) };
-const SectionSpec = struct { name: []const u8, keys: []const KeySpec };
+/// A key is known by being read: `get` takes it out, and `end` refuses what is left.
+const Section = struct {
+    name: []const u8,
+    table: toml.Table,
 
-const config_schema = [_]SectionSpec{
-    .{ .name = "server", .keys = &.{
-        .{ .name = "listen", .kind = .string_array },
-        .{ .name = "max-udp-payload", .kind = .integer },
-        .{ .name = "user", .kind = .integer },
-        .{ .name = "group", .kind = .integer },
-        .{ .name = "clients", .kind = .string_array },
-        .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
-        .{ .name = "tcp-queries-per-conn", .kind = .integer },
-        .{ .name = "memory", .kind = .integer },
-    } },
-    .{ .name = "resolver", .keys = &.{
-        .{ .name = "root-hints", .kind = .string_array },
-        .{ .name = "stub-zones", .kind = .string_array },
-        .{ .name = "upstream-port", .kind = .integer },
-        .{ .name = "dot-port", .kind = .integer },
-        .{ .name = "allow-loopback-upstreams", .kind = .boolean },
-        .{ .name = "trust-anchors", .kind = .string_array },
-        .{ .name = "dnssec", .kind = .boolean },
-        .{ .name = "qname-minimization", .kind = .boolean },
-        .{ .name = "dns64-prefix", .kind = .string },
-        .{ .name = "stagger-ms", .kind = .integer },
-        .{ .name = "encrypted-transport", .kind = .string },
-        .{ .name = "max-queries", .kind = .integer },
-    } },
-    .{ .name = "cache", .keys = &.{
-        .{ .name = "size", .kind = .integer },
-        .{ .name = "prefetch", .kind = .boolean },
-        .{ .name = "serve-stale-ttl", .kind = .integer },
-        .{ .name = "min-ttl", .kind = .integer },
-        .{ .name = "servfail-ttl", .kind = .integer },
-    } },
-    .{ .name = "logging", .keys = &.{
-        .{ .name = "queries", .kind = .boolean },
-    } },
-    .{ .name = "rebinding", .keys = &.{
-        .{ .name = "enabled", .kind = .boolean },
-        .{ .name = "allow-zones", .kind = .string_array },
-        .{ .name = "extra-block", .kind = .string_array },
-        .{ .name = "extra-allow", .kind = .string_array },
-    } },
+    fn get(s: *Section, key: []const u8, comptime kind: std.meta.Tag(toml.Value)) ConfigError!?@FieldType(toml.Value, @tagName(kind)) {
+        const kv = s.table.map.fetchSwapRemove(key) orelse return null;
+        if (kv.value != kind) {
+            errLog("config: [{s}] {s} expects {s}, got {s}", .{ s.name, key, @tagName(kind), @tagName(kv.value) });
+            return error.InvalidValue;
+        }
+        return @field(kv.value, @tagName(kind));
+    }
+
+    fn of(root: *toml.Table, comptime name: []const u8) ConfigError!?Section {
+        const kv = root.map.fetchSwapRemove(name) orelse return null;
+        return switch (kv.value) {
+            .table => |t| .{ .name = name, .table = t },
+            .string, .integer, .boolean, .string_array => topLevel(name),
+        };
+    }
+
+    fn end(s: Section) ConfigError!void {
+        if (s.table.map.count() == 0) return;
+        errLog("config: unknown key '{s}' in [{s}]", .{ s.table.map.keys()[0], s.name });
+        return error.UnknownConfigKey;
+    }
 };
 
-fn validateSchema(root: toml.Table) ConfigError!void {
-    var sections = root.map.iterator();
-    while (sections.next()) |entry| {
-        const section_name = entry.key_ptr.*;
-        const spec = for (config_schema) |s| {
-            if (mem.eql(u8, s.name, section_name)) break s;
-        } else {
-            errLog("config: unknown section [{s}]", .{section_name});
-            return error.UnknownConfigKey;
-        };
-        const table = switch (entry.value_ptr.*) {
-            .table => |t| t,
-            .string, .integer, .boolean, .string_array => {
-                errLog("config: top-level key '{s}' — every setting lives under a [section]", .{section_name});
-                return error.UnknownConfigKey;
-            },
-        };
-        var keys = table.map.iterator();
-        while (keys.next()) |kv| {
-            const key = kv.key_ptr.*;
-            const kspec = for (spec.keys) |k| {
-                if (mem.eql(u8, k.name, key)) break k;
-            } else {
-                errLog("config: unknown key '{s}' in [{s}]", .{ key, section_name });
-                return error.UnknownConfigKey;
-            };
-            if (kv.value_ptr.* != kspec.kind) {
-                errLog("config: [{s}] {s} expects {s}, got {s}", .{
-                    section_name, key, @tagName(kspec.kind), @tagName(kv.value_ptr.*),
-                });
-                return error.InvalidValue;
-            }
-        }
-    }
+fn topLevel(key: []const u8) ConfigError {
+    errLog("config: top-level key '{s}' — every setting lives under a [section]", .{key});
+    return error.UnknownConfigKey;
 }
 
-fn integer(comptime T: type, table: toml.Table, key: []const u8, min: T, max: T) ConfigError!?T {
-    const v = table.get(key, .integer) orelse return null;
+fn strays(root: toml.Table) ConfigError!void {
+    if (root.map.count() == 0) return;
+    const key = root.map.keys()[0];
+    switch (root.map.values()[0]) {
+        .table => errLog("config: unknown section [{s}]", .{key}),
+        .string, .integer, .boolean, .string_array => return topLevel(key),
+    }
+    return error.UnknownConfigKey;
+}
+
+fn integer(comptime T: type, s: *Section, key: []const u8, min: T, max: T) ConfigError!?T {
+    const v = try s.get(key, .integer) orelse return null;
     if (v < min or v > max) {
         errLog("config: {s} must be {d} to {d}, got {d}", .{ key, min, max, v });
         return error.InvalidValue;
@@ -216,8 +178,8 @@ fn integer(comptime T: type, table: toml.Table, key: []const u8, min: T, max: T)
     return @intCast(v);
 }
 
-fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
-    const v = try integer(u32, table, key, 0, maxInt(u32)) orelse return null;
+fn credential(s: *Section, key: []const u8) ConfigError!?u32 {
+    const v = try integer(u32, s, key, 0, maxInt(u32)) orelse return null;
     if (v == maxInt(u32)) {
         errLog("config: {s} must be a real id, got the 'unchanged' sentinel {d}", .{ key, v });
         return error.InvalidValue;
@@ -232,28 +194,29 @@ fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
 pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
-    const root = try toml.parse(scratch.allocator(), contents);
-
-    try validateSchema(root);
+    var root = try toml.parse(scratch.allocator(), contents);
 
     var cfg: ServerConfig = .{ .arena = .init(gpa) };
     errdefer cfg.deinit();
     const arena = cfg.arena.allocator();
 
-    if (root.get("server", .table)) |server| {
-        if (server.get("listen", .string_array)) |addrs| cfg.listen = try parseAddressList(arena, addrs, error.InvalidListenAddress);
-        if (try integer(u16, server, "max-udp-payload", dns.max_udp_payload, dns.max_message_len)) |v| cfg.max_udp_payload = v;
-        if (try credential(server, "user")) |u| cfg.drop_uid = u;
-        if (try credential(server, "group")) |g| cfg.drop_gid = g;
-        if (server.get("clients", .string_array)) |entries| cfg.clients = try parseCidrList(arena, entries);
+    if (try Section.of(&root, "server")) |s| {
+        var server = s;
+        if (try server.get("listen", .string_array)) |addrs| cfg.listen = try parseAddressList(arena, addrs, error.InvalidListenAddress);
+        if (try integer(u16, &server, "max-udp-payload", dns.max_udp_payload, dns.max_message_len)) |v| cfg.max_udp_payload = v;
+        if (try credential(&server, "user")) |u| cfg.drop_uid = u;
+        if (try credential(&server, "group")) |g| cfg.drop_gid = g;
+        if (try server.get("clients", .string_array)) |entries| cfg.clients = try parseCidrList(arena, entries);
         // RFC 7828 §3.1: the keepalive TIMEOUT is a u16 of 100 ms units.
-        if (try integer(u32, server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
-        if (try integer(u32, server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
-        if (try integer(usize, server, "memory", 1, maxInt(usize))) |v| cfg.memory = v;
+        if (try integer(u32, &server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
+        if (try integer(u32, &server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
+        if (try integer(usize, &server, "memory", 1, maxInt(usize))) |v| cfg.memory = v;
+        try server.end();
     }
 
-    if (root.get("resolver", .table)) |resolver| {
-        if (resolver.get("root-hints", .string_array)) |addrs| {
+    if (try Section.of(&root, "resolver")) |s| {
+        var resolver = s;
+        if (try resolver.get("root-hints", .string_array)) |addrs| {
             cfg.root_hints = try parseAddressList(arena, addrs, error.InvalidRootHintAddress);
             const max_hints = delegation.max_servers_per_level;
             if (addrs.len > max_hints) {
@@ -261,59 +224,68 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
                 return error.TooManyRootHints;
             }
         }
-        if (resolver.get("stub-zones", .string_array)) |entries| cfg.stub_zones = try parseStubZones(arena, entries);
-        if (try integer(u16, resolver, "upstream-port", 1, 65535)) |p| {
+        if (try resolver.get("stub-zones", .string_array)) |entries| cfg.stub_zones = try parseStubZones(arena, entries);
+        if (try integer(u16, &resolver, "upstream-port", 1, 65535)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.upstream_port = p;
         }
-        if (try integer(u16, resolver, "dot-port", 1, 65535)) |p| {
+        if (try integer(u16, &resolver, "dot-port", 1, 65535)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.dot_port = p;
         }
-        if (resolver.get("allow-loopback-upstreams", .boolean)) |b| {
+        if (try resolver.get("allow-loopback-upstreams", .boolean)) |b| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.allow_loopback_upstreams = b;
         }
-        if (resolver.get("trust-anchors", .string_array)) |entries| {
+        if (try resolver.get("trust-anchors", .string_array)) |entries| {
             cfg.trust_anchors = try parseTrustAnchors(arena, entries);
         }
-        if (resolver.get("dnssec", .boolean)) |d| cfg.dnssec = d;
-        if (resolver.get("qname-minimization", .boolean)) |q| cfg.qname_minimization = q;
-        if (resolver.get("dns64-prefix", .string)) |s| if (s.len > 0) {
-            cfg.dns64 = dns64.Prefix.parse(s) orelse {
-                errLog("config: dns64-prefix '{s}' is not an IPv6 /32, /40, /48, /56, /64 or /96 (RFC 6052 §2.2)", .{s});
+        if (try resolver.get("dnssec", .boolean)) |d| cfg.dnssec = d;
+        if (try resolver.get("qname-minimization", .boolean)) |q| cfg.qname_minimization = q;
+        if (try resolver.get("dns64-prefix", .string)) |val| if (val.len > 0) {
+            cfg.dns64 = dns64.Prefix.parse(val) orelse {
+                errLog("config: dns64-prefix '{s}' is not an IPv6 /32, /40, /48, /56, /64 or /96 (RFC 6052 §2.2)", .{val});
                 return error.InvalidValue;
             };
         };
-        if (try integer(u32, resolver, "stagger-ms", 0, 1000)) |v| cfg.stagger_ms = v;
-        if (try integer(u32, resolver, "max-queries", 1, maxInt(u32))) |v| cfg.max_queries = v;
-        if (resolver.get("encrypted-transport", .string)) |s| {
-            cfg.encrypted_transport = std.meta.stringToEnum(EncryptedTransport, s) orelse {
-                errLog("config: encrypted-transport must be \"off\" or \"opportunistic\", got '{s}'", .{s});
+        if (try integer(u32, &resolver, "stagger-ms", 0, 1000)) |v| cfg.stagger_ms = v;
+        if (try integer(u32, &resolver, "max-queries", 1, maxInt(u32))) |v| cfg.max_queries = v;
+        if (try resolver.get("encrypted-transport", .string)) |val| {
+            cfg.encrypted_transport = std.meta.stringToEnum(EncryptedTransport, val) orelse {
+                errLog("config: encrypted-transport must be \"off\" or \"opportunistic\", got '{s}'", .{val});
                 return error.InvalidValue;
             };
         }
+        try resolver.end();
     }
 
-    if (root.get("cache", .table)) |cache| {
-        if (try integer(usize, cache, "size", 1, maxInt(usize))) |v| cfg.cache_size = v;
-        if (cache.get("prefetch", .boolean)) |p| cfg.prefetch = p;
-        if (try integer(u32, cache, "serve-stale-ttl", 0, maxInt(u32))) |v| cfg.serve_stale_ttl = v;
-        if (try integer(u32, cache, "min-ttl", 0, maxInt(u32))) |v| cfg.min_ttl = v;
+    if (try Section.of(&root, "cache")) |s| {
+        var cache = s;
+        if (try integer(usize, &cache, "size", 1, maxInt(usize))) |v| cfg.cache_size = v;
+        if (try cache.get("prefetch", .boolean)) |p| cfg.prefetch = p;
+        if (try integer(u32, &cache, "serve-stale-ttl", 0, maxInt(u32))) |v| cfg.serve_stale_ttl = v;
+        if (try integer(u32, &cache, "min-ttl", 0, maxInt(u32))) |v| cfg.min_ttl = v;
         // RFC 9520 §3.2: a failure is remembered no longer than 5 minutes.
-        if (try integer(u32, cache, "servfail-ttl", 0, 300)) |v| cfg.servfail_ttl = v;
+        if (try integer(u32, &cache, "servfail-ttl", 0, 300)) |v| cfg.servfail_ttl = v;
+        try cache.end();
     }
 
-    if (root.get("logging", .table)) |logging| {
-        if (logging.get("queries", .boolean)) |q| cfg.log_queries = q;
+    if (try Section.of(&root, "logging")) |s| {
+        var logging = s;
+        if (try logging.get("queries", .boolean)) |q| cfg.log_queries = q;
+        try logging.end();
     }
 
-    if (root.get("rebinding", .table)) |reb| {
-        if (reb.get("enabled", .boolean)) |b| cfg.rebinding.enabled = b;
-        if (reb.get("allow-zones", .string_array)) |entries| cfg.rebinding.allow_zones = try parseZoneList(arena, entries);
-        if (reb.get("extra-block", .string_array)) |entries| cfg.rebinding.extra_block = try parseCidrList(arena, entries);
-        if (reb.get("extra-allow", .string_array)) |entries| cfg.rebinding.extra_allow = try parseCidrList(arena, entries);
+    if (try Section.of(&root, "rebinding")) |s| {
+        var reb = s;
+        if (try reb.get("enabled", .boolean)) |b| cfg.rebinding.enabled = b;
+        if (try reb.get("allow-zones", .string_array)) |entries| cfg.rebinding.allow_zones = try parseZoneList(arena, entries);
+        if (try reb.get("extra-block", .string_array)) |entries| cfg.rebinding.extra_block = try parseCidrList(arena, entries);
+        if (try reb.get("extra-allow", .string_array)) |entries| cfg.rebinding.extra_allow = try parseCidrList(arena, entries);
+        try reb.end();
     }
+
+    try strays(root);
 
     cfg.rebinding.nat64 = cfg.dns64;
 
