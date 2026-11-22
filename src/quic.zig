@@ -1588,7 +1588,7 @@ pub const Conn = struct {
             const head = c.headLen(l, s);
             if (used + head + 16 + 8 > max_datagram) break;
             var p: Plan = .{ .level = l, .pn = s.next_pn, .pn_len = pnLen(s.next_pn, s.largest_acked), .head = head };
-            var w: Writer = .{ .buf = p.body[0 .. max_datagram - used - head - 16] };
+            var w: Writer = .{ .buf = buf[used + head .. max_datagram - 16] };
             if (!c.fill(l, &w, now, &p)) continue;
             if (p.acks) {
                 s.unacked = 0;
@@ -1607,7 +1607,7 @@ pub const Conn = struct {
         // question is padded to the full 1200 bytes.
         var pad = if (initial or stream_carried) max_datagram - used else 0;
         if (last.pn_len + last.len + pad < 4) pad = 4 - last.pn_len - last.len;
-        @memset(last.body[last.len..][0..pad], 0);
+        @memset(buf[used - 16 ..][0..pad], 0);
         last.len += pad;
         if (pad > 0) last.in_flight = true;
         var at: usize = 0;
@@ -1623,7 +1623,6 @@ pub const Conn = struct {
         pn: u64,
         pn_len: usize,
         head: usize,
-        body: [max_datagram]u8 = undefined,
         len: usize = 0,
         acks: bool = false,
         eliciting: bool = false,
@@ -1802,11 +1801,10 @@ pub const Conn = struct {
         var pn_be: [4]u8 = undefined;
         mem.writeInt(u32, &pn_be, @truncate(p.pn), .big);
         w.put(pn_be[4 - p.pn_len ..]);
-        const head = w.at;
-        w.put(p.body[0..p.len]);
-        w.at += 16;
+        std.debug.assert(w.at == p.head);
+        w.at += p.len + 16;
         const keys = s.tx.?;
-        keys.seal(out[0..w.at], head, p.pn_len, p.pn);
+        keys.seal(out[0..w.at], p.head, p.pn_len, p.pn);
         s.next_pn += 1;
         if (p.level == .application) c.sealed += 1;
         // With no room in the ring only a padded ACK reaches here (`fill` holds
@@ -1848,7 +1846,8 @@ pub const Conn = struct {
             if (s.tx == null) continue;
             var p: Plan = .{ .level = l, .pn = s.next_pn, .pn_len = pnLen(s.next_pn, s.largest_acked), .head = c.headLen(l, s) };
             if (at + p.head + 16 + 32 > max_datagram) break;
-            var w: Writer = .{ .buf = &p.body };
+            const body = buf[at + p.head .. max_datagram - 16];
+            var w: Writer = .{ .buf = body };
             if (why.app and l == .application) {
                 w.byte(0x1d);
                 w.varint(why.code);
@@ -1859,9 +1858,9 @@ pub const Conn = struct {
             }
             w.varint(0);
             p.len = w.at;
-            const want = if (l == .initial) max_datagram - at - p.head - 16 else 4 -| p.pn_len;
+            const want = if (l == .initial) body.len else 4 -| p.pn_len;
             if (p.len < want) {
-                @memset(p.body[p.len..want], 0);
+                @memset(body[p.len..want], 0);
                 p.len = want;
             }
             at += c.seal(&p, buf[at..], 0);
