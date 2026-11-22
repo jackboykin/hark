@@ -146,17 +146,7 @@ pub fn ready(sock: *Socket, sh: *Shared, _: u32) !carrier.News {
 }
 
 pub fn next(sock: *Socket, _: *Shared) !?carrier.Event {
-    const ev = sock.conn.next() orelse return null;
-    return switch (ev) {
-        .established => .established,
-        .reply => |r| .{ .reply = .{ .id = r.id, .bytes = r.bytes } },
-        .refused => |id| .{ .refused = id },
-        .room => .room,
-        .ended => |how| .{ .ended = switch (how) {
-            .failed => .failed,
-            .closed => .closed,
-        } },
-    };
+    return sock.conn.next();
 }
 
 pub fn flush(sock: *Socket, sh: *Shared) !bool {

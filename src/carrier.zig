@@ -2,6 +2,7 @@
 //! interface `Sessions` drives, whichever transport is underneath.
 
 const na = @import("net_address.zig");
+const quic = @import("quic.zig");
 const Edge = @import("edge.zig");
 const DotSocket = @import("dot_socket.zig");
 const DoqSocket = @import("doq_socket.zig");
@@ -136,7 +137,7 @@ pub const Taken = union(enum) {
     gone,
 };
 
-pub const End = enum { failed, closed };
+pub const End = quic.End;
 
 pub const News = union(enum) {
     nothing,
@@ -144,10 +145,4 @@ pub const News = union(enum) {
     ended: End,
 };
 
-pub const Event = union(enum) {
-    established,
-    reply: struct { id: QueryId, bytes: []u8 },
-    refused: QueryId,
-    room,
-    ended: End,
-};
+pub const Event = quic.Event;
