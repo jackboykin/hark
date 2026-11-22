@@ -347,7 +347,7 @@ fn unseeded(arena: Allocator, f: File) !void {
         if (t.nodeTag(node) != .field_access) continue;
         const path = try chain(arena, t, node, aliases) orelse continue;
         for (fixed_seed) |name| if (samePath(path, name))
-            report(f, t.nodeData(node).node_and_token[1], "std's string hash has a fixed seed: key with rand.Keyed", .{});
+            report(f, t.nodeData(node).node_and_token[1], "std's string hash has a fixed seed: key with keyed.Strings", .{});
     }
 }
 

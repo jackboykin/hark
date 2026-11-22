@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const mem = std.mem;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
-const rand = @import("rand.zig");
+const keyed = @import("keyed.zig");
 
 /// A DNAME and its synthesised CNAME count once. Chains in the wild run to
 /// 12; resolvers stop at 10 to 19.
@@ -56,7 +56,7 @@ pub const Key = struct {
     }
 
     fn hashName(name: []const u8) u32 {
-        return rand.Keyed.hash(.{}, name);
+        return keyed.Strings.hash(.{}, name);
     }
 
     pub fn hash(k: Key) u64 {
@@ -247,10 +247,10 @@ pub const Chain = struct {
 };
 
 test "a key's name hash follows the process key" {
-    const saved = rand.hash_key;
-    defer rand.hash_key = saved;
+    const saved = keyed.hash_key;
+    defer keyed.hash_key = saved;
     const a: Key = .of(.rrset, .lit("www.example"), .a);
-    rand.hash_key[0] ^= 1;
+    keyed.hash_key[0] ^= 1;
     const b: Key = .of(.rrset, .lit("www.example"), .a);
     try std.testing.expect(a.name_hash != b.name_hash);
 }

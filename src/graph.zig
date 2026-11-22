@@ -13,7 +13,6 @@
 //! What a cell is keyed by and holds is model.zig, which the store reads too.
 const std = @import("std");
 const builtin = @import("builtin");
-const rand = @import("rand.zig");
 const Arena = @import("arena.zig");
 const slab = @import("slab.zig");
 const mem = std.mem;
@@ -26,7 +25,7 @@ const dnssec = @import("dnssec.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
 const denial = @import("denial.zig");
-const failures = @import("failures.zig");
+const keyed = @import("keyed.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
 const stub = @import("stub.zig");
@@ -347,7 +346,7 @@ pub const Graph = struct {
     as_of: i64 = 0,
     unpaid: Budget = undefined,
     flights: u32 = 0,
-    failed: failures.Memory(Key, Failure.Name, Key.Context) = .{},
+    failed: keyed.Memory(Key, Failure.Name, Key.Context) = .{},
     stats: Stats = .{},
     index: std.array_hash_map.Custom(CellId, void, struct {}, true) = .empty,
     /// The top of the ready stack, which threads through the slots: a queued
@@ -1481,13 +1480,14 @@ pub const Graph = struct {
 const Quiet = struct {
     now: i64 = std.time.ns_per_s,
     wall: i64 = 0,
+    prng: std.Random.DefaultPrng = .init(0),
 
     fn graph(q: *Quiet, cfg: Config) !Graph {
         return q.graphOn(std.testing.allocator, std.testing.allocator, cfg);
     }
 
     fn graphOn(q: *Quiet, gpa: Allocator, work: Allocator, cfg: Config) !Graph {
-        return .init(gpa, work, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
+        return .init(gpa, work, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = q.prng.random(), .sendFn = send, .wakeFn = wake });
     }
 
     fn send(_: *anyopaque, _: Exchange) Error!Exposure {

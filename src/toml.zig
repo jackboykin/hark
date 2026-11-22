@@ -6,7 +6,7 @@ const slab = @import("slab.zig");
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
-const rand = @import("rand.zig");
+const keyed = @import("keyed.zig");
 
 pub const Value = union(enum) {
     string: []const u8,
@@ -17,7 +17,7 @@ pub const Value = union(enum) {
 };
 
 pub const Table = struct {
-    map: std.array_hash_map.Custom([]const u8, Value, rand.Keyed, true),
+    map: std.array_hash_map.Custom([]const u8, Value, keyed.Strings, true),
 
     pub fn get(t: Table, key: []const u8, comptime kind: std.meta.Tag(Value)) ?@FieldType(Value, @tagName(kind)) {
         const v = t.map.get(key) orelse return null;

@@ -12,7 +12,7 @@ const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 const graph = @import("graph.zig");
 const model = @import("model.zig");
-const rand = @import("rand.zig");
+const keyed = @import("keyed.zig");
 const walk = @import("walk.zig");
 
 const store = @import("store.zig");
@@ -259,7 +259,7 @@ const Zone = struct {
 };
 
 pub const Index = struct {
-    zones: std.array_hash_map.Custom([]const u8, Zone, rand.Keyed, true) = .empty,
+    zones: std.array_hash_map.Custom([]const u8, Zone, keyed.Strings, true) = .empty,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator, st: *store.Store) void {
         var it = ix.zones.iterator();
@@ -616,21 +616,21 @@ test "a read pays for a name's hash once" {
     try testing.expect(allowance.nsec3_blocks_spent > spent);
 }
 
-fn testGraph(ctx: *u8, now: *const i64, wall: *const i64) !Graph {
+fn testGraph(prng: *std.Random.DefaultPrng, now: *const i64, wall: *const i64) !Graph {
     const Stub = struct {
         fn send(_: *anyopaque, _: graph.Exchange) graph.Error!graph.Exposure {
             return .none;
         }
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) graph.Error!void {}
     };
-    return Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = ctx, .now_ns = now, .wall_sec = wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    return Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = prng, .now_ns = now, .wall_sec = wall, .rng = prng.random(), .sendFn = Stub.send, .wakeFn = Stub.wake });
 }
 
 test "re-absorbing a spanless zone survives the store replacing its SOA" {
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
-    var ctx: u8 = 0;
-    var g = try testGraph(&ctx, &now, &wall);
+    var prng: std.Random.DefaultPrng = .init(0);
+    var g = try testGraph(&prng, &now, &wall);
     defer g.deinit();
 
     const zone: dns.Name = .lit("example");

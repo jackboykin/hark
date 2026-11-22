@@ -1,7 +1,7 @@
 //! std.Io.net.IpAddress, with constructors and a hashable key.
 const std = @import("std");
 const mem = std.mem;
-const rand = @import("rand.zig");
+const keyed = @import("keyed.zig");
 const acl = @import("acl.zig");
 
 pub const Address = std.Io.net.IpAddress;
@@ -59,7 +59,7 @@ pub const AddressKey = struct {
             bytes[0..16].* = key.addr;
             bytes[16] = @backingInt(key.family);
             mem.writeInt(u16, bytes[17..19], key.port, .little);
-            return rand.hash(&bytes);
+            return keyed.hash(&bytes);
         }
 
         pub fn eql(_: @This(), a: AddressKey, b: AddressKey) bool {

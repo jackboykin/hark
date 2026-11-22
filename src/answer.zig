@@ -8,9 +8,8 @@ const graph = @import("graph.zig");
 const model = @import("model.zig");
 const walk = @import("walk.zig");
 const store = @import("store.zig");
-const rand = @import("rand.zig");
+const keyed = @import("keyed.zig");
 const dns64 = @import("dns64.zig");
-const failures = @import("failures.zig");
 const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
 const response = @import("response.zig");
@@ -541,7 +540,7 @@ const Seen = struct {
     }
 
     fn hash(rr: dns.ResourceRecord) usize {
-        var h: rand.Hasher = .init(&rand.hash_key);
+        var h: keyed.Hasher = .init(&keyed.hash_key);
         h.update(rr.name.wire);
         h.update(std.mem.asBytes(&[2]u16{ @backingInt(rr.rtype), @backingInt(rr.rclass) }));
         h.update(rr.rdata);
@@ -558,7 +557,7 @@ fn sameRecord(a: dns.ResourceRecord, b: dns.ResourceRecord) bool {
 /// to 5 minutes. Keyed with CD, since a CD client is owed bogus data. The
 /// graph remembers the fact that failed, for every question resting on it;
 /// this remembers the answer, whose window grows per question.
-const Failures = failures.Memory([]const u8, union(enum) { stale, failure: struct { window_s: u32, ede: dns.Ede } }, rand.Keyed);
+const Failures = keyed.Memory([]const u8, union(enum) { stale, failure: struct { window_s: u32, ede: dns.Ede } }, keyed.Strings);
 
 const Held = union(enum) { stale, failed: dns.Ede };
 
@@ -671,7 +670,7 @@ test "an answer finished short of memory holds no blob" {
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
     var ctx: u8 = 0;
-    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
+    var g = try graph.Graph.init(testing.allocator, testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Quiet.send, .wakeFn = Quiet.wake });
     defer g.deinit();
     var d: Desk = .{ .g = &g, .retention = .{}, .dns64 = .well_known };
     defer d.deinit();
