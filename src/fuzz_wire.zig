@@ -354,11 +354,9 @@ test "fuzz: store round trip" {
                 try testing.expectEqual(have.len, sec.len);
                 var it = sec.iterator();
                 for (want, have) |a, b| {
-                    try testing.expect(a.name.eql(b.name) and a.rtype == b.rtype and a.rclass == b.rclass and a.ttl == b.ttl);
-                    try testing.expectEqualSlices(u8, a.rdata, b.rdata);
+                    try testing.expect(sameMember(a, b) and a.ttl == b.ttl);
                     const c = it.next().?;
-                    try testing.expect(b.name.eql(c.name) and b.rtype == c.rtype and b.rclass == c.rclass and b.ttl == c.ttl);
-                    try testing.expectEqualSlices(u8, b.rdata, c.rdata);
+                    try testing.expect(sameMember(b, c) and b.ttl == c.ttl);
                 }
                 try testing.expectEqual(null, it.next());
             }
