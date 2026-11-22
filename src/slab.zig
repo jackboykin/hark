@@ -33,6 +33,7 @@ const slot_sizes: [class_count]u32 = blk: {
             const base = fine_max << ((c - fine_max / 16) / steps);
             s.* = base + base / steps * ((c - fine_max / 16) % steps + 1);
         }
+        assert(s.* % 16 == 0);
     }
     break :blk sizes;
 };
@@ -89,9 +90,8 @@ const Slab = struct {
 
     fn slot(slab: *Slab, ptr: [*]u8) ?usize {
         const at = @intFromPtr(ptr);
-        const size = slot_sizes[slab.class];
-        if (at >= slab.fresh or (at - slab.base()) % size != 0) return null;
-        return (at - slab.base()) / size;
+        if (at >= slab.fresh or at & 15 != 0) return null;
+        return (at & (slab_len - 1)) >> 4;
     }
 
     fn handOut(slab: *Slab, ptr: [*]u8) void {
@@ -100,10 +100,11 @@ const Slab = struct {
         slab.out.set(i);
     }
 
-    fn fault(slab: *Slab, memory: []u8) ?[]const u8 {
+    fn takeBack(slab: *Slab, memory: []u8) ?[]const u8 {
         const i = slab.slot(memory.ptr) orelse return "slab: freed a pointer that is no slot";
         if (!slab.out.isSet(i)) return "slab: double free, or a slot never handed out";
         if (memory.len > slot_sizes[slab.class]) return "slab: freed more than its slot";
+        slab.out.unset(i);
         return null;
     }
 };
@@ -356,8 +357,7 @@ pub const Tenant = struct {
         assert(slab.owner == t and slab.used > 0);
         t.share.held -= slot_sizes[slab.class];
         if (!safe) return release(slab, memory.ptr);
-        if (slab.fault(memory)) |why| @panic(why);
-        slab.out.unset(slab.slot(memory.ptr).?);
+        if (slab.takeBack(memory)) |why| @panic(why);
         if (!quarantined) return release(slab, memory.ptr);
         const size = slot_sizes[slab.class];
         @memset(memory.ptr[0..size], 0xaa);
@@ -502,12 +502,12 @@ test "a free of anything but a slot handed out is a fault" {
     const x = try a.alloc(u8, 40);
     const slab = Slab.of(x.ptr);
     const size = slot_sizes[slab.class];
-    try testing.expectEqual(null, slab.fault(x));
-    try testing.expectEqualStrings("slab: freed more than its slot", slab.fault(x.ptr[0 .. size + 1]).?);
-    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.fault(x.ptr[1..41]).?);
-    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.fault((x.ptr + size)[0..40]).?);
+    try testing.expectEqualStrings("slab: freed more than its slot", slab.takeBack(x.ptr[0 .. size + 1]).?);
+    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.takeBack(x.ptr[1..41]).?);
+    try testing.expectEqualStrings("slab: freed a pointer that is no slot", slab.takeBack((x.ptr + size)[0..40]).?);
+    try testing.expectEqualStrings("slab: double free, or a slot never handed out", slab.takeBack(x.ptr[16..40]).?);
     a.free(x);
-    try testing.expectEqualStrings("slab: double free, or a slot never handed out", slab.fault(x).?);
+    try testing.expectEqualStrings("slab: double free, or a slot never handed out", slab.takeBack(x).?);
 }
 
 test "a freed slot comes back only after the quarantine has moved past it" {
