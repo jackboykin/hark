@@ -1,0 +1,45 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a narrowed proof leaves the next proof still to judge
+
+; The root's NSEC carries its real signature beside one of an unassigned
+; algorithm, which the stored set drops. The NSEC after it is forged, its
+; signature by no key, and must still be judged; the honest one after
+; that lends it nothing.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      . 3600 IN RRSIG NSEC 200 0 3600 20990101000000 20200101000000 1 . AAAA
+      a. 3600 IN NSEC c. A RRSIG NSEC
+      a. 3600 IN RRSIG NSEC 13 1 3600 20990101000000 20200101000000 1 . AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      x. 3600 IN NSEC y. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+SCENARIO_END

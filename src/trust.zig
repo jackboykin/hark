@@ -456,10 +456,15 @@ fn flooded(r: *const model.Reply, qtype: dns.RType) bool {
 const Claims = struct {
     r: *const model.Reply,
     qtype: dns.RType,
-    p: usize = 0,
-    i: usize = 0,
+    /// The head of the set last yielded. The next call steps past it, since
+    /// narrowing may have shortened that set in between.
+    pos: union(enum) {
+        start,
+        auth: usize,
+        answer: usize,
+        done,
+    } = .start,
     slot: u8 = 0,
-    ended: bool = false,
 
     const Claim = struct {
         slot: u8,
@@ -476,30 +481,40 @@ const Claims = struct {
 
     fn next(it: *Claims) ?Claim {
         const auth = it.r.authorities;
-        while (it.p < auth.len) {
-            const i = it.p;
-            it.p += dnssec.setFrom(auth, i).len;
-            const rr = auth[i];
+        var p: usize = switch (it.pos) {
+            .start => 0,
+            .auth => |head| head + dnssec.setFrom(auth, head).len,
+            .answer => auth.len,
+            .done => return null,
+        };
+        while (p < auth.len) {
+            const head = p;
+            p += dnssec.setFrom(auth, head).len;
+            const rr = auth[head];
             switch (rr.rtype) {
-                .nsec, .nsec3, .soa => return it.claim(rr.name, rr.rtype, i, .proof),
+                .nsec, .nsec3, .soa => {
+                    it.pos = .{ .auth = head };
+                    return it.claim(rr.name, rr.rtype, head, .proof);
+                },
                 else => {},
             }
         }
         const answers = it.r.answers;
-        while (it.i < answers.len) {
-            const i = it.i;
-            it.i += dnssec.setFrom(answers, i).len;
-            const rr = answers[i];
+        var i: usize = if (it.pos == .answer) it.pos.answer + dnssec.setFrom(answers, it.pos.answer).len else 0;
+        while (i < answers.len) {
+            const head = i;
+            i += dnssec.setFrom(answers, head).len;
+            const rr = answers[head];
             if (rr.rtype == .rrsig) continue;
             var dname: ?RR = null;
             if (rr.rtype == .cname) for (answers) |d| {
                 if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.depth() > dname.?.name.depth())) dname = d;
             };
-            if (dname) |d| return it.claim(rr.name, rr.rtype, i, .{ .synthesised = .{ .cname = rr, .dname = d } });
-            return it.claim(rr.name, rr.rtype, i, .rrset);
+            it.pos = .{ .answer = head };
+            if (dname) |d| return it.claim(rr.name, rr.rtype, head, .{ .synthesised = .{ .cname = rr, .dname = d } });
+            return it.claim(rr.name, rr.rtype, head, .rrset);
         }
-        if (it.ended) return null;
-        it.ended = true;
+        it.pos = .done;
         return switch (it.r.kind) {
             .nodata, .nxdomain => it.claim(it.r.target, it.qtype, 0, .denial),
             .answer, .alias, .yxdomain => null,
@@ -594,7 +609,7 @@ fn verifiedProofs(g: *Graph, r: *const model.Reply, qtype: dns.RType, s: *const 
 }
 
 /// Drops the signatures the verifier did not weigh before a verdict is
-/// stamped on the bytes. Only signatures go, so claim slots do not move.
+/// stamped on the bytes.
 fn keepWeighed(g: *Graph, target: CellId, r: *const model.Reply, c: *const Claims.Claim, zone: dns.Name, keys: []const RR, now: u32) !void {
     const section = if (c.is == .proof) r.authorities else r.answers;
     const set = dnssec.setFrom(section, c.head);
