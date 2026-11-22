@@ -9,6 +9,7 @@ const answer = @import("answer.zig");
 const Arena = @import("arena.zig");
 const store = @import("store.zig");
 const slab = @import("slab.zig");
+const Share = @import("share.zig");
 const Batch = @import("batch.zig");
 
 const linux = std.os.linux;
@@ -915,7 +916,7 @@ const Server = struct {
     }
 };
 
-pub fn run(gpa: Allocator, work: Allocator, owed: *const slab.Share, facts: store.Facts, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
+pub fn run(gpa: Allocator, work: Allocator, owed: *const Share, facts: store.Facts, reserve: *slab.Reserve, cfg: *const config.ServerConfig, trace: bool) !void {
     var e = try Edge.init(gpa);
     defer e.deinit();
     e.idle_max = fdShare(16);

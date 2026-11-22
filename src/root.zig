@@ -7,6 +7,7 @@ pub const rand = @import("rand.zig");
 pub const rpl = @import("sim/rpl.zig");
 pub const serve = @import("serve.zig");
 pub const slab = @import("slab.zig");
+pub const Share = @import("share.zig");
 
 // Tests are found by reachability from here: a file not listed runs none.
 test {

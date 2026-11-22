@@ -9,6 +9,7 @@ const Allocator = mem.Allocator;
 const Alignment = mem.Alignment;
 const testing = std.testing;
 const assert = std.debug.assert;
+const Share = @import("share.zig");
 
 const slab_len = 64 << 10;
 const region_len = 4 << 20;
@@ -154,23 +155,6 @@ const Region = struct {
 
     comptime {
         assert(@sizeOf(Region) <= slab_len);
-    }
-};
-
-pub const Share = struct {
-    held: usize = 0,
-    limit: usize = std.math.maxInt(usize),
-
-    pub fn crowded(s: *const Share, num: usize, den: usize) bool {
-        return @as(u128, s.held) * den >= @as(u128, s.limit) * num;
-    }
-
-    pub fn atDoor(s: *const Share) bool {
-        return s.crowded(7, 8);
-    }
-
-    fn room(s: *const Share, n: usize) bool {
-        return s.held + n <= s.limit;
     }
 };
 

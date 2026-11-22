@@ -22,8 +22,8 @@ const log = std.log;
 const leaks = std.log.scoped(.slab);
 
 var reserve: hark.slab.Reserve = .{};
-var kept: hark.slab.Share = .{};
-var owed: hark.slab.Share = .{};
+var kept: hark.Share = .{};
+var owed: hark.Share = .{};
 var facts: hark.slab.Tenant = .in(&reserve, &kept);
 var lasting: hark.slab.Tenant = .in(&reserve, &owed);
 var work: hark.slab.Tenant = .in(&reserve, &owed);

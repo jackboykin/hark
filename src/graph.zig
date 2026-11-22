@@ -14,7 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Arena = @import("arena.zig");
-const slab = @import("slab.zig");
+const Share = @import("share.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
@@ -141,7 +141,7 @@ pub const Config = struct {
     stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
     max_flights: u32 = std.math.maxInt(u32),
-    owed: ?*const slab.Share = null,
+    owed: ?*const Share = null,
     servfail_ttl: u32 = 5,
     prefetch: bool = false,
     trust_anchors: ?[]const dns.DsData = null,
@@ -1604,7 +1604,7 @@ test "an exchange holds a reply as it arrived, whatever its names expand to" {
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
     const testing = std.testing;
     var q: Quiet = .{};
-    var owed: slab.Share = .{ .limit = 8 };
+    var owed: Share = .{ .limit = 8 };
     var g = try q.graph(.{ .root_hints = &.{}, .owed = &owed });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

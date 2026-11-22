@@ -7,7 +7,7 @@ const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const model = @import("model.zig");
-const slab = @import("slab.zig");
+const Share = @import("share.zig");
 
 const Kind = model.Kind;
 const Key = model.Key;
@@ -101,7 +101,7 @@ pub const Life = struct {
 
 const OnEvict = *const fn (*Store, *Blob) void;
 
-pub const Facts = struct { allocator: Allocator, share: *const slab.Share };
+pub const Facts = struct { allocator: Allocator, share: *const Share };
 
 pub const Store = struct {
     gpa: Allocator,
@@ -111,7 +111,7 @@ pub const Store = struct {
     /// The bytes of the blobs the map holds.
     held: usize = 0,
     cap: usize,
-    share: ?*const slab.Share = null,
+    share: ?*const Share = null,
     visited: std.bit_set.Dynamic = .{},
     hand: usize = 0,
     /// Over the cap a new key is turned away the first time and admitted the
@@ -168,7 +168,7 @@ pub const Store = struct {
         return s.map.getIndexAdapted(Probe{ .key = key, .h = key.hash() }, ByKey{});
     }
 
-    pub fn init(gpa: Allocator, cap: usize, share: ?*const slab.Share) Store {
+    pub fn init(gpa: Allocator, cap: usize, share: ?*const Share) Store {
         return .{ .gpa = gpa, .cap = cap, .share = share };
     }
 
@@ -657,9 +657,10 @@ test "the cap holds by eviction and admission" {
 
 test "a store on a share evicts for all it holds but what only others read" {
     const testing = std.testing;
+    const slab = @import("slab.zig");
     var reserve: slab.Reserve = .{};
     defer reserve.deinit();
-    var kept: slab.Share = .{};
+    var kept: Share = .{};
     var facts: slab.Tenant = .in(&reserve, &kept);
     var s: Store = .init(facts.allocator(), 4096, &kept);
     var read: [64]*Blob = undefined;
