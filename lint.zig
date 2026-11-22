@@ -15,6 +15,8 @@
 //! - A `pub` declaration is named by another file.
 //! - No import cycle outside the named knots, and no import left unused.
 //! - Every file under src/ is listed in root.zig, or its tests never run.
+//! - Only the files named as the shell touch the OS, and no other file under
+//!   src/ imports one, outside a test.
 
 const std = @import("std");
 const mem = std.mem;
@@ -51,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
         try unreserved(arena, f);
         try shape(arena, f);
         unusedImports(f);
+        try pure(arena, f);
     }
     try needlessPub(arena, files);
     try cycles(arena, files);
@@ -489,6 +492,55 @@ fn unusedImports(f: File) void {
             if (token != name and t.tokenTag(token) == .identifier and mem.eql(u8, t.tokenSlice(token), t.tokenSlice(name))) continue :decls;
         }
         report(f, name, "{s} is imported and never used", .{t.tokenSlice(name)});
+    }
+}
+
+const shell = [_][]const u8{
+    "src/batch.zig",
+    "src/carrier.zig",
+    "src/doq_socket.zig",
+    "src/dot_socket.zig",
+    "src/edge.zig",
+    "src/log.zig",
+    "src/main.zig",
+    "src/root.zig",
+    "src/serve.zig",
+    "src/sessions.zig",
+    "src/sim/replay.zig",
+    "src/slab.zig",
+    "src/stream.zig",
+    "src/sys.zig",
+    "src/sys_linux.zig",
+};
+
+const os_surface = [_][]const []const u8{
+    &.{"posix"},
+    &.{"os"},
+    &.{"c"},
+    &.{"fs"},
+    &.{"process"},
+    &.{"Thread"},
+    &.{ "Io", "Dir" },
+    &.{ "Io", "File" },
+};
+
+fn pure(arena: Allocator, f: File) !void {
+    if (!mem.startsWith(u8, f.path, "src/") or holds(&shell, f.path)) return;
+    const t = f.tree;
+    const aliases = try stdAliases(arena, t);
+    const tests = try testRanges(arena, t);
+    nodes: for (0..t.nodes.len) |n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const at = t.firstToken(node);
+        for (tests) |r| if (at >= r[0] and at <= r[1]) continue :nodes;
+        if (importTarget(t, node)) |target| {
+            const path = try Io.Dir.path.resolveAlloc(arena, &.{ Io.Dir.path.dirname(f.path) orelse ".", target });
+            if (holds(&shell, path)) report(f, at, "imports {s}, which touches the OS: a pure file is handed what it needs", .{path});
+        } else if (t.nodeTag(node) == .field_access) {
+            const path = try chain(arena, t, node, aliases) orelse continue;
+            for (os_surface) |name| if (samePath(path, name))
+                report(f, t.nodeData(node).node_and_token[1], "std.{s} is the OS: only a shell file names it", .{name[name.len - 1]});
+        }
     }
 }
 
