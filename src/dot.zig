@@ -6,7 +6,6 @@ const mem = std.mem;
 const crypto = std.crypto;
 const tls = crypto.tls;
 const dns = @import("dns.zig");
-const stream = @import("stream.zig");
 const tls13 = @import("tls13.zig");
 const Keys = tls13.Keys;
 
@@ -85,7 +84,7 @@ pub const Session = struct {
 
     pub fn next(s: *Session, rx: *Rx, out: []u8) Error!?Event {
         while (true) {
-            if (stream.framed(rx.buf[rx.frame..rx.opened])) |m| {
+            if (dns.framed(rx.buf[rx.frame..rx.opened])) |m| {
                 if (m.len < 12) return error.DecodeError;
                 rx.frame += 2 + m.len;
                 return .{ .reply = m };

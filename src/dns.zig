@@ -39,6 +39,12 @@ pub const max_negative_ttl: u32 = 10_800;
 pub const edns_udp_payload: u16 = 1232;
 pub const max_message_len: u16 = 65535;
 
+pub fn framed(bytes: []u8) ?[]u8 {
+    if (bytes.len < 2) return null;
+    const len = mem.readInt(u16, bytes[0..2], .big);
+    return if (bytes.len < 2 + @as(usize, len)) null else bytes[2..][0..len];
+}
+
 pub const OpCode = enum(u4) {
     query = 0,
     _,

@@ -9,12 +9,6 @@ const Allocator = std.mem.Allocator;
 
 pub const max_frame = 2 + @as(usize, std.math.maxInt(u16));
 
-pub fn framed(bytes: []u8) ?[]u8 {
-    if (bytes.len < 2) return null;
-    const len = std.mem.readInt(u16, bytes[0..2], .big);
-    return if (bytes.len < 2 + @as(usize, len)) null else bytes[2..][0..len];
-}
-
 const Read = union(enum) {
     bytes: []u8,
     ended,

@@ -359,7 +359,7 @@ const Server = struct {
             // Judged by its length alone, so a frame too long for a query is
             // never held while it arrives.
             if (rest.len >= 2 and mem.readInt(u16, rest[0..2], .big) > max_frame) return s.drop(c);
-            const query = stream.framed(rest) orelse break;
+            const query = dns.framed(rest) orelse break;
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;

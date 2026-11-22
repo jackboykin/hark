@@ -23,6 +23,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 const monotonic = @import("monotonic.zig");
@@ -349,7 +350,7 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
         .wait => return null,
         .ended, .failed => return e.finish(id, .timeout),
     };
-    const reply = stream.framed(got) orelse {
+    const reply = dns.framed(got) orelse {
         t.held.keep(e.work, got) catch return e.finish(id, .unheld);
         return null;
     };
