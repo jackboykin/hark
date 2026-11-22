@@ -815,13 +815,15 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         cur = c.cname();
     };
     const yx = msg.header.flags.rcode == .yx_domain;
+    // RFC 1034 §6.2.7: AA only covers the first owner; a CNAME target needs its SOA.
+    const denies = denied and (hops == 0 or delegation.soaAbove(msg.authorities, cur));
     // YXDOMAIN is derived from an overflowing substitution and must match the rcode
     // (RFC 6604 §4). Where the chain leaves the zone the rcode speaks for a name outside it (§3).
     const kind: Reply.Of = switch (end) {
         .left, .clipped, .asked_alias => .alias,
         .overflow => if (yx) .yxdomain else return null,
         .answered => if (yx) return null else .answer,
-        .dead_end => if (yx) return null else if (denied) .nxdomain else if (hops > 0) .alias else .nodata,
+        .dead_end => if (yx) return null else if (denies) .nxdomain else if (hops > 0) .alias else .nodata,
     };
     var reply: Reply = .{
         .kind = kind,
