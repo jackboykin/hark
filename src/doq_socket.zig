@@ -106,10 +106,6 @@ pub fn due(sock: *const Socket) ?i64 {
 
 pub fn fire(sock: *Socket, sh: *Shared) !carrier.News {
     try sock.conn.fire(sock.edge.now_ns);
-    return sock.news(sh);
-}
-
-fn news(sock: *Socket, sh: *Shared) !carrier.News {
     if (sock.conn.ended == null and !try sock.flush(sh)) return .{ .ended = .closed };
     return sock.said();
 }
