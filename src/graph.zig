@@ -1081,9 +1081,7 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    /// `read` marks a hop read from the denial index for this recall: its
-    /// blob is the caller's to let go.
-    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?model.Chain, read: bool = false };
+    const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, standing: ?model.Chain };
 
     fn readHop(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType) !?*store.Blob {
         const r = try denial.read(g, arena, name, qtype) orelse return null;
@@ -1102,7 +1100,7 @@ pub const Graph = struct {
     }
 
     pub fn letGo(g: *Graph, hops: []const Recalled) void {
-        for (hops) |h| if (h.read) g.store.unref(h.blob);
+        for (hops) |h| g.store.unref(h.blob);
     }
 
     /// The caller refs what it keeps, then lets the hops go.
@@ -1114,11 +1112,12 @@ pub const Graph = struct {
         errdefer g.letGo(hops.items);
         while (true) {
             kind = g.hopKind(kind, next, qtype) orelse return g.lost(hops.items);
-            const kept = g.storedHop(kind.?, next, qtype, age);
+            try hops.ensureUnusedCapacity(arena, 1);
+            const kept = if (g.storedHop(kind.?, next, qtype, age)) |b| b.ref() else null;
             const drawn = if (kept == null and age == .fresh and g.awaitsVerdict(kind.?)) try g.readHop(arena, next, qtype) else null;
             const e = kept orelse drawn orelse return g.lost(hops.items);
             // Listed before any return, so every way out lets it go.
-            try hops.append(arena, .{ .blob = e, .rrset = .of(e), .standing = null, .read = drawn != null });
+            hops.appendAssumeCapacity(.{ .blob = e, .rrset = .of(e), .standing = null });
             const hop = &hops.items[hops.items.len - 1];
             if (g.awaitsVerdict(kind.?)) {
                 hop.standing = e.verdict.standing(g.now());
@@ -1689,4 +1688,41 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.payer = &g.unpaid;
     g.unhold(first);
     g.unhold(second);
+}
+
+test "a recalled chain holds an earlier hop a later denial read evicts" {
+    const testing = std.testing;
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{}, .trust_anchors = &.{} });
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const zone: dns.Name = .lit("example");
+    const www: dns.Name = .lit("www.example");
+    const target: dns.Name = .lit("t.example");
+    const until = q.now + 3600 * std.time.ns_per_s;
+
+    // With the store empty, the alias is the first the clock hand reaches.
+    g.store.drop(g.store.any(.of(.cut, .root, .a)).?);
+
+    const cname: dns.ResourceRecord = .fixture(.{ .name = www, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = target } });
+    const alias = (try g.fact(.of(.rrset, www, .a), .{ .rrset = .{ .kind = .alias, .aa = true, .answers = &.{cname}, .target = target, .zone = zone, .stored_ns = q.now, .ttl = 3600 } }, until)).?;
+    alias.verdict.stamp(.{ .status = .secure, .proven_until_ns = until }, until, q.now);
+
+    const soa: dns.ResourceRecord = .fixture(.{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } });
+    const nsec: dns.ResourceRecord = .fixture(.{ .name = zone, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = zone, .type_bit_maps = &.{ 0x00, 0x01, 0x02 } } } });
+    try denial.absorb(&g, zone, q.now, .{ .rrs = &.{ soa, nsec }, .until = &.{ until, until } }, until);
+
+    _ = (try g.fact(.of(.rrset, target, .a), .{ .rrset = .{ .kind = .nodata, .aa = true, .target = target, .zone = zone, .stored_ns = q.now } }, q.now + 1)).?;
+    q.now += 1;
+    g.store.cap = g.store.held;
+
+    const chain = (try g.recall(arena.allocator(), www, .a, .fresh)).?;
+    defer g.letGo(chain);
+    try testing.expectEqual(2, chain.len);
+    try testing.expectEqual(null, g.store.any(.of(.rrset, www, .a)));
+    try testing.expectEqual(1, chain[0].blob.refs);
+    var it = chain[0].rrset.sections[0].iterator();
+    try testing.expect(it.next().?.cname().eql(target));
 }

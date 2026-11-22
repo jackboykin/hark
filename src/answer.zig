@@ -364,6 +364,7 @@ fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Serve
     const g = d.g;
     if (d.retention.min_ttl == 0) return null;
     const chain = try g.recall(arena, q.name, q.qtype, .any) orelse return null;
+    defer g.letGo(chain);
     var expired = false;
     for (chain) |h| {
         if (g.now() >= retainedUntil(d, h.rrset)) return null;
@@ -379,6 +380,7 @@ fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served 
     const g = d.g;
     if (d.retention.serve_stale_ttl == 0) return null;
     const chain = try g.recall(arena, q.name, q.qtype, .any) orelse return null;
+    defer g.letGo(chain);
     var window: i64 = std.math.maxInt(i64);
     var any = false;
     const hops = try arena.alloc(Hop, chain.len);
