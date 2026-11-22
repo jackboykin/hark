@@ -415,27 +415,16 @@ const Parser = struct {
     }
 
     fn replyToken(p: *Parser, e: *Entry, t: []const u8) Error!void {
-        const flags = &e.flags;
-        if (mem.eql(u8, t, "QR")) {
-            flags.qr = true;
-        } else if (mem.eql(u8, t, "AA")) {
-            flags.aa = true;
-        } else if (mem.eql(u8, t, "TC")) {
-            flags.tc = true;
-        } else if (mem.eql(u8, t, "RD")) {
-            flags.rd = true;
-        } else if (mem.eql(u8, t, "RA")) {
-            flags.ra = true;
-        } else if (mem.eql(u8, t, "AD")) {
-            flags.ad = true;
-        } else if (mem.eql(u8, t, "CD")) {
-            flags.cd = true;
-        } else if (mem.eql(u8, t, "DO")) {
+        inline for (.{ "qr", "aa", "tc", "rd", "ra", "ad", "cd" }) |bit| if (eqlIgnoreCase(t, bit)) {
+            @field(e.flags, bit) = true;
+            return;
+        };
+        if (eqlIgnoreCase(t, "DO")) {
             e.do_bit = true;
-        } else if (mem.eql(u8, t, "EDNS")) {
+        } else if (eqlIgnoreCase(t, "EDNS")) {
             e.edns = true;
         } else if (rcodeFromText(t)) |rc| {
-            flags.rcode = rc;
+            e.flags.rcode = rc;
         } else return p.fail("unknown REPLY token");
     }
 
@@ -879,7 +868,7 @@ fn rcodeFromText(t: []const u8) ?dns.RCode {
         .{ "REFUSED", dns.RCode.refused },
         .{ "YXDOMAIN", dns.RCode.yx_domain },
     };
-    inline for (table) |row| if (mem.eql(u8, t, row[0])) return row[1];
+    inline for (table) |row| if (eqlIgnoreCase(t, row[0])) return row[1];
     return null;
 }
 
