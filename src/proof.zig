@@ -381,18 +381,23 @@ fn validateNsecNegativeProof(
     var wc_buf: dns.Name.Buf = undefined;
     const wildcard = dns.Name.child(&wc_buf, "*", ce) orelse return .unchecked;
 
+    var owned: ?SecurityStatus = null;
     var denied = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
         var other: dns.Name.Buf = undefined;
         const nsec = rr.nsec(&other);
-        if (rr.name.eql(wildcard)) return if (is_nxdomain) .bogus else nodataAt(nsec.type_bit_maps, qname, qtype);
+        if (rr.name.eql(wildcard)) {
+            owned = owned orelse if (is_nxdomain) .bogus else nodataAt(nsec.type_bit_maps, qname, qtype);
+            continue;
+        }
         // RFC 4035 §5.4 shape under NOERROR: qname and `*.CE` both denied. The
         // rcode is unsigned, so the proof decides. `nsecCovers`, not name
         // nonexistence: a wildcard that is an empty non-terminal is NODATA too.
         if (if (is_nxdomain) nsecProvesNameNonexistence(rr.name, nsec, wildcard) else nsecCovers(rr.name, nsec, wildcard)) denied = true;
     }
-    return if (denied) .secure else .unchecked;
+    const at = owned orelse return if (denied) .secure else .unchecked;
+    return if (denied) .bogus else at;
 }
 
 const Nsec3Chain = struct {
@@ -798,11 +803,14 @@ test "an NSEC NODATA set reads the same whatever order its records come in" {
     const acme = dns.Name.lit("_acme-challenge.go-vip.net");
     const qname = dns.Name.lit("nasa-tv.go-vip.net");
 
-    const owns = nsecRrWithBitmap(wildcard, acme, &[_]u8{ 0x00, 0x09, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x40 });
+    const with_type = nsecRrWithBitmap(wildcard, acme, &[_]u8{ 0x00, 0x09, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x40 });
+    const without_type = nsecRrWithBitmap(wildcard, acme, &[_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03 });
     const denies = nsecRr(apex, lotus);
     var b: rrsig.ValidationBudget = .{};
-    for ([_][3]dns.ResourceRecord{ .{ nsecRr(lotus, ns1), owns, denies }, .{ nsecRr(lotus, ns1), denies, owns } }) |authorities| {
-        try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+    for ([_]dns.ResourceRecord{ with_type, without_type }) |owns| {
+        for ([_][3]dns.ResourceRecord{ .{ nsecRr(lotus, ns1), owns, denies }, .{ nsecRr(lotus, ns1), denies, owns } }) |authorities| {
+            try testing.expectEqual(SecurityStatus.bogus, try validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+        }
     }
 }
 
