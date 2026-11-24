@@ -330,7 +330,7 @@ fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     return switch (linux.errno(rc)) {
         .SUCCESS => e.finish(id, .{ .reply = .{ .bytes = e.rx[0..rc] } }),
         .AGAIN, .INTR => null,
-        else => e.finish(id, .timeout),
+        else => e.finish(id, .bounced),
     };
 }
 

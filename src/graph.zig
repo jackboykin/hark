@@ -86,6 +86,7 @@ pub const Heard = struct {
 
 pub const Completion = union(enum) {
     reply: Heard,
+    bounced,
     timeout,
     unsent,
     moved,
@@ -645,7 +646,7 @@ pub const Graph = struct {
             },
             .unsent => g.stats.resolver.faults.unsent += 1,
             .moved => g.stats.resolver.faults.moved += 1,
-            .mismatch, .malformed, .oversized => {},
+            .mismatch, .malformed, .oversized, .bounced => {},
         }
         g.settleExchange(id, outcome);
         g.drain();
@@ -656,6 +657,7 @@ pub const Graph = struct {
         return switch (completion) {
             .wake => unreachable,
             .unheld => error.OutOfMemory,
+            .bounced => .bounced,
             .timeout => .timeout,
             .unsent => .unsent,
             .moved => .moved,

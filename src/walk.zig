@@ -1057,7 +1057,7 @@ fn reap(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType, refus
             .oversized => continue,
             // Once more over a stream with plain case: a forger cannot follow there,
             // and a server that normalises 0x20 case answers.
-            .mismatch, .malformed => if (at.case == .random) .{ .need = .stream, .case = .plain } else continue,
+            .mismatch, .malformed, .bounced => if (at.case == .random) .{ .need = .stream, .case = .plain } else continue,
             // TC over a stream is a broken server, as good as a timeout.
             .reply => |r| if (dns.Header.parse(r.wire[0..12]).flags.tc) (if (r.stream) continue else Way{ .need = .stream, .case = .random }) else {
                 const msg = try g.read(at.exchange) orelse continue :heard .malformed;

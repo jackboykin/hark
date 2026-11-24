@@ -152,6 +152,12 @@ pub const Sim = struct {
             try s.hear(q, silence);
             return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
+        if (entry.bounce) {
+            try s.hear(q, silence);
+            const at = s.now_ns + delay;
+            if (ex.need == .stream or at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+            return s.schedule(ex.id, at, tie, .bounced);
+        }
 
         var flags = entry.flags;
         flags.qr = true;

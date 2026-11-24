@@ -67,6 +67,7 @@ pub const Entry = struct {
     edns: bool = false,
     ede: ?u16 = null,
     drop: bool = false,
+    bounce: bool = false,
     echo: enum { copy, upper, none } = .copy,
     unsigned: bool = false,
     sign_as: ?dns.Name = null,
@@ -360,6 +361,8 @@ const Parser = struct {
                 while (toks.next()) |t| {
                     if (eqlIgnoreCase(t, "drop")) {
                         e.drop = true;
+                    } else if (eqlIgnoreCase(t, "bounce")) {
+                        e.bounce = true;
                     } else if (eqlIgnoreCase(t, "force_upper_qname")) {
                         e.echo = .upper;
                     } else if (eqlIgnoreCase(t, "drop_question")) {

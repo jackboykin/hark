@@ -131,6 +131,7 @@ type loadedEntry struct {
 	Edns           bool
 	Ede            *int
 	Drop, Unsigned bool
+	Bounce         bool
 	Echo           string
 	SignAs         string `json:"sign_as"`
 	Wildcard       string
@@ -223,6 +224,9 @@ func (l *loadedEntry) entry() (*entry, error) {
 	m := &dns.Msg{Data: l.Message}
 	if err := m.Unpack(); err != nil {
 		return nil, err
+	}
+	if l.Bounce {
+		return nil, fmt.Errorf("a bounce needs a raw socket: mark the scenario sim-only")
 	}
 	e := &entry{
 		match: map[string]bool{}, drop: l.Drop, echo: l.Echo, unsigned: l.Unsigned,

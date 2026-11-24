@@ -144,6 +144,7 @@ pub const Outcome = union(enum) {
     mismatch,
     malformed,
     oversized,
+    bounced,
 };
 
 pub const Failure = struct {
