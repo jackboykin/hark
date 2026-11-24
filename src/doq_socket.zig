@@ -4,7 +4,6 @@ edge: *Edge,
 token: u32,
 fd: posix.fd_t,
 conn: quic.Conn,
-errno: ?[]const u8 = null,
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -52,7 +51,7 @@ pub fn open(edge: *Edge, sh: *Shared, server: na.Address, port: u16, token: u32)
     var sock: Socket = .{ .edge = edge, .token = token, .fd = fd, .conn = try .begin(edge.work, &entropy, edge.now_ns) };
     errdefer sock.conn.deinit();
     try edge.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.IN, Edge.session_tag | token);
-    if (!try sock.flush(sh)) return error.Unsent;
+    _ = try sock.flush(sh);
     return sock;
 }
 
@@ -84,7 +83,7 @@ pub fn stage(sock: *const Socket) []const u8 {
 }
 
 pub fn fault(sock: *const Socket) []const u8 {
-    return sock.errno orelse sock.conn.fault;
+    return sock.conn.fault;
 }
 
 pub fn query(sock: *Socket, _: *Shared, wire: []const u8, _: anytype) !carrier.Taken {
@@ -106,7 +105,7 @@ pub fn due(sock: *const Socket) ?i64 {
 
 pub fn fire(sock: *Socket, sh: *Shared) !carrier.News {
     try sock.conn.fire(sock.edge.now_ns);
-    if (sock.conn.ended == null and !try sock.flush(sh)) return .{ .ended = .closed };
+    if (sock.conn.ended == null) _ = try sock.flush(sh);
     return sock.said();
 }
 
@@ -124,14 +123,9 @@ pub fn ready(sock: *Socket, sh: *Shared, _: u32) !carrier.News {
         m.* = .{ .hdr = .{ .name = null, .namelen = 0, .iov = v[0..1].ptr, .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
     }
     const rc = linux.recvmmsg(sock.fd, &msgs, batch, linux.MSG.DONTWAIT, null);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .AGAIN, .INTR => return sock.said(),
-        else => |err| {
-            sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";
-            return .{ .ended = .failed };
-        },
-    }
+    // An error here is an ICMP message anyone on the path can forge: QUIC's
+    // own timers judge the session.
+    if (linux.errno(rc) != .SUCCESS) return sock.said();
     for (msgs[0..rc], sh.rx[0..rc]) |m, *b| {
         // Larger than the server was told it may send: lost, as on the wire.
         if (m.hdr.flags & linux.MSG.TRUNC != 0) continue;
@@ -155,14 +149,8 @@ pub fn flush(sock: *Socket, sh: *Shared) !bool {
         msgs[n] = .{ .hdr = .{ .name = null, .namelen = 0, .iov = iov[n..].ptr, .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
     }
     if (n == 0) return true;
-    const rc = linux.sendmmsg(sock.fd, &msgs, @intCast(n), 0);
-    switch (linux.errno(rc)) {
-        // What the kernel didn't take is lost as on the wire, and QUIC's loss
-        // recovery sends it again.
-        .SUCCESS, .AGAIN, .INTR, .NOBUFS => return true,
-        else => |err| {
-            sock.errno = std.enums.tagName(linux.E, err) orelse "unnamed errno";
-            return false;
-        },
-    }
+    // What the kernel refuses is lost as on the wire, and QUIC's loss
+    // recovery sends it again.
+    _ = linux.sendmmsg(sock.fd, &msgs, @intCast(n), 0);
+    return true;
 }
