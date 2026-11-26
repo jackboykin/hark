@@ -870,7 +870,7 @@ pub const Conn = struct {
             if (first & 0x40 == 0) return null;
             const s = c.space(.application);
             if (s.rx == null or rest.len < 1 + 20) return null;
-            try c.protected(.application, rest, 1, now, delivered, any);
+            if (try c.protected(.application, rest, 1, now, delivered)) any.* = true;
             return rest.len;
         }
         var r: Reader = .{ .rest = rest };
@@ -900,12 +900,15 @@ pub const Conn = struct {
         if (c.space(level).rx == null or length < 20) return size;
         if (c.server_scid) |known| {
             if (!known.eql(scid)) return size;
-        } else if (level == .initial) {
-            c.server_scid = .of(scid);
-            c.dcid = .of(scid);
-            c.cids[0] = .{ .seq = 0, .cid = .of(scid), .token = null };
-        } else return size;
-        try c.protected(level, rest[0..size], pn_at, now, delivered, any);
+        } else if (level != .initial) return size;
+        if (try c.protected(level, rest[0..size], pn_at, now, delivered)) {
+            any.* = true;
+            if (c.server_scid == null) {
+                c.server_scid = .of(scid);
+                c.dcid = .of(scid);
+                c.cids[0] = .{ .seq = 0, .cid = .of(scid), .token = null };
+            }
+        }
         return size;
     }
 
@@ -935,9 +938,9 @@ pub const Conn = struct {
         c.heard = true;
     }
 
-    fn protected(c: *Conn, level: Level, pkt: []u8, pn_at: usize, now: i64, delivered: *std.ArrayList([]u8), any: *bool) Error!void {
+    fn protected(c: *Conn, level: Level, pkt: []u8, pn_at: usize, now: i64, delivered: *std.ArrayList([]u8)) Error!bool {
         const s = c.space(level);
-        if (pkt.len < pn_at + 4 + 16) return;
+        if (pkt.len < pn_at + 4 + 16) return false;
         var keys = s.rx.?;
         const h = keys.unmask(pkt, pn_at);
         const pn = decodePn(s.largest_rx, h.truncated, h.len);
@@ -957,10 +960,9 @@ pub const Conn = struct {
         const plain = keys.open(pkt, head, pn) orelse {
             c.forgeries += 1;
             if (c.forgeries >= forgeries_allowed) return error.AeadLimitReached;
-            return;
+            return false;
         };
-        if (s.received.known(pn)) return;
-        any.* = true;
+        if (s.received.known(pn)) return false;
         c.heard = true;
         if (h.first & @as(u8, if (level == .application) 0x18 else 0x0c) != 0) return error.ProtocolViolation;
         if (update) {
@@ -982,6 +984,7 @@ pub const Conn = struct {
             s.unacked += 1;
             if (s.ack_by_ns == null) s.ack_by_ns = now + max_ack_delay_ns;
         }
+        return true;
     }
 
     fn frames(c: *Conn, level: Level, payload: []u8, now: i64, delivered: *std.ArrayList([]u8)) Error!bool {
@@ -1958,6 +1961,10 @@ test "RFC 9001 A.3: the server's Initial moves the handshake on and is acknowled
         "2158407dd074ee");
     var delivered: std.ArrayList([]u8) = .empty;
     defer delivered.deinit(testing.allocator);
+    var forged = [_]u8{ 0xc0, 0, 0, 0, 1, 0, 8 } ++ "evilevil".* ++ [_]u8{ 0, 0x40, 40 } ++ @as([40]u8, @splat(0x5a));
+    try c.input(&forged, std.time.ns_per_ms, &delivered);
+    try testing.expectEqual(null, c.server_scid);
+    try testing.expectEqualSlices(u8, &hex("8394c8f03e515708"), c.dcid.slice());
     try c.input(&packet, std.time.ns_per_ms, &delivered);
     try testing.expectEqual(null, c.next());
     try testing.expectEqual(.handshake, c.phase);
